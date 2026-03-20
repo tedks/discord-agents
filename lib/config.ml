@@ -1,5 +1,7 @@
 (** Application configuration, loaded from a YAML/JSON file or environment. *)
 
+open Ppx_yojson_conv_lib.Yojson_conv.Primitives
+
 type agent_kind =
   | Claude
   | Codex

@@ -104,5 +104,5 @@ let connect _t =
   Logs.info (fun m -> m "gateway: connect not yet implemented");
   ignore (identify_payload _t);
   ignore (heartbeat_payload _t);
-  ignore (handle_payload _t);
+  ignore (handle_payload _t (`Null));
   ()

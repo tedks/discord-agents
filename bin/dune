@@ -2,4 +2,4 @@
  (name main)
  (public_name discord-agents)
  (package discord_agents)
- (libraries discord_agents eio_main logs fmt))
+ (libraries discord_agents eio_main logs logs.fmt fmt fmt.tty))

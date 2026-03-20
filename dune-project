@@ -26,8 +26,9 @@
    (>= 1.0))
   (cohttp-eio
    (>= 6.0))
-  (websocket
-   (>= 2.0))
+  httpun-ws
+  httpun-eio
+  uri
   (yojson
    (>= 2.0))
   ppx_yojson_conv

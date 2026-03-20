@@ -11,6 +11,19 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         ocamlPackages = pkgs.ocaml-ng.ocamlPackages_5_3;
+        deps = with ocamlPackages; [
+          eio_main
+          cohttp-eio
+          httpun-ws
+          httpun-eio
+          yojson
+          ppx_yojson_conv
+          ppx_deriving
+          tls-eio
+          logs
+          fmt
+          uri
+        ];
       in
       {
         devShells.default = pkgs.mkShell {
@@ -20,19 +33,7 @@
             findlib
             ocaml-lsp
             ocamlformat
-
-            # Core deps
-            eio_main
-            cohttp-eio
-            websocket
-            yojson
-            ppx_yojson_conv
-            ppx_deriving
-            tls-eio
-            logs
-            fmt
-
-            # For TLS
+          ] ++ deps ++ [
             pkgs.gmp
           ];
 
@@ -47,17 +48,7 @@
           pname = "discord_agents";
           version = "0.1.0";
           src = ./.;
-          buildInputs = with ocamlPackages; [
-            eio_main
-            cohttp-eio
-            websocket
-            yojson
-            ppx_yojson_conv
-            ppx_deriving
-            tls-eio
-            logs
-            fmt
-          ];
+          buildInputs = deps;
         };
       });
 }

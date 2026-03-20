@@ -3,6 +3,8 @@
     We only model what we need: messages, channels, threads, reactions.
     No voice, no presence, no guild member management. *)
 
+open Ppx_yojson_conv_lib.Yojson_conv.Primitives
+
 (* Channel types per Discord API *)
 type channel_type =
   | Guild_text        (* 0 *)
