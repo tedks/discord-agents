@@ -175,13 +175,13 @@ let send_close t =
 let handshake t ~host ~path =
   let key = generate_ws_key () in
   let request = Printf.sprintf
-    "GET %s HTTP/1.1\r\n\
-     Host: %s\r\n\
-     Upgrade: websocket\r\n\
-     Connection: Upgrade\r\n\
-     Sec-WebSocket-Key: %s\r\n\
-     Sec-WebSocket-Version: 13\r\n\
-     \r\n"
+"GET %s HTTP/1.1\r\n\
+Host: %s\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: %s\r\n\
+Sec-WebSocket-Version: 13\r\n\
+\r\n"
     path host key
   in
   Eio.Flow.write (t.flow :> Eio.Flow.sink_ty Eio.Resource.t)
