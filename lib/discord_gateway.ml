@@ -75,7 +75,7 @@ let heartbeat_payload t =
   ]
 
 (** Build a Resume payload. *)
-let resume_payload t =
+let _resume_payload t =
   `Assoc [
     ("op", `Int 6);
     ("d", `Assoc [
@@ -86,7 +86,7 @@ let resume_payload t =
   ]
 
 (** Parse a gateway payload and dispatch events. *)
-let handle_payload t ~sw json =
+let handle_payload t ~sw ~clock json =
   let open Yojson.Safe.Util in
   let op = json |> member "op" |> to_int |> gateway_opcode_of_int in
   let d = json |> member "d" in
@@ -130,7 +130,7 @@ let handle_payload t ~sw json =
     Eio.Fiber.fork_daemon ~sw (fun () ->
       (* Initial jitter: random fraction of the interval *)
       let jitter = Random.float (float_of_int heartbeat_interval /. 1000.0) in
-      Unix.sleepf jitter;
+      Eio.Time.sleep clock jitter;
       let rec heartbeat_loop () =
         if not t.last_heartbeat_acked then begin
           Logs.warn (fun m -> m "gateway: heartbeat not acked, reconnecting");
@@ -141,7 +141,7 @@ let handle_payload t ~sw json =
           send_json t (heartbeat_payload t);
           Logs.debug (fun m -> m "gateway: heartbeat sent (seq=%s)"
             (match t.sequence with Some s -> string_of_int s | None -> "null"));
-          Unix.sleepf (float_of_int t.heartbeat_interval_ms /. 1000.0);
+          Eio.Time.sleep clock (float_of_int t.heartbeat_interval_ms /. 1000.0);
           heartbeat_loop ()
         end
       in
@@ -176,8 +176,8 @@ let handle_payload t ~sw json =
 (** Connect to the gateway and run the event loop.
     Reconnects automatically on disconnect. *)
 let connect ~sw ~env t =
-  ignore resume_payload;
   let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
   let gateway_host = "gateway.discord.gg" in
   let gateway_path = "/?v=10&encoding=json" in
   let rec connect_loop () =
@@ -191,7 +191,7 @@ let connect ~sw ~env t =
       | { Websocket.opcode = Text; payload } ->
         (try
            let json = Yojson.Safe.from_string payload in
-           handle_payload t ~sw json
+           handle_payload t ~sw ~clock json
          with exn ->
            Logs.warn (fun m -> m "gateway: failed to parse payload: %s"
              (Printexc.to_string exn)));
@@ -208,7 +208,7 @@ let connect ~sw ~env t =
     t.ws <- None;
     (* Reconnect after a brief delay *)
     Logs.info (fun m -> m "gateway: reconnecting in 5s...");
-    Unix.sleepf 5.0;
+    Eio.Time.sleep clock 5.0;
     connect_loop ()
   in
   connect_loop ()

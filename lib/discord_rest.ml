@@ -13,6 +13,7 @@ type t = {
   token : string;
   client : Cohttp_eio.Client.t;
   sw : Eio.Switch.t;
+  clock : float Eio.Time.clock_ty Eio.Resource.t;
 }
 
 let create ~sw ~(env : Eio_unix.Stdenv.base) ~token =
@@ -36,7 +37,8 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) ~token =
   in
   let net = Eio.Stdenv.net env in
   let client = Cohttp_eio.Client.make ~https:(Some https) net in
-  { token; client; sw }
+  let clock = Eio.Stdenv.clock env in
+  { token; client; sw; clock }
 
 let make_headers t =
   Http.Header.of_list [
@@ -94,7 +96,7 @@ let request t ~meth ~path ?body () =
         with _ -> 5.0
       in
       Logs.warn (fun m -> m "REST: rate limited on %s, retrying after %.1fs" path retry_after);
-      Unix.sleepf retry_after;
+      Eio.Time.sleep t.clock retry_after;
       handle_response (do_call ())
     end else
       handle_response (resp, resp_body)
