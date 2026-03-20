@@ -67,7 +67,6 @@ let handle_control_message t msg =
     ignore (Discord_rest.create_message t.rest
       ~channel_id:msg.channel_id ~content:text ())
   | Start_agent { project; kind } ->
-    (* Find project, create worktree, create thread, start session *)
     let proj = List.find_opt (fun (p : Project.t) -> p.name = project) t.projects in
     (match proj with
      | None ->
@@ -85,7 +84,6 @@ let handle_control_message t msg =
            ~channel_id:msg.channel_id
            ~content:(Printf.sprintf "Failed to create worktree: %s" e) ())
        | Ok worktree_path ->
-         (* TODO: create Discord thread, then start session *)
          let thread_id = "TODO" in
          let session = Session.create
            ~project_name:p.name ~agent_kind:kind
@@ -130,7 +128,7 @@ let handle_control_message t msg =
 (** Handle a message in a session thread — forward to agent. *)
 let handle_thread_message t msg =
   match SessionMap.find_opt msg.Discord_types.channel_id t.sessions with
-  | None -> () (* Not a session thread, ignore *)
+  | None -> ()
   | Some session ->
     (match Session.send_to_agent session msg.content with
      | Ok () -> ()
@@ -139,7 +137,6 @@ let handle_thread_message t msg =
 
 (** Route an incoming Discord message. *)
 let handle_message t (msg : Discord_types.message) =
-  (* Ignore bot messages *)
   (match msg.author.bot with Some true -> () | _ ->
     match t.config.control_channel_id with
     | Some ctl_id when msg.channel_id = ctl_id ->
@@ -147,8 +144,8 @@ let handle_message t (msg : Discord_types.message) =
     | _ ->
       handle_thread_message t msg)
 
-let create config =
-  let rest = Discord_rest.create ~token:config.Config.discord_token in
+let create ~sw ~env config =
+  let rest = Discord_rest.create ~sw ~env ~token:config.Config.discord_token in
   let projects = Project.discover ~base_directories:config.base_directories in
   let gateway = Discord_gateway.create
     ~token:config.discord_token
@@ -162,17 +159,22 @@ let create config =
     projects;
     sessions = SessionMap.empty;
   } in
-  (* Wire up gateway handler *)
   bot.gateway.handler <- (fun event ->
     match event with
+    | Discord_gateway.Connected user ->
+      Logs.info (fun m -> m "bot: connected as %s" user.Discord_types.username)
     | Discord_gateway.Message_received msg -> handle_message bot msg
-    | _ -> ()
+    | Discord_gateway.Thread_created ch ->
+      Logs.info (fun m -> m "bot: thread created: %s"
+        (Option.value ~default:"(unnamed)" ch.Discord_types.name))
+    | Discord_gateway.Disconnected reason ->
+      Logs.warn (fun m -> m "bot: disconnected: %s" reason)
   );
   bot
 
-let run bot =
+let run ~sw ~env bot =
   Logs.info (fun m -> m "bot: discovered %d projects" (List.length bot.projects));
   List.iter (fun (p : Project.t) ->
     Logs.info (fun m -> m "  - %s (%s)" p.name p.path)
   ) bot.projects;
-  Discord_gateway.connect bot.gateway
+  Discord_gateway.connect ~sw ~env bot.gateway

@@ -20,5 +20,7 @@ let () =
     Logs.err (fun m -> m "set discord_token in %s" (Discord_agents.Config.config_path ()));
     exit 1
   );
-  let bot = Discord_agents.Bot.create config in
-  Discord_agents.Bot.run bot
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let bot = Discord_agents.Bot.create ~sw ~env config in
+  Discord_agents.Bot.run ~sw ~env bot
