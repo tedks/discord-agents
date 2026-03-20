@@ -14,15 +14,15 @@
         deps = with ocamlPackages; [
           eio_main
           cohttp-eio
-          httpun-ws
-          httpun-eio
           yojson
           ppx_yojson_conv
           ppx_deriving
           tls-eio
+          ca-certs
           logs
           fmt
           uri
+          mirage-crypto-rng
         ];
       in
       {

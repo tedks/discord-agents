@@ -26,9 +26,10 @@
    (>= 1.0))
   (cohttp-eio
    (>= 6.0))
-  httpun-ws
-  httpun-eio
   uri
+  ca-certs
+  (mirage-crypto-rng
+   (>= 1.0))
   (yojson
    (>= 2.0))
   ppx_yojson_conv
