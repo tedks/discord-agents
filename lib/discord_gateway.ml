@@ -198,11 +198,8 @@ let connect ~sw ~env t =
         recv_loop ()
       | { opcode = Close; _ } ->
         Logs.info (fun m -> m "gateway: received close frame")
-      | { opcode = Ping; payload } ->
-        (* Pong is handled in recv_frame, but just in case *)
-        Websocket.send_frame ws ~opcode:Pong payload;
-        recv_loop ()
       | { opcode = _; _ } ->
+        (* Ping/Pong handled inside recv_frame *)
         recv_loop ()
       | exception exn ->
         Logs.warn (fun m -> m "gateway: recv error: %s" (Printexc.to_string exn))

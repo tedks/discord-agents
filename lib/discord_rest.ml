@@ -63,10 +63,9 @@ let read_body (body : Cohttp_eio.Body.t) =
 let request t ~meth ~path ?body () =
   let uri = Uri.of_string (api_base ^ path) in
   let headers = make_headers t in
-  let cohttp_body = Option.map (fun j ->
-    Cohttp_eio.Body.of_string (Yojson.Safe.to_string j)
-  ) body in
+  let body_str = Option.map (fun j -> Yojson.Safe.to_string j) body in
   let do_call () =
+    let cohttp_body = Option.map Cohttp_eio.Body.of_string body_str in
     Cohttp_eio.Client.call t.client ~sw:t.sw ~headers ?body:cohttp_body meth uri
   in
   let handle_response (resp, resp_body) =
