@@ -5,7 +5,11 @@
     2. Receive Hello, start heartbeating
     3. Send Identify with token + intents
     4. Dispatch events to handler callback
-    5. Maintain heartbeat, handle reconnect/resume *)
+    5. Maintain heartbeat, handle reconnect/resume
+
+    On disconnect with a valid session_id + sequence, we attempt to
+    Resume the session instead of re-Identifying, which avoids missing
+    events during the reconnect window. *)
 
 open Discord_types
 
@@ -26,6 +30,7 @@ type t = {
   mutable resume_gateway_url : string option;
   mutable heartbeat_interval_ms : int;
   mutable last_heartbeat_acked : bool;
+  mutable resuming : bool;
   mutable handler : handler;
 }
 
@@ -37,6 +42,7 @@ let create ~token ~intents ~handler =
     resume_gateway_url = None;
     heartbeat_interval_ms = 0;
     last_heartbeat_acked = true;
+    resuming = false;
     handler }
 
 let default_intents =
@@ -74,8 +80,8 @@ let heartbeat_payload t =
     ("d", match t.sequence with Some s -> `Int s | None -> `Null);
   ]
 
-(** Build a Resume payload. *)
-let _resume_payload t =
+(** Build a Resume payload for reconnecting without losing events. *)
+let resume_payload t =
   `Assoc [
     ("op", `Int 6);
     ("d", `Assoc [
@@ -85,8 +91,12 @@ let _resume_payload t =
     ]);
   ]
 
+(** Can we attempt a resume? Requires both session_id and sequence. *)
+let can_resume t =
+  Option.is_some t.session_id && Option.is_some t.sequence
+
 (** Parse a gateway payload and dispatch events. *)
-let handle_payload t ~sw ~clock json =
+let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
   let open Yojson.Safe.Util in
   let op = json |> member "op" |> to_int |> gateway_opcode_of_int in
   let d = json |> member "d" in
@@ -102,9 +112,14 @@ let handle_payload t ~sw ~clock json =
        t.session_id <- Some (d |> member "session_id" |> to_string);
        let resume_url = d |> member "resume_gateway_url" |> to_string_option in
        t.resume_gateway_url <- resume_url;
+       t.resuming <- false;
        Logs.info (fun m -> m "gateway: READY as %s (session %s)"
          user.username (Option.value ~default:"?" t.session_id));
        t.handler (Connected user)
+     | "RESUMED" ->
+       t.resuming <- false;
+       Logs.info (fun m -> m "gateway: RESUMED successfully (session %s)"
+         (Option.value ~default:"?" t.session_id))
      | "MESSAGE_CREATE" ->
        (try
           let msg = message_of_yojson d in
@@ -147,9 +162,17 @@ let handle_payload t ~sw ~clock json =
       in
       heartbeat_loop ()
     );
-    (* Send Identify *)
-    Logs.info (fun m -> m "gateway: sending Identify");
-    send_json t (identify_payload t)
+    (* Send Identify or Resume depending on whether we have a session *)
+    if t.resuming && can_resume t then begin
+      Logs.info (fun m -> m "gateway: sending Resume (session %s, seq %s)"
+        (Option.value ~default:"?" t.session_id)
+        (match t.sequence with Some s -> string_of_int s | None -> "null"));
+      send_json t (resume_payload t)
+    end else begin
+      Logs.info (fun m -> m "gateway: sending Identify");
+      t.resuming <- false;
+      send_json t (identify_payload t)
+    end
   | Heartbeat ->
     (* Server requesting immediate heartbeat *)
     Logs.debug (fun m -> m "gateway: server requested heartbeat");
@@ -166,7 +189,8 @@ let handle_payload t ~sw ~clock json =
     Logs.warn (fun m -> m "gateway: invalid session (resumable=%b)" resumable);
     if not resumable then begin
       t.session_id <- None;
-      t.sequence <- None
+      t.sequence <- None;
+      t.resuming <- false
     end;
     (match t.ws with Some ws -> Websocket.send_close ws | None -> ());
     t.handler (Disconnected "invalid session")
@@ -174,16 +198,24 @@ let handle_payload t ~sw ~clock json =
     Logs.debug (fun m -> m "gateway: unhandled opcode")
 
 (** Connect to the gateway and run the event loop.
-    Reconnects automatically on disconnect. *)
-let connect ~sw ~env t =
+    Reconnects automatically on disconnect, using Resume when possible. *)
+let connect ~sw ~(env : Eio_unix.Stdenv.base) t =
   let net = Eio.Stdenv.net env in
   let clock = Eio.Stdenv.clock env in
   let gateway_host = "gateway.discord.gg" in
   let gateway_path = "/?v=10&encoding=json" in
   let rec connect_loop () =
-    Logs.info (fun m -> m "gateway: connecting to %s" gateway_host);
-    let ws = Websocket.connect ~sw ~net
-      ~host:gateway_host ~port:443 ~path:gateway_path in
+    (* Use resume_gateway_url if we have one from a previous READY *)
+    let host = match t.resume_gateway_url with
+      | Some url ->
+        (* resume_gateway_url is like "wss://gateway-us-east1-b.discord.gg" *)
+        (match Uri.host (Uri.of_string url) with
+         | Some h -> h
+         | None -> gateway_host)
+      | None -> gateway_host
+    in
+    Logs.info (fun m -> m "gateway: connecting to %s" host);
+    let ws = Websocket.connect ~sw ~net ~host ~port:443 ~path:gateway_path in
     t.ws <- Some ws;
     Logs.info (fun m -> m "gateway: WebSocket connected");
     let rec recv_loop () =
@@ -206,6 +238,9 @@ let connect ~sw ~env t =
     in
     recv_loop ();
     t.ws <- None;
+    (* Mark that we should attempt resume on next connect *)
+    if can_resume t then
+      t.resuming <- true;
     (* Reconnect after a brief delay *)
     Logs.info (fun m -> m "gateway: reconnecting in 5s...");
     Eio.Time.sleep clock 5.0;
