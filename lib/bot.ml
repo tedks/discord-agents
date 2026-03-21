@@ -588,25 +588,32 @@ let handle_control_message t msg =
   | Restart ->
     ignore (Discord_rest.create_message t.rest
       ~channel_id:msg.channel_id ~content:"Rebuilding and restarting..." ());
-    (* Build first, only restart if build succeeds *)
     Eio.Fiber.fork ~sw:t.sw (fun () ->
-      let build_result = Eio_unix.run_in_systhread (fun () ->
-        let exit_code = Sys.command
+      let build_and_restart () =
+        (* Build in the project directory *)
+        let build_exit = Sys.command
           "cd /home/tedks/Projects/claude-discord/master && nix develop --command dune build 2>&1" in
-        exit_code
-      ) in
-      if build_result <> 0 then
+        if build_exit <> 0 then
+          `Build_failed
+        else begin
+          (* Spawn new instance — it will kill us via pidfile *)
+          let _pid = Unix.create_process "/bin/sh"
+            [| "/bin/sh"; "-c";
+               "cd /home/tedks/Projects/claude-discord/master && nix develop --command dune exec discord-agents &" |]
+            Unix.stdin Unix.stdout Unix.stderr in
+          `Restarting
+        end
+      in
+      match Eio_unix.run_in_systhread build_and_restart with
+      | `Build_failed ->
         ignore (Discord_rest.create_message t.rest
           ~channel_id:msg.channel_id ~content:"Build failed, not restarting." ())
-      else begin
+      | `Restarting ->
         ignore (Discord_rest.create_message t.rest
-          ~channel_id:msg.channel_id ~content:"Build succeeded, restarting now." ());
-        (* Give Discord a moment to deliver the message *)
-        Unix.sleepf 1.0;
-        (* Re-exec ourselves *)
-        let exe = "/home/tedks/Projects/claude-discord/master/_build/default/bin/main.exe" in
-        Unix.execv exe [| exe |]
-      end)
+          ~channel_id:msg.channel_id ~content:"Build succeeded. New instance starting (will kill this one via pidfile)." ());
+        (* Give the new instance time to start and kill us *)
+        let clock = Eio.Stdenv.clock t.env in
+        Eio.Time.sleep clock 30.0)
   | Help ->
     let text = String.concat "\n" [
       "**Commands:**";
