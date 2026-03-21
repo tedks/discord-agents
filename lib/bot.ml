@@ -557,12 +557,22 @@ let handle_control_message t msg =
           ignore (Discord_rest.create_message t.rest ~channel_id:msg.channel_id
             ~content:(Printf.sprintf "Failed to get channels: %s" e) ())
         | Ok channels ->
-          let project_names = List.map (fun (p : Project.t) -> p.name) t.projects in
-          (* Find channels under Agent Projects category that don't match any project *)
+          (* Discord lowercases channel names, so compare case-insensitively *)
+          let project_names = List.map (fun (p : Project.t) ->
+            String.lowercase_ascii p.name) t.projects in
+          (* Find channels under Agent Projects that don't match any project,
+             plus duplicates (keep only the first channel per name) *)
+          let seen_names = Hashtbl.create 32 in
           let to_delete = List.filter (fun (ch : Discord_types.channel) ->
             match ch.parent_id, ch.name, t.category_id with
             | Some pid, Some name, Some cat_id when pid = cat_id ->
-              not (List.mem name project_names)
+              let lname = String.lowercase_ascii name in
+              if Hashtbl.mem seen_names lname then
+                true (* duplicate — delete *)
+              else begin
+                Hashtbl.add seen_names lname true;
+                not (List.mem lname project_names) (* stale — delete *)
+              end
             | _ -> false
           ) channels in
           if to_delete = [] then
