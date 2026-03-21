@@ -14,6 +14,44 @@ let setup_logging () =
   Logs.set_reporter (Logs_fmt.reporter ());
   Logs.set_level (Some Logs.Info)
 
+let pidfile_path () =
+  let home = Sys.getenv "HOME" in
+  Filename.concat home ".config/discord-agents/discord-agents.pid"
+
+(** Acquire a pidfile lock. Kills any existing instance first.
+    Returns a file descriptor that must be kept open (closing releases the lock). *)
+let acquire_pidfile () =
+  let path = pidfile_path () in
+  let dir = Filename.dirname path in
+  if not (Sys.file_exists dir) then
+    Unix.mkdir dir 0o700;
+  (* Check for existing pid and kill it *)
+  (if Sys.file_exists path then
+    try
+      let ic = open_in path in
+      let pid_str = String.trim (input_line ic) in
+      close_in ic;
+      let pid = int_of_string pid_str in
+      (* Check if process is alive *)
+      (try Unix.kill pid 0; (* signal 0 = check existence *)
+        Logs.info (fun m -> m "killing existing instance (pid %d)" pid);
+        Unix.kill pid Sys.sigterm;
+        Unix.sleepf 2.0;
+        (* Force kill if still alive *)
+        (try Unix.kill pid 0;
+          Unix.kill pid Sys.sigkill;
+          Unix.sleepf 1.0
+        with Unix.Unix_error _ -> ())
+      with Unix.Unix_error _ -> ())
+    with _ -> ());
+  (* Write our PID *)
+  let oc = open_out path in
+  output_string oc (string_of_int (Unix.getpid ()));
+  output_char oc '\n';
+  close_out oc;
+  (* Register cleanup *)
+  at_exit (fun () -> try Sys.remove path with _ -> ())
+
 (** Smoke test: verify REST client works, optionally send a test message,
     then connect to gateway briefly to confirm Hello/Identify/READY. *)
 let run_test ~sw ~env config test_channel =
@@ -84,6 +122,8 @@ let () =
     | _ -> None
   in
   Logs.info (fun m -> m "discord-agents starting%s" (if test_mode then " (test mode)" else ""));
+  (* Ensure only one instance runs — kill any existing one *)
+  if not test_mode then acquire_pidfile ();
   let config = Discord_agents.Config.load () in
   if config.discord_token = "" then (
     Logs.err (fun m -> m "no discord token configured");
