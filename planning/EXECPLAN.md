@@ -17,8 +17,8 @@ The system scans configured base directories (like `~/Projects`) to discover git
 - [x] (2026-03-21) Milestone 2: Discord Gateway client (custom WebSocket over tls-eio, heartbeat, identify, resume)
 - [x] (2026-03-21) Milestone 3: Agent subprocess management (Eio.Process.spawn, stream-json parsing)
 - [x] (2026-03-21) Milestone 4: Session I/O bridge (streaming output to Discord, typing refresh, message editing)
-- [ ] Milestone 5: Bot orchestration (project channels, category, ack reactions)
-- [ ] Milestone 6: End-to-end integration and hardening
+- [x] (2026-03-21) Milestone 5: Bot orchestration (project channels, category, ack reactions, commands from any channel)
+- [x] (2026-03-21) Milestone 6: Hardening (graceful shutdown, code-block-aware splitting, robust channel type handling)
 
 ## Surprises & Discoveries
 
