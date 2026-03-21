@@ -33,7 +33,9 @@ type t = {
 type command =
   | List_projects
   | List_sessions
+  | List_claude_sessions
   | Start_agent of { project : string; kind : Config.agent_kind }
+  | Resume_session of { session_id : string }
   | Stop_session of { thread_id : string }
   | Help
   | Unknown of string
@@ -43,10 +45,12 @@ let parse_command content =
   match parts with
   | ["!projects"] | ["!list"] -> List_projects
   | ["!sessions"] -> List_sessions
+  | ["!claude-sessions"] -> List_claude_sessions
   | ["!start"; project; kind_str] ->
     (match Config.agent_kind_of_string kind_str with
      | Ok kind -> Start_agent { project; kind }
      | Error _ -> Unknown content)
+  | ["!resume"; session_id] -> Resume_session { session_id }
   | ["!stop"; thread_id] -> Stop_session { thread_id }
   | ["!help"] -> Help
   | _ -> Unknown content
@@ -137,6 +141,128 @@ let post_response rest ~channel_id text =
     | Error e -> Logs.warn (fun m -> m "bot: failed to post response: %s" e)
   ) chunks
 
+(** Info about a Claude Code session discovered on disk. *)
+type claude_session_info = {
+  cs_session_id : string;
+  cs_project_dir : string;   (** e.g. "-home-tedks-Projects-claude-discord" *)
+  cs_working_dir : string;   (** resolved working directory *)
+  cs_summary : string;       (** first user message, truncated *)
+  cs_mtime : float;
+}
+
+(** Scan ~/.claude/projects/ for recent Claude Code sessions.
+    Returns sessions modified in the last [hours] hours, newest first. *)
+let discover_claude_sessions ?(hours=24) () =
+  Eio_unix.run_in_systhread @@ fun () ->
+  let home = Sys.getenv "HOME" in
+  let projects_dir = Filename.concat home ".claude/projects" in
+  if not (Sys.file_exists projects_dir) then []
+  else
+    let cutoff = Unix.gettimeofday () -. (float_of_int hours *. 3600.0) in
+    let results = ref [] in
+    let project_dirs = Sys.readdir projects_dir |> Array.to_list in
+    List.iter (fun proj_name ->
+      let proj_path = Filename.concat projects_dir proj_name in
+      if try Sys.is_directory proj_path with Sys_error _ -> false then begin
+        let files = try Sys.readdir proj_path |> Array.to_list with Sys_error _ -> [] in
+        List.iter (fun fname ->
+          if Filename.check_suffix fname ".jsonl"
+             && not (String.contains fname '/') then begin
+            let fpath = Filename.concat proj_path fname in
+            let stat = try Some (Unix.stat fpath) with Unix.Unix_error _ -> None in
+            match stat with
+            | Some st when st.Unix.st_mtime > cutoff ->
+              let session_id = Filename.chop_suffix fname ".jsonl" in
+              (* Extract first user message as summary *)
+              let summary =
+                try
+                  let ic = open_in fpath in
+                  let summary = ref "" in
+                  (try while !summary = "" do
+                    let line = input_line ic in
+                    let json = Yojson.Safe.from_string line in
+                    let open Yojson.Safe.Util in
+                    if json |> member "type" |> to_string = "user" then begin
+                      let msg = json |> member "message" in
+                      let content = msg |> member "content" in
+                      match content with
+                      | `List items ->
+                        List.iter (fun item ->
+                          if !summary = "" then
+                            match item |> member "type" |> to_string_option with
+                            | Some "text" ->
+                              let text = item |> member "text" |> to_string in
+                              summary := String.sub text 0 (min 80 (String.length text))
+                            | _ -> ()
+                        ) items
+                      | `String s ->
+                        summary := String.sub s 0 (min 80 (String.length s))
+                      | _ -> ()
+                    end
+                  done with End_of_file | _ -> ());
+                  close_in ic;
+                  !summary
+                with _ -> "(unknown)"
+              in
+              (* Resolve working directory from project dir name *)
+              let working_dir =
+                let stripped = proj_name in
+                (* Convert "-home-tedks-Projects-foo" to "/home/tedks/Projects/foo" *)
+                let path = String.split_on_char '-' stripped
+                  |> List.filter (fun s -> s <> "")
+                  |> String.concat "/" in
+                "/" ^ path
+              in
+              results := {
+                cs_session_id = session_id;
+                cs_project_dir = proj_name;
+                cs_working_dir = working_dir;
+                cs_summary = summary;
+                cs_mtime = st.Unix.st_mtime;
+              } :: !results
+            | _ -> ()
+          end
+        ) files
+      end
+    ) project_dirs;
+    (* Sort newest first *)
+    List.sort (fun a b -> compare b.cs_mtime a.cs_mtime) !results
+
+(** Find a Claude session by ID (or prefix) and return its info. *)
+let find_claude_session session_id_prefix =
+  let home = Sys.getenv "HOME" in
+  let projects_dir = Filename.concat home ".claude/projects" in
+  if not (Sys.file_exists projects_dir) then None
+  else
+    let project_dirs = try Sys.readdir projects_dir |> Array.to_list with _ -> [] in
+    let result = ref None in
+    List.iter (fun proj_name ->
+      if !result = None then begin
+        let proj_path = Filename.concat projects_dir proj_name in
+        if try Sys.is_directory proj_path with Sys_error _ -> false then begin
+          let files = try Sys.readdir proj_path |> Array.to_list with _ -> [] in
+          List.iter (fun fname ->
+            if !result = None
+               && Filename.check_suffix fname ".jsonl"
+               && not (String.contains fname '/') then begin
+              let sid = Filename.chop_suffix fname ".jsonl" in
+              if String.length sid >= String.length session_id_prefix
+                 && String.sub sid 0 (String.length session_id_prefix) = session_id_prefix then begin
+                let working_dir =
+                  let path = String.split_on_char '-' proj_name
+                    |> List.filter (fun s -> s <> "")
+                    |> String.concat "/" in
+                  "/" ^ path
+                in
+                result := Some (sid, working_dir)
+              end
+            end
+          ) files
+        end
+      end
+    ) project_dirs;
+    !result
+
 (** Handle a message from the control channel. *)
 let handle_control_message t msg =
   let cmd = parse_command msg.Discord_types.content in
@@ -163,6 +289,26 @@ let handle_control_message t msg =
       else "**Sessions:**\n" ^ String.concat "\n" lines in
     ignore (Discord_rest.create_message t.rest
       ~channel_id:msg.channel_id ~content:text ())
+  | List_claude_sessions ->
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      let sessions = discover_claude_sessions ~hours:24 () in
+      let lines = List.map (fun (s : claude_session_info) ->
+        let age_min = int_of_float ((Unix.gettimeofday () -. s.cs_mtime) /. 60.0) in
+        let age_str =
+          if age_min < 60 then Printf.sprintf "%dm ago" age_min
+          else Printf.sprintf "%dh ago" (age_min / 60)
+        in
+        Printf.sprintf "- `%s` %s\n  %s — *%s*"
+          (String.sub s.cs_session_id 0 (min 8 (String.length s.cs_session_id)))
+          age_str
+          s.cs_working_dir
+          (if s.cs_summary = "" then "(no summary)" else s.cs_summary)
+      ) (List.filteri (fun i _ -> i < 10) sessions) in
+      let text = if lines = [] then "No recent Claude sessions found."
+        else "**Recent Claude sessions** (last 24h):\n" ^ String.concat "\n" lines
+             ^ "\n\nUse `!resume <session_id_prefix>` to attach." in
+      ignore (Discord_rest.create_message t.rest
+        ~channel_id:msg.channel_id ~content:text ()))
   | Start_agent { project; kind } ->
     let proj = List.find_opt (fun (p : Project.t) -> p.name = project) t.projects in
     (match proj with
@@ -204,6 +350,41 @@ let handle_control_message t msg =
            in
            ignore (Discord_rest.create_message t.rest
              ~channel_id:thread_ch.id ~content:welcome ()))
+  | Resume_session { session_id } ->
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      (* find_claude_session runs blocking I/O *)
+      let found = Eio_unix.run_in_systhread (fun () ->
+        find_claude_session session_id
+      ) in
+      match found with
+      | None ->
+        ignore (Discord_rest.create_message t.rest
+          ~channel_id:msg.channel_id
+          ~content:(Printf.sprintf "No Claude session found matching `%s`." session_id) ())
+      | Some (full_session_id, working_dir) ->
+        let thread_name = Printf.sprintf "resume / %s" (String.sub full_session_id 0 8) in
+        match Discord_rest.create_thread_no_message t.rest
+                ~channel_id:msg.channel_id ~name:thread_name () with
+        | Error e ->
+          ignore (Discord_rest.create_message t.rest
+            ~channel_id:msg.channel_id
+            ~content:(Printf.sprintf "Failed to create thread: %s" e) ())
+        | Ok thread_ch ->
+          let session = {
+            project_name = Filename.basename working_dir;
+            working_dir;
+            agent_kind = Config.Claude;
+            session_id = full_session_id;
+            thread_id = thread_ch.Discord_types.id;
+            message_count = 1; (* >0 so we use --resume *)
+          } in
+          t.sessions <- SessionMap.add thread_ch.id session t.sessions;
+          let welcome = Printf.sprintf
+            "**Resumed** Claude session `%s`\nWorking in: `%s`\nSend a message to continue."
+            (String.sub full_session_id 0 8) working_dir
+          in
+          ignore (Discord_rest.create_message t.rest
+            ~channel_id:thread_ch.id ~content:welcome ()))
   | Stop_session { thread_id } ->
     (match SessionMap.find_opt thread_id t.sessions with
      | None ->
@@ -219,8 +400,10 @@ let handle_control_message t msg =
     let text = String.concat "\n" [
       "**Commands:**";
       "`!projects` — list discovered projects";
-      "`!sessions` — list active agent sessions";
-      "`!start <project> <claude|codex|gemini>` — start an agent session";
+      "`!sessions` — list active bot sessions";
+      "`!claude-sessions` — list recent Claude Code sessions on this machine";
+      "`!start <project> <claude|codex|gemini>` — start a new agent session";
+      "`!resume <session_id>` — resume an existing Claude session in a new thread";
       "`!stop <thread_id>` — stop a session";
       "`!help` — this message";
     ] in
