@@ -37,8 +37,13 @@ type command =
   | Start_agent of { project : string; kind : Config.agent_kind }
   | Resume_session of { session_id : string }
   | Stop_session of { thread_id : string }
+  | Restart
   | Help
   | Unknown of string
+
+let is_command content =
+  let trimmed = String.trim content in
+  String.length trimmed > 0 && trimmed.[0] = '!'
 
 let parse_command content =
   let parts = String.split_on_char ' ' (String.trim content) in
@@ -52,6 +57,7 @@ let parse_command content =
      | Error _ -> Unknown content)
   | ["!resume"; session_id] -> Resume_session { session_id }
   | ["!stop"; thread_id] -> Stop_session { thread_id }
+  | ["!restart"] -> Restart
   | ["!help"] -> Help
   | _ -> Unknown content
 
@@ -426,6 +432,28 @@ let handle_control_message t msg =
        ignore (Discord_rest.create_message t.rest
          ~channel_id:msg.channel_id
          ~content:(Printf.sprintf "Stopped session for **%s**." session.project_name) ()))
+  | Restart ->
+    ignore (Discord_rest.create_message t.rest
+      ~channel_id:msg.channel_id ~content:"Rebuilding and restarting..." ());
+    (* Build first, only restart if build succeeds *)
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      let build_result = Eio_unix.run_in_systhread (fun () ->
+        let exit_code = Sys.command
+          "cd /home/tedks/Projects/claude-discord/master && nix develop --command dune build 2>&1" in
+        exit_code
+      ) in
+      if build_result <> 0 then
+        ignore (Discord_rest.create_message t.rest
+          ~channel_id:msg.channel_id ~content:"Build failed, not restarting." ())
+      else begin
+        ignore (Discord_rest.create_message t.rest
+          ~channel_id:msg.channel_id ~content:"Build succeeded, restarting now." ());
+        (* Give Discord a moment to deliver the message *)
+        Unix.sleepf 1.0;
+        (* Re-exec ourselves *)
+        let exe = "/home/tedks/Projects/claude-discord/master/_build/default/bin/main.exe" in
+        Unix.execv exe [| exe |]
+      end)
   | Help ->
     let text = String.concat "\n" [
       "**Commands:**";
@@ -435,6 +463,7 @@ let handle_control_message t msg =
       "`!start <project> <claude|codex|gemini>` — start a new agent session";
       "`!resume <session_id>` — resume an existing Claude session in a new thread";
       "`!stop <thread_id>` — stop a session";
+      "`!restart` — rebuild and restart the bot";
       "`!help` — this message";
     ] in
     ignore (Discord_rest.create_message t.rest
@@ -483,12 +512,13 @@ let handle_thread_message t msg =
 
 (** Route an incoming Discord message. *)
 let handle_message t (msg : Discord_types.message) =
-  (match msg.author.bot with Some true -> () | _ ->
-    match t.config.control_channel_id with
-    | Some ctl_id when msg.channel_id = ctl_id ->
-      handle_control_message t msg
-    | _ ->
-      handle_thread_message t msg)
+  (* Ignore bot messages *)
+  match msg.author.bot with Some true -> () | _ ->
+  (* Commands (messages starting with !) are handled regardless of channel *)
+  if is_command msg.content then
+    handle_control_message t msg
+  else
+    handle_thread_message t msg
 
 let create ~sw ~(env : Eio_unix.Stdenv.base) config =
   let rest = Discord_rest.create ~sw ~env ~token:config.Config.discord_token in

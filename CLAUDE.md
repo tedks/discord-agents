@@ -43,8 +43,13 @@ lib/bot.ml               — Top-level orchestrator
 
 ## Commands
 
+Commands work in any channel/thread the bot can see:
+
 - `!projects` — list discovered projects
-- `!sessions` — list active agent sessions
-- `!start <project> <claude|codex|gemini>` — start an agent
+- `!sessions` — list active bot sessions
+- `!claude-sessions` — list recent Claude Code sessions on this machine
+- `!start <project> <claude|codex|gemini>` — start a new agent session
+- `!resume <session_id>` — resume an existing Claude session in a new thread
 - `!stop <thread_id>` — stop a session
+- `!restart` — rebuild and restart the bot (hot reload)
 - `!help` — command reference
