@@ -50,33 +50,28 @@ let run_test ~sw ~env config test_channel =
         ready := true
       | _ -> ())
   in
-  (* Run gateway in a fiber, cancel after READY or timeout *)
-  Eio.Fiber.both
-    (fun () ->
-      Discord_agents.Discord_gateway.connect ~sw ~env gateway)
-    (fun () ->
-      (* Wait up to 15s for READY *)
-      let clock = Eio.Stdenv.clock env in
-      let deadline = Eio.Time.now clock +. 15.0 in
-      let rec wait () =
-        if !ready then begin
-          Logs.info (fun m -> m "test: all tests passed");
-          (* Force close the gateway to exit *)
-          (match gateway.ws with
-           | Some ws -> Discord_agents.Websocket.send_close ws
-           | None -> ())
-        end else if Eio.Time.now clock > deadline then begin
-          Logs.err (fun m -> m "test: timed out waiting for READY");
-          (match gateway.ws with
-           | Some ws -> Discord_agents.Websocket.send_close ws
-           | None -> ());
-          exit 1
-        end else begin
-          Eio.Time.sleep clock 0.5;
-          wait ()
-        end
-      in
-      wait ())
+  (* Run gateway in a sub-switch so we can cancel it cleanly *)
+  let clock = Eio.Stdenv.clock env in
+  let deadline = Eio.Time.now clock +. 15.0 in
+  (try
+    Eio.Switch.run @@ fun test_sw ->
+    Eio.Fiber.fork ~sw:test_sw (fun () ->
+      Discord_agents.Discord_gateway.connect ~sw:test_sw ~env gateway);
+    (* Poll for READY or timeout *)
+    let rec wait () =
+      if !ready then begin
+        Logs.info (fun m -> m "test: all tests passed");
+        Eio.Switch.fail test_sw Exit
+      end else if Eio.Time.now clock > deadline then begin
+        Logs.err (fun m -> m "test: timed out waiting for READY");
+        Eio.Switch.fail test_sw (Failure "timeout")
+      end else begin
+        Eio.Time.sleep clock 0.5;
+        wait ()
+      end
+    in
+    wait ()
+  with Exit -> ())
 
 let () =
   setup_logging ();
