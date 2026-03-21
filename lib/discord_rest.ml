@@ -158,6 +158,22 @@ let get_guild_channels t ~guild_id () =
      with exn -> Error (Printf.sprintf "get_guild_channels: parse error: %s" (Printexc.to_string exn)))
   | Error e -> Error e
 
+(** Delete a channel. *)
+let delete_channel t ~channel_id () =
+  match request t ~meth:`DELETE ~path:(Printf.sprintf "/channels/%s" channel_id) () with
+  | Ok _ -> Ok ()
+  | Error e -> Error e
+
+(** Move a channel to a given position within its category. *)
+let modify_channel_position t ~guild_id ~channel_id ~position () =
+  let body = `List [`Assoc [
+    ("id", `String channel_id);
+    ("position", `Int position);
+  ]] in
+  match request t ~meth:`PATCH ~path:(Printf.sprintf "/guilds/%s/channels" guild_id) ~body () with
+  | Ok _ -> Ok ()
+  | Error e -> Error e
+
 (** Create a thread from a message. *)
 let create_thread t ~channel_id ~message_id ~name () =
   let body = `Assoc [

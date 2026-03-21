@@ -103,6 +103,7 @@ type command =
   | Start_agent of { project : string; kind : Config.agent_kind }
   | Resume_session of { session_id : string }
   | Stop_session of { thread_id : string }
+  | Cleanup_channels
   | Restart
   | Help
   | Unknown of string
@@ -123,6 +124,7 @@ let parse_command content =
      | Error _ -> Unknown content)
   | ["!resume"; session_id] -> Resume_session { session_id }
   | ["!stop"; thread_id] -> Stop_session { thread_id }
+  | ["!cleanup-channels"] -> Cleanup_channels
   | ["!restart"] -> Restart
   | ["!help"] -> Help
   | _ -> Unknown content
@@ -544,6 +546,45 @@ let handle_control_message t msg =
        ignore (Discord_rest.create_message t.rest
          ~channel_id:msg.channel_id
          ~content:(Printf.sprintf "Stopped session for **%s**." session.project_name) ()))
+  | Cleanup_channels ->
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      if t.config.guild_id = "" then
+        ignore (Discord_rest.create_message t.rest ~channel_id:msg.channel_id
+          ~content:"No guild_id configured." ())
+      else begin
+        match Discord_rest.get_guild_channels t.rest ~guild_id:t.config.guild_id () with
+        | Error e ->
+          ignore (Discord_rest.create_message t.rest ~channel_id:msg.channel_id
+            ~content:(Printf.sprintf "Failed to get channels: %s" e) ())
+        | Ok channels ->
+          let project_names = List.map (fun (p : Project.t) -> p.name) t.projects in
+          (* Find channels under Agent Projects category that don't match any project *)
+          let to_delete = List.filter (fun (ch : Discord_types.channel) ->
+            match ch.parent_id, ch.name, t.category_id with
+            | Some pid, Some name, Some cat_id when pid = cat_id ->
+              not (List.mem name project_names)
+            | _ -> false
+          ) channels in
+          if to_delete = [] then
+            ignore (Discord_rest.create_message t.rest ~channel_id:msg.channel_id
+              ~content:"No stale channels to clean up." ())
+          else begin
+            let clock = Eio.Stdenv.clock t.env in
+            let deleted = ref 0 in
+            List.iter (fun (ch : Discord_types.channel) ->
+              let name = Option.value ~default:"?" ch.name in
+              match Discord_rest.delete_channel t.rest ~channel_id:ch.id () with
+              | Ok () ->
+                Logs.info (fun m -> m "bot: deleted stale channel %s (%s)" name ch.id);
+                incr deleted;
+                Eio.Time.sleep clock 0.5
+              | Error e ->
+                Logs.warn (fun m -> m "bot: failed to delete channel %s: %s" name e)
+            ) to_delete;
+            ignore (Discord_rest.create_message t.rest ~channel_id:msg.channel_id
+              ~content:(Printf.sprintf "Cleaned up %d stale channels." !deleted) ())
+          end
+      end)
   | Restart ->
     ignore (Discord_rest.create_message t.rest
       ~channel_id:msg.channel_id ~content:"Rebuilding and restarting..." ());
@@ -575,12 +616,23 @@ let handle_control_message t msg =
       "`!start <project> <claude|codex|gemini>` — start a new agent session";
       "`!resume <session_id>` — resume an existing Claude session in a new thread";
       "`!stop <thread_id>` — stop a session";
+      "`!cleanup-channels` — delete stale project channels from before dedup";
       "`!restart` — rebuild and restart the bot";
       "`!help` — this message";
     ] in
     ignore (Discord_rest.create_message t.rest
       ~channel_id:msg.channel_id ~content:text ())
   | Unknown _ -> ()
+
+(** Move a project's channel to the top of the category (position 0).
+    Called on session activity so recently-used projects float up. *)
+let bump_project_channel t project_name =
+  match ChannelMap.find_opt project_name t.project_channels with
+  | None -> ()
+  | Some ch_id ->
+    if t.config.guild_id <> "" then
+      ignore (Discord_rest.modify_channel_position t.rest
+        ~guild_id:t.config.guild_id ~channel_id:ch_id ~position:0 ())
 
 (** Handle a message in a session thread — run the agent and stream the response. *)
 let handle_thread_message t msg =
@@ -590,10 +642,11 @@ let handle_thread_message t msg =
     (* Fork a fiber so we don't block the gateway recv loop *)
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       let channel_id = msg.Discord_types.channel_id in
-      (* Ack with eyes reaction, then send typing *)
+      (* Ack with eyes reaction, send typing, bump channel to top *)
       ignore (Discord_rest.create_reaction t.rest ~channel_id
         ~message_id:msg.id ~emoji:"\xF0\x9F\x91\x80" ());
       ignore (Discord_rest.send_typing t.rest ~channel_id ());
+      bump_project_channel t session.project_name;
       let prompt = msg.content in
       Logs.info (fun m -> m "bot: running %s for %s: %s"
         (Config.string_of_agent_kind session.agent_kind)
