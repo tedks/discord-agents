@@ -757,25 +757,12 @@ let setup_project_channels t =
             end
           | _ -> ()
         ) channels;
-        (* Create channels for projects that don't have one yet.
-           Pace creation to avoid blocking heartbeats and hitting rate limits. *)
-        let to_create = List.filter (fun (p : Project.t) ->
-          not (ChannelMap.mem p.name t.project_channels)
-        ) t.projects in
-        let clock = Eio.Stdenv.clock t.env in
-        List.iter (fun (p : Project.t) ->
-          let topic = Printf.sprintf "Agent sessions for %s (%s)" p.name p.path in
-          match Discord_rest.create_channel t.rest ~guild_id ~name:p.name
-                  ~parent_id:cat_id ~topic () with
-          | Ok ch ->
-            t.project_channels <- ChannelMap.add p.name ch.id t.project_channels;
-            Logs.info (fun m -> m "bot: created channel for project %s" p.name);
-            (* Small delay to yield to heartbeat fiber and avoid rate limits *)
-            Eio.Time.sleep clock 0.5
-          | Error e ->
-            Logs.warn (fun m -> m "bot: failed to create channel for %s: %s" p.name e);
-            Eio.Time.sleep clock 1.0
-        ) to_create
+        (* Channels are created on demand when !start is used.
+           Log how many projects are mapped vs unmapped. *)
+        let mapped = ChannelMap.cardinal t.project_channels in
+        let total = List.length t.projects in
+        Logs.info (fun m -> m "bot: %d/%d projects have channels (others created on demand)"
+          mapped total)
       end
   end
 
