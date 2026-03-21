@@ -141,6 +141,45 @@ let post_response rest ~channel_id text =
     | Error e -> Logs.warn (fun m -> m "bot: failed to post response: %s" e)
   ) chunks
 
+(** Resolve a Claude project directory name back to a filesystem path.
+    e.g. "-home-tedks-Projects-claude-discord" -> "/home/tedks/Projects/claude-discord"
+
+    Can't just split on '-' because project names contain hyphens.
+    Instead, walk the filesystem: at each level, try consuming path
+    segments greedily (longest directory name that matches). *)
+let resolve_project_dir proj_name =
+  (* Strip leading dash *)
+  let s = if String.length proj_name > 0 && proj_name.[0] = '-'
+          then String.sub proj_name 1 (String.length proj_name - 1)
+          else proj_name in
+  let rec resolve path remaining =
+    if String.length remaining = 0 then path
+    else
+      (* Try to find the longest prefix of 'remaining' that is a directory under 'path' *)
+      let parts = String.split_on_char '-' remaining in
+      let rec try_lengths n =
+        if n < 1 then
+          (* Fallback: just use the first part *)
+          let first = List.hd parts in
+          let rest_parts = List.tl parts in
+          let next_path = Filename.concat path first in
+          let rest = String.concat "-" rest_parts in
+          resolve next_path rest
+        else
+          let candidate_parts = List.filteri (fun i _ -> i < n) parts in
+          let candidate = String.concat "-" candidate_parts in
+          let candidate_path = Filename.concat path candidate in
+          if (try Sys.file_exists candidate_path with _ -> false) then
+            let rest_parts = List.filteri (fun i _ -> i >= n) parts in
+            let rest = String.concat "-" rest_parts in
+            resolve candidate_path rest
+          else
+            try_lengths (n - 1)
+      in
+      try_lengths (List.length parts)
+  in
+  resolve "/" s
+
 (** Info about a Claude Code session discovered on disk. *)
 type claude_session_info = {
   cs_session_id : string;
@@ -204,15 +243,11 @@ let discover_claude_sessions ?(hours=24) () =
                   !summary
                 with _ -> "(unknown)"
               in
-              (* Resolve working directory from project dir name *)
-              let working_dir =
-                let stripped = proj_name in
-                (* Convert "-home-tedks-Projects-foo" to "/home/tedks/Projects/foo" *)
-                let path = String.split_on_char '-' stripped
-                  |> List.filter (fun s -> s <> "")
-                  |> String.concat "/" in
-                "/" ^ path
-              in
+              (* Resolve working directory from project dir name.
+                 The dir name is the cwd with / replaced by - and leading -.
+                 We can't just split on - because project names have hyphens.
+                 Instead, scan the filesystem to find the longest matching prefix. *)
+              let working_dir = resolve_project_dir proj_name in
               results := {
                 cs_session_id = session_id;
                 cs_project_dir = proj_name;
@@ -248,12 +283,7 @@ let find_claude_session session_id_prefix =
               let sid = Filename.chop_suffix fname ".jsonl" in
               if String.length sid >= String.length session_id_prefix
                  && String.sub sid 0 (String.length session_id_prefix) = session_id_prefix then begin
-                let working_dir =
-                  let path = String.split_on_char '-' proj_name
-                    |> List.filter (fun s -> s <> "")
-                    |> String.concat "/" in
-                  "/" ^ path
-                in
+                let working_dir = resolve_project_dir proj_name in
                 result := Some (sid, working_dir)
               end
             end
