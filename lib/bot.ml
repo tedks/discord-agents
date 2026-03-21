@@ -26,6 +26,7 @@ type t = {
   gateway : Discord_gateway.t;
   projects : Project.t list;
   mutable sessions : agent_session SessionMap.t;
+  env : Eio_unix.Stdenv.base;
   sw : Eio.Switch.t;
 }
 
@@ -90,40 +91,9 @@ let working_dir_of_project (p : Project.t) =
   else
     Ok p.path
 
-(** Run a Claude agent subprocess and return the text output.
-    Runs in a system thread to avoid blocking Eio fibers. *)
-let run_claude ~working_dir ~session_id ~message_count ~prompt =
-  Eio_unix.run_in_systhread @@ fun () ->
-  let session_arg =
-    if message_count = 0 then
-      Printf.sprintf "--session-id %s" (Filename.quote session_id)
-    else
-      Printf.sprintf "--resume %s" (Filename.quote session_id)
-  in
-  let cmd = Printf.sprintf "cd %s && claude -p %s %s 2>/dev/null"
-    (Filename.quote working_dir)
-    session_arg
-    (Filename.quote prompt)
-  in
-  let ic = Unix.open_process_in cmd in
-  let buf = Buffer.create 4096 in
-  (try
-    let chunk = Bytes.create 4096 in
-    let rec read_all () =
-      let n = input ic chunk 0 4096 in
-      if n > 0 then begin
-        Buffer.add_subbytes buf chunk 0 n;
-        read_all ()
-      end
-    in
-    read_all ()
-  with End_of_file -> ());
-  let status = Unix.close_process_in ic in
-  match status with
-  | Unix.WEXITED 0 -> Ok (Buffer.contents buf)
-  | Unix.WEXITED code -> Error (Printf.sprintf "claude exited with code %d" code)
-  | Unix.WSIGNALED s -> Error (Printf.sprintf "claude killed by signal %d" s)
-  | Unix.WSTOPPED _ -> Error "claude stopped"
+(** Typing indicator refresh interval in seconds.
+    Discord's typing indicator expires after ~10s, so refresh every 8s. *)
+let typing_interval = 8.0
 
 (** Split text into chunks that fit Discord's 2000-char message limit. *)
 let split_message ?(max_len=1900) text =
@@ -470,15 +440,16 @@ let handle_control_message t msg =
       ~channel_id:msg.channel_id ~content:text ())
   | Unknown _ -> ()
 
-(** Handle a message in a session thread — run the agent and post the response. *)
+(** Handle a message in a session thread — run the agent and stream the response. *)
 let handle_thread_message t msg =
   match SessionMap.find_opt msg.Discord_types.channel_id t.sessions with
   | None -> ()
   | Some session ->
     (* Fork a fiber so we don't block the gateway recv loop *)
     Eio.Fiber.fork ~sw:t.sw (fun () ->
+      let channel_id = msg.Discord_types.channel_id in
       (* Send typing indicator *)
-      ignore (Discord_rest.send_typing t.rest ~channel_id:msg.channel_id ());
+      ignore (Discord_rest.send_typing t.rest ~channel_id ());
       let prompt = msg.content in
       Logs.info (fun m -> m "bot: running %s for %s: %s"
         (Config.string_of_agent_kind session.agent_kind)
@@ -486,29 +457,79 @@ let handle_thread_message t msg =
         (if String.length prompt > 80
          then String.sub prompt 0 80 ^ "..."
          else prompt));
-      match session.agent_kind with
-      | Config.Claude ->
-        (match run_claude
-                 ~working_dir:session.working_dir
-                 ~session_id:session.session_id
-                 ~message_count:session.message_count
-                 ~prompt with
-         | Ok response ->
-           session.message_count <- session.message_count + 1;
-           if String.length response = 0 then
-             ignore (Discord_rest.create_message t.rest
-               ~channel_id:msg.channel_id ~content:"(no response)" ())
-           else
-             post_response t.rest ~channel_id:msg.channel_id response
-         | Error e ->
-           Logs.warn (fun m -> m "bot: claude error: %s" e);
+      (* Accumulate text and post/edit a Discord message as chunks arrive *)
+      let result_buf = Buffer.create 4096 in
+      let current_msg_id = ref None in
+      let current_msg_buf = Buffer.create 1900 in
+      let last_typing = ref (Unix.gettimeofday ()) in
+      let last_edit = ref (Unix.gettimeofday ()) in
+      (* Flush current buffer to Discord — create or edit message *)
+      let flush_to_discord () =
+        let text = Buffer.contents current_msg_buf in
+        if String.length text = 0 then ()
+        else match !current_msg_id with
+        | None ->
+          (match Discord_rest.create_message t.rest ~channel_id ~content:text () with
+           | Ok sent -> current_msg_id := Some sent.Discord_types.id
+           | Error e -> Logs.warn (fun m -> m "bot: send error: %s" e))
+        | Some mid ->
+          (match Discord_rest.edit_message t.rest ~channel_id ~message_id:mid ~content:text () with
+           | Ok _ -> ()
+           | Error e -> Logs.warn (fun m -> m "bot: edit error: %s" e))
+      in
+      (* Start a new message (when current one is getting long) *)
+      let start_new_message () =
+        flush_to_discord ();
+        Buffer.clear current_msg_buf;
+        current_msg_id := None
+      in
+      let on_event = function
+        | Agent_process.Text_delta text ->
+          Buffer.add_string result_buf text;
+          Buffer.add_string current_msg_buf text;
+          (* If current message is getting long, start a new one *)
+          if Buffer.length current_msg_buf > 1800 then
+            start_new_message ()
+          else begin
+            (* Edit every 2s to avoid rate limits *)
+            let now = Unix.gettimeofday () in
+            if now -. !last_edit > 2.0 then begin
+              flush_to_discord ();
+              last_edit := now
+            end;
+            (* Refresh typing indicator *)
+            if now -. !last_typing > typing_interval then begin
+              ignore (Discord_rest.send_typing t.rest ~channel_id ());
+              last_typing := now
+            end
+          end
+        | Agent_process.Result { text = _; session_id = _ } ->
+          (* Final flush *)
+          flush_to_discord ()
+        | Agent_process.Tool_use name ->
+          Logs.debug (fun m -> m "bot: agent using tool: %s" name)
+        | Agent_process.Error e ->
+          Logs.warn (fun m -> m "bot: agent error event: %s" e)
+        | Agent_process.Other _ -> ()
+      in
+      (match Agent_process.run_streaming ~sw:t.sw ~env:t.env
+               ~working_dir:session.working_dir
+               ~kind:session.agent_kind
+               ~session_id:session.session_id
+               ~message_count:session.message_count
+               ~prompt ~on_event with
+       | Ok () ->
+         session.message_count <- session.message_count + 1;
+         (* Final flush if not already done *)
+         flush_to_discord ();
+         if Buffer.length result_buf = 0 then
            ignore (Discord_rest.create_message t.rest
-             ~channel_id:msg.channel_id
-             ~content:(Printf.sprintf "Agent error: %s" e) ()))
-      | _ ->
-        ignore (Discord_rest.create_message t.rest
-          ~channel_id:msg.channel_id
-          ~content:"Only Claude is supported for now." ()))
+             ~channel_id ~content:"(no response)" ())
+       | Error e ->
+         Logs.warn (fun m -> m "bot: agent error: %s" e);
+         ignore (Discord_rest.create_message t.rest
+           ~channel_id
+           ~content:(Printf.sprintf "Agent error: %s" e) ())))
 
 (** Route an incoming Discord message. *)
 let handle_message t (msg : Discord_types.message) =
@@ -534,6 +555,7 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
     gateway;
     projects;
     sessions = SessionMap.empty;
+    env;
     sw;
   } in
   bot.gateway.handler <- (fun event ->
