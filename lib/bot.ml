@@ -439,15 +439,26 @@ let handle_control_message t msg =
          ~channel_id:msg.channel_id
          ~content:(Printf.sprintf "Project `%s` not found." project) ())
      | Some p ->
-       match working_dir_of_project p with
+       let kind_str = Config.string_of_agent_kind kind in
+       (* Create a worktree for the session *)
+       let branch_name = Printf.sprintf "agent/%s-%s"
+         kind_str (String.sub (generate_uuid ()) 0 8) in
+       (match Project.create_worktree p ~branch_name with
        | Error e ->
-         ignore (Discord_rest.create_message t.rest
-           ~channel_id:msg.channel_id
-           ~content:(Printf.sprintf "Cannot find working directory: %s" e) ())
-       | Ok working_dir ->
-         let kind_str = Config.string_of_agent_kind kind in
+         (* Fall back to existing working dir if worktree creation fails *)
+         Logs.warn (fun m -> m "bot: worktree creation failed, using default: %s" e);
+         (match working_dir_of_project p with
+          | Error e2 ->
+            ignore (Discord_rest.create_message t.rest
+              ~channel_id:msg.channel_id
+              ~content:(Printf.sprintf "Cannot find working directory: %s" e2) ())
+          | Ok working_dir ->
+            ignore (Discord_rest.create_message t.rest
+              ~channel_id:msg.channel_id
+              ~content:(Printf.sprintf "Worktree failed (%s), using `%s`" e working_dir) ()))
+       | Ok worktree_path ->
+         let working_dir = worktree_path in
          let thread_name = Printf.sprintf "%s / %s" kind_str p.name in
-         (* Create thread in project channel if available, else control channel *)
          let thread_parent = match ChannelMap.find_opt p.name t.project_channels with
            | Some ch_id -> ch_id
            | None -> msg.channel_id
@@ -469,13 +480,12 @@ let handle_control_message t msg =
              message_count = 0;
            } in
            add_session t thread_ch.id session;
-           (* Post welcome message in the thread *)
            let welcome = Printf.sprintf
-             "**%s** session started for **%s**\nWorking in: `%s`\nSend a message to interact with the agent."
-             kind_str p.name working_dir
+             "**%s** session started for **%s**\nBranch: `%s`\nWorking in: `%s`\nSend a message to interact with the agent."
+             kind_str p.name branch_name working_dir
            in
            ignore (Discord_rest.create_message t.rest
-             ~channel_id:thread_ch.id ~content:welcome ()))
+             ~channel_id:thread_ch.id ~content:welcome ())))
   | Resume_session { session_id } ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       (* find_claude_session runs blocking I/O *)
@@ -757,12 +767,23 @@ let setup_project_channels t =
             end
           | _ -> ()
         ) channels;
-        (* Channels are created on demand when !start is used.
-           Log how many projects are mapped vs unmapped. *)
-        let mapped = ChannelMap.cardinal t.project_channels in
-        let total = List.length t.projects in
-        Logs.info (fun m -> m "bot: %d/%d projects have channels (others created on demand)"
-          mapped total)
+        (* Create channels for projects that don't have one yet.
+           Pace creation to avoid blocking heartbeats and hitting rate limits. *)
+        let to_create = List.filter (fun (p : Project.t) ->
+          not (ChannelMap.mem p.name t.project_channels)
+        ) t.projects in
+        let clock = Eio.Stdenv.clock t.env in
+        List.iter (fun (p : Project.t) ->
+          let topic = Printf.sprintf "Agent sessions for %s (%s)" p.name p.path in
+          match Discord_rest.create_channel t.rest ~guild_id ~name:p.name
+                  ~parent_id:cat_id ~topic () with
+          | Ok ch ->
+            t.project_channels <- ChannelMap.add p.name ch.id t.project_channels;
+            Logs.info (fun m -> m "bot: created channel for project %s" p.name);
+            Eio.Time.sleep clock 0.5
+          | Error e ->
+            Logs.warn (fun m -> m "bot: failed to create channel for %s: %s" p.name e)
+        ) to_create
       end
   end
 
