@@ -8,14 +8,25 @@
     - Project channels: one per project, start agents here
     - Session threads: one per agent session, bridges I/O *)
 
-module SessionMap = Map.Make(String) (* thread_id -> session *)
+module SessionMap = Map.Make(String) (* thread_id -> agent_session *)
+
+(** Lightweight agent session — tracks a Discord thread <-> Claude session. *)
+type agent_session = {
+  project_name : string;
+  working_dir : string;
+  agent_kind : Config.agent_kind;
+  session_id : string;
+  thread_id : string;
+  mutable message_count : int;
+}
 
 type t = {
   config : Config.t;
   rest : Discord_rest.t;
   gateway : Discord_gateway.t;
   projects : Project.t list;
-  mutable sessions : Session.t SessionMap.t;
+  mutable sessions : agent_session SessionMap.t;
+  sw : Eio.Switch.t;
 }
 
 (** Commands the bot recognizes in the control channel. *)
@@ -40,6 +51,92 @@ let parse_command content =
   | ["!help"] -> Help
   | _ -> Unknown content
 
+(** Generate a UUID for Claude session tracking. *)
+let generate_uuid () =
+  let buf = Bytes.create 16 in
+  let ic = open_in "/dev/urandom" in
+  really_input ic buf 0 16;
+  close_in ic;
+  let hex = Buffer.create 32 in
+  Bytes.iter (fun c ->
+    Buffer.add_string hex (Printf.sprintf "%02x" (Char.code c))
+  ) buf;
+  let s = Buffer.contents hex in
+  Printf.sprintf "%s-%s-%s-%s-%s"
+    (String.sub s 0 8) (String.sub s 8 4) (String.sub s 12 4)
+    (String.sub s 16 4) (String.sub s 20 12)
+
+(** Find a usable working directory for a project.
+    For bare repos, look for master/ or main/ worktree. *)
+let working_dir_of_project (p : Project.t) =
+  if p.is_bare then
+    let candidates = ["master"; "main"] in
+    match List.find_opt (fun name ->
+      let path = Filename.concat p.path name in
+      try Sys.is_directory path with Sys_error _ -> false
+    ) candidates with
+    | Some name -> Ok (Filename.concat p.path name)
+    | None -> Error "bare repo has no master/ or main/ worktree"
+  else
+    Ok p.path
+
+(** Run a Claude agent subprocess and return the text output.
+    Runs in a system thread to avoid blocking Eio fibers. *)
+let run_claude ~working_dir ~session_id ~message_count ~prompt =
+  Eio_unix.run_in_systhread @@ fun () ->
+  let session_arg =
+    if message_count = 0 then
+      Printf.sprintf "--session-id %s" (Filename.quote session_id)
+    else
+      Printf.sprintf "--resume %s" (Filename.quote session_id)
+  in
+  let cmd = Printf.sprintf "cd %s && claude -p %s %s 2>/dev/null"
+    (Filename.quote working_dir)
+    session_arg
+    (Filename.quote prompt)
+  in
+  let ic = Unix.open_process_in cmd in
+  let buf = Buffer.create 4096 in
+  (try
+    let chunk = Bytes.create 4096 in
+    let rec read_all () =
+      let n = input ic chunk 0 4096 in
+      if n > 0 then begin
+        Buffer.add_subbytes buf chunk 0 n;
+        read_all ()
+      end
+    in
+    read_all ()
+  with End_of_file -> ());
+  let status = Unix.close_process_in ic in
+  match status with
+  | Unix.WEXITED 0 -> Ok (Buffer.contents buf)
+  | Unix.WEXITED code -> Error (Printf.sprintf "claude exited with code %d" code)
+  | Unix.WSIGNALED s -> Error (Printf.sprintf "claude killed by signal %d" s)
+  | Unix.WSTOPPED _ -> Error "claude stopped"
+
+(** Split text into chunks that fit Discord's 2000-char message limit. *)
+let split_message ?(max_len=1900) text =
+  let len = String.length text in
+  if len <= max_len then [text]
+  else
+    let rec split pos acc =
+      if pos >= len then List.rev acc
+      else
+        let chunk_end = min (pos + max_len) len in
+        split chunk_end (String.sub text pos (chunk_end - pos) :: acc)
+    in
+    split 0 []
+
+(** Post a (potentially long) response to a Discord channel, splitting if needed. *)
+let post_response rest ~channel_id text =
+  let chunks = split_message text in
+  List.iter (fun chunk ->
+    match Discord_rest.create_message rest ~channel_id ~content:chunk () with
+    | Ok _ -> ()
+    | Error e -> Logs.warn (fun m -> m "bot: failed to post response: %s" e)
+  ) chunks
+
 (** Handle a message from the control channel. *)
 let handle_control_message t msg =
   let cmd = parse_command msg.Discord_types.content in
@@ -55,12 +152,12 @@ let handle_control_message t msg =
       ~channel_id:msg.channel_id ~content:text ())
   | List_sessions ->
     let entries = SessionMap.bindings t.sessions in
-    let lines = List.map (fun (_tid, (s : Session.t)) ->
-      Printf.sprintf "- **%s** / %s (%s) — %s"
+    let lines = List.map (fun (_tid, (s : agent_session)) ->
+      Printf.sprintf "- **%s** / %s — %d messages (thread: <#%s>)"
         s.project_name
         (Config.string_of_agent_kind s.agent_kind)
-        s.id
-        (Session.show_state s.state)
+        s.message_count
+        s.thread_id
     ) entries in
     let text = if lines = [] then "No active sessions."
       else "**Sessions:**\n" ^ String.concat "\n" lines in
@@ -74,32 +171,39 @@ let handle_control_message t msg =
          ~channel_id:msg.channel_id
          ~content:(Printf.sprintf "Project `%s` not found." project) ())
      | Some p ->
-       let branch = Printf.sprintf "agent/%s-%s"
-         (Config.string_of_agent_kind kind)
-         (Session.generate_id ())
-       in
-       match Project.create_worktree p ~branch_name:branch with
+       match working_dir_of_project p with
        | Error e ->
          ignore (Discord_rest.create_message t.rest
            ~channel_id:msg.channel_id
-           ~content:(Printf.sprintf "Failed to create worktree: %s" e) ())
-       | Ok worktree_path ->
-         let thread_id = "TODO" in
-         let session = Session.create
-           ~project_name:p.name ~agent_kind:kind
-           ~thread_id ~worktree_path
-         in
-         (match Session.start session with
-          | Ok () ->
-            t.sessions <- SessionMap.add thread_id session t.sessions;
-            ignore (Discord_rest.create_message t.rest
-              ~channel_id:msg.channel_id
-              ~content:(Printf.sprintf "Started %s session for **%s** (thread: TODO)"
-                (Config.string_of_agent_kind kind) p.name) ())
-          | Error e ->
-            ignore (Discord_rest.create_message t.rest
-              ~channel_id:msg.channel_id
-              ~content:(Printf.sprintf "Failed to start session: %s" e) ())))
+           ~content:(Printf.sprintf "Cannot find working directory: %s" e) ())
+       | Ok working_dir ->
+         let kind_str = Config.string_of_agent_kind kind in
+         let thread_name = Printf.sprintf "%s / %s" kind_str p.name in
+         (* Create a thread in the control channel *)
+         match Discord_rest.create_thread_no_message t.rest
+                 ~channel_id:msg.channel_id ~name:thread_name () with
+         | Error e ->
+           ignore (Discord_rest.create_message t.rest
+             ~channel_id:msg.channel_id
+             ~content:(Printf.sprintf "Failed to create thread: %s" e) ())
+         | Ok thread_ch ->
+           let session_id = generate_uuid () in
+           let session = {
+             project_name = p.name;
+             working_dir;
+             agent_kind = kind;
+             session_id;
+             thread_id = thread_ch.Discord_types.id;
+             message_count = 0;
+           } in
+           t.sessions <- SessionMap.add thread_ch.id session t.sessions;
+           (* Post welcome message in the thread *)
+           let welcome = Printf.sprintf
+             "**%s** session started for **%s**\nWorking in: `%s`\nSend a message to interact with the agent."
+             kind_str p.name working_dir
+           in
+           ignore (Discord_rest.create_message t.rest
+             ~channel_id:thread_ch.id ~content:welcome ()))
   | Stop_session { thread_id } ->
     (match SessionMap.find_opt thread_id t.sessions with
      | None ->
@@ -107,11 +211,10 @@ let handle_control_message t msg =
          ~channel_id:msg.channel_id
          ~content:"Session not found." ())
      | Some session ->
-       Session.stop session;
        t.sessions <- SessionMap.remove thread_id t.sessions;
        ignore (Discord_rest.create_message t.rest
          ~channel_id:msg.channel_id
-         ~content:(Printf.sprintf "Stopped session %s." session.id) ()))
+         ~content:(Printf.sprintf "Stopped session for **%s**." session.project_name) ()))
   | Help ->
     let text = String.concat "\n" [
       "**Commands:**";
@@ -125,15 +228,45 @@ let handle_control_message t msg =
       ~channel_id:msg.channel_id ~content:text ())
   | Unknown _ -> ()
 
-(** Handle a message in a session thread — forward to agent. *)
+(** Handle a message in a session thread — run the agent and post the response. *)
 let handle_thread_message t msg =
   match SessionMap.find_opt msg.Discord_types.channel_id t.sessions with
   | None -> ()
   | Some session ->
-    (match Session.send_to_agent session msg.content with
-     | Ok () -> ()
-     | Error e ->
-       Logs.warn (fun m -> m "failed to send to agent: %s" e))
+    (* Fork a fiber so we don't block the gateway recv loop *)
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      (* Send typing indicator *)
+      ignore (Discord_rest.send_typing t.rest ~channel_id:msg.channel_id ());
+      let prompt = msg.content in
+      Logs.info (fun m -> m "bot: running %s for %s: %s"
+        (Config.string_of_agent_kind session.agent_kind)
+        session.project_name
+        (if String.length prompt > 80
+         then String.sub prompt 0 80 ^ "..."
+         else prompt));
+      match session.agent_kind with
+      | Config.Claude ->
+        (match run_claude
+                 ~working_dir:session.working_dir
+                 ~session_id:session.session_id
+                 ~message_count:session.message_count
+                 ~prompt with
+         | Ok response ->
+           session.message_count <- session.message_count + 1;
+           if String.length response = 0 then
+             ignore (Discord_rest.create_message t.rest
+               ~channel_id:msg.channel_id ~content:"(no response)" ())
+           else
+             post_response t.rest ~channel_id:msg.channel_id response
+         | Error e ->
+           Logs.warn (fun m -> m "bot: claude error: %s" e);
+           ignore (Discord_rest.create_message t.rest
+             ~channel_id:msg.channel_id
+             ~content:(Printf.sprintf "Agent error: %s" e) ()))
+      | _ ->
+        ignore (Discord_rest.create_message t.rest
+          ~channel_id:msg.channel_id
+          ~content:"Only Claude is supported for now." ()))
 
 (** Route an incoming Discord message. *)
 let handle_message t (msg : Discord_types.message) =
@@ -158,6 +291,7 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
     gateway;
     projects;
     sessions = SessionMap.empty;
+    sw;
   } in
   bot.gateway.handler <- (fun event ->
     match event with
@@ -172,9 +306,9 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
   );
   bot
 
-let run ~sw ~(env : Eio_unix.Stdenv.base) bot =
+let run ~sw:_ ~(env : Eio_unix.Stdenv.base) bot =
   Logs.info (fun m -> m "bot: discovered %d projects" (List.length bot.projects));
   List.iter (fun (p : Project.t) ->
     Logs.info (fun m -> m "  - %s (%s)" p.name p.path)
   ) bot.projects;
-  Discord_gateway.connect ~sw ~env bot.gateway
+  Discord_gateway.connect ~sw:bot.sw ~env bot.gateway
