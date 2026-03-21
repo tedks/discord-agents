@@ -96,5 +96,26 @@ let () =
     run_test ~sw ~env config test_channel
   else begin
     let bot = Discord_agents.Bot.create ~sw ~env config in
+    (* Graceful shutdown on SIGINT/SIGTERM *)
+    let shutdown_requested = ref false in
+    let handle_signal _signum =
+      if not !shutdown_requested then begin
+        shutdown_requested := true;
+        Logs.info (fun m -> m "shutdown: signal received, cleaning up...");
+        (* Post shutdown message to control channel *)
+        (match config.control_channel_id with
+         | Some ch_id ->
+           ignore (Discord_agents.Discord_rest.create_message bot.rest
+             ~channel_id:ch_id ~content:"Bot shutting down." ())
+         | None -> ());
+        (* Close the gateway WebSocket to exit the event loop *)
+        (match bot.gateway.ws with
+         | Some ws -> Discord_agents.Websocket.send_close ws
+         | None -> ());
+        Logs.info (fun m -> m "shutdown: complete")
+      end
+    in
+    Sys.set_signal Sys.sigint (Sys.Signal_handle handle_signal);
+    Sys.set_signal Sys.sigterm (Sys.Signal_handle handle_signal);
     Discord_agents.Bot.run ~sw ~env bot
   end

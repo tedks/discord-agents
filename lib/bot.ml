@@ -99,16 +99,67 @@ let working_dir_of_project (p : Project.t) =
     Discord's typing indicator expires after ~10s, so refresh every 8s. *)
 let typing_interval = 8.0
 
-(** Split text into chunks that fit Discord's 2000-char message limit. *)
+(** Split text into chunks that fit Discord's 2000-char message limit.
+    Tries to split at paragraph breaks, then newlines, then spaces.
+    Avoids splitting inside code blocks (triple backticks). *)
 let split_message ?(max_len=1900) text =
   let len = String.length text in
   if len <= max_len then [text]
   else
+    let find_split_point pos limit =
+      (* Try paragraph break first *)
+      let try_find sep =
+        let sep_len = String.length sep in
+        let best = ref None in
+        let i = ref pos in
+        while !i + sep_len <= limit do
+          if String.sub text !i sep_len = sep then
+            best := Some !i;
+          incr i
+        done;
+        !best
+      in
+      match try_find "\n\n" with
+      | Some p -> p + 2
+      | None ->
+        match try_find "\n" with
+        | Some p -> p + 1
+        | None ->
+          match try_find " " with
+          | Some p -> p + 1
+          | None -> limit
+    in
     let rec split pos acc =
       if pos >= len then List.rev acc
       else
-        let chunk_end = min (pos + max_len) len in
-        split chunk_end (String.sub text pos (chunk_end - pos) :: acc)
+        let remaining = len - pos in
+        if remaining <= max_len then
+          List.rev (String.sub text pos remaining :: acc)
+        else
+          let split_at = find_split_point pos (pos + max_len) in
+          let chunk = String.sub text pos (split_at - pos) in
+          (* Check if we're splitting inside a code block *)
+          let backtick_count =
+            let count = ref 0 in
+            let i = ref 0 in
+            let s = chunk in
+            let slen = String.length s in
+            while !i + 2 < slen do
+              if s.[!i] = '`' && s.[!i+1] = '`' && s.[!i+2] = '`' then begin
+                incr count;
+                i := !i + 3
+              end else
+                incr i
+            done;
+            !count
+          in
+          let chunk =
+            if backtick_count mod 2 = 1 then
+              (* Odd number of ``` — we're inside a code block. Close it. *)
+              chunk ^ "\n```"
+            else chunk
+          in
+          split split_at (chunk :: acc)
     in
     split 0 []
 
