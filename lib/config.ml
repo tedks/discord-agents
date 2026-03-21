@@ -64,12 +64,19 @@ let load_file path =
 
 let load () =
   let path = config_path () in
-  if Sys.file_exists path then
-    let contents = load_file path in
-    let json = Yojson.Safe.from_string contents in
-    t_of_yojson json
-  else
-    default
+  let config =
+    if Sys.file_exists path then
+      let contents = load_file path in
+      let json = Yojson.Safe.from_string contents in
+      t_of_yojson json
+    else
+      default
+  in
+  (* Allow env var override for the token *)
+  match Sys.getenv_opt "DISCORD_BOT_TOKEN" with
+  | Some token when token <> "" && config.discord_token = "" ->
+    { config with discord_token = token }
+  | _ -> config
 
 let save config =
   let path = config_path () in
