@@ -9,25 +9,39 @@ open Ppx_yojson_conv_lib.Yojson_conv.Primitives
 type channel_type =
   | Guild_text        (* 0 *)
   | DM                (* 1 *)
+  | Guild_voice       (* 2 *)
   | Guild_category    (* 4 *)
+  | Guild_announcement (* 5 *)
+  | Guild_stage       (* 13 *)
+  | Guild_forum       (* 15 *)
   | Guild_public_thread  (* 11 *)
   | Guild_private_thread (* 12 *)
+  | Unknown_channel_type of int
 [@@deriving show, eq]
 
 let int_of_channel_type = function
   | Guild_text -> 0
   | DM -> 1
+  | Guild_voice -> 2
   | Guild_category -> 4
+  | Guild_announcement -> 5
   | Guild_public_thread -> 11
   | Guild_private_thread -> 12
+  | Guild_stage -> 13
+  | Guild_forum -> 15
+  | Unknown_channel_type n -> n
 
 let channel_type_of_int = function
   | 0 -> Guild_text
   | 1 -> DM
+  | 2 -> Guild_voice
   | 4 -> Guild_category
+  | 5 -> Guild_announcement
   | 11 -> Guild_public_thread
   | 12 -> Guild_private_thread
-  | n -> failwith (Printf.sprintf "unknown channel type: %d" n)
+  | 13 -> Guild_stage
+  | 15 -> Guild_forum
+  | n -> Unknown_channel_type n
 
 let channel_type_of_yojson = function
   | `Int n -> channel_type_of_int n
@@ -40,16 +54,16 @@ type snowflake = string [@@deriving show, eq, yojson]
 type user = {
   id : snowflake;
   username : string;
-  bot : bool option; [@yojson.option]
+  bot : bool option; [@default None]
 } [@@deriving show, yojson] [@@yojson.allow_extra_fields]
 
 type channel = {
   id : snowflake;
   type_ : channel_type; [@key "type"]
-  guild_id : snowflake option; [@yojson.option]
-  name : string option; [@yojson.option]
-  topic : string option; [@yojson.option]
-  parent_id : snowflake option; [@yojson.option]
+  guild_id : snowflake option; [@default None]
+  name : string option; [@default None]
+  topic : string option; [@default None]
+  parent_id : snowflake option; [@default None]
 } [@@deriving show, yojson] [@@yojson.allow_extra_fields]
 
 type attachment = {
@@ -57,7 +71,7 @@ type attachment = {
   filename : string;
   size : int;
   url : string;
-  content_type : string option; [@yojson.option]
+  content_type : string option; [@default None]
 } [@@deriving show, yojson] [@@yojson.allow_extra_fields]
 
 type message = {
@@ -66,9 +80,9 @@ type message = {
   author : user;
   content : string;
   timestamp : string;
-  guild_id : snowflake option; [@yojson.option]
+  guild_id : snowflake option; [@default None]
   attachments : attachment list; [@default []]
-  referenced_message : message option; [@yojson.option]
+  referenced_message : message option; [@default None]
 } [@@deriving show, yojson] [@@yojson.allow_extra_fields]
 
 type guild = {
