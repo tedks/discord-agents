@@ -137,10 +137,10 @@ let send_typing t ~channel_id () =
   | Error e -> Error e
 
 (** Create a new text channel in a guild. *)
-let create_channel t ~guild_id ~name ?parent_id ?topic () =
+let create_channel t ~guild_id ~name ?(channel_type=0) ?parent_id ?topic () =
   let body = `Assoc ([
     ("name", `String name);
-    ("type", `Int 0);
+    ("type", `Int channel_type);
   ] @ (match parent_id with Some id -> [("parent_id", `String id)] | None -> [])
     @ (match topic with Some t -> [("topic", `String t)] | None -> []))
   in
@@ -148,6 +148,14 @@ let create_channel t ~guild_id ~name ?parent_id ?topic () =
   | Ok json ->
     (try Ok (channel_of_yojson json)
      with exn -> Error (Printf.sprintf "create_channel: parse error: %s" (Printexc.to_string exn)))
+  | Error e -> Error e
+
+(** Get all channels in a guild. *)
+let get_guild_channels t ~guild_id () =
+  match request t ~meth:`GET ~path:(Printf.sprintf "/guilds/%s/channels" guild_id) () with
+  | Ok json ->
+    (try Ok (Yojson.Safe.Util.to_list json |> List.map channel_of_yojson)
+     with exn -> Error (Printf.sprintf "get_guild_channels: parse error: %s" (Printexc.to_string exn)))
   | Error e -> Error e
 
 (** Create a thread from a message. *)

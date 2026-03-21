@@ -20,12 +20,16 @@ type agent_session = {
   mutable message_count : int;
 }
 
+module ChannelMap = Map.Make(String) (* project_name -> channel_id *)
+
 type t = {
   config : Config.t;
   rest : Discord_rest.t;
   gateway : Discord_gateway.t;
   projects : Project.t list;
   mutable sessions : agent_session SessionMap.t;
+  mutable project_channels : string ChannelMap.t;
+  mutable category_id : string option;
   env : Eio_unix.Stdenv.base;
   sw : Eio.Switch.t;
 }
@@ -331,9 +335,13 @@ let handle_control_message t msg =
        | Ok working_dir ->
          let kind_str = Config.string_of_agent_kind kind in
          let thread_name = Printf.sprintf "%s / %s" kind_str p.name in
-         (* Create a thread in the control channel *)
+         (* Create thread in project channel if available, else control channel *)
+         let thread_parent = match ChannelMap.find_opt p.name t.project_channels with
+           | Some ch_id -> ch_id
+           | None -> msg.channel_id
+         in
          match Discord_rest.create_thread_no_message t.rest
-                 ~channel_id:msg.channel_id ~name:thread_name () with
+                 ~channel_id:thread_parent ~name:thread_name () with
          | Error e ->
            ignore (Discord_rest.create_message t.rest
              ~channel_id:msg.channel_id
@@ -448,7 +456,9 @@ let handle_thread_message t msg =
     (* Fork a fiber so we don't block the gateway recv loop *)
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       let channel_id = msg.Discord_types.channel_id in
-      (* Send typing indicator *)
+      (* Ack with eyes reaction, then send typing *)
+      ignore (Discord_rest.create_reaction t.rest ~channel_id
+        ~message_id:msg.id ~emoji:"\xF0\x9F\x91\x80" ());
       ignore (Discord_rest.send_typing t.rest ~channel_id ());
       let prompt = msg.content in
       Logs.info (fun m -> m "bot: running %s for %s: %s"
@@ -541,6 +551,66 @@ let handle_message t (msg : Discord_types.message) =
   else
     handle_thread_message t msg
 
+(** Set up project channels under an "Agent Projects" category.
+    Finds or creates the category, then creates a channel per project. *)
+let setup_project_channels t =
+  let guild_id = t.config.guild_id in
+  if guild_id = "" then
+    Logs.info (fun m -> m "bot: no guild_id configured, skipping channel setup")
+  else begin
+    match Discord_rest.get_guild_channels t.rest ~guild_id () with
+    | Error e ->
+      Logs.warn (fun m -> m "bot: failed to get guild channels: %s" e)
+    | Ok channels ->
+      (* Find or create "Agent Projects" category (type 4) *)
+      let category = List.find_opt (fun (ch : Discord_types.channel) ->
+        ch.type_ = Guild_category
+        && ch.name = Some "Agent Projects"
+      ) channels in
+      let cat_id = match category with
+        | Some ch ->
+          Logs.info (fun m -> m "bot: found Agent Projects category: %s" ch.id);
+          ch.id
+        | None ->
+          Logs.info (fun m -> m "bot: creating Agent Projects category");
+          match Discord_rest.create_channel t.rest ~guild_id
+                  ~name:"Agent Projects" ~channel_type:4 () with
+          | Ok ch -> ch.id
+          | Error e ->
+            Logs.warn (fun m -> m "bot: failed to create category: %s" e);
+            ""
+      in
+      if cat_id <> "" then begin
+        t.category_id <- Some cat_id;
+        (* Map existing text channels under this category to projects *)
+        List.iter (fun (ch : Discord_types.channel) ->
+          match ch.parent_id, ch.name with
+          | Some pid, Some name when pid = cat_id ->
+            (* Check if this matches a project name *)
+            if List.exists (fun (p : Project.t) -> p.name = name) t.projects then begin
+              t.project_channels <- ChannelMap.add name ch.id t.project_channels;
+              Logs.info (fun m -> m "bot: mapped channel %s -> project %s" ch.id name)
+            end
+          | _ -> ()
+        ) channels;
+        (* Create channels for projects that don't have one yet (limit to 10 to avoid spam) *)
+        let missing = List.filter (fun (p : Project.t) ->
+          not (ChannelMap.mem p.name t.project_channels)
+        ) t.projects in
+        let to_create = List.filteri (fun i _ -> i < 10) missing in
+        List.iter (fun (p : Project.t) ->
+          let topic = Printf.sprintf "Agent sessions for %s (%s)" p.name p.path in
+          match Discord_rest.create_channel t.rest ~guild_id ~name:p.name
+                  ~parent_id:cat_id ~topic () with
+          | Ok ch ->
+            t.project_channels <- ChannelMap.add p.name ch.id t.project_channels;
+            Logs.info (fun m -> m "bot: created channel for project %s" p.name)
+          | Error e ->
+            Logs.warn (fun m -> m "bot: failed to create channel for %s: %s" p.name e)
+        ) to_create
+      end
+  end
+
 let create ~sw ~(env : Eio_unix.Stdenv.base) config =
   let rest = Discord_rest.create ~sw ~env ~token:config.Config.discord_token in
   let projects = Project.discover ~base_directories:config.base_directories in
@@ -555,13 +625,17 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
     gateway;
     projects;
     sessions = SessionMap.empty;
+    project_channels = ChannelMap.empty;
+    category_id = None;
     env;
     sw;
   } in
   bot.gateway.handler <- (fun event ->
     match event with
     | Discord_gateway.Connected user ->
-      Logs.info (fun m -> m "bot: connected as %s" user.Discord_types.username)
+      Logs.info (fun m -> m "bot: connected as %s" user.Discord_types.username);
+      (* Set up project channels in a fiber so it doesn't block the gateway *)
+      Eio.Fiber.fork ~sw (fun () -> setup_project_channels bot)
     | Discord_gateway.Message_received msg -> handle_message bot msg
     | Discord_gateway.Thread_created ch ->
       Logs.info (fun m -> m "bot: thread created: %s"
