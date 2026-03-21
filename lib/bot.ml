@@ -144,7 +144,7 @@ let handle_message t (msg : Discord_types.message) =
     | _ ->
       handle_thread_message t msg)
 
-let create ~sw ~env config =
+let create ~sw ~(env : Eio_unix.Stdenv.base) config =
   let rest = Discord_rest.create ~sw ~env ~token:config.Config.discord_token in
   let projects = Project.discover ~base_directories:config.base_directories in
   let gateway = Discord_gateway.create
@@ -172,7 +172,7 @@ let create ~sw ~env config =
   );
   bot
 
-let run ~sw ~env bot =
+let run ~sw ~(env : Eio_unix.Stdenv.base) bot =
   Logs.info (fun m -> m "bot: discovered %d projects" (List.length bot.projects));
   List.iter (fun (p : Project.t) ->
     Logs.info (fun m -> m "  - %s (%s)" p.name p.path)
