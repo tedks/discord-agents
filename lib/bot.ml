@@ -20,6 +20,59 @@ type agent_session = {
   mutable message_count : int;
 }
 
+let sessions_file () =
+  let home = Sys.getenv "HOME" in
+  Filename.concat home ".config/discord-agents/sessions.json"
+
+let save_sessions sessions =
+  let entries = SessionMap.bindings sessions in
+  let json = `List (List.map (fun (_tid, s) ->
+    `Assoc [
+      ("project_name", `String s.project_name);
+      ("working_dir", `String s.working_dir);
+      ("agent_kind", `String (Config.string_of_agent_kind s.agent_kind));
+      ("session_id", `String s.session_id);
+      ("thread_id", `String s.thread_id);
+      ("message_count", `Int s.message_count);
+    ]
+  ) entries) in
+  let path = sessions_file () in
+  let oc = open_out path in
+  output_string oc (Yojson.Safe.pretty_to_string json);
+  output_char oc '\n';
+  close_out oc
+
+let load_sessions () =
+  let path = sessions_file () in
+  if not (Sys.file_exists path) then SessionMap.empty
+  else
+    try
+      let ic = open_in path in
+      let n = in_channel_length ic in
+      let s = Bytes.create n in
+      really_input ic s 0 n;
+      close_in ic;
+      let json = Yojson.Safe.from_string (Bytes.to_string s) in
+      let open Yojson.Safe.Util in
+      let entries = to_list json |> List.map (fun j ->
+        let thread_id = j |> member "thread_id" |> to_string in
+        let session = {
+          project_name = j |> member "project_name" |> to_string;
+          working_dir = j |> member "working_dir" |> to_string;
+          agent_kind = (match Config.agent_kind_of_string
+            (j |> member "agent_kind" |> to_string) with
+            | Ok k -> k | Error _ -> Config.Claude);
+          session_id = j |> member "session_id" |> to_string;
+          thread_id;
+          message_count = j |> member "message_count" |> to_int;
+        } in
+        (thread_id, session)
+      ) in
+      List.fold_left (fun acc (tid, s) -> SessionMap.add tid s acc) SessionMap.empty entries
+    with exn ->
+      Logs.warn (fun m -> m "bot: failed to load sessions: %s" (Printexc.to_string exn));
+      SessionMap.empty
+
 module ChannelMap = Map.Make(String) (* project_name -> channel_id *)
 
 type t = {
@@ -33,6 +86,14 @@ type t = {
   env : Eio_unix.Stdenv.base;
   sw : Eio.Switch.t;
 }
+
+let add_session (t : t) thread_id session =
+  t.sessions <- SessionMap.add thread_id session t.sessions;
+  save_sessions t.sessions
+
+let remove_session (t : t) thread_id =
+  t.sessions <- SessionMap.remove thread_id t.sessions;
+  save_sessions t.sessions
 
 (** Commands the bot recognizes in the control channel. *)
 type command =
@@ -407,7 +468,7 @@ let handle_control_message t msg =
              thread_id = thread_ch.Discord_types.id;
              message_count = 0;
            } in
-           t.sessions <- SessionMap.add thread_ch.id session t.sessions;
+           add_session t thread_ch.id session;
            (* Post welcome message in the thread *)
            let welcome = Printf.sprintf
              "**%s** session started for **%s**\nWorking in: `%s`\nSend a message to interact with the agent."
@@ -457,7 +518,7 @@ let handle_control_message t msg =
          ~channel_id:msg.channel_id
          ~content:"Session not found." ())
      | Some session ->
-       t.sessions <- SessionMap.remove thread_id t.sessions;
+       remove_session t thread_id;
        ignore (Discord_rest.create_message t.rest
          ~channel_id:msg.channel_id
          ~content:(Printf.sprintf "Stopped session for **%s**." session.project_name) ()))
@@ -581,6 +642,7 @@ let handle_thread_message t msg =
                ~prompt ~on_event with
        | Ok () ->
          session.message_count <- session.message_count + 1;
+         save_sessions t.sessions;
          (* Final flush if not already done *)
          flush_to_discord ();
          if Buffer.length result_buf = 0 then
@@ -592,6 +654,25 @@ let handle_thread_message t msg =
            ~channel_id
            ~content:(Printf.sprintf "Agent error: %s" e) ())))
 
+(** Ensure a session exists for a channel, creating one if needed.
+    Used for the control channel and project channels so users can
+    just chat naturally without explicit !start. *)
+let ensure_channel_session t ~channel_id ~project_name ~working_dir =
+  match SessionMap.find_opt channel_id t.sessions with
+  | Some _ -> () (* Already has a session *)
+  | None ->
+    let session = {
+      project_name;
+      working_dir;
+      agent_kind = Config.Claude;
+      session_id = generate_uuid ();
+      thread_id = channel_id;
+      message_count = 0;
+    } in
+    add_session t channel_id session;
+    Logs.info (fun m -> m "bot: auto-created session for channel %s (%s)"
+      channel_id project_name)
+
 (** Route an incoming Discord message. *)
 let handle_message t (msg : Discord_types.message) =
   (* Ignore bot messages *)
@@ -599,8 +680,40 @@ let handle_message t (msg : Discord_types.message) =
   (* Commands (messages starting with !) are handled regardless of channel *)
   if is_command msg.content then
     handle_control_message t msg
-  else
-    handle_thread_message t msg
+  else begin
+    (* Check if this is in the control channel or a project channel —
+       auto-create a session for natural language chat *)
+    let is_control = match t.config.control_channel_id with
+      | Some ctl_id -> msg.channel_id = ctl_id
+      | None -> false
+    in
+    let project_for_channel =
+      ChannelMap.bindings t.project_channels
+      |> List.find_opt (fun (_, ch_id) -> ch_id = msg.channel_id)
+      |> Option.map fst
+    in
+    if is_control then begin
+      (* Control channel: use a global session with cwd as working dir *)
+      let working_dir = Sys.getcwd () in
+      ensure_channel_session t ~channel_id:msg.channel_id
+        ~project_name:"control" ~working_dir;
+      handle_thread_message t msg
+    end else match project_for_channel with
+    | Some proj_name ->
+      (* Project channel: auto-create a session for that project *)
+      let proj = List.find_opt (fun (p : Project.t) -> p.name = proj_name) t.projects in
+      (match proj with
+       | Some p ->
+         let working_dir = match working_dir_of_project p with
+           | Ok d -> d | Error _ -> p.path in
+         ensure_channel_session t ~channel_id:msg.channel_id
+           ~project_name:p.name ~working_dir;
+         handle_thread_message t msg
+       | None -> handle_thread_message t msg)
+    | None ->
+      (* Thread or unknown channel — check existing sessions *)
+      handle_thread_message t msg
+  end
 
 (** Set up project channels under an "Agent Projects" category.
     Finds or creates the category, then creates a channel per project. *)
@@ -644,11 +757,10 @@ let setup_project_channels t =
             end
           | _ -> ()
         ) channels;
-        (* Create channels for projects that don't have one yet (limit to 10 to avoid spam) *)
-        let missing = List.filter (fun (p : Project.t) ->
+        (* Create channels for projects that don't have one yet *)
+        let to_create = List.filter (fun (p : Project.t) ->
           not (ChannelMap.mem p.name t.project_channels)
         ) t.projects in
-        let to_create = List.filteri (fun i _ -> i < 10) missing in
         List.iter (fun (p : Project.t) ->
           let topic = Printf.sprintf "Agent sessions for %s (%s)" p.name p.path in
           match Discord_rest.create_channel t.rest ~guild_id ~name:p.name
@@ -675,7 +787,7 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
     rest;
     gateway;
     projects;
-    sessions = SessionMap.empty;
+    sessions = load_sessions ();
     project_channels = ChannelMap.empty;
     category_id = None;
     env;
@@ -685,8 +797,9 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
     match event with
     | Discord_gateway.Connected user ->
       Logs.info (fun m -> m "bot: connected as %s" user.Discord_types.username);
-      (* Set up project channels in a fiber so it doesn't block the gateway *)
-      Eio.Fiber.fork ~sw (fun () -> setup_project_channels bot)
+      (* Set up project channels only on first connect, not on resume/reconnect *)
+      if bot.category_id = None then
+        Eio.Fiber.fork ~sw (fun () -> setup_project_channels bot)
     | Discord_gateway.Message_received msg -> handle_message bot msg
     | Discord_gateway.Thread_created ch ->
       Logs.info (fun m -> m "bot: thread created: %s"
