@@ -459,9 +459,21 @@ let handle_control_message t msg =
        | Ok worktree_path ->
          let working_dir = worktree_path in
          let thread_name = Printf.sprintf "%s / %s" kind_str p.name in
+         (* Create project channel on demand if it doesn't exist yet *)
          let thread_parent = match ChannelMap.find_opt p.name t.project_channels with
            | Some ch_id -> ch_id
-           | None -> msg.channel_id
+           | None ->
+             match t.category_id with
+             | Some cat_id ->
+               let topic = Printf.sprintf "Agent sessions for %s (%s)" p.name p.path in
+               (match Discord_rest.create_channel t.rest ~guild_id:t.config.guild_id
+                        ~name:p.name ~parent_id:cat_id ~topic () with
+                | Ok ch ->
+                  t.project_channels <- ChannelMap.add p.name ch.id t.project_channels;
+                  Logs.info (fun m -> m "bot: created channel for project %s" p.name);
+                  ch.id
+                | Error _ -> msg.channel_id)
+             | None -> msg.channel_id
          in
          match Discord_rest.create_thread_no_message t.rest
                  ~channel_id:thread_parent ~name:thread_name () with
@@ -767,23 +779,11 @@ let setup_project_channels t =
             end
           | _ -> ()
         ) channels;
-        (* Create channels for projects that don't have one yet.
-           Pace creation to avoid blocking heartbeats and hitting rate limits. *)
-        let to_create = List.filter (fun (p : Project.t) ->
-          not (ChannelMap.mem p.name t.project_channels)
-        ) t.projects in
-        let clock = Eio.Stdenv.clock t.env in
-        List.iter (fun (p : Project.t) ->
-          let topic = Printf.sprintf "Agent sessions for %s (%s)" p.name p.path in
-          match Discord_rest.create_channel t.rest ~guild_id ~name:p.name
-                  ~parent_id:cat_id ~topic () with
-          | Ok ch ->
-            t.project_channels <- ChannelMap.add p.name ch.id t.project_channels;
-            Logs.info (fun m -> m "bot: created channel for project %s" p.name);
-            Eio.Time.sleep clock 0.5
-          | Error e ->
-            Logs.warn (fun m -> m "bot: failed to create channel for %s: %s" p.name e)
-        ) to_create
+        (* Channels created on demand via !start. Log mapping status. *)
+        let mapped = ChannelMap.cardinal t.project_channels in
+        let total = List.length t.projects in
+        Logs.info (fun m -> m "bot: %d/%d projects have channels (others created on demand)"
+          mapped total)
       end
   end
 
