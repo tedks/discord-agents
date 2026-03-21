@@ -25,7 +25,7 @@ let discover_in_directory base_dir =
     let entries = Sys.readdir base_dir |> Array.to_list in
     List.filter_map (fun name ->
       let path = Filename.concat base_dir name in
-      if not (Sys.is_directory path) then None
+      if not (try Sys.is_directory path with Sys_error _ -> false) then None
       else if is_bare_repo path then
         Some { name; path; is_bare = true }
       else if is_git_dir path then
