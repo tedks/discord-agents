@@ -922,6 +922,7 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
       thread_id = channel_id;
       system_prompt;
       message_count = 0;
+      processing = false;
     } in
     add_session t channel_id session;
     Logs.info (fun m -> m "bot: auto-created session for channel %s (%s)"
