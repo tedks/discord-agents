@@ -175,17 +175,38 @@ let list_worktrees project =
   in
   parse_groups lines None None []
 
-(** Create a new worktree with a new branch for an agent session. *)
+(** Find the default branch for a project (main or master). *)
+let default_branch project =
+  (* Try git symbolic-ref, then fall back to checking common names *)
+  let try_branch name =
+    let cmd = Printf.sprintf "git -C %s rev-parse --verify %s 2>/dev/null"
+      (Filename.quote project.path) (Filename.quote name) in
+    let ic = Unix.open_process_in cmd in
+    let _output = try input_line ic with End_of_file -> "" in
+    match Unix.close_process_in ic with
+    | Unix.WEXITED 0 -> true
+    | _ -> false
+  in
+  if try_branch "main" then "main"
+  else if try_branch "master" then "master"
+  else "HEAD"
+
+(** Create a new worktree with a new branch for an agent session.
+    Bases the branch on the project's default branch (main/master). *)
 let create_worktree project ~branch_name =
   let worktree_path = Filename.concat project.path branch_name in
-  let cmd = Printf.sprintf "git -C %s worktree add -b %s %s 2>&1"
+  let start_point = default_branch project in
+  let cmd = Printf.sprintf "git -C %s worktree add -b %s %s %s 2>&1"
     (Filename.quote project.path)
     (Filename.quote branch_name)
     (Filename.quote worktree_path)
+    (Filename.quote start_point)
   in
   let ic = Unix.open_process_in cmd in
-  let rec drain () = match input_line ic with _ -> drain () | exception End_of_file -> () in
-  drain ();
+  let output = Buffer.create 256 in
+  (try while true do Buffer.add_string output (input_line ic); Buffer.add_char output '\n' done
+   with End_of_file -> ());
   match Unix.close_process_in ic with
   | Unix.WEXITED 0 -> Ok worktree_path
-  | _ -> Error (Printf.sprintf "failed to create worktree: %s" branch_name)
+  | _ -> Error (Printf.sprintf "failed to create worktree %s: %s"
+    branch_name (Buffer.contents output))
