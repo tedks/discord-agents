@@ -622,7 +622,7 @@ let handle_control_message t msg =
              kind_str p.name branch_str working_dir
            in
            ignore (Discord_rest.create_message t.rest
-             ~channel_id:thread_ch.id ~content:welcome ()))
+             ~channel_id:thread_ch.id ~content:welcome ())
        end (* working_dir <> "" *))
   | Resume_session { session_id } ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
