@@ -102,9 +102,13 @@ let read_exactly reader n =
 (** Read a WebSocket frame from the connection.
     Handles fragmented incoming messages by accumulating continuation frames.
     Server frames are NOT masked per the spec. *)
+(** Maximum payload size we'll accept (100MB). Prevents OOM from malicious frames. *)
+let max_payload_size = 100 * 1024 * 1024
+
 let recv_frame t =
   if t.closed then failwith "websocket: connection closed";
-  let rec read_fragments ~first_opcode ~acc =
+  let acc_buf = Buffer.create 4096 in
+  let rec read_fragments ~first_opcode =
     let b0 = Char.code (Eio.Buf_read.any_char t.reader) in
     let fin = b0 land 0x80 <> 0 in
     let opcode_int = b0 land 0x0F in
@@ -118,14 +122,17 @@ let recv_frame t =
         let lo = Char.code (Eio.Buf_read.any_char t.reader) in
         (hi lsl 8) lor lo
       end else begin
-        (* 8-byte extended length *)
         let len = ref 0 in
         for _ = 0 to 7 do
           len := (!len lsl 8) lor Char.code (Eio.Buf_read.any_char t.reader)
         done;
+        if !len > max_payload_size then
+          failwith (Printf.sprintf "websocket: payload too large: %d bytes" !len);
         !len
       end
     in
+    if payload_len > max_payload_size then
+      failwith (Printf.sprintf "websocket: payload too large: %d bytes" payload_len);
     let mask_key =
       if masked then Some (Bytes.of_string (read_exactly t.reader 4))
       else None
@@ -136,25 +143,24 @@ let recv_frame t =
      | None -> ());
     let payload = Bytes.to_string payload_bytes in
     let effective_opcode = if opcode_int = 0 then first_opcode else opcode_of_int opcode_int in
-    (* Handle control frames (ping/pong/close) immediately, even mid-fragment *)
     match effective_opcode with
     | Ping ->
-      (* Respond with pong and continue reading data frames *)
       send_frame t ~opcode:Pong payload;
-      read_fragments ~first_opcode ~acc
+      read_fragments ~first_opcode
     | Close ->
       t.closed <- true;
-      (* Send close back *)
       (try send_frame t ~opcode:Close "" with _ -> ());
       { opcode = Close; payload }
     | _ ->
-      let acc = acc ^ payload in
+      Buffer.add_string acc_buf payload;
+      if Buffer.length acc_buf > max_payload_size then
+        failwith "websocket: accumulated fragments too large";
       if fin then
-        { opcode = effective_opcode; payload = acc }
+        { opcode = effective_opcode; payload = Buffer.contents acc_buf }
       else
-        read_fragments ~first_opcode:effective_opcode ~acc
+        read_fragments ~first_opcode:effective_opcode
   in
-  read_fragments ~first_opcode:(Unknown 0) ~acc:""
+  read_fragments ~first_opcode:(Unknown 0)
 
 let send_text t text = send_frame t ~opcode:Text text
 
@@ -217,9 +223,16 @@ let connect ~sw ~net ~host ~port ~path =
     | Ok dn -> (match Domain_name.host dn with Ok h -> Some h | Error _ -> None)
     | Error _ -> None
   in
-  let tls_flow = Tls_eio.client_of_flow tls_config ?host:host_dn tcp_flow in
-  let flow = (tls_flow :> Eio.Flow.two_way_ty Eio.Resource.t) in
-  let reader = Eio.Buf_read.of_flow ~max_size:(1024 * 1024) flow in
-  let t = { flow; reader; closed = false } in
-  handshake t ~host ~path;
-  t
+  (* If TLS or handshake fails, close the TCP flow to avoid leaking it *)
+  match
+    let tls_flow = Tls_eio.client_of_flow tls_config ?host:host_dn tcp_flow in
+    let flow = (tls_flow :> Eio.Flow.two_way_ty Eio.Resource.t) in
+    let reader = Eio.Buf_read.of_flow ~max_size:(1024 * 1024) flow in
+    let t = { flow; reader; closed = false } in
+    handshake t ~host ~path;
+    t
+  with
+  | t -> t
+  | exception exn ->
+    Eio.Resource.close tcp_flow;
+    raise exn

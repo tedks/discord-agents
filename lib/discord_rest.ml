@@ -47,7 +47,10 @@ let make_headers t =
     ("User-Agent", "DiscordBot (discord-agents/0.1.0, OCaml)");
   ]
 
-(** Read entire body from a cohttp-eio response source. *)
+(** Read entire body from a cohttp-eio response source.
+    Capped at 10MB to prevent OOM from unexpected large responses. *)
+let max_body_size = 10 * 1024 * 1024
+
 let read_body (body : Cohttp_eio.Body.t) =
   let buf = Buffer.create 4096 in
   let chunk = Cstruct.create 4096 in
@@ -55,7 +58,10 @@ let read_body (body : Cohttp_eio.Body.t) =
     match Eio.Flow.single_read body chunk with
     | n ->
       Buffer.add_string buf (Cstruct.to_string ~off:0 ~len:n chunk);
-      loop ()
+      if Buffer.length buf > max_body_size then
+        Buffer.contents buf  (* truncate *)
+      else
+        loop ()
     | exception End_of_file -> Buffer.contents buf
   in
   loop ()

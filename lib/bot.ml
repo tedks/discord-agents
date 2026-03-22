@@ -39,6 +39,7 @@ type agent_session = {
   thread_id : string;
   system_prompt : string option;
   mutable message_count : int;
+  mutable processing : bool;  (* guard: only one agent invocation at a time *)
 }
 
 let sessions_file () =
@@ -102,6 +103,7 @@ let load_sessions () =
           thread_id;
           system_prompt = j |> member "system_prompt" |> to_string_option;
           message_count = j |> member "message_count" |> to_int;
+          processing = false;
         } in
         (thread_id, session)
       ) in
@@ -610,6 +612,7 @@ let handle_control_message t msg =
              thread_id = thread_ch.Discord_types.id;
              system_prompt = None;
              message_count = 0;
+             processing = false;
            } in
            add_session t thread_ch.id session;
            let welcome = Printf.sprintf
@@ -646,11 +649,14 @@ let handle_control_message t msg =
             thread_id = thread_ch.Discord_types.id;
             system_prompt = None;
             message_count = 1; (* >0 so we use --resume *)
+            processing = false;
           } in
-          t.sessions <- SessionMap.add thread_ch.id session t.sessions;
+          add_session t thread_ch.id session;
+          let sid_short = if String.length full_session_id >= 8
+            then String.sub full_session_id 0 8 else full_session_id in
           let welcome = Printf.sprintf
             "**Resumed** Claude session `%s`\nWorking in: `%s`\nSend a message to continue."
-            (String.sub full_session_id 0 8) working_dir
+            sid_short working_dir
           in
           ignore (Discord_rest.create_message t.rest
             ~channel_id:thread_ch.id ~content:welcome ()))
@@ -776,8 +782,16 @@ let handle_thread_message t msg =
   match SessionMap.find_opt msg.Discord_types.channel_id t.sessions with
   | None -> ()
   | Some session ->
+    (* Only one agent invocation at a time per session *)
+    if session.processing then begin
+      ignore (Discord_rest.create_message t.rest
+        ~channel_id:msg.Discord_types.channel_id
+        ~content:"Still processing previous message..." ());
+    end else begin
+    session.processing <- true;
     (* Fork a fiber so we don't block the gateway recv loop *)
     Eio.Fiber.fork ~sw:t.sw (fun () ->
+      Fun.protect ~finally:(fun () -> session.processing <- false) (fun () ->
       let channel_id = msg.Discord_types.channel_id in
       (* Ack with eyes reaction, send typing, bump channel to top *)
       ignore (Discord_rest.create_reaction t.rest ~channel_id
@@ -865,7 +879,8 @@ let handle_thread_message t msg =
          Logs.warn (fun m -> m "bot: agent error: %s" e);
          ignore (Discord_rest.create_message t.rest
            ~channel_id
-           ~content:(Printf.sprintf "Agent error: %s" e) ())))
+           ~content:(Printf.sprintf "Agent error: %s" e) ()))))
+    end (* processing guard *)
 
 (** Ensure a session exists for a channel, creating one if needed.
     Used for the control channel and project channels so users can
