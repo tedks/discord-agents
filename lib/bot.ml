@@ -564,21 +564,19 @@ let handle_control_message t msg =
        (* Create a worktree for the session *)
        let branch_name = Printf.sprintf "agent/%s-%s"
          kind_str (String.sub (generate_uuid ()) 0 8) in
-       (match Project.create_worktree p ~branch_name with
-       | Error e ->
-         (* Fall back to existing working dir if worktree creation fails *)
-         Logs.warn (fun m -> m "bot: worktree creation failed, using default: %s" e);
-         (match working_dir_of_project p with
-          | Error e2 ->
-            ignore (Discord_rest.create_message t.rest
-              ~channel_id:msg.channel_id
-              ~content:(Printf.sprintf "Cannot find working directory: %s" e2) ())
-          | Ok working_dir ->
-            ignore (Discord_rest.create_message t.rest
-              ~channel_id:msg.channel_id
-              ~content:(Printf.sprintf "Worktree failed (%s), using `%s`" e working_dir) ()))
-       | Ok worktree_path ->
-         let working_dir = worktree_path in
+       let working_dir, branch_info = match Project.create_worktree p ~branch_name with
+         | Ok worktree_path -> worktree_path, Some branch_name
+         | Error e ->
+           Logs.warn (fun m -> m "bot: worktree creation failed: %s" e);
+           (match working_dir_of_project p with
+            | Ok wd -> wd, None
+            | Error e2 ->
+              ignore (Discord_rest.create_message t.rest
+                ~channel_id:msg.channel_id
+                ~content:(Printf.sprintf "Cannot find working directory: %s" e2) ());
+              "", None)
+       in
+       if working_dir <> "" then begin
          let thread_name = Printf.sprintf "%s / %s" kind_str p.name in
          (* Create project channel on demand if it doesn't exist yet *)
          let thread_parent = match ChannelMap.find_opt p.name t.project_channels with
@@ -615,12 +613,17 @@ let handle_control_message t msg =
              processing = false;
            } in
            add_session t thread_ch.id session;
+           let branch_str = match branch_info with
+             | Some b -> Printf.sprintf "\nBranch: `%s`" b
+             | None -> ""
+           in
            let welcome = Printf.sprintf
-             "**%s** session started for **%s**\nBranch: `%s`\nWorking in: `%s`\nSend a message to interact with the agent."
-             kind_str p.name branch_name working_dir
+             "**%s** session started for **%s**%s\nWorking in: `%s`\nSend a message to interact with the agent."
+             kind_str p.name branch_str working_dir
            in
            ignore (Discord_rest.create_message t.rest
-             ~channel_id:thread_ch.id ~content:welcome ())))
+             ~channel_id:thread_ch.id ~content:welcome ()))
+       end (* working_dir <> "" *))
   | Resume_session { session_id } ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       (* find_claude_session runs blocking I/O *)

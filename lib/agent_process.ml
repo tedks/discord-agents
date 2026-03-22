@@ -99,33 +99,38 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
   (* Close write ends so reads get EOF when process exits *)
   Eio.Resource.close stdout_w;
   Eio.Resource.close stderr_w;
-  (* Read stdout line by line and parse events *)
-  let reader = Eio.Buf_read.of_flow ~max_size:(1024 * 1024) stdout_r in
-  (try
-    while true do
-      let line = Eio.Buf_read.line reader in
-      if String.length line > 0 then begin
-        match kind with
-        | Config.Claude | Config.Gemini ->
-          let event = parse_stream_json_line line in
-          on_event event
-        | Config.Codex ->
-          on_event (Text_delta line)
-      end
-    done
-  with End_of_file -> ());
-  Eio.Resource.close stdout_r;
-  (* Read any stderr *)
-  let stderr_text =
-    try
-      let sr = Eio.Buf_read.of_flow ~max_size:(64 * 1024) stderr_r in
-      Eio.Buf_read.take_all sr
-    with End_of_file -> ""
-  in
-  Eio.Resource.close stderr_r;
+  (* Read stdout and stderr concurrently to avoid deadlock.
+     If the child fills the stderr pipe buffer (~64KB) before stdout
+     hits EOF, the child blocks on write and stdout never closes. *)
+  let stderr_buf = Buffer.create 1024 in
+  Eio.Fiber.both
+    (fun () ->
+      (* Drain stderr in parallel *)
+      (try
+        let sr = Eio.Buf_read.of_flow ~max_size:(64 * 1024) stderr_r in
+        Buffer.add_string stderr_buf (Eio.Buf_read.take_all sr)
+      with End_of_file -> ());
+      Eio.Resource.close stderr_r)
+    (fun () ->
+      (* Read stdout line by line and parse events *)
+      let reader = Eio.Buf_read.of_flow ~max_size:(1024 * 1024) stdout_r in
+      (try
+        while true do
+          let line = Eio.Buf_read.line reader in
+          if String.length line > 0 then begin
+            match kind with
+            | Config.Claude | Config.Gemini ->
+              let event = parse_stream_json_line line in
+              on_event event
+            | Config.Codex ->
+              on_event (Text_delta line)
+          end
+        done
+      with End_of_file -> ());
+      Eio.Resource.close stdout_r);
+  let stderr_text = Buffer.contents stderr_buf in
   (* Wait for process to finish *)
   let status = Eio.Process.await proc in
-  ignore sw;
   match status with
   | `Exited 0 -> Ok ()
   | `Exited code ->
