@@ -112,30 +112,47 @@ type command =
   | Help
   | Unknown of string
 
+(** Strip leading ! from a word if present. *)
+let strip_bang s =
+  if String.length s > 0 && s.[0] = '!' then
+    String.sub s 1 (String.length s - 1)
+  else s
+
+(** Check if a message looks like a command (starts with a known command word,
+    with or without leading !). *)
 let is_command content =
-  let trimmed = String.trim content in
-  String.length trimmed > 0 && trimmed.[0] = '!'
+  let parts = String.split_on_char ' ' (String.trim content) in
+  let first = match parts with w :: _ -> strip_bang (String.lowercase_ascii w) | [] -> "" in
+  List.mem first [
+    "projects"; "list"; "sessions"; "claude-sessions";
+    "start"; "resume"; "stop"; "cleanup-channels"; "cleanup";
+    "restart"; "help"
+  ]
 
 let parse_command content =
   let parts = String.split_on_char ' ' (String.trim content) in
+  (* Normalize: strip ! from first word, lowercase it *)
+  let parts = match parts with
+    | w :: rest -> strip_bang (String.lowercase_ascii w) :: rest
+    | [] -> []
+  in
   match parts with
-  | ["!projects"] | ["!list"] -> List_projects
-  | ["!sessions"] -> List_sessions
-  | ["!claude-sessions"] -> List_claude_sessions
-  (* !start project agent  OR  !start project (defaults to claude) *)
-  | "!start" :: project :: kind_str :: _ ->
-    let kind = match Config.agent_kind_of_string kind_str with
+  | ["projects"] | ["list"] -> List_projects
+  | ["sessions"] -> List_sessions
+  | ["claude-sessions"] -> List_claude_sessions
+  | "start" :: project :: kind_str :: _ ->
+    let kind = match Config.agent_kind_of_string (String.lowercase_ascii kind_str) with
       | Ok k -> k | Error _ -> Config.Claude in
     Start_agent { project; kind }
-  | ["!start"; project] ->
+  | ["start"; project] ->
     Start_agent { project; kind = Config.Claude }
-  | ["!start"] ->
-    List_projects (* no args = show what's available *)
-  | ["!resume"; session_id] -> Resume_session { session_id }
-  | ["!stop"; thread_id] -> Stop_session { thread_id }
-  | ["!cleanup-channels"] | ["!cleanup"] -> Cleanup_channels
-  | ["!restart"] -> Restart
-  | ["!help"] -> Help
+  | ["start"] ->
+    List_projects
+  | ["resume"; session_id] -> Resume_session { session_id }
+  | ["stop"; thread_id] -> Stop_session { thread_id }
+  | ["cleanup-channels"] | ["cleanup"] -> Cleanup_channels
+  | ["restart"] -> Restart
+  | ["help"] -> Help
   | _ -> Unknown content
 
 (** Fuzzy-match a query against project names.
