@@ -882,7 +882,20 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
       Logs.info (fun m -> m "bot: connected as %s" user.Discord_types.username);
       (* Set up project channels only on first connect, not on resume/reconnect *)
       if bot.category_id = None then
-        Eio.Fiber.fork ~sw (fun () -> setup_project_channels bot)
+        Eio.Fiber.fork ~sw (fun () ->
+          setup_project_channels bot;
+          (* Post startup announcement *)
+          match bot.config.control_channel_id with
+          | Some ch_id ->
+            let n_projects = List.length bot.projects in
+            let n_sessions = SessionMap.cardinal bot.sessions in
+            let n_channels = ChannelMap.cardinal bot.project_channels in
+            let text = Printf.sprintf
+              "Bot online. %d projects, %d channels, %d active sessions."
+              n_projects n_channels n_sessions in
+            ignore (Discord_rest.create_message bot.rest
+              ~channel_id:ch_id ~content:text ())
+          | None -> ())
     | Discord_gateway.Message_received msg -> handle_message bot msg
     | Discord_gateway.Thread_created ch ->
       Logs.info (fun m -> m "bot: thread created: %s"
