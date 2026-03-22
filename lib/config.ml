@@ -84,7 +84,9 @@ let save config =
   if not (Sys.file_exists dir) then
     Sys.mkdir dir 0o700;
   let json = yojson_of_t config in
-  let oc = open_out path in
+  (* Write with restricted permissions — file contains discord token *)
+  let fd = Unix.openfile path [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o600 in
+  let oc = Unix.out_channel_of_descr fd in
   output_string oc (Yojson.Safe.pretty_to_string json);
   output_char oc '\n';
   close_out oc

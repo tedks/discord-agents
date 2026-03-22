@@ -62,7 +62,22 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
   let mgr = Eio.Stdenv.process_mgr env in
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
-  let mcp_config = "/home/tedks/Projects/claude-discord/master/scripts/mcp.json" in
+  (* Derive MCP config path from executable location *)
+  let mcp_config =
+    try
+      let exe = Sys.executable_name in
+      let exe = if Filename.is_relative exe then Filename.concat (Sys.getcwd ()) exe else exe in
+      let rec find_root path =
+        let candidate = Filename.concat path "scripts/mcp.json" in
+        if Sys.file_exists candidate then candidate
+        else
+          let parent = Filename.dirname path in
+          if parent = path then "scripts/mcp.json"
+          else find_root parent
+      in
+      find_root (Filename.dirname exe)
+    with _ -> "scripts/mcp.json"
+  in
   let args = match kind with
     | Config.Claude ->
       let base = claude_args ~session_id ~message_count ~prompt in

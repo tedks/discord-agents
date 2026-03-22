@@ -47,21 +47,14 @@ let int_of_opcode = function
   | Pong -> 10
   | Unknown n -> n
 
-(** Generate 4 random bytes for WebSocket client masking. *)
+(** Generate 4 random bytes for WebSocket client masking.
+    Uses mirage-crypto-rng (already initialized by discord_rest). *)
 let generate_mask_key () =
-  let buf = Bytes.create 4 in
-  let ic = open_in "/dev/urandom" in
-  really_input ic buf 0 4;
-  close_in ic;
-  buf
+  Bytes.of_string (Mirage_crypto_rng.generate 4)
 
 (** Generate a random 16-byte base64-encoded key for the Sec-WebSocket-Key header. *)
 let generate_ws_key () =
-  let buf = Bytes.create 16 in
-  let ic = open_in "/dev/urandom" in
-  really_input ic buf 0 16;
-  close_in ic;
-  Base64.encode_exn (Bytes.to_string buf)
+  Base64.encode_exn (Mirage_crypto_rng.generate 16)
 
 (** Apply XOR masking to payload bytes (in-place). *)
 let apply_mask ~mask_key payload_bytes =

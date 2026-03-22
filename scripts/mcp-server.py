@@ -37,7 +37,10 @@ def load_sessions():
     return []
 
 def save_sessions(sessions):
-    SESSIONS_FILE.write_text(json.dumps(sessions, indent=2) + "\n")
+    """Atomic write: write to temp file, then rename."""
+    tmp = SESSIONS_FILE.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(sessions, indent=2) + "\n")
+    tmp.rename(SESSIONS_FILE)
 
 # --- Discord REST helpers ---
 
@@ -50,12 +53,18 @@ def discord_request(method, path, token, body=None):
         "User-Agent": "DiscordBot (discord-agents-mcp/0.1.0)",
     })
     try:
-        resp = urllib.request.urlopen(req)
+        resp = urllib.request.urlopen(req, timeout=30)
         if resp.status == 204:
             return {"ok": True}
         return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        return {"error": f"HTTP {e.code}: {e.read().decode()[:200]}"}
+        try:
+            body = e.read().decode()[:200]
+        except Exception:
+            body = "(unreadable)"
+        return {"error": f"HTTP {e.code}: {body}"}
+    except Exception as e:
+        return {"error": f"request failed: {e}"}
 
 # --- Project discovery ---
 
@@ -501,19 +510,21 @@ def handle_tool_call(name, arguments, config, projects):
         return f"Resumed session `{full_sid[:8]}` in <#{thread_id}>."
 
     elif name == "restart_bot":
+        # Derive project root from this script's location
+        script_dir = Path(__file__).resolve().parent
+        project_root = script_dir.parent
         result = subprocess.run(
-            ["bash", "-c",
-             "cd /home/tedks/Projects/claude-discord/master && "
-             "nix develop --command dune build 2>&1"],
-            capture_output=True, text=True, timeout=120)
+            ["nix", "develop", "--command", "dune", "build"],
+            capture_output=True, text=True, timeout=120,
+            cwd=str(project_root))
         if result.returncode != 0:
-            return f"Build failed:\n```\n{result.stdout[-500:]}\n```"
+            output = (result.stdout + result.stderr)[-500:]
+            return f"Build failed:\n```\n{output}\n```"
 
         # Spawn new instance (it kills the old via pidfile)
         subprocess.Popen(
-            ["bash", "-c",
-             "cd /home/tedks/Projects/claude-discord/master && "
-             "nix develop --command dune exec discord-agents &"],
+            ["nix", "develop", "--command", "dune", "exec", "discord-agents"],
+            cwd=str(project_root),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)

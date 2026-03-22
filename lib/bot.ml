@@ -10,6 +10,26 @@
 
 module SessionMap = Map.Make(String) (* thread_id -> agent_session *)
 
+(** Derive the project source directory from the running executable path.
+    e.g. _build/default/bin/main.exe -> <project_root>
+    Falls back to cwd if derivation fails. *)
+let project_root =
+  lazy (
+    try
+      (* Executable is at <root>/_build/.../bin/main.exe or <root>/_build/.../bin/discord-agents *)
+      let exe = Sys.executable_name in
+      let exe = if Filename.is_relative exe then Filename.concat (Sys.getcwd ()) exe else exe in
+      let rec find_root path =
+        if Sys.file_exists (Filename.concat path "dune-project") then path
+        else
+          let parent = Filename.dirname path in
+          if parent = path then Sys.getcwd ()  (* hit filesystem root *)
+          else find_root parent
+      in
+      find_root (Filename.dirname exe)
+    with _ -> Sys.getcwd ()
+  )
+
 (** Lightweight agent session — tracks a Discord thread <-> Claude session. *)
 type agent_session = {
   project_name : string;
@@ -25,6 +45,9 @@ let sessions_file () =
   let home = Sys.getenv "HOME" in
   Filename.concat home ".config/discord-agents/sessions.json"
 
+(** Save sessions atomically — write to temp file, then rename.
+    Prevents corruption if the bot crashes mid-write or the MCP
+    server reads while we're writing. *)
 let save_sessions sessions =
   let entries = SessionMap.bindings sessions in
   let json = `List (List.map (fun (_tid, s) ->
@@ -40,22 +63,32 @@ let save_sessions sessions =
          | None -> []))
   ) entries) in
   let path = sessions_file () in
-  let oc = open_out path in
-  output_string oc (Yojson.Safe.pretty_to_string json);
-  output_char oc '\n';
-  close_out oc
+  let tmp = path ^ ".tmp" in
+  let oc = open_out tmp in
+  (try
+    output_string oc (Yojson.Safe.pretty_to_string json);
+    output_char oc '\n';
+    close_out oc;
+    Unix.rename tmp path
+  with exn ->
+    (try close_out oc with _ -> ());
+    (try Sys.remove tmp with _ -> ());
+    Logs.warn (fun m -> m "bot: failed to save sessions: %s" (Printexc.to_string exn)))
 
 let load_sessions () =
   let path = sessions_file () in
   if not (Sys.file_exists path) then SessionMap.empty
   else
-    try
+    let contents =
       let ic = open_in path in
-      let n = in_channel_length ic in
-      let s = Bytes.create n in
-      really_input ic s 0 n;
-      close_in ic;
-      let json = Yojson.Safe.from_string (Bytes.to_string s) in
+      Fun.protect ~finally:(fun () -> close_in ic) (fun () ->
+        let n = in_channel_length ic in
+        let s = Bytes.create n in
+        really_input ic s 0 n;
+        Bytes.to_string s)
+    in
+    try
+      let json = Yojson.Safe.from_string contents in
       let open Yojson.Safe.Util in
       let entries = to_list json |> List.map (fun j ->
         let thread_id = j |> member "thread_id" |> to_string in
@@ -197,16 +230,14 @@ let find_project_fuzzy projects query =
   | [p] -> Some p  (* unique substring *)
   | _ -> None)
 
-(** Generate a UUID for Claude session tracking. *)
+(** Generate a UUID for Claude session tracking.
+    Uses mirage-crypto-rng (initialized by discord_rest). *)
 let generate_uuid () =
-  let buf = Bytes.create 16 in
-  let ic = open_in "/dev/urandom" in
-  really_input ic buf 0 16;
-  close_in ic;
+  let raw = Mirage_crypto_rng.generate 16 in
   let hex = Buffer.create 32 in
-  Bytes.iter (fun c ->
+  String.iter (fun c ->
     Buffer.add_string hex (Printf.sprintf "%02x" (Char.code c))
-  ) buf;
+  ) raw;
   let s = Buffer.contents hex in
   Printf.sprintf "%s-%s-%s-%s-%s"
     (String.sub s 0 8) (String.sub s 8 4) (String.sub s 12 4)
@@ -260,39 +291,38 @@ let split_message ?(max_len=1900) text =
           | Some p -> p + 1
           | None -> limit
     in
-    let rec split pos acc =
+    (* Count triple backticks in a string *)
+    let count_backticks s =
+      let count = ref 0 in
+      let i = ref 0 in
+      let slen = String.length s in
+      while !i + 2 < slen do
+        if s.[!i] = '`' && s.[!i+1] = '`' && s.[!i+2] = '`' then begin
+          incr count;
+          i := !i + 3
+        end else
+          incr i
+      done;
+      !count
+    in
+    let rec split pos in_code_block acc =
       if pos >= len then List.rev acc
       else
         let remaining = len - pos in
-        if remaining <= max_len then
-          List.rev (String.sub text pos remaining :: acc)
+        let prefix = if in_code_block then "```\n" else "" in
+        let effective_max = max_len - String.length prefix in
+        if remaining <= effective_max then
+          List.rev ((prefix ^ String.sub text pos remaining) :: acc)
         else
-          let split_at = find_split_point pos (pos + max_len) in
-          let chunk = String.sub text pos (split_at - pos) in
-          (* Check if we're splitting inside a code block *)
-          let backtick_count =
-            let count = ref 0 in
-            let i = ref 0 in
-            let s = chunk in
-            let slen = String.length s in
-            while !i + 2 < slen do
-              if s.[!i] = '`' && s.[!i+1] = '`' && s.[!i+2] = '`' then begin
-                incr count;
-                i := !i + 3
-              end else
-                incr i
-            done;
-            !count
-          in
-          let chunk =
-            if backtick_count mod 2 = 1 then
-              (* Odd number of ``` — we're inside a code block. Close it. *)
-              chunk ^ "\n```"
-            else chunk
-          in
-          split split_at (chunk :: acc)
+          let split_at = find_split_point pos (pos + effective_max) in
+          let raw_chunk = String.sub text pos (split_at - pos) in
+          let chunk = prefix ^ raw_chunk in
+          let total_backticks = count_backticks chunk in
+          let ends_in_code = total_backticks mod 2 = 1 in
+          let chunk = if ends_in_code then chunk ^ "\n```" else chunk in
+          split split_at ends_in_code (chunk :: acc)
     in
-    split 0 []
+    split 0 false []
 
 (** Post a (potentially long) response to a Discord channel, splitting if needed. *)
 let post_response rest ~channel_id text =
@@ -689,16 +719,17 @@ let handle_control_message t msg =
       ~channel_id:msg.channel_id ~content:"Rebuilding and restarting..." ());
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       let build_and_restart () =
-        (* Build in the project directory *)
+        let root = Lazy.force project_root in
         let build_exit = Sys.command
-          "cd /home/tedks/Projects/claude-discord/master && nix develop --command dune build 2>&1" in
+          (Printf.sprintf "cd %s && nix develop --command dune build 2>&1"
+            (Filename.quote root)) in
         if build_exit <> 0 then
           `Build_failed
         else begin
-          (* Spawn new instance — it will kill us via pidfile *)
           let _pid = Unix.create_process "/bin/sh"
             [| "/bin/sh"; "-c";
-               "cd /home/tedks/Projects/claude-discord/master && nix develop --command dune exec discord-agents &" |]
+               Printf.sprintf "cd %s && nix develop --command dune exec discord-agents &"
+                 (Filename.quote root) |]
             Unix.stdin Unix.stdout Unix.stderr in
           `Restarting
         end

@@ -137,22 +137,16 @@ let () =
   else begin
     let bot = Discord_agents.Bot.create ~sw ~env config in
     (* Graceful shutdown on SIGINT/SIGTERM *)
+    (* Signal handler only sets a flag and closes the WebSocket —
+       no blocking I/O (REST calls) in signal context. *)
     let shutdown_requested = ref false in
     let handle_signal _signum =
       if not !shutdown_requested then begin
         shutdown_requested := true;
-        Logs.info (fun m -> m "shutdown: signal received, cleaning up...");
-        (* Post shutdown message to control channel *)
-        (match config.control_channel_id with
-         | Some ch_id ->
-           ignore (Discord_agents.Discord_rest.create_message bot.rest
-             ~channel_id:ch_id ~content:"Bot shutting down." ())
-         | None -> ());
-        (* Close the gateway WebSocket to exit the event loop *)
+        (* Close WebSocket to unblock the recv loop — this is safe in a signal *)
         (match bot.gateway.ws with
-         | Some ws -> Discord_agents.Websocket.send_close ws
-         | None -> ());
-        Logs.info (fun m -> m "shutdown: complete")
+         | Some ws -> (try Discord_agents.Websocket.send_close ws with _ -> ())
+         | None -> ())
       end
     in
     Sys.set_signal Sys.sigint (Sys.Signal_handle handle_signal);
