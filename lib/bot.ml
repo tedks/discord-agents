@@ -846,26 +846,22 @@ let control_system_prompt t =
   Printf.sprintf
 "You are the control agent for a Discord bot that manages AI coding sessions.
 
-You are chatting in a Discord channel. The user can ask you questions, ask you to start sessions, or just chat.
+You are chatting in a Discord channel. You have MCP tools available to manage the bot:
+- start_session: Start a new agent session for a project (creates thread + worktree)
+- list_projects: List all discovered projects
+- list_sessions: List active bot sessions
+- list_claude_sessions: Find recent Claude Code sessions to resume
+- resume_session: Resume an existing Claude session in a new thread
+- restart_bot: Rebuild and restart the bot after code changes
+- cleanup_channels: Delete stale Discord channels
 
-Available bot commands (the user can type these, or you can suggest them):
-  !start <project> [agent] — start a Claude session for a project (agent defaults to claude)
-  !resume <session_id> — resume an existing Claude Code session
-  !projects — list all projects
-  !sessions — list active sessions
-  !claude-sessions — list recent Claude Code sessions on this machine
-  !cleanup-channels — delete stale Discord channels
-  !restart — rebuild and restart the bot
-  !help — show commands
+USE THESE TOOLS. When the user asks to work on a project, start a session, see what's running, etc., call the appropriate tool. Don't tell them to type commands — just do it.
 
 Project names support fuzzy matching — prefixes and substrings work.
-You can also use project numbers from the !projects list.
 
 Known projects:
 %s
 
-If the user asks to start a session or work on a project, suggest the appropriate !start command.
-If they ask about what's available, suggest !projects or !claude-sessions.
 Keep responses concise — this is Discord, not a document." project_list
 
 let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prompt =
@@ -885,8 +881,31 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
     Logs.info (fun m -> m "bot: auto-created session for channel %s (%s)"
       channel_id project_name)
 
+(** Reload sessions from disk if the file has changed.
+    Allows the MCP server to create sessions that the bot picks up. *)
+let sessions_mtime = ref 0.0
+
+let maybe_reload_sessions (t : t) =
+  let path = sessions_file () in
+  if Sys.file_exists path then begin
+    let stat = Unix.stat path in
+    if stat.Unix.st_mtime > !sessions_mtime then begin
+      sessions_mtime := stat.Unix.st_mtime;
+      let loaded = load_sessions () in
+      (* Merge: keep in-memory sessions that aren't in the file,
+         add file sessions that aren't in memory *)
+      SessionMap.iter (fun tid session ->
+        if not (SessionMap.mem tid t.sessions) then
+          t.sessions <- SessionMap.add tid session t.sessions
+      ) loaded;
+      Logs.debug (fun m -> m "bot: reloaded sessions from disk (%d total)"
+        (SessionMap.cardinal t.sessions))
+    end
+  end
+
 (** Route an incoming Discord message. *)
 let handle_message t (msg : Discord_types.message) =
+  maybe_reload_sessions t;
   (* Ignore bot messages *)
   match msg.author.bot with Some true -> () | _ ->
   (* Commands (messages starting with !) are handled regardless of channel *)

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "discord-agents": {
+      "command": "python3",
+      "args": ["/home/tedks/Projects/claude-discord/master/scripts/mcp-server.py"]
+    }
+  }
+}

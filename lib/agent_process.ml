@@ -62,12 +62,18 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
   let mgr = Eio.Stdenv.process_mgr env in
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
+  let mcp_config = "/home/tedks/Projects/claude-discord/master/scripts/mcp.json" in
   let args = match kind with
     | Config.Claude ->
       let base = claude_args ~session_id ~message_count ~prompt in
-      (match system_prompt with
-       | Some sp -> base @ ["--append-system-prompt"; sp]
-       | None -> base)
+      let base = match system_prompt with
+        | Some sp ->
+          (* Control channel sessions get MCP tools + system prompt *)
+          base @ ["--append-system-prompt"; sp;
+                  "--mcp-config"; mcp_config]
+        | None -> base
+      in
+      base
     | Config.Codex -> ["codex"; "exec"; "--json"; prompt]
     | Config.Gemini -> ["gemini"; "-p"; "-o"; "stream-json"; prompt]
   in
