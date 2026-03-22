@@ -148,8 +148,9 @@ let recv_frame t =
       send_frame t ~opcode:Pong payload;
       read_fragments ~first_opcode
     | Close ->
-      t.closed <- true;
+      (* Send close reply BEFORE setting closed flag *)
       (try send_frame t ~opcode:Close "" with _ -> ());
+      t.closed <- true;
       { opcode = Close; payload }
     | _ ->
       Buffer.add_string acc_buf payload;
@@ -166,8 +167,9 @@ let send_text t text = send_frame t ~opcode:Text text
 
 let send_close t =
   if not t.closed then begin
-    t.closed <- true;
-    (try send_frame t ~opcode:Close "" with _ -> ())
+    (* Send close frame BEFORE setting flag, otherwise send_frame rejects it *)
+    (try send_frame t ~opcode:Close "" with _ -> ());
+    t.closed <- true
   end
 
 (** Perform the WebSocket upgrade handshake over an existing TLS connection. *)

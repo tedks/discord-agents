@@ -30,7 +30,7 @@ type t = {
   mutable resume_gateway_url : string option;
   mutable heartbeat_interval_ms : int;
   mutable last_heartbeat_acked : bool;
-  mutable heartbeat_cancel : bool;  (* signal old heartbeat daemon to stop *)
+  mutable heartbeat_gen : int;  (* generation counter: daemon stops when it mismatches *)
   mutable resuming : bool;
   mutable handler : handler;
 }
@@ -43,7 +43,7 @@ let create ~token ~intents ~handler =
     resume_gateway_url = None;
     heartbeat_interval_ms = 0;
     last_heartbeat_acked = true;
-    heartbeat_cancel = false;
+    heartbeat_gen = 0;
     resuming = false;
     handler }
 
@@ -156,18 +156,16 @@ let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
     in
     t.heartbeat_interval_ms <- heartbeat_interval;
     t.last_heartbeat_acked <- true;
-    (* Cancel any previous heartbeat daemon *)
-    t.heartbeat_cancel <- true;
-    Logs.info (fun m -> m "gateway: Hello, heartbeat interval %dms" heartbeat_interval);
-    (* Start new heartbeat daemon *)
-    t.heartbeat_cancel <- false;
+    (* Bump generation to signal any old heartbeat daemon to stop *)
+    t.heartbeat_gen <- t.heartbeat_gen + 1;
+    let my_gen = t.heartbeat_gen in
+    Logs.info (fun m -> m "gateway: Hello, heartbeat interval %dms (gen %d)" heartbeat_interval my_gen);
     Eio.Fiber.fork_daemon ~sw (fun () ->
-      (* Initial jitter: random fraction of the interval *)
       let jitter = Random.float (float_of_int heartbeat_interval /. 1000.0) in
       Eio.Time.sleep clock jitter;
       let rec heartbeat_loop () =
-        (* Check if we've been cancelled by a newer Hello *)
-        if t.heartbeat_cancel then
+        (* Stop if a newer Hello has bumped the generation *)
+        if t.heartbeat_gen <> my_gen then
           `Stop_daemon
         else if not t.last_heartbeat_acked then begin
           Logs.warn (fun m -> m "gateway: heartbeat not acked, reconnecting");
@@ -251,7 +249,7 @@ let connect ~sw ~(env : Eio_unix.Stdenv.base) t =
       backoff := 5.0;  (* Reset backoff on successful connect *)
       Logs.info (fun m -> m "gateway: WebSocket connected");
       (* Cancel any stale heartbeat daemon from previous connection *)
-      t.heartbeat_cancel <- true;
+      t.heartbeat_gen <- t.heartbeat_gen + 1;
       let rec recv_loop () =
         match Websocket.recv_frame ws with
         | { Websocket.opcode = Text; payload } ->
@@ -271,7 +269,7 @@ let connect ~sw ~(env : Eio_unix.Stdenv.base) t =
       in
       recv_loop ();
       t.ws <- None;
-      t.heartbeat_cancel <- true;
+      t.heartbeat_gen <- t.heartbeat_gen + 1;
       if can_resume t then
         t.resuming <- true;
       Logs.info (fun m -> m "gateway: reconnecting in %.0fs..." !backoff);
