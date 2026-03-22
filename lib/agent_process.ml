@@ -1,99 +1,113 @@
-(** Subprocess management for AI agents.
+(** Agent subprocess management using Eio.
 
-    Each agent session is a subprocess (claude, codex, gemini CLI) running
-    in a git worktree. This module handles spawning, I/O bridging, and
-    lifecycle management. *)
+    Spawns Claude/Codex/Gemini as subprocesses with proper I/O handling.
+    Claude and Gemini use stream-json output for real-time streaming.
+    Codex uses plain text output. *)
 
-type status =
-  | Running
-  | Stopped of int (** exit code *)
-  | Failed of string
-[@@deriving show]
+type stream_event =
+  | Text_delta of string   (** Incremental text from the agent *)
+  | Result of { text: string; session_id: string option }
+  | Tool_use of string     (** Agent is using a tool *)
+  | Error of string
+  | Other of string        (** Unrecognized event type *)
 
-type t = {
-  kind : Config.agent_kind;
-  pid : int;
-  stdin_fd : Unix.file_descr;
-  stdout_fd : Unix.file_descr;
-  stderr_fd : Unix.file_descr;
-  working_dir : string;
-  mutable status : status;
-}
+(** Parse a stream-json line from Claude's output.
+    Key event types:
+    - {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
+    - {"type":"result","subtype":"success","result":"...","session_id":"..."} *)
+let parse_stream_json_line line =
+  try
+    let json = Yojson.Safe.from_string line in
+    let open Yojson.Safe.Util in
+    let typ = json |> member "type" |> to_string_option in
+    match typ with
+    | Some "assistant" ->
+      let msg = json |> member "message" in
+      let content = msg |> member "content" in
+      let texts = match content with
+        | `List items ->
+          List.filter_map (fun item ->
+            match item |> member "type" |> to_string_option with
+            | Some "text" -> item |> member "text" |> to_string_option
+            | Some "tool_use" ->
+              let name = item |> member "name" |> to_string_option in
+              Some (Printf.sprintf "[tool: %s]" (Option.value ~default:"?" name))
+            | _ -> None
+          ) items
+        | _ -> []
+      in
+      if texts = [] then Other line
+      else Text_delta (String.concat "" texts)
+    | Some "result" ->
+      let result_text = json |> member "result" |> to_string_option
+        |> Option.value ~default:"" in
+      let session_id = json |> member "session_id" |> to_string_option in
+      Result { text = result_text; session_id }
+    | _ -> Other line
+  with _ -> Other line
 
-let command_of_kind = function
-  | Config.Claude -> ("claude", [| "claude"; "--print" |])
-  | Config.Codex -> ("codex", [| "codex" |])
-  | Config.Gemini -> ("gemini", [| "gemini" |])
-
-(** Spawn an agent subprocess in the given working directory.
-    Returns the process handle for I/O bridging. *)
-let spawn ~kind ~working_dir ~initial_prompt:_ =
-  let (cmd, _argv) = command_of_kind kind in
-  (* Create pipes for stdin/stdout/stderr *)
-  let (child_stdin_r, parent_stdin_w) = Unix.pipe ~cloexec:true () in
-  let (parent_stdout_r, child_stdout_w) = Unix.pipe ~cloexec:true () in
-  let (parent_stderr_r, child_stderr_w) = Unix.pipe ~cloexec:true () in
-  let pid = Unix.create_process_env cmd [| cmd |]
-    (Unix.environment ())
-    child_stdin_r child_stdout_w child_stderr_w
+(** Build the command args for an agent invocation. *)
+let claude_args ~session_id ~message_count ~prompt =
+  let session_flag =
+    if message_count = 0 then ["--session-id"; session_id]
+    else ["--resume"; session_id]
   in
-  (* Close child-side fds in parent *)
-  Unix.close child_stdin_r;
-  Unix.close child_stdout_w;
-  Unix.close child_stderr_w;
-  (* Change to working directory handled by the subprocess *)
-  ignore working_dir;
-  {
-    kind;
-    pid;
-    stdin_fd = parent_stdin_w;
-    stdout_fd = parent_stdout_r;
-    stderr_fd = parent_stderr_r;
-    working_dir;
-    status = Running;
-  }
+  ["claude"; "-p"; "--output-format"; "stream-json"] @ session_flag @ [prompt]
 
-(** Send a message to the agent's stdin. *)
-let send_input t msg =
-  let bytes = Bytes.of_string (msg ^ "\n") in
-  let len = Bytes.length bytes in
-  let written = Unix.write t.stdin_fd bytes 0 len in
-  if written <> len then
-    Logs.warn (fun m -> m "agent_process: short write (%d/%d)" written len)
-
-(** Non-blocking read from agent's stdout. Returns None if no data available. *)
-let read_output t =
-  let buf = Bytes.create 4096 in
-  match Unix.select [t.stdout_fd] [] [] 0.0 with
-  | ((_ :: _), _, _) ->
-    let n = Unix.read t.stdout_fd buf 0 4096 in
-    if n = 0 then None (* EOF *)
-    else Some (Bytes.sub_string buf 0 n)
-  | _ -> None
-
-(** Check if the process is still running, update status if not. *)
-let check_status t =
-  match t.status with
-  | Running ->
-    (match Unix.waitpid [Unix.WNOHANG] t.pid with
-     | (0, _) -> Running
-     | (_, Unix.WEXITED code) ->
-       t.status <- Stopped code;
-       Stopped code
-     | (_, Unix.WSIGNALED sig_) ->
-       let msg = Printf.sprintf "killed by signal %d" sig_ in
-       t.status <- Failed msg;
-       Failed msg
-     | (_, Unix.WSTOPPED _) -> Running)
-  | other -> other
-
-(** Send EOF to stdin and wait for the process to exit. *)
-let stop t =
-  (try Unix.close t.stdin_fd with Unix.Unix_error _ -> ());
-  let (_pid, status) = Unix.waitpid [] t.pid in
-  (try Unix.close t.stdout_fd with Unix.Unix_error _ -> ());
-  (try Unix.close t.stderr_fd with Unix.Unix_error _ -> ());
+(** Spawn an agent and stream its output via a callback.
+    The callback is called with each parsed event as it arrives.
+    Returns when the process exits. *)
+let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
+    ?system_prompt ~prompt ~on_event () =
+  let mgr = Eio.Stdenv.process_mgr env in
+  let fs = Eio.Stdenv.fs env in
+  let cwd = Eio.Path.(fs / working_dir) in
+  let args = match kind with
+    | Config.Claude ->
+      let base = claude_args ~session_id ~message_count ~prompt in
+      (match system_prompt with
+       | Some sp -> base @ ["--append-system-prompt"; sp]
+       | None -> base)
+    | Config.Codex -> ["codex"; "exec"; "--json"; prompt]
+    | Config.Gemini -> ["gemini"; "-p"; "-o"; "stream-json"; prompt]
+  in
+  let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in
+  let stderr_r, stderr_w = Eio.Process.pipe ~sw mgr in
+  let proc = Eio.Process.spawn ~sw mgr ~cwd
+    ~stdout:stdout_w ~stderr:stderr_w args in
+  (* Close write ends so reads get EOF when process exits *)
+  Eio.Resource.close stdout_w;
+  Eio.Resource.close stderr_w;
+  (* Read stdout line by line and parse events *)
+  let reader = Eio.Buf_read.of_flow ~max_size:(1024 * 1024) stdout_r in
+  (try
+    while true do
+      let line = Eio.Buf_read.line reader in
+      if String.length line > 0 then begin
+        match kind with
+        | Config.Claude | Config.Gemini ->
+          let event = parse_stream_json_line line in
+          on_event event
+        | Config.Codex ->
+          on_event (Text_delta line)
+      end
+    done
+  with End_of_file -> ());
+  Eio.Resource.close stdout_r;
+  (* Read any stderr *)
+  let stderr_text =
+    try
+      let sr = Eio.Buf_read.of_flow ~max_size:(64 * 1024) stderr_r in
+      Eio.Buf_read.take_all sr
+    with End_of_file -> ""
+  in
+  Eio.Resource.close stderr_r;
+  (* Wait for process to finish *)
+  let status = Eio.Process.await proc in
+  ignore sw;
   match status with
-  | Unix.WEXITED code -> t.status <- Stopped code
-  | Unix.WSIGNALED sig_ -> t.status <- Failed (Printf.sprintf "signal %d" sig_)
-  | Unix.WSTOPPED _ -> t.status <- Failed "stopped"
+  | `Exited 0 -> Ok ()
+  | `Exited code ->
+    Error (Printf.sprintf "agent exited with code %d: %s" code stderr_text)
+  | `Signaled sig_ ->
+    Error (Printf.sprintf "agent killed by signal %d" sig_)
