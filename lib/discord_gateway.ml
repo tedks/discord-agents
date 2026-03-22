@@ -32,6 +32,7 @@ type t = {
   mutable last_heartbeat_acked : bool;
   mutable heartbeat_gen : int;  (* generation counter: daemon stops when it mismatches *)
   mutable resuming : bool;
+  mutable shutdown : bool;
   mutable handler : handler;
 }
 
@@ -45,6 +46,7 @@ let create ~token ~intents ~handler =
     last_heartbeat_acked = true;
     heartbeat_gen = 0;
     resuming = false;
+    shutdown = false;
     handler }
 
 let default_intents =
@@ -226,6 +228,10 @@ let connect ~sw ~(env : Eio_unix.Stdenv.base) t =
   let gateway_path = "/?v=10&encoding=json" in
   let backoff = ref 5.0 in
   let rec connect_loop () =
+    if t.shutdown then begin
+      Logs.info (fun m -> m "gateway: shutdown requested, exiting");
+      ()
+    end else
     let host = match t.resume_gateway_url with
       | Some url ->
         (match Uri.host (Uri.of_string url) with

@@ -89,8 +89,8 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
         | None -> base
       in
       base
-    | Config.Codex -> ["codex"; "exec"; "--json"; prompt]
-    | Config.Gemini -> ["gemini"; "-p"; "-o"; "stream-json"; prompt]
+    | Config.Codex -> ["codex"; "exec"; prompt]
+    | Config.Gemini -> ["gemini"; "-p"; prompt; "-o"; "stream-json"]
   in
   let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in
   let stderr_r, stderr_w = Eio.Process.pipe ~sw mgr in

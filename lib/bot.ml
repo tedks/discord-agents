@@ -46,10 +46,28 @@ let sessions_file () =
   let home = Sys.getenv "HOME" in
   Filename.concat home ".config/discord-agents/sessions.json"
 
-(** Save sessions atomically — write to temp file, then rename.
-    Prevents corruption if the bot crashes mid-write or the MCP
-    server reads while we're writing. *)
+let sessions_lock_file () =
+  sessions_file () ^ ".lock"
+
+(** Acquire an exclusive file lock for sessions.json operations.
+    Both the OCaml bot and Python MCP server use this to prevent
+    lost-update races on concurrent read-modify-write. *)
+let with_sessions_lock f =
+  let lock_path = sessions_lock_file () in
+  let fd = Unix.openfile lock_path [Unix.O_WRONLY; Unix.O_CREAT] 0o600 in
+  Fun.protect ~finally:(fun () ->
+    (try Unix.lockf fd Unix.F_ULOCK 0 with _ -> ());
+    Unix.close fd
+  ) (fun () ->
+    Unix.lockf fd Unix.F_LOCK 0;
+    f ()
+  )
+
+(** Save sessions atomically with file locking.
+    Holds sessions.json.lock during write to prevent concurrent updates
+    from the MCP server from being lost. *)
 let save_sessions sessions =
+  with_sessions_lock (fun () ->
   let entries = SessionMap.bindings sessions in
   let json = `List (List.map (fun (_tid, s) ->
     `Assoc ([
@@ -74,7 +92,7 @@ let save_sessions sessions =
   with exn ->
     (try close_out oc with _ -> ());
     (try Sys.remove tmp with _ -> ());
-    Logs.warn (fun m -> m "bot: failed to save sessions: %s" (Printexc.to_string exn)))
+    Logs.warn (fun m -> m "bot: failed to save sessions: %s" (Printexc.to_string exn))))
 
 let load_sessions () =
   let path = sessions_file () in
@@ -147,29 +165,19 @@ type command =
   | Help
   | Unknown of string
 
-(** Strip leading ! from a word if present. *)
-let strip_bang s =
-  if String.length s > 0 && s.[0] = '!' then
-    String.sub s 1 (String.length s - 1)
-  else s
-
-(** Check if a message looks like a command (starts with a known command word,
-    with or without leading !). *)
+(** Check if a message is a command. Commands MUST start with ! to avoid
+    hijacking natural language like "help me debug this" or "start here". *)
 let is_command content =
-  let parts = String.split_on_char ' ' (String.trim content) in
-  let first = match parts with w :: _ -> strip_bang (String.lowercase_ascii w) | [] -> "" in
-  List.mem first [
-    "projects"; "list"; "sessions"; "claude-sessions";
-    "start"; "resume"; "stop"; "cleanup-channels"; "cleanup";
-    "restart"; "help"
-  ]
+  let trimmed = String.trim content in
+  String.length trimmed > 0 && trimmed.[0] = '!'
 
 let parse_command content =
   let parts = String.split_on_char ' ' (String.trim content) in
-  (* Normalize: strip ! from first word, lowercase it *)
+  (* Strip ! prefix and lowercase the command word *)
   let parts = match parts with
-    | w :: rest -> strip_bang (String.lowercase_ascii w) :: rest
-    | [] -> []
+    | w :: rest when String.length w > 0 && w.[0] = '!' ->
+      String.lowercase_ascii (String.sub w 1 (String.length w - 1)) :: rest
+    | other -> other
   in
   match parts with
   | ["projects"] | ["list"] -> List_projects
@@ -410,31 +418,31 @@ let discover_claude_sessions ?(hours=24) () =
               let summary =
                 try
                   let ic = open_in fpath in
-                  let summary = ref "" in
-                  (try while !summary = "" do
-                    let line = input_line ic in
-                    let json = Yojson.Safe.from_string line in
-                    let open Yojson.Safe.Util in
-                    if json |> member "type" |> to_string = "user" then begin
-                      let msg = json |> member "message" in
-                      let content = msg |> member "content" in
-                      match content with
-                      | `List items ->
-                        List.iter (fun item ->
-                          if !summary = "" then
-                            match item |> member "type" |> to_string_option with
-                            | Some "text" ->
-                              let text = item |> member "text" |> to_string in
-                              summary := String.sub text 0 (min 80 (String.length text))
-                            | _ -> ()
-                        ) items
-                      | `String s ->
-                        summary := String.sub s 0 (min 80 (String.length s))
-                      | _ -> ()
-                    end
-                  done with End_of_file | _ -> ());
-                  close_in ic;
-                  !summary
+                  Fun.protect ~finally:(fun () -> close_in ic) (fun () ->
+                    let summary = ref "" in
+                    (try while !summary = "" do
+                      let line = input_line ic in
+                      let json = Yojson.Safe.from_string line in
+                      let open Yojson.Safe.Util in
+                      if json |> member "type" |> to_string = "user" then begin
+                        let msg = json |> member "message" in
+                        let content = msg |> member "content" in
+                        match content with
+                        | `List items ->
+                          List.iter (fun item ->
+                            if !summary = "" then
+                              match item |> member "type" |> to_string_option with
+                              | Some "text" ->
+                                let text = item |> member "text" |> to_string in
+                                summary := String.sub text 0 (min 80 (String.length text))
+                              | _ -> ()
+                          ) items
+                        | `String s ->
+                          summary := String.sub s 0 (min 80 (String.length s))
+                        | _ -> ()
+                      end
+                    done with End_of_file | _ -> ());
+                    !summary)
                 with _ -> "(unknown)"
               in
               (* Resolve working directory from project dir name.
@@ -837,22 +845,28 @@ let handle_thread_message t msg =
       let on_event = function
         | Agent_process.Text_delta text ->
           Buffer.add_string result_buf text;
-          Buffer.add_string current_msg_buf text;
-          (* If current message is getting long, start a new one *)
-          if Buffer.length current_msg_buf > 1800 then
-            start_new_message ()
-          else begin
-            (* Edit every 2s to avoid rate limits *)
-            let now = Unix.gettimeofday () in
-            if now -. !last_edit > 2.0 then begin
-              flush_to_discord ();
-              last_edit := now
-            end;
-            (* Refresh typing indicator *)
-            if now -. !last_typing > typing_interval then begin
-              ignore (Discord_rest.send_typing t.rest ~channel_id ());
-              last_typing := now
-            end
+          (* Append to current message buf, flushing when it gets long.
+             Handles large deltas by splitting at 1800 char boundaries. *)
+          let text_len = String.length text in
+          let pos = ref 0 in
+          while !pos < text_len do
+            let remaining_capacity = 1800 - Buffer.length current_msg_buf in
+            let chunk_len = min remaining_capacity (text_len - !pos) in
+            if chunk_len > 0 then
+              Buffer.add_substring current_msg_buf text !pos chunk_len;
+            pos := !pos + chunk_len;
+            if Buffer.length current_msg_buf >= 1800 then
+              start_new_message ()
+          done;
+          (* Periodically flush edits and refresh typing *)
+          let now = Unix.gettimeofday () in
+          if now -. !last_edit > 2.0 && Buffer.length current_msg_buf > 0 then begin
+            flush_to_discord ();
+            last_edit := now
+          end;
+          if now -. !last_typing > typing_interval then begin
+            ignore (Discord_rest.send_typing t.rest ~channel_id ());
+            last_typing := now
           end
         | Agent_process.Result { text = _; session_id = _ } ->
           (* Final flush *)
@@ -932,15 +946,21 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
       channel_id project_name)
 
 (** Reload sessions from disk if the file has changed.
-    Allows the MCP server to create sessions that the bot picks up. *)
+    Rate-limited to once per 5 seconds to avoid blocking Eio with
+    frequent Unix.stat calls on every message. *)
 let sessions_mtime = ref 0.0
+let last_reload_check = ref 0.0
 
 let maybe_reload_sessions (t : t) =
-  let path = sessions_file () in
-  if Sys.file_exists path then begin
-    let stat = Unix.stat path in
-    if stat.Unix.st_mtime > !sessions_mtime then begin
-      sessions_mtime := stat.Unix.st_mtime;
+  let now = Unix.gettimeofday () in
+  if now -. !last_reload_check < 5.0 then ()
+  else begin
+    last_reload_check := now;
+    let path = sessions_file () in
+    if Sys.file_exists path then begin
+      let stat = Unix.stat path in
+      if stat.Unix.st_mtime > !sessions_mtime then begin
+        sessions_mtime := stat.Unix.st_mtime;
       let loaded = load_sessions () in
       (* Merge: keep in-memory sessions that aren't in the file,
          add file sessions that aren't in memory *)
@@ -952,6 +972,7 @@ let maybe_reload_sessions (t : t) =
         (SessionMap.cardinal t.sessions))
     end
   end
+  end (* rate limit *)
 
 (** Route an incoming Discord message. *)
 let handle_message t (msg : Discord_types.message) =
@@ -1032,11 +1053,14 @@ let setup_project_channels t =
         List.iter (fun (ch : Discord_types.channel) ->
           match ch.parent_id, ch.name with
           | Some pid, Some name when pid = cat_id ->
-            (* Check if this matches a project name *)
-            if List.exists (fun (p : Project.t) -> p.name = name) t.projects then begin
-              t.project_channels <- ChannelMap.add name ch.id t.project_channels;
-              Logs.info (fun m -> m "bot: mapped channel %s -> project %s" ch.id name)
-            end
+            let matching_project = List.find_opt (fun (p : Project.t) ->
+              String.lowercase_ascii p.name = String.lowercase_ascii name
+            ) t.projects in
+            (match matching_project with
+             | Some p ->
+               t.project_channels <- ChannelMap.add p.name ch.id t.project_channels;
+               Logs.info (fun m -> m "bot: mapped channel %s -> project %s" ch.id p.name)
+             | None -> ())
           | _ -> ()
         ) channels;
         (* Channels created on demand via !start. Log mapping status. *)

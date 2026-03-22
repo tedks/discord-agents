@@ -56,11 +56,11 @@ let config_path () =
 
 let load_file path =
   let ic = open_in path in
-  let n = in_channel_length ic in
-  let s = Bytes.create n in
-  really_input ic s 0 n;
-  close_in ic;
-  Bytes.to_string s
+  Fun.protect ~finally:(fun () -> close_in ic) (fun () ->
+    let n = in_channel_length ic in
+    let s = Bytes.create n in
+    really_input ic s 0 n;
+    Bytes.to_string s)
 
 let load () =
   let path = config_path () in

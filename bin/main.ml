@@ -18,39 +18,46 @@ let pidfile_path () =
   let home = Sys.getenv "HOME" in
   Filename.concat home ".config/discord-agents/discord-agents.pid"
 
-(** Acquire a pidfile lock. Kills any existing instance first.
-    Returns a file descriptor that must be kept open (closing releases the lock). *)
+(** Acquire an exclusive pidfile lock using Unix.lockf.
+    Kills any existing instance first (via the lock holder's PID).
+    The returned fd must stay open — closing it releases the lock. *)
 let acquire_pidfile () =
   let path = pidfile_path () in
   let dir = Filename.dirname path in
   if not (Sys.file_exists dir) then
     Unix.mkdir dir 0o700;
-  (* Check for existing pid and kill it *)
-  (if Sys.file_exists path then
-    try
-      let ic = open_in path in
-      let pid_str = String.trim (input_line ic) in
-      close_in ic;
-      let pid = int_of_string pid_str in
-      (* Check if process is alive *)
-      (try Unix.kill pid 0; (* signal 0 = check existence *)
-        Logs.info (fun m -> m "killing existing instance (pid %d)" pid);
-        Unix.kill pid Sys.sigterm;
-        Unix.sleepf 2.0;
-        (* Force kill if still alive *)
-        (try Unix.kill pid 0;
-          Unix.kill pid Sys.sigkill;
-          Unix.sleepf 1.0
-        with Unix.Unix_error _ -> ())
+  (* Try to acquire the lock non-blocking first *)
+  let fd = Unix.openfile path [Unix.O_WRONLY; Unix.O_CREAT] 0o600 in
+  (try
+    Unix.lockf fd Unix.F_TLOCK 0
+  with Unix.Unix_error (Unix.EAGAIN, _, _) | Unix.Unix_error (Unix.EACCES, _, _) ->
+    (* Lock held by another instance — read its PID and kill it *)
+    let ic = open_in path in
+    let pid = try int_of_string (String.trim (input_line ic)) with _ -> 0 in
+    close_in ic;
+    if pid > 0 then begin
+      Logs.info (fun m -> m "killing existing instance (pid %d)" pid);
+      (try Unix.kill pid Sys.sigterm with Unix.Unix_error _ -> ());
+      Unix.sleepf 2.0;
+      (try Unix.kill pid 0;
+        Unix.kill pid Sys.sigkill;
+        Unix.sleepf 1.0
       with Unix.Unix_error _ -> ())
-    with _ -> ());
+    end;
+    (* Retry lock *)
+    Unix.lockf fd Unix.F_LOCK 0);
   (* Write our PID *)
-  let oc = open_out path in
-  output_string oc (string_of_int (Unix.getpid ()));
-  output_char oc '\n';
-  close_out oc;
-  (* Register cleanup *)
-  at_exit (fun () -> try Sys.remove path with _ -> ())
+  ignore (Unix.lseek fd 0 Unix.SEEK_SET);
+  let _ = Unix.ftruncate fd 0 in
+  let pid_str = string_of_int (Unix.getpid ()) ^ "\n" in
+  let _ = Unix.write_substring fd pid_str 0 (String.length pid_str) in
+  (* Keep fd open — lock is held until process exits.
+     at_exit cleanup is best-effort. *)
+  at_exit (fun () ->
+    (try Unix.lockf fd Unix.F_ULOCK 0 with _ -> ());
+    (try Unix.close fd with _ -> ());
+    (try Sys.remove path with _ -> ()));
+  fd
 
 (** Smoke test: verify REST client works, optionally send a test message,
     then connect to gateway briefly to confirm Hello/Identify/READY. *)
@@ -58,12 +65,10 @@ let run_test ~sw ~env config test_channel =
   Logs.info (fun m -> m "test: creating REST client...");
   let rest = Discord_agents.Discord_rest.create ~sw ~env
     ~token:config.Discord_agents.Config.discord_token in
-  (* Test 1: GET /gateway/bot *)
   Logs.info (fun m -> m "test: calling GET /gateway/bot...");
   (match Discord_agents.Discord_rest.get_gateway rest with
    | Ok url -> Logs.info (fun m -> m "test: gateway URL = %s" url)
    | Error e -> Logs.err (fun m -> m "test: get_gateway failed: %s" e); exit 1);
-  (* Test 2: optionally send a message *)
   (match test_channel with
    | Some channel_id ->
      Logs.info (fun m -> m "test: sending message to channel %s..." channel_id);
@@ -75,7 +80,6 @@ let run_test ~sw ~env config test_channel =
         Logs.err (fun m -> m "test: create_message failed: %s" e); exit 1)
    | None ->
      Logs.info (fun m -> m "test: skipping message send (no channel_id given)"));
-  (* Test 3: connect to gateway, wait for READY, then exit *)
   Logs.info (fun m -> m "test: connecting to gateway...");
   let ready = ref false in
   let gateway = Discord_agents.Discord_gateway.create
@@ -88,14 +92,12 @@ let run_test ~sw ~env config test_channel =
         ready := true
       | _ -> ())
   in
-  (* Run gateway in a sub-switch so we can cancel it cleanly *)
   let clock = Eio.Stdenv.clock env in
   let deadline = Eio.Time.now clock +. 15.0 in
   (try
     Eio.Switch.run @@ fun test_sw ->
     Eio.Fiber.fork ~sw:test_sw (fun () ->
       Discord_agents.Discord_gateway.connect ~sw:test_sw ~env gateway);
-    (* Poll for READY or timeout *)
     let rec wait () =
       if !ready then begin
         Logs.info (fun m -> m "test: all tests passed");
@@ -113,7 +115,6 @@ let run_test ~sw ~env config test_channel =
 
 let () =
   setup_logging ();
-  (* Parse args *)
   let args = Array.to_list Sys.argv |> List.tl in
   let test_mode = List.mem "--test" args in
   let test_channel =
@@ -122,8 +123,9 @@ let () =
     | _ -> None
   in
   Logs.info (fun m -> m "discord-agents starting%s" (if test_mode then " (test mode)" else ""));
-  (* Ensure only one instance runs — kill any existing one *)
-  if not test_mode then acquire_pidfile ();
+  (* Acquire pidfile lock — keeps fd open for process lifetime *)
+  let _lock_fd = if not test_mode then Some (acquire_pidfile ()) else None in
+  Random.self_init ();  (* Seed PRNG for heartbeat jitter *)
   let config = Discord_agents.Config.load () in
   if config.discord_token = "" then (
     Logs.err (fun m -> m "no discord token configured");
@@ -136,20 +138,28 @@ let () =
     run_test ~sw ~env config test_channel
   else begin
     let bot = Discord_agents.Bot.create ~sw ~env config in
-    (* Graceful shutdown on SIGINT/SIGTERM *)
-    (* Signal handler only sets a flag and closes the WebSocket —
-       no blocking I/O (REST calls) in signal context. *)
-    let shutdown_requested = ref false in
+    (* Shutdown via pipe: signal handler writes a byte, fiber reads it.
+       No Eio I/O in the signal handler — just a raw Unix write. *)
+    let shutdown_r, shutdown_w = Unix.pipe ~cloexec:true () in
     let handle_signal _signum =
-      if not !shutdown_requested then begin
-        shutdown_requested := true;
-        (* Close WebSocket to unblock the recv loop — this is safe in a signal *)
-        (match bot.gateway.ws with
-         | Some ws -> (try Discord_agents.Websocket.send_close ws with _ -> ())
-         | None -> ())
-      end
+      (* Write a single byte to wake up the shutdown fiber.
+         Unix.write on a pipe is async-signal-safe. *)
+      ignore (Unix.write_substring shutdown_w "!" 0 1)
     in
     Sys.set_signal Sys.sigint (Sys.Signal_handle handle_signal);
     Sys.set_signal Sys.sigterm (Sys.Signal_handle handle_signal);
+    (* Fiber that waits for the shutdown signal *)
+    Eio.Fiber.fork ~sw (fun () ->
+      let buf = Bytes.create 1 in
+      (* Block until signal handler writes to the pipe *)
+      let _n = Eio_unix.run_in_systhread (fun () ->
+        Unix.read shutdown_r buf 0 1) in
+      Logs.info (fun m -> m "shutdown: signal received");
+      bot.gateway.shutdown <- true;
+      (match bot.gateway.ws with
+       | Some ws -> (try Discord_agents.Websocket.send_close ws with _ -> ())
+       | None -> ());
+      Unix.close shutdown_r;
+      Unix.close shutdown_w);
     Discord_agents.Bot.run ~sw ~env bot
   end

@@ -28,19 +28,38 @@ def load_config():
         return json.loads(CONFIG_FILE.read_text())
     return {}
 
-def load_sessions():
-    if SESSIONS_FILE.exists():
+SESSIONS_LOCK = CONFIG_DIR / "sessions.json.lock"
+
+import fcntl
+
+def _with_sessions_lock(fn):
+    """Execute fn while holding an exclusive lock on sessions.json.lock.
+    Prevents lost-update races between the bot and MCP server."""
+    SESSIONS_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(SESSIONS_LOCK, 'w') as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
-            return json.loads(SESSIONS_FILE.read_text())
-        except json.JSONDecodeError:
-            return []
-    return []
+            return fn()
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+def load_sessions():
+    def _load():
+        if SESSIONS_FILE.exists():
+            try:
+                return json.loads(SESSIONS_FILE.read_text())
+            except json.JSONDecodeError:
+                return []
+        return []
+    return _with_sessions_lock(_load)
 
 def save_sessions(sessions):
-    """Atomic write: write to temp file, then rename."""
-    tmp = SESSIONS_FILE.with_suffix('.json.tmp')
-    tmp.write_text(json.dumps(sessions, indent=2) + "\n")
-    tmp.rename(SESSIONS_FILE)
+    """Atomic write with file locking."""
+    def _save():
+        tmp = SESSIONS_FILE.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps(sessions, indent=2) + "\n")
+        tmp.rename(SESSIONS_FILE)
+    _with_sessions_lock(_save)
 
 # --- Discord REST helpers ---
 

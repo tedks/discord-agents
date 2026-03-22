@@ -54,14 +54,17 @@ let max_body_size = 10 * 1024 * 1024
 let read_body (body : Cohttp_eio.Body.t) =
   let buf = Buffer.create 4096 in
   let chunk = Cstruct.create 4096 in
+  let truncated = ref false in
   let rec loop () =
     match Eio.Flow.single_read body chunk with
     | n ->
-      Buffer.add_string buf (Cstruct.to_string ~off:0 ~len:n chunk);
-      if Buffer.length buf > max_body_size then
-        Buffer.contents buf  (* truncate *)
-      else
-        loop ()
+      if not !truncated then begin
+        Buffer.add_string buf (Cstruct.to_string ~off:0 ~len:n chunk);
+        if Buffer.length buf > max_body_size then
+          truncated := true
+      end;
+      (* Always drain to EOF so the connection stays clean for reuse *)
+      loop ()
     | exception End_of_file -> Buffer.contents buf
   in
   loop ()

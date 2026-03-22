@@ -12,10 +12,7 @@ type state =
 [@@deriving show]
 
 let generate_id () =
-  let buf = Bytes.create 8 in
-  let ic = open_in "/dev/urandom" in
-  really_input ic buf 0 8;
-  close_in ic;
+  let raw = Mirage_crypto_rng.generate 8 in
   let hex = Buffer.create 16 in
-  Bytes.iter (fun c -> Buffer.add_string hex (Printf.sprintf "%02x" (Char.code c))) buf;
+  String.iter (fun c -> Buffer.add_string hex (Printf.sprintf "%02x" (Char.code c))) raw;
   Buffer.contents hex
