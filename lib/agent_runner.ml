@@ -22,7 +22,7 @@ let tool_display_info name =
   | "Bash" -> "\xF0\x9F\x92\xBB", "Running"             (* 💻 *)
   | "Grep" -> "\xF0\x9F\x94\x8D", "Searching"           (* 🔍 *)
   | "Glob" -> "\xF0\x9F\x93\x82", "Finding files"       (* 📂 *)
-  | "Agent" -> "\xF0\x9F\xA4\x96", "Spawning agent"     (* 🤖 *)
+  | "Agent" | "Task" -> "\xF0\x9F\xA4\x96", "Spawning agent"  (* 🤖 *)
   | "Skill" -> "\xE2\x9A\xA1", "Using skill"            (* ⚡ *)
   | _ -> "\xF0\x9F\x94\xA7", "Using " ^ name            (* 🔧 *)
 
@@ -128,8 +128,19 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id) ~prompt
       if Buffer.length current_msg_buf > 0 then
         start_new_message ();
       (* Accumulate tool status lines into a single batched message.
-         Each new tool call appends a line and edits the message in-place. *)
+         Each new tool call appends a line and edits the message in-place.
+         Start a new status message if we'd exceed Discord's 2000-char limit. *)
       let status = format_tool_status info in
+      let projected_len =
+        let existing = List.fold_left (fun acc l -> acc + String.length l + 1)
+          0 !tool_status_lines in
+        existing + String.length status
+      in
+      if projected_len > 1800 && !tool_status_lines <> [] then begin
+        flush_tool_status ();
+        tool_status_lines := [];
+        tool_status_msg_id := None
+      end;
       tool_status_lines := status :: !tool_status_lines;
       flush_tool_status ()
     | Agent_process.Error e ->

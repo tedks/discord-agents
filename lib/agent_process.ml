@@ -16,7 +16,17 @@ type stream_event =
   | Error of string
   | Other of string        (** Unrecognized event type *)
 
-(** Extract a short summary from tool_use input JSON for display. *)
+(** Sanitize a string for use inside Discord inline backticks.
+    Replaces backticks with single quotes and newlines with spaces. *)
+let sanitize_for_inline_code s =
+  String.init (String.length s) (fun i ->
+    match s.[i] with
+    | '`' -> '\''
+    | '\n' | '\r' -> ' '
+    | c -> c)
+
+(** Extract a short summary from tool_use input JSON for display.
+    The result is safe for embedding in Discord inline code spans. *)
 let summarize_tool_input name input =
   let open Yojson.Safe.Util in
   let get key = input |> member key |> to_string_option in
@@ -29,37 +39,28 @@ let summarize_tool_input name input =
     if String.length s <= n then s
     else String.sub s 0 n ^ "..."
   in
+  let clean n s = truncate n (sanitize_for_inline_code s) in
   match name with
-  | "Read" ->
-    (match get "file_path" with
-     | Some p -> basename p | None -> "")
-  | "Edit" ->
-    (match get "file_path" with
-     | Some p -> basename p | None -> "")
-  | "Write" ->
+  | "Read" | "Edit" | "Write" ->
     (match get "file_path" with
      | Some p -> basename p | None -> "")
   | "Bash" ->
     (match get "command" with
-     | Some c -> truncate 60 c | None -> "")
+     | Some c -> clean 60 c | None -> "")
   | "Grep" ->
     (match get "pattern" with
      | Some pat ->
        let path = match get "path" with Some p -> " in " ^ basename p | None -> "" in
-       truncate 40 pat ^ path
+       clean 40 pat ^ path
      | None -> "")
   | "Glob" ->
     (match get "pattern" with
-     | Some pat -> truncate 60 pat | None -> "")
-  | "Agent" ->
+     | Some pat -> clean 60 pat | None -> "")
+  | "Agent" | "Task" ->
     (match get "description" with
-     | Some d -> truncate 60 d | None -> "")
+     | Some d -> clean 60 d | None -> "")
   | _ -> ""
 
-(** Parse a stream-json line from Claude's output.
-    Key event types:
-    - {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
-    - {"type":"result","subtype":"success","result":"...","session_id":"..."} *)
 (** Parse a stream-json line into a list of events.
     Returns a list because a single assistant message can contain
     both text and tool_use content blocks. *)
