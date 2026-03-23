@@ -142,7 +142,9 @@ let split_message ?(max_len=1900) text =
           | None -> ""
           | Some lang -> "```" ^ lang ^ "\n"
         in
-        let effective_max = max_len - String.length prefix in
+        (* Reserve space for both the prefix and a potential closing "\n```" (4 chars) *)
+        let closing_reserve = 4 in
+        let effective_max = max_len - String.length prefix - closing_reserve in
         if remaining <= effective_max then
           List.rev ((prefix ^ String.sub text pos remaining) :: acc)
         else
