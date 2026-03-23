@@ -10,8 +10,8 @@ type session = {
   project_name : string;
   working_dir : string;
   agent_kind : Config.agent_kind;
-  session_id : string;
-  thread_id : string;
+  session_id : string;  (* Claude session UUID, not a Discord snowflake *)
+  thread_id : Discord_types.channel_id;  (* threads are channels in Discord *)
   system_prompt : string option;
   mutable message_count : int;
   mutable processing : bool;
@@ -94,17 +94,17 @@ let create () =
   { sessions = load_from_disk (); last_reload = Unix.gettimeofday () }
 
 (** Add a session and persist to disk. *)
-let add t ~thread_id session =
+let add t ~(thread_id : Discord_types.channel_id) session =
   t.sessions <- SessionMap.add thread_id session t.sessions;
   save t
 
 (** Remove a session and persist to disk. *)
-let remove t ~thread_id =
+let remove t ~(thread_id : Discord_types.channel_id) =
   t.sessions <- SessionMap.remove thread_id t.sessions;
   save t
 
 (** Find a session by thread ID. *)
-let find_opt t ~thread_id =
+let find_opt t ~(thread_id : Discord_types.channel_id) =
   SessionMap.find_opt thread_id t.sessions
 
 (** Get all sessions as (thread_id, session) pairs. *)

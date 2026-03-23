@@ -25,7 +25,7 @@ let bindings t = ChannelMap.bindings t.channels
 
 (** Set up the "Agent Projects" category and map existing channels
     to projects (case-insensitive match on names). *)
-let setup ~rest ~guild_id ~projects t =
+let setup ~rest ~(guild_id : Discord_types.guild_id) ~projects t =
   if guild_id = "" then
     Logs.info (fun m -> m "channel_manager: no guild_id, skipping")
   else begin
@@ -72,7 +72,7 @@ let setup ~rest ~guild_id ~projects t =
   end
 
 (** Find or create a channel for a project. Returns the channel ID. *)
-let find_or_create ~rest ~guild_id ~project t =
+let find_or_create ~rest ~(guild_id : Discord_types.guild_id) ~project t =
   match find t ~project_name:project.Project.name with
   | Some ch_id -> Some ch_id
   | None ->
@@ -92,7 +92,7 @@ let find_or_create ~rest ~guild_id ~project t =
     | None -> None
 
 (** Move a project's channel to position 0 (top of category). *)
-let bump ~rest ~guild_id ~project_name t =
+let bump ~rest ~(guild_id : Discord_types.guild_id) ~project_name t =
   match find t ~project_name with
   | None -> ()
   | Some ch_id ->
@@ -102,7 +102,7 @@ let bump ~rest ~guild_id ~project_name t =
 
 (** Delete channels that don't match any current project name.
     Also removes duplicates (keeps first per name). *)
-let cleanup ~rest ~guild_id ~projects t =
+let cleanup ~rest ~(guild_id : Discord_types.guild_id) ~projects t =
   if guild_id = "" then Error "no guild_id"
   else
     match Discord_rest.get_guild_channels rest ~guild_id () with
@@ -130,7 +130,7 @@ let cleanup ~rest ~guild_id ~projects t =
       Ok deleted
 
 (** Check if a channel ID belongs to a project channel, return the project name. *)
-let project_for_channel t ~channel_id =
+let project_for_channel t ~(channel_id : Discord_types.channel_id) =
   ChannelMap.bindings t.channels
   |> List.find_opt (fun (_, ch_id) -> ch_id = channel_id)
   |> Option.map fst

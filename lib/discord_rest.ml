@@ -114,7 +114,8 @@ let request t ~meth ~path ?body () =
       (Http.Method.to_string meth) path (Printexc.to_string exn))
 
 (** Send a message to a channel. *)
-let create_message t ~channel_id ~content ?reply_to () =
+let create_message t ~(channel_id : Discord_types.channel_id) ~content
+    ?(reply_to : Discord_types.message_id option) () =
   let body = `Assoc ([
     ("content", `String content);
   ] @ match reply_to with
@@ -128,7 +129,8 @@ let create_message t ~channel_id ~content ?reply_to () =
   | Error e -> Error e
 
 (** Edit an existing message. *)
-let edit_message t ~channel_id ~message_id ~content () =
+let edit_message t ~(channel_id : Discord_types.channel_id)
+    ~(message_id : Discord_types.message_id) ~content () =
   let body = `Assoc [("content", `String content)] in
   match request t ~meth:`PATCH
     ~path:(Printf.sprintf "/channels/%s/messages/%s" channel_id message_id)
@@ -139,14 +141,15 @@ let edit_message t ~channel_id ~message_id ~content () =
   | Error e -> Error e
 
 (** Send a typing indicator. *)
-let send_typing t ~channel_id () =
+let send_typing t ~(channel_id : Discord_types.channel_id) () =
   match request t ~meth:`POST
     ~path:(Printf.sprintf "/channels/%s/typing" channel_id) () with
   | Ok _ -> Ok ()
   | Error e -> Error e
 
 (** Create a new text channel in a guild. *)
-let create_channel t ~guild_id ~name ?(channel_type=0) ?parent_id ?topic () =
+let create_channel t ~(guild_id : Discord_types.guild_id) ~name ?(channel_type=0)
+    ?(parent_id : Discord_types.channel_id option) ?topic () =
   let body = `Assoc ([
     ("name", `String name);
     ("type", `Int channel_type);
@@ -160,7 +163,7 @@ let create_channel t ~guild_id ~name ?(channel_type=0) ?parent_id ?topic () =
   | Error e -> Error e
 
 (** Get all channels in a guild. *)
-let get_guild_channels t ~guild_id () =
+let get_guild_channels t ~(guild_id : Discord_types.guild_id) () =
   match request t ~meth:`GET ~path:(Printf.sprintf "/guilds/%s/channels" guild_id) () with
   | Ok json ->
     (try Ok (Yojson.Safe.Util.to_list json |> List.map channel_of_yojson)
@@ -168,13 +171,14 @@ let get_guild_channels t ~guild_id () =
   | Error e -> Error e
 
 (** Delete a channel. *)
-let delete_channel t ~channel_id () =
+let delete_channel t ~(channel_id : Discord_types.channel_id) () =
   match request t ~meth:`DELETE ~path:(Printf.sprintf "/channels/%s" channel_id) () with
   | Ok _ -> Ok ()
   | Error e -> Error e
 
 (** Move a channel to a given position within its category. *)
-let modify_channel_position t ~guild_id ~channel_id ~position () =
+let modify_channel_position t ~(guild_id : Discord_types.guild_id)
+    ~(channel_id : Discord_types.channel_id) ~position () =
   let body = `List [`Assoc [
     ("id", `String channel_id);
     ("position", `Int position);
@@ -184,7 +188,8 @@ let modify_channel_position t ~guild_id ~channel_id ~position () =
   | Error e -> Error e
 
 (** Create a thread from a message. *)
-let create_thread t ~channel_id ~message_id ~name () =
+let create_thread t ~(channel_id : Discord_types.channel_id)
+    ~(message_id : Discord_types.message_id) ~name () =
   let body = `Assoc [
     ("name", `String name);
     ("auto_archive_duration", `Int 1440);
@@ -198,7 +203,7 @@ let create_thread t ~channel_id ~message_id ~name () =
   | Error e -> Error e
 
 (** Create a thread without a starter message. *)
-let create_thread_no_message t ~channel_id ~name () =
+let create_thread_no_message t ~(channel_id : Discord_types.channel_id) ~name () =
   let body = `Assoc [
     ("name", `String name);
     ("type", `Int 11);
@@ -213,7 +218,7 @@ let create_thread_no_message t ~channel_id ~name () =
   | Error e -> Error e
 
 (** Fetch messages from a channel. *)
-let get_messages t ~channel_id ?(limit=20) () =
+let get_messages t ~(channel_id : Discord_types.channel_id) ?(limit=20) () =
   match request t ~meth:`GET
     ~path:(Printf.sprintf "/channels/%s/messages?limit=%d" channel_id limit) () with
   | Ok json ->
@@ -224,7 +229,8 @@ let get_messages t ~channel_id ?(limit=20) () =
   | Error e -> Error e
 
 (** Add a reaction to a message. *)
-let create_reaction t ~channel_id ~message_id ~emoji () =
+let create_reaction t ~(channel_id : Discord_types.channel_id)
+    ~(message_id : Discord_types.message_id) ~emoji () =
   let encoded_emoji = Uri.pct_encode emoji in
   match request t ~meth:`PUT
     ~path:(Printf.sprintf "/channels/%s/messages/%s/reactions/%s/@me"
