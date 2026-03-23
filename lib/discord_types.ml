@@ -1,11 +1,28 @@
 (** Discord API types — minimal subset for text bot operations.
 
     We only model what we need: messages, channels, threads, reactions.
-    No voice, no presence, no guild member management. *)
+    No voice, no presence, no guild member management.
+
+    ID types: Discord uses "snowflake" IDs (64-bit integers as strings).
+    We define distinct types for each ID kind so the compiler prevents
+    mixing up channel_id with message_id, etc. They're all strings at
+    runtime but distinct types at compile time. *)
 
 open Ppx_yojson_conv_lib.Yojson_conv.Primitives
 
-(* Channel types per Discord API *)
+(** {1 ID types}
+    Each is a distinct type alias with its own deriving.
+    They share the same runtime representation (string) but are
+    not interchangeable at compile time thanks to the .mli. *)
+
+type channel_id = string [@@deriving show, eq, yojson]
+type message_id = string [@@deriving show, eq, yojson]
+type guild_id = string [@@deriving show, eq, yojson]
+type user_id = string [@@deriving show, eq, yojson]
+type attachment_id = string [@@deriving show, eq, yojson]
+
+(** {1 Channel types} *)
+
 type channel_type =
   | Guild_text        (* 0 *)
   | DM                (* 1 *)
@@ -49,25 +66,25 @@ let channel_type_of_yojson = function
 
 let yojson_of_channel_type ct = `Int (int_of_channel_type ct)
 
-type snowflake = string [@@deriving show, eq, yojson]
+(** {1 API object types} *)
 
 type user = {
-  id : snowflake;
+  id : user_id;
   username : string;
   bot : bool option; [@default None]
 } [@@deriving show, yojson] [@@yojson.allow_extra_fields]
 
 type channel = {
-  id : snowflake;
+  id : channel_id;
   type_ : channel_type; [@key "type"]
-  guild_id : snowflake option; [@default None]
+  guild_id : guild_id option; [@default None]
   name : string option; [@default None]
   topic : string option; [@default None]
-  parent_id : snowflake option; [@default None]
+  parent_id : channel_id option; [@default None]
 } [@@deriving show, yojson] [@@yojson.allow_extra_fields]
 
 type attachment = {
-  id : snowflake;
+  id : attachment_id;
   filename : string;
   size : int;
   url : string;
@@ -75,22 +92,23 @@ type attachment = {
 } [@@deriving show, yojson] [@@yojson.allow_extra_fields]
 
 type message = {
-  id : snowflake;
-  channel_id : snowflake;
+  id : message_id;
+  channel_id : channel_id;
   author : user;
   content : string;
   timestamp : string;
-  guild_id : snowflake option; [@default None]
+  guild_id : guild_id option; [@default None]
   attachments : attachment list; [@default []]
   referenced_message : message option; [@default None]
 } [@@deriving show, yojson] [@@yojson.allow_extra_fields]
 
 type guild = {
-  id : snowflake;
+  id : guild_id;
   name : string;
 } [@@deriving show, yojson] [@@yojson.allow_extra_fields]
 
-(** Gateway event types we care about *)
+(** {1 Gateway types} *)
+
 type gateway_dispatch =
   | Ready of { user : user; guilds : Yojson.Safe.t list }
   | Message_create of message
@@ -98,7 +116,6 @@ type gateway_dispatch =
   | Guild_create of guild
   | Unknown of string * Yojson.Safe.t
 
-(** Gateway opcodes *)
 type gateway_opcode =
   | Dispatch        (* 0 *)
   | Heartbeat       (* 1 *)
@@ -121,7 +138,6 @@ let gateway_opcode_of_int = function
   | 11 -> Heartbeat_ack
   | n -> Unknown_op n
 
-(** Intent flags for gateway identify *)
 module Intent = struct
   let guilds = 1 lsl 0
   let guild_messages = 1 lsl 9
