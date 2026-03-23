@@ -146,21 +146,37 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
   let mgr = Eio.Stdenv.process_mgr env in
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
-  (* Derive MCP config path from executable location *)
+  (* Generate MCP config with absolute path to the Python script.
+     The static mcp.json has a relative path that breaks when Claude
+     runs in a different working directory. *)
   let mcp_config =
-    try
-      let exe = Sys.executable_name in
-      let exe = if Filename.is_relative exe then Filename.concat (Sys.getcwd ()) exe else exe in
-      let rec find_root path =
-        let candidate = Filename.concat path "scripts/mcp.json" in
-        if Sys.file_exists candidate then candidate
-        else
-          let parent = Filename.dirname path in
-          if parent = path then "scripts/mcp.json"
-          else find_root parent
-      in
-      find_root (Filename.dirname exe)
-    with _ -> "scripts/mcp.json"
+    let script_path =
+      try
+        let exe = Sys.executable_name in
+        let exe = if Filename.is_relative exe then Filename.concat (Sys.getcwd ()) exe else exe in
+        let rec find_root path =
+          let candidate = Filename.concat path "scripts/mcp-server.py" in
+          if Sys.file_exists candidate then candidate
+          else
+            let parent = Filename.dirname path in
+            if parent = path then "scripts/mcp-server.py"
+            else find_root parent
+        in
+        find_root (Filename.dirname exe)
+      with _ -> "scripts/mcp-server.py"
+    in
+    (* Write a temp MCP config with the absolute script path *)
+    let config_dir = Filename.concat (Sys.getenv "HOME") ".config/discord-agents" in
+    let config_path = Filename.concat config_dir "mcp-generated.json" in
+    let json = Printf.sprintf
+      {|{"mcpServers":{"discord-agents":{"command":"python3","args":["%s"]}}}|}
+      script_path in
+    (try
+      let oc = open_out config_path in
+      output_string oc json;
+      close_out oc
+    with _ -> ());
+    config_path
   in
   let args = match kind with
     | Config.Claude ->
