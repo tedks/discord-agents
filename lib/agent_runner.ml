@@ -13,7 +13,7 @@ let typing_interval = 8.0
 (** Run an agent and stream its output to a Discord channel.
     Handles message creation/editing, typing indicators, and splitting.
     Returns Ok () on success, Error msg on failure. *)
-let run ~sw ~env ~rest ~session ~channel_id ~prompt () =
+let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id) ~prompt () =
   (* Send typing indicator *)
   ignore (Discord_rest.send_typing rest ~channel_id ());
   Logs.info (fun m -> m "agent_runner: running %s for %s: %s"
