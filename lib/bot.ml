@@ -77,7 +77,8 @@ Keep responses concise — this is Discord." project_list
 
 (** Split text into chunks for Discord's 2000-char limit.
     Splits at paragraph breaks > newlines > spaces.
-    Handles code blocks by closing/reopening ```. *)
+    Handles code blocks by closing/reopening ``` with language hints
+    preserved (e.g. ```ocaml gets reopened as ```ocaml). *)
 let split_message ?(max_len=1900) text =
   let len = String.length text in
   if len <= max_len then [text]
@@ -103,22 +104,44 @@ let split_message ?(max_len=1900) text =
           | Some p -> p + 1
           | None -> limit
     in
-    let count_backticks s =
-      let count = ref 0 in
+    (* Scan a chunk for ``` fences, tracking whether we end inside a code block
+       and what language the most recent opening fence used. *)
+    let scan_fences chunk_text =
+      let in_code = ref false in
+      let lang = ref "" in
       let i = ref 0 in
-      let slen = String.length s in
-      while !i + 2 < slen do
-        if s.[!i] = '`' && s.[!i+1] = '`' && s.[!i+2] = '`' then begin
-          incr count; i := !i + 3
-        end else incr i
+      let clen = String.length chunk_text in
+      while !i + 2 < clen do
+        if chunk_text.[!i] = '`' && chunk_text.[!i+1] = '`' && chunk_text.[!i+2] = '`' then begin
+          if not !in_code then begin
+            (* Opening fence — extract language hint *)
+            let rest_start = !i + 3 in
+            let eol = match String.index_from_opt chunk_text rest_start '\n' with
+              | Some nl -> nl | None -> clen in
+            let l = String.trim (String.sub chunk_text rest_start (eol - rest_start)) in
+            lang := (if String.length l > 0 && String.length l <= 20
+                        && not (String.contains l ' ') then l else "");
+            in_code := true
+          end else begin
+            in_code := false;
+            lang := ""
+          end;
+          i := !i + 3
+        end else
+          incr i
       done;
-      !count
+      (!in_code, !lang)
     in
-    let rec split pos in_code_block acc =
+    (* code_state: None = not in code block, Some lang = in code block.
+       lang may be "" for bare ``` fences. *)
+    let rec split pos code_state acc =
       if pos >= len then List.rev acc
       else
         let remaining = len - pos in
-        let prefix = if in_code_block then "```\n" else "" in
+        let prefix = match code_state with
+          | None -> ""
+          | Some lang -> "```" ^ lang ^ "\n"
+        in
         let effective_max = max_len - String.length prefix in
         if remaining <= effective_max then
           List.rev ((prefix ^ String.sub text pos remaining) :: acc)
@@ -126,12 +149,12 @@ let split_message ?(max_len=1900) text =
           let split_at = find_split_point pos (pos + effective_max) in
           let raw_chunk = String.sub text pos (split_at - pos) in
           let chunk = prefix ^ raw_chunk in
-          let total_backticks = count_backticks chunk in
-          let ends_in_code = total_backticks mod 2 = 1 in
+          let (ends_in_code, lang) = scan_fences chunk in
           let chunk = if ends_in_code then chunk ^ "\n```" else chunk in
-          split split_at ends_in_code (chunk :: acc)
+          let next_state = if ends_in_code then Some lang else None in
+          split split_at next_state (chunk :: acc)
     in
-    split 0 false []
+    split 0 None []
 
 let post_response rest ~channel_id text =
   List.iter (fun chunk ->

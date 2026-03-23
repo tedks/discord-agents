@@ -5,10 +5,34 @@
 
     Key design: one agent invocation at a time per session, enforced by
     the session's `processing` flag. Large text deltas are split at
-    1800-char boundaries before being sent to Discord. *)
+    1800-char boundaries before being sent to Discord.
+
+    Tool use events are displayed as compact status messages with emoji
+    indicators so users can follow what the agent is doing. *)
 
 (** Typing indicator refresh interval in seconds. *)
 let typing_interval = 8.0
+
+(** Map tool names to emoji + verb for compact status display. *)
+let tool_display_info name =
+  match name with
+  | "Read" -> "\xF0\x9F\x93\x96", "Reading"            (* 📖 *)
+  | "Edit" -> "\xE2\x9C\x8F\xEF\xB8\x8F", "Editing"   (* ✏️ *)
+  | "Write" -> "\xF0\x9F\x93\x9D", "Writing"            (* 📝 *)
+  | "Bash" -> "\xF0\x9F\x92\xBB", "Running"             (* 💻 *)
+  | "Grep" -> "\xF0\x9F\x94\x8D", "Searching"           (* 🔍 *)
+  | "Glob" -> "\xF0\x9F\x93\x82", "Finding files"       (* 📂 *)
+  | "Agent" -> "\xF0\x9F\xA4\x96", "Spawning agent"     (* 🤖 *)
+  | "Skill" -> "\xE2\x9A\xA1", "Using skill"            (* ⚡ *)
+  | _ -> "\xF0\x9F\x94\xA7", "Using " ^ name            (* 🔧 *)
+
+(** Format a tool use event as a compact status line. *)
+let format_tool_status (info : Agent_process.tool_info) =
+  let emoji, verb = tool_display_info info.tool_name in
+  if info.tool_summary = "" then
+    Printf.sprintf "%s %s..." emoji verb
+  else
+    Printf.sprintf "%s %s `%s`..." emoji verb info.tool_summary
 
 (** Run an agent and stream its output to a Discord channel.
     Handles message creation/editing, typing indicators, and splitting.
@@ -25,6 +49,8 @@ let run ~sw ~env ~rest ~session ~channel_id ~prompt () =
   let result_buf = Buffer.create 4096 in
   let current_msg_id = ref None in
   let current_msg_buf = Buffer.create 1900 in
+  let tool_status_lines = ref [] in
+  let tool_status_msg_id = ref None in
   let last_typing = ref (Unix.gettimeofday ()) in
   let last_edit = ref (Unix.gettimeofday ()) in
   let flush_to_discord () =
@@ -45,8 +71,31 @@ let run ~sw ~env ~rest ~session ~channel_id ~prompt () =
     Buffer.clear current_msg_buf;
     current_msg_id := None
   in
+  (* Flush accumulated tool status lines to a single Discord message.
+     Consecutive tool calls get batched into one message, edited in-place. *)
+  let flush_tool_status () =
+    match !tool_status_lines with
+    | [] -> ()
+    | lines ->
+      let text = String.concat "\n" (List.rev lines) in
+      (match !tool_status_msg_id with
+       | None ->
+         (match Discord_rest.create_message rest ~channel_id ~content:text () with
+          | Ok sent -> tool_status_msg_id := Some sent.Discord_types.id
+          | Error e -> Logs.warn (fun m -> m "agent_runner: tool status error: %s" e))
+       | Some mid ->
+         (match Discord_rest.edit_message rest ~channel_id ~message_id:mid ~content:text () with
+          | Ok _ -> ()
+          | Error e -> Logs.warn (fun m -> m "agent_runner: tool status edit error: %s" e)))
+  in
   let on_event = function
     | Agent_process.Text_delta text ->
+      (* Transitioning from tool status to text — finalize tool status message *)
+      if !tool_status_lines <> [] then begin
+        flush_tool_status ();
+        tool_status_lines := [];
+        tool_status_msg_id := None
+      end;
       Buffer.add_string result_buf text;
       (* Split large deltas at 1800-char boundaries *)
       let text_len = String.length text in
@@ -70,9 +119,19 @@ let run ~sw ~env ~rest ~session ~channel_id ~prompt () =
         last_typing := now
       end
     | Agent_process.Result { text = _; session_id = _ } ->
+      flush_tool_status ();
       flush_to_discord ()
-    | Agent_process.Tool_use name ->
-      Logs.debug (fun m -> m "agent_runner: tool: %s" name)
+    | Agent_process.Tool_use info ->
+      Logs.debug (fun m -> m "agent_runner: tool: %s (%s)"
+        info.tool_name info.tool_summary);
+      (* Flush any pending text before showing tool status *)
+      if Buffer.length current_msg_buf > 0 then
+        start_new_message ();
+      (* Accumulate tool status lines into a single batched message.
+         Each new tool call appends a line and edits the message in-place. *)
+      let status = format_tool_status info in
+      tool_status_lines := status :: !tool_status_lines;
+      flush_tool_status ()
     | Agent_process.Error e ->
       Logs.warn (fun m -> m "agent_runner: error event: %s" e)
     | Agent_process.Other _ -> ()

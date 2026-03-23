@@ -4,17 +4,65 @@
     Claude and Gemini use stream-json output for real-time streaming.
     Codex uses plain text output. *)
 
+type tool_info = {
+  tool_name: string;        (** Tool name (e.g. "Read", "Edit", "Bash") *)
+  tool_summary: string;     (** Human-readable summary of what the tool is doing *)
+}
+
 type stream_event =
   | Text_delta of string   (** Incremental text from the agent *)
   | Result of { text: string; session_id: string option }
-  | Tool_use of string     (** Agent is using a tool *)
+  | Tool_use of tool_info  (** Agent is using a tool *)
   | Error of string
   | Other of string        (** Unrecognized event type *)
+
+(** Extract a short summary from tool_use input JSON for display. *)
+let summarize_tool_input name input =
+  let open Yojson.Safe.Util in
+  let get key = input |> member key |> to_string_option in
+  let basename s =
+    match String.rindex_opt s '/' with
+    | Some i -> String.sub s (i + 1) (String.length s - i - 1)
+    | None -> s
+  in
+  let truncate n s =
+    if String.length s <= n then s
+    else String.sub s 0 n ^ "..."
+  in
+  match name with
+  | "Read" ->
+    (match get "file_path" with
+     | Some p -> basename p | None -> "")
+  | "Edit" ->
+    (match get "file_path" with
+     | Some p -> basename p | None -> "")
+  | "Write" ->
+    (match get "file_path" with
+     | Some p -> basename p | None -> "")
+  | "Bash" ->
+    (match get "command" with
+     | Some c -> truncate 60 c | None -> "")
+  | "Grep" ->
+    (match get "pattern" with
+     | Some pat ->
+       let path = match get "path" with Some p -> " in " ^ basename p | None -> "" in
+       truncate 40 pat ^ path
+     | None -> "")
+  | "Glob" ->
+    (match get "pattern" with
+     | Some pat -> truncate 60 pat | None -> "")
+  | "Agent" ->
+    (match get "description" with
+     | Some d -> truncate 60 d | None -> "")
+  | _ -> ""
 
 (** Parse a stream-json line from Claude's output.
     Key event types:
     - {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
     - {"type":"result","subtype":"success","result":"...","session_id":"..."} *)
+(** Parse a stream-json line into a list of events.
+    Returns a list because a single assistant message can contain
+    both text and tool_use content blocks. *)
 let parse_stream_json_line line =
   try
     let json = Yojson.Safe.from_string line in
@@ -24,27 +72,32 @@ let parse_stream_json_line line =
     | Some "assistant" ->
       let msg = json |> member "message" in
       let content = msg |> member "content" in
-      let texts = match content with
+      let events = match content with
         | `List items ->
           List.filter_map (fun item ->
             match item |> member "type" |> to_string_option with
-            | Some "text" -> item |> member "text" |> to_string_option
+            | Some "text" ->
+              (match item |> member "text" |> to_string_option with
+               | Some t -> Some (Text_delta t)
+               | None -> None)
             | Some "tool_use" ->
-              let name = item |> member "name" |> to_string_option in
-              Some (Printf.sprintf "[tool: %s]" (Option.value ~default:"?" name))
+              let name = item |> member "name" |> to_string_option
+                |> Option.value ~default:"unknown" in
+              let input = item |> member "input" in
+              let summary = summarize_tool_input name input in
+              Some (Tool_use { tool_name = name; tool_summary = summary })
             | _ -> None
           ) items
         | _ -> []
       in
-      if texts = [] then Other line
-      else Text_delta (String.concat "" texts)
+      if events = [] then [Other line] else events
     | Some "result" ->
       let result_text = json |> member "result" |> to_string_option
         |> Option.value ~default:"" in
       let session_id = json |> member "session_id" |> to_string_option in
-      Result { text = result_text; session_id }
-    | _ -> Other line
-  with _ -> Other line
+      [Result { text = result_text; session_id }]
+    | _ -> [Other line]
+  with _ -> [Other line]
 
 (** Build the command args for an agent invocation. *)
 let claude_args ~session_id ~message_count ~prompt =
@@ -120,8 +173,8 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
           if String.length line > 0 then begin
             match kind with
             | Config.Claude | Config.Gemini ->
-              let event = parse_stream_json_line line in
-              on_event event
+              let events = parse_stream_json_line line in
+              List.iter on_event events
             | Config.Codex ->
               on_event (Text_delta line)
           end
