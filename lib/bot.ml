@@ -104,34 +104,7 @@ let split_message ?(max_len=1900) text =
           | Some p -> p + 1
           | None -> limit
     in
-    (* Scan a chunk for ``` fences, tracking whether we end inside a code block
-       and what language the most recent opening fence used. *)
-    let scan_fences chunk_text =
-      let in_code = ref false in
-      let lang = ref "" in
-      let i = ref 0 in
-      let clen = String.length chunk_text in
-      while !i + 2 < clen do
-        if chunk_text.[!i] = '`' && chunk_text.[!i+1] = '`' && chunk_text.[!i+2] = '`' then begin
-          if not !in_code then begin
-            (* Opening fence — extract language hint *)
-            let rest_start = !i + 3 in
-            let eol = match String.index_from_opt chunk_text rest_start '\n' with
-              | Some nl -> nl | None -> clen in
-            let l = String.trim (String.sub chunk_text rest_start (eol - rest_start)) in
-            lang := (if String.length l > 0 && String.length l <= 20
-                        && not (String.contains l ' ') then l else "");
-            in_code := true
-          end else begin
-            in_code := false;
-            lang := ""
-          end;
-          i := !i + 3
-        end else
-          incr i
-      done;
-      (!in_code, !lang)
-    in
+    let scan_fences = Agent_process.scan_fences in
     (* code_state: None = not in code block, Some lang = in code block.
        lang may be "" for bare ``` fences. *)
     let rec split pos code_state acc =

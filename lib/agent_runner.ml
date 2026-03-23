@@ -34,34 +34,6 @@ let format_tool_status (info : Agent_process.tool_info) =
   else
     Printf.sprintf "%s %s `%s`..." emoji verb info.tool_summary
 
-(** Scan text for ``` fences, returning whether it ends inside a code block
-    and the language hint of the most recent opening fence.
-    Returns (in_code, lang) where lang may be "" for bare fences. *)
-let scan_fences text =
-  let in_code = ref false in
-  let lang = ref "" in
-  let i = ref 0 in
-  let len = String.length text in
-  while !i + 2 < len do
-    if text.[!i] = '`' && text.[!i+1] = '`' && text.[!i+2] = '`' then begin
-      if not !in_code then begin
-        let rest_start = !i + 3 in
-        let eol = match String.index_from_opt text rest_start '\n' with
-          | Some nl -> nl | None -> len in
-        let l = String.trim (String.sub text rest_start (eol - rest_start)) in
-        lang := (if String.length l > 0 && String.length l <= 20
-                    && not (String.contains l ' ') then l else "");
-        in_code := true
-      end else begin
-        in_code := false;
-        lang := ""
-      end;
-      i := !i + 3
-    end else
-      incr i
-  done;
-  (!in_code, !lang)
-
 (** Run an agent and stream its output to a Discord channel.
     Handles message creation/editing, typing indicators, and splitting.
     Returns Ok () on success, Error msg on failure. *)
@@ -99,7 +71,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id) ~prompt
        If so, close it in this message so Discord renders it properly,
        and remember to reopen it in the next message. *)
     let buf_text = Buffer.contents current_msg_buf in
-    let (in_code, lang) = scan_fences buf_text in
+    let (in_code, lang) = Agent_process.scan_fences buf_text in
     if in_code then
       Buffer.add_string current_msg_buf "\n```";
     flush_to_discord ();
@@ -140,10 +112,13 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id) ~prompt
       let text_len = String.length text in
       let pos = ref 0 in
       while !pos < text_len do
+        (* Flush first if buffer is already at capacity (e.g. from a
+           reopened code block prefix) to avoid zero-progress loops *)
+        if Buffer.length current_msg_buf >= 1796 then
+          start_new_message ();
         let remaining_capacity = 1796 - Buffer.length current_msg_buf in
         let chunk_len = min remaining_capacity (text_len - !pos) in
-        if chunk_len > 0 then
-          Buffer.add_substring current_msg_buf text !pos chunk_len;
+        Buffer.add_substring current_msg_buf text !pos chunk_len;
         pos := !pos + chunk_len;
         if Buffer.length current_msg_buf >= 1796 then
           start_new_message ()

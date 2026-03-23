@@ -16,6 +16,34 @@ type stream_event =
   | Error of string
   | Other of string        (** Unrecognized event type *)
 
+(** Scan text for ``` fences, returning whether it ends inside a code block
+    and the language hint of the most recent opening fence.
+    Returns (in_code, lang) where lang may be "" for bare fences. *)
+let scan_fences text =
+  let in_code = ref false in
+  let lang = ref "" in
+  let i = ref 0 in
+  let len = String.length text in
+  while !i + 2 < len do
+    if text.[!i] = '`' && text.[!i+1] = '`' && text.[!i+2] = '`' then begin
+      if not !in_code then begin
+        let rest_start = !i + 3 in
+        let eol = match String.index_from_opt text rest_start '\n' with
+          | Some nl -> nl | None -> len in
+        let l = String.trim (String.sub text rest_start (eol - rest_start)) in
+        lang := (if String.length l > 0 && String.length l <= 20
+                    && not (String.contains l ' ') then l else "");
+        in_code := true
+      end else begin
+        in_code := false;
+        lang := ""
+      end;
+      i := !i + 3
+    end else
+      incr i
+  done;
+  (!in_code, !lang)
+
 (** Sanitize a string for use inside Discord inline backticks.
     Replaces backticks with single quotes and newlines with spaces. *)
 let sanitize_for_inline_code s =
@@ -40,17 +68,19 @@ let summarize_tool_input name input =
     else String.sub s 0 n ^ "..."
   in
   let clean n s = truncate n (sanitize_for_inline_code s) in
+  let safe_basename p = sanitize_for_inline_code (basename p) in
   match name with
   | "Read" | "Edit" | "Write" ->
     (match get "file_path" with
-     | Some p -> basename p | None -> "")
+     | Some p -> safe_basename p | None -> "")
   | "Bash" ->
     (match get "command" with
      | Some c -> clean 60 c | None -> "")
   | "Grep" ->
     (match get "pattern" with
      | Some pat ->
-       let path = match get "path" with Some p -> " in " ^ basename p | None -> "" in
+       let path = match get "path" with
+         | Some p -> " in " ^ safe_basename p | None -> "" in
        clean 40 pat ^ path
      | None -> "")
   | "Glob" ->
@@ -91,7 +121,7 @@ let parse_stream_json_line line =
           ) items
         | _ -> []
       in
-      if events = [] then [Other line] else events
+      (match events with [] -> [Other line] | _ -> events)
     | Some "result" ->
       let result_text = json |> member "result" |> to_string_option
         |> Option.value ~default:"" in
