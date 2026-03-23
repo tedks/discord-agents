@@ -71,24 +71,44 @@ let setup ~rest ~(guild_id : Discord_types.guild_id) ~projects t =
       end
   end
 
-(** Find or create a channel for a project. Returns the channel ID. *)
+(** Find or create a channel for a project. Returns the channel ID.
+    Checks Discord's actual channels first to avoid creating duplicates
+    (e.g. if the MCP server or another session already created one). *)
 let find_or_create ~rest ~(guild_id : Discord_types.guild_id) ~project t =
   match find t ~project_name:project.Project.name with
   | Some ch_id -> Some ch_id
   | None ->
     match t.category_id with
     | Some cat_id ->
-      let topic = Printf.sprintf "Agent sessions for %s (%s)"
-        project.Project.name project.Project.path in
-      (match Discord_rest.create_channel rest ~guild_id
-               ~name:project.name ~parent_id:cat_id ~topic () with
-       | Ok ch ->
+      (* Check Discord for an existing channel before creating *)
+      let existing =
+        match Discord_rest.get_guild_channels rest ~guild_id () with
+        | Ok channels ->
+          List.find_opt (fun (ch : Discord_types.channel) ->
+            ch.parent_id = Some cat_id
+            && (match ch.name with
+                | Some n -> String.lowercase_ascii n = String.lowercase_ascii project.Project.name
+                | None -> false)
+          ) channels
+        | Error _ -> None
+      in
+      (match existing with
+       | Some ch ->
          t.channels <- ChannelMap.add project.name ch.id t.channels;
-         Logs.info (fun m -> m "channel_manager: created channel for %s" project.name);
+         Logs.info (fun m -> m "channel_manager: found existing channel for %s" project.name);
          Some ch.id
-       | Error e ->
-         Logs.warn (fun m -> m "channel_manager: create failed for %s: %s" project.name e);
-         None)
+       | None ->
+         let topic = Printf.sprintf "Agent sessions for %s (%s)"
+           project.Project.name project.Project.path in
+         (match Discord_rest.create_channel rest ~guild_id
+                  ~name:project.name ~parent_id:cat_id ~topic () with
+          | Ok ch ->
+            t.channels <- ChannelMap.add project.name ch.id t.channels;
+            Logs.info (fun m -> m "channel_manager: created channel for %s" project.name);
+            Some ch.id
+          | Error e ->
+            Logs.warn (fun m -> m "channel_manager: create failed for %s: %s" project.name e);
+            None))
     | None -> None
 
 (** Move a project's channel to position 0 (top of category). *)
