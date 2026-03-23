@@ -100,8 +100,28 @@ let deduplicate projects =
     match p.remote_url with
     | None -> no_remote := p :: !no_remote
     | Some url ->
-      (* Normalize URL for comparison *)
-      let key = String.lowercase_ascii url in
+      (* Normalize URL: strip .git, convert SSH to common format *)
+      let norm = String.lowercase_ascii url in
+      let norm = if String.length norm > 4 &&
+        String.sub norm (String.length norm - 4) 4 = ".git"
+        then String.sub norm 0 (String.length norm - 4) else norm in
+      let key =
+        (* git@github.com:user/repo -> github.com/user/repo *)
+        match String.split_on_char ':' norm with
+        | [host; path] when String.length host > 0 && host.[0] <> '/' ->
+          let host = match String.split_on_char '@' host with
+            | [_; h] -> h | _ -> host in
+          host ^ "/" ^ path
+        | _ ->
+          (* https://github.com/user/repo -> github.com/user/repo *)
+          let stripped = List.fold_left (fun s prefix ->
+            if String.length s > String.length prefix &&
+               String.sub s 0 (String.length prefix) = prefix
+            then String.sub s (String.length prefix) (String.length s - String.length prefix)
+            else s
+          ) norm ["https://"; "http://"] in
+          stripped
+      in
       match UrlMap.find_opt key !by_url with
       | None -> by_url := UrlMap.add key p !by_url
       | Some existing ->
