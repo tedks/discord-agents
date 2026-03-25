@@ -238,6 +238,14 @@ let create_reaction t ~(channel_id : Discord_types.channel_id)
   | Ok _ -> Ok ()
   | Error e -> Error e
 
+(** Get a single channel by ID (works for threads too — returns parent_id). *)
+let get_channel t ~(channel_id : Discord_types.channel_id) () =
+  match request t ~meth:`GET ~path:(Printf.sprintf "/channels/%s" channel_id) () with
+  | Ok json ->
+    (try Ok (channel_of_yojson json)
+     with exn -> Error (Printf.sprintf "get_channel: parse error: %s" (Printexc.to_string exn)))
+  | Error e -> Error e
+
 (** Get the gateway URL for WebSocket connection. *)
 let get_gateway t =
   match request t ~meth:`GET ~path:"/gateway/bot" () with

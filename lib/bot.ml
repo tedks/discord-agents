@@ -305,6 +305,23 @@ let handle_command t msg cmd =
     ])
   | Command.Unknown _ -> ()
 
+(** Resolve the channel name and type for context injection. *)
+let resolve_channel_context t ~(channel_id : Discord_types.channel_id) ~(session : Session_store.session) =
+  let is_control = match t.config.control_channel_id with
+    | Some ctl_id -> channel_id = ctl_id | None -> false in
+  if is_control then ("control", "control-channel")
+  else
+    (* Check if this is a project channel (not a thread) *)
+    match Channel_manager.project_for_channel t.channels ~channel_id with
+    | Some _ -> (session.project_name, "project-channel")
+    | None ->
+      (* It's a thread — try to get its name *)
+      match Discord_rest.get_channel t.rest ~channel_id () with
+      | Ok ch ->
+        let name = Option.value ~default:"unknown" ch.Discord_types.name in
+        (name, "thread")
+      | Error _ -> (session.project_name, "thread")
+
 (** Handle a message in a session thread. *)
 let handle_thread_message t msg =
   match Session_store.find_opt t.sessions ~thread_id:msg.Discord_types.channel_id with
@@ -322,8 +339,12 @@ let handle_thread_message t msg =
             ~message_id:msg.id ~emoji:"\xF0\x9F\x91\x80" ());
           Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
             ~project_name:session.project_name t.channels;
+          let author_name = msg.author.username in
+          let (channel_name, channel_type) =
+            resolve_channel_context t ~channel_id ~session in
           match Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
-                  ~session ~channel_id ~prompt:msg.content () with
+                  ~session ~channel_id ~prompt:msg.content
+                  ~author_name ~channel_name ~channel_type () with
           | Ok () ->
             Session_store.increment_message_count t.sessions session
           | Error _ -> ()))
@@ -368,7 +389,34 @@ let handle_message t (msg : Discord_types.message) =
            ~project_name:p.name ~working_dir:wd ~system_prompt:None;
          handle_thread_message t msg
        | None -> handle_thread_message t msg)
-    | None -> handle_thread_message t msg
+    | None ->
+      (* Check if this is a thread under a project channel *)
+      (match Session_store.find_opt t.sessions ~thread_id:msg.channel_id with
+       | Some _ -> handle_thread_message t msg
+       | None ->
+         (* Look up the channel to find its parent *)
+         (match Discord_rest.get_channel t.rest ~channel_id:msg.channel_id () with
+          | Ok ch ->
+            let parent_project = match ch.Discord_types.parent_id with
+              | Some pid -> Channel_manager.project_for_channel t.channels ~channel_id:pid
+              | None -> None
+            in
+            (match parent_project with
+             | Some proj_name ->
+               let proj = List.find_opt (fun (p : Project.t) ->
+                 p.name = proj_name) t.projects in
+               (match proj with
+                | Some p ->
+                  let wd = match working_dir_of_project p with
+                    | Ok d -> d | Error _ -> p.path in
+                  ensure_channel_session t ~channel_id:msg.channel_id
+                    ~project_name:p.name ~working_dir:wd ~system_prompt:None;
+                  handle_thread_message t msg
+                | None -> handle_thread_message t msg)
+             | None -> handle_thread_message t msg)
+          | Error e ->
+            Logs.debug (fun m -> m "bot: channel lookup failed: %s" e);
+            handle_thread_message t msg))
   end
 
 let create ~sw ~(env : Eio_unix.Stdenv.base) config =

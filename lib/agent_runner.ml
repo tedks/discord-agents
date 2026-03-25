@@ -34,10 +34,26 @@ let format_tool_status (info : Agent_process.tool_info) =
   else
     Printf.sprintf "%s %s `%s`..." emoji verb info.tool_summary
 
+(** Build a context header to prepend to the prompt so the agent knows
+    where the message came from. *)
+let build_context_header ~(session : Session_store.session) ~author_name
+    ~channel_name ~channel_type =
+  let lines = [
+    Printf.sprintf "[Discord context: project=%s, channel=%s (%s), from=%s]"
+      session.project_name
+      channel_name channel_type author_name;
+  ] in
+  String.concat "\n" lines ^ "\n\n"
+
 (** Run an agent and stream its output to a Discord channel.
     Handles message creation/editing, typing indicators, and splitting.
     Returns Ok () on success, Error msg on failure. *)
-let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id) ~prompt () =
+let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
+    ~prompt ~author_name ~channel_name ~channel_type () =
+  let context_prompt =
+    build_context_header ~session ~author_name ~channel_name ~channel_type
+    ^ prompt
+  in
   (* Send typing indicator *)
   ignore (Discord_rest.send_typing rest ~channel_id ());
   Logs.info (fun m -> m "agent_runner: running %s for %s: %s"
@@ -167,7 +183,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id) ~prompt
           ~session_id:session.session_id
           ~message_count:session.message_count
           ?system_prompt:session.system_prompt
-          ~prompt ~on_event () with
+          ~prompt:context_prompt ~on_event () with
   | Ok () ->
     flush_to_discord ();
     if Buffer.length result_buf = 0 then
