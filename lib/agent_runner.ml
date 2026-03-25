@@ -34,12 +34,29 @@ let format_tool_status (info : Agent_process.tool_info) =
   else
     Printf.sprintf "%s %s `%s`..." emoji verb info.tool_summary
 
+(** Sanitize a metadata value for safe embedding in the context header.
+    Removes newlines, control characters, and brackets to prevent
+    prompt injection via user-controlled fields like thread names. *)
+let sanitize_context_value s =
+  let max_len = 100 in
+  let s = if String.length s > max_len then String.sub s 0 max_len else s in
+  String.init (String.length s) (fun i ->
+    match s.[i] with
+    | '\n' | '\r' | '\t' -> ' '
+    | '[' | ']' -> '_'
+    | c when Char.code c < 32 -> ' '
+    | c -> c)
+
 (** Build a context header to prepend to the prompt so the agent knows
-    where the message came from. *)
+    where the message came from. Values are sanitized to prevent injection
+    via user-controlled fields (e.g. thread names). *)
 let build_context_header ~(session : Session_store.session) ~author_name
     ~channel_name ~channel_type =
   Printf.sprintf "[Discord context: project=%s, channel=%s (%s), from=%s]\n\n"
-    session.project_name channel_name channel_type author_name
+    (sanitize_context_value session.project_name)
+    (sanitize_context_value channel_name)
+    channel_type
+    (sanitize_context_value author_name)
 
 (** Run an agent and stream its output to a Discord channel.
     Handles message creation/editing, typing indicators, and splitting.

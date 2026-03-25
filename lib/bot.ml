@@ -426,8 +426,11 @@ let handle_message t (msg : Discord_types.message) =
                 | None -> handle_thread_message t msg ())
              | None -> handle_thread_message t msg ())
           | Error e ->
-            Logs.debug (fun m -> m "bot: channel lookup failed: %s" e);
-            handle_thread_message t msg ()))
+            Logs.warn (fun m -> m "bot: channel lookup failed for %s: %s"
+              msg.channel_id e);
+            ignore (Discord_rest.create_message t.rest
+              ~channel_id:msg.channel_id
+              ~content:"Could not set up a session for this thread (channel lookup failed). Try again or use `!start`." ())))
   end
 
 let create ~sw ~(env : Eio_unix.Stdenv.base) config =
