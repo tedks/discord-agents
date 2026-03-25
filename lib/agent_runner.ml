@@ -38,12 +38,8 @@ let format_tool_status (info : Agent_process.tool_info) =
     where the message came from. *)
 let build_context_header ~(session : Session_store.session) ~author_name
     ~channel_name ~channel_type =
-  let lines = [
-    Printf.sprintf "[Discord context: project=%s, channel=%s (%s), from=%s]"
-      session.project_name
-      channel_name channel_type author_name;
-  ] in
-  String.concat "\n" lines ^ "\n\n"
+  Printf.sprintf "[Discord context: project=%s, channel=%s (%s), from=%s]\n\n"
+    session.project_name channel_name channel_type author_name
 
 (** Run an agent and stream its output to a Discord channel.
     Handles message creation/editing, typing indicators, and splitting.
