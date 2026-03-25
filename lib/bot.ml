@@ -360,7 +360,8 @@ let handle_thread_message t msg ?channel_info () =
           | Error _ -> ()))
     end
 
-(** Ensure a session exists for a channel (control/project auto-sessions). *)
+(** Ensure a session exists for a channel (control channel only).
+    Project channels use auto-thread creation instead. *)
 let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prompt =
   match Session_store.find_opt t.sessions ~thread_id:channel_id with
   | Some _ -> ()
@@ -372,6 +373,49 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
     } in
     Session_store.add t.sessions ~thread_id:channel_id session;
     Logs.info (fun m -> m "bot: auto-created session for %s" project_name)
+
+(** Create a thread from a message in a project channel, set up a session
+    with a worktree, and return the thread's channel_id.
+    This is the core of "every message in a project channel starts a new session". *)
+let auto_create_thread t ~msg ~project =
+  let kind_str = "claude" in
+  let branch_name = Printf.sprintf "agent/%s-%s"
+    kind_str (String.sub (Resource.generate_uuid ()) 0 8) in
+  let working_dir, branch_info =
+    match Project.create_worktree project ~branch_name with
+    | Ok wt -> wt, Some branch_name
+    | Error e ->
+      Logs.warn (fun m -> m "bot: worktree failed: %s" e);
+      (match working_dir_of_project project with
+       | Ok wd -> wd, None | Error _ -> project.Project.path, None)
+  in
+  (* Create thread from the user's message *)
+  let thread_name = Printf.sprintf "%s — %s"
+    project.Project.name
+    (let content = msg.Discord_types.content in
+     if String.length content > 40
+     then String.sub content 0 40 ^ "..."
+     else content) in
+  match Discord_rest.create_thread t.rest
+          ~channel_id:msg.channel_id ~message_id:msg.id
+          ~name:thread_name () with
+  | Error e ->
+    Logs.warn (fun m -> m "bot: thread creation failed: %s" e);
+    None
+  | Ok thread_ch ->
+    let session : Session_store.session = {
+      project_name = project.name; working_dir;
+      agent_kind = Config.Claude;
+      session_id = Resource.generate_uuid ();
+      thread_id = thread_ch.Discord_types.id;
+      system_prompt = None; message_count = 0; processing = false;
+    } in
+    Session_store.add t.sessions ~thread_id:thread_ch.id session;
+    let branch_str = match branch_info with
+      | Some b -> Printf.sprintf " on `%s`" b | None -> "" in
+    Logs.info (fun m -> m "bot: auto-created thread for %s%s"
+      project.name branch_str);
+    Some (thread_ch.Discord_types.id, session)
 
 (** Route an incoming Discord message. *)
 let handle_message t (msg : Discord_types.message) =
@@ -391,14 +435,22 @@ let handle_message t (msg : Discord_types.message) =
       handle_thread_message t msg ()
     end else match project_for_channel with
     | Some proj_name ->
+      (* Message in a project channel — auto-create a thread for this conversation *)
       let proj = List.find_opt (fun (p : Project.t) -> p.name = proj_name) t.projects in
       (match proj with
        | Some p ->
-         let wd = match working_dir_of_project p with Ok d -> d | Error _ -> p.path in
-         ensure_channel_session t ~channel_id:msg.channel_id
-           ~project_name:p.name ~working_dir:wd ~system_prompt:None;
-         handle_thread_message t msg ()
-       | None -> handle_thread_message t msg ())
+         (match auto_create_thread t ~msg ~project:p with
+          | Some (thread_id, _session) ->
+            (* Route to the newly created thread *)
+            let thread_msg = { msg with Discord_types.channel_id = thread_id } in
+            handle_thread_message t thread_msg ()
+          | None ->
+            (* Fallback: respond in the channel directly *)
+            let wd = match working_dir_of_project p with Ok d -> d | Error _ -> p.path in
+            ensure_channel_session t ~channel_id:msg.channel_id
+              ~project_name:p.name ~working_dir:wd ~system_prompt:None;
+            handle_thread_message t msg ())
+       | None -> ())
     | None ->
       (* Check if this is a thread under a project channel *)
       (match Session_store.find_opt t.sessions ~thread_id:msg.channel_id with

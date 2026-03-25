@@ -58,6 +58,12 @@ let sanitize_for_inline_code s =
 let summarize_tool_input name input =
   let open Yojson.Safe.Util in
   let get key = input |> member key |> to_string_option in
+  let get_any key =
+    match input |> member key with
+    | `Null -> None
+    | v -> Some (Yojson.Safe.to_string v)
+    | exception _ -> None
+  in
   let basename s =
     match String.rindex_opt s '/' with
     | Some i -> String.sub s (i + 1) (String.length s - i - 1)
@@ -70,26 +76,50 @@ let summarize_tool_input name input =
   let clean n s = truncate n (sanitize_for_inline_code s) in
   let safe_basename p = sanitize_for_inline_code (basename p) in
   match name with
-  | "Read" | "Edit" | "Write" ->
-    (match get "file_path" with
-     | Some p -> safe_basename p | None -> "")
+  | "Read" ->
+    let path = match get "file_path" with Some p -> p | None -> "" in
+    let detail = match get_any "offset", get_any "limit" with
+      | Some o, Some l -> " (offset " ^ o ^ ", limit " ^ l ^ ")"
+      | _, Some l -> " (" ^ l ^ " lines)"
+      | _ -> "" in
+    clean 120 path ^ detail
+  | "Edit" ->
+    let path = match get "file_path" with Some p -> p | None -> "" in
+    let old_str = match get "old_string" with
+      | Some s -> " — replacing " ^ truncate 40 s | None -> "" in
+    clean 80 path ^ old_str
+  | "Write" ->
+    (match get "file_path" with Some p -> clean 120 p | None -> "")
   | "Bash" ->
     (match get "command" with
-     | Some c -> clean 60 c | None -> "")
+     | Some c -> clean 120 c | None -> "")
   | "Grep" ->
     (match get "pattern" with
      | Some pat ->
        let path = match get "path" with
          | Some p -> " in " ^ safe_basename p | None -> "" in
-       clean 40 pat ^ path
+       "/" ^ clean 60 pat ^ "/" ^ path
      | None -> "")
   | "Glob" ->
     (match get "pattern" with
-     | Some pat -> clean 60 pat | None -> "")
+     | Some pat -> clean 80 pat | None -> "")
   | "Agent" | "Task" ->
     (match get "description" with
-     | Some d -> clean 60 d | None -> "")
-  | _ -> ""
+     | Some d -> clean 80 d | None -> "")
+  | "Skill" ->
+    (match get "skill" with
+     | Some s -> clean 40 s | None -> "")
+  | "WebSearch" | "WebFetch" ->
+    (match get "query" with
+     | Some q -> clean 80 q
+     | None ->
+       match get "url" with Some u -> clean 80 u | None -> "")
+  | _ ->
+    (* For unknown tools, try to show something useful *)
+    let keys = Yojson.Safe.Util.keys input in
+    match keys with
+    | k :: _ -> (match get k with Some v -> clean 60 v | None -> "")
+    | [] -> ""
 
 (** Parse a stream-json line into a list of events.
     Returns a list because a single assistant message can contain

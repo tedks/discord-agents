@@ -26,13 +26,14 @@ let tool_display_info name =
   | "Skill" -> "\xE2\x9A\xA1", "Using skill"            (* ⚡ *)
   | _ -> "\xF0\x9F\x94\xA7", "Using " ^ name            (* 🔧 *)
 
-(** Format a tool use event as a compact status line. *)
+(** Format a tool use event as a descriptive status line.
+    Shows enough detail to understand what the agent is doing. *)
 let format_tool_status (info : Agent_process.tool_info) =
   let emoji, verb = tool_display_info info.tool_name in
   if info.tool_summary = "" then
-    Printf.sprintf "%s %s..." emoji verb
+    Printf.sprintf "%s **%s**..." emoji verb
   else
-    Printf.sprintf "%s %s `%s`..." emoji verb info.tool_summary
+    Printf.sprintf "%s **%s** `%s`" emoji verb info.tool_summary
 
 (** Sanitize a metadata value for safe embedding in the context header.
     Removes newlines, control characters, and brackets to prevent
