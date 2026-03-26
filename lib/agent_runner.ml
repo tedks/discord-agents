@@ -168,10 +168,14 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
   let on_event = function
     | Agent_process.Text_delta text ->
       (* Transitioning from tool status to text — clear tool state.
-         No need to flush: the last Tool_use event already flushed. *)
+         The tool status message visually breaks continuity, so any
+         code block reopening prefix left in the buffer from before
+         the tool use would render the new text as monospace. *)
       if !tool_status_lines <> [] then begin
         tool_status_lines := [];
-        tool_status_msg_id := None
+        tool_status_msg_id := None;
+        Buffer.clear current_msg_buf;
+        current_msg_id := None
       end;
       Buffer.add_string result_buf text;
       (* Split at 1800-char boundaries, reserving space for closing ```
