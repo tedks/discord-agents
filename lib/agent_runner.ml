@@ -83,10 +83,8 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
   let tool_status_msg_id = ref None in
   let last_typing = ref (Unix.gettimeofday ()) in
   let last_edit = ref (Unix.gettimeofday ()) in
-  let flush_to_discord () =
-    let text = Agent_process.reformat_tables (Buffer.contents current_msg_buf) in
-    if String.length text = 0 then ()
-    else match !current_msg_id with
+  let send_single_message text =
+    match !current_msg_id with
     | None ->
       (match Discord_rest.create_message rest ~channel_id ~content:text () with
        | Ok sent -> current_msg_id := Some sent.Discord_types.id
@@ -95,6 +93,23 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       (match Discord_rest.edit_message rest ~channel_id ~message_id:mid ~content:text () with
        | Ok _ -> ()
        | Error e -> Logs.warn (fun m -> m "agent_runner: edit error: %s" e))
+  in
+  let flush_to_discord () =
+    let text = Agent_process.reformat_tables (Buffer.contents current_msg_buf) in
+    if String.length text = 0 then ()
+    else if String.length text <= Agent_process.discord_max_len then
+      send_single_message text
+    else
+      (* Table wrapping expanded text beyond Discord's limit — split it.
+         First chunk updates the existing message; overflow creates new ones. *)
+      let chunks = Agent_process.split_message text in
+      List.iteri (fun i chunk ->
+        if i = 0 then send_single_message chunk
+        else begin
+          current_msg_id := None;
+          send_single_message chunk
+        end
+      ) chunks
   in
   let start_new_message () =
     (* Before flushing, check if buffer ends inside a code block.

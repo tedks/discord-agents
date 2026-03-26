@@ -99,6 +99,68 @@ let reformat_tables text =
     add_line "```";
   Buffer.contents buf
 
+(** Discord's maximum message length. *)
+let discord_max_len = 2000
+
+(** Default split threshold — leaves room for code block fences added
+    during splitting (closing "\n```" = 4 chars, opening "```lang\n" ≤ 24 chars). *)
+let default_split_max = 1900
+
+(** Split text into chunks for Discord's 2000-char limit.
+    Splits at paragraph breaks > newlines > spaces.
+    Handles code blocks by closing/reopening ``` with language hints
+    preserved (e.g. ```ocaml gets reopened as ```ocaml). *)
+let split_message ?(max_len=default_split_max) text =
+  let len = String.length text in
+  if len <= max_len then [text]
+  else
+    let find_split_point pos limit =
+      let try_find sep =
+        let sep_len = String.length sep in
+        let best = ref None in
+        let i = ref pos in
+        while !i + sep_len <= limit do
+          if String.sub text !i sep_len = sep then best := Some !i;
+          incr i
+        done;
+        !best
+      in
+      match try_find "\n\n" with
+      | Some p -> p + 2
+      | None ->
+        match try_find "\n" with
+        | Some p -> p + 1
+        | None ->
+          match try_find " " with
+          | Some p -> p + 1
+          | None -> limit
+    in
+    (* code_state: None = not in code block, Some lang = in code block.
+       lang may be "" for bare ``` fences. *)
+    let rec split pos code_state acc =
+      if pos >= len then List.rev acc
+      else
+        let remaining = len - pos in
+        let prefix = match code_state with
+          | None -> ""
+          | Some lang -> "```" ^ lang ^ "\n"
+        in
+        (* Reserve space for both the prefix and a potential closing "\n```" (4 chars) *)
+        let closing_reserve = 4 in
+        let effective_max = max_len - String.length prefix - closing_reserve in
+        if remaining <= effective_max then
+          List.rev ((prefix ^ String.sub text pos remaining) :: acc)
+        else
+          let split_at = find_split_point pos (pos + effective_max) in
+          let raw_chunk = String.sub text pos (split_at - pos) in
+          let chunk = prefix ^ raw_chunk in
+          let (ends_in_code, lang) = scan_fences chunk in
+          let chunk = if ends_in_code then chunk ^ "\n```" else chunk in
+          let next_state = if ends_in_code then Some lang else None in
+          split split_at next_state (chunk :: acc)
+    in
+    split 0 None []
+
 (** Sanitize a string for use inside Discord inline backticks.
     Replaces backticks with single quotes and newlines with spaces. *)
 let sanitize_for_inline_code s =
