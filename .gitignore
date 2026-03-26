@@ -7,3 +7,4 @@ _build/
 result
 result-*
 .direnv/
+.discord-attachments/

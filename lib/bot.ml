@@ -299,6 +299,7 @@ let handle_thread_message t msg ?channel_info () =
             resolve_channel_context t ~channel_id ~session ?channel_info () in
           match Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
                   ~session ~channel_id ~prompt:msg.content
+                  ~attachments:msg.attachments
                   ~author_name ~channel_name ~channel_type () with
           | Ok () ->
             Session_store.increment_message_count t.sessions session
