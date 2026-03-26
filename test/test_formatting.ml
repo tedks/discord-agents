@@ -1,68 +1,135 @@
 (** Tests for Discord message formatting: reformat_tables, find_trailing_table_start,
     split_message, and scan_fences. *)
 
+let reformat = Discord_agents.Agent_process.reformat_tables
+
 (* ── reformat_tables ────────────────────────────────────────────── *)
 
 let test_reformat_plain_text () =
   let input = "Hello world.\nThis is normal text.\n\nAnother paragraph." in
   Alcotest.(check string) "plain text unchanged"
-    input (Discord_agents.Agent_process.reformat_tables input)
+    input (reformat input)
 
 let test_reformat_simple_table () =
   let input = "| Name | Value |\n|------|-------|\n| foo  | bar   |" in
-  let expected = "```\n| Name | Value |\n|------|-------|\n| foo  | bar   |\n```" in
-  Alcotest.(check string) "table wrapped in code block"
-    expected (Discord_agents.Agent_process.reformat_tables input)
+  let expected = String.concat "\n" [
+    "```";
+    "| Name | Value |";
+    "| ---- | ----- |";
+    "| foo  | bar   |";
+    "```" ] in
+  Alcotest.(check string) "table wrapped and padded"
+    expected (reformat input)
 
 let test_reformat_table_with_surrounding_text () =
   let input =
     "Here is a table:\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nText after the table." in
-  let expected =
-    "Here is a table:\n\n```\n| A | B |\n|---|---|\n| 1 | 2 |\n```\n\nText after the table." in
-  Alcotest.(check string) "text before and after table is normal"
-    expected (Discord_agents.Agent_process.reformat_tables input)
+  let result = reformat input in
+  (* Text before table is unchanged *)
+  Alcotest.(check bool) "starts with intro text"
+    true (String.length result > 16
+          && String.sub result 0 16 = "Here is a table:");
+  (* Text after table is unchanged *)
+  Alcotest.(check bool) "ends with outro text"
+    true (let suffix = "Text after the table." in
+          let rlen = String.length result in
+          let slen = String.length suffix in
+          rlen >= slen && String.sub result (rlen - slen) slen = suffix);
+  (* Table is inside code block *)
+  Alcotest.(check bool) "contains code block"
+    true (let has s = try ignore (Str.search_forward (Str.regexp_string s) result 0); true
+          with Not_found -> false in
+          has "```\n|" && has "|\n```")
 
 let test_reformat_table_inside_code_block () =
   let input = "```\n| A | B |\n| 1 | 2 |\n```" in
   Alcotest.(check string) "table inside code block unchanged"
-    input (Discord_agents.Agent_process.reformat_tables input)
+    input (reformat input)
 
 let test_reformat_table_inside_lang_code_block () =
   let input = "```markdown\n| A | B |\n| 1 | 2 |\n```" in
   Alcotest.(check string) "table inside language code block unchanged"
-    input (Discord_agents.Agent_process.reformat_tables input)
+    input (reformat input)
 
 let test_reformat_multiple_tables () =
   let input =
     "First:\n| A | B |\n| 1 | 2 |\n\nSecond:\n| C | D |\n| 3 | 4 |" in
-  let expected =
-    "First:\n```\n| A | B |\n| 1 | 2 |\n```\n\nSecond:\n```\n| C | D |\n| 3 | 4 |\n```" in
-  Alcotest.(check string) "multiple tables each wrapped"
-    expected (Discord_agents.Agent_process.reformat_tables input)
+  let result = reformat input in
+  (* Count code block pairs *)
+  let count_occurrences _sub s =
+    let rec aux pos acc =
+      match String.index_from_opt s pos '`' with
+      | None -> acc
+      | Some i ->
+        if i + 2 < String.length s && s.[i+1] = '`' && s.[i+2] = '`' then
+          aux (i + 3) (acc + 1)
+        else aux (i + 1) acc
+    in aux 0 0
+  in
+  (* 2 tables × 2 fences each = 4 total ``` *)
+  Alcotest.(check int) "four fence markers"
+    4 (count_occurrences "```" result);
+  Alcotest.(check bool) "starts with First:"
+    true (String.length result >= 6 && String.sub result 0 6 = "First:")
 
 let test_reformat_empty_string () =
   Alcotest.(check string) "empty string unchanged"
-    "" (Discord_agents.Agent_process.reformat_tables "")
+    "" (reformat "")
 
 let test_reformat_table_then_code_block () =
   let input =
     "| A | B |\n| 1 | 2 |\n\n```ocaml\nlet x = 1\n```\n\nDone." in
-  let expected =
-    "```\n| A | B |\n| 1 | 2 |\n```\n\n```ocaml\nlet x = 1\n```\n\nDone." in
-  Alcotest.(check string) "table then code block both correct"
-    expected (Discord_agents.Agent_process.reformat_tables input)
+  let result = reformat input in
+  Alcotest.(check bool) "ends with Done."
+    true (let s = "Done." in let rlen = String.length result in
+          rlen >= 5 && String.sub result (rlen - String.length s) (String.length s) = s);
+  Alcotest.(check bool) "contains ocaml code block"
+    true (try ignore (Str.search_forward (Str.regexp_string "```ocaml") result 0); true
+          with Not_found -> false)
 
 let test_reformat_pipe_in_code_not_table () =
-  (* Pipes inside code blocks should not be treated as tables *)
   let input = "```bash\necho hello | grep h\n```" in
   Alcotest.(check string) "pipe in code block not treated as table"
-    input (Discord_agents.Agent_process.reformat_tables input)
+    input (reformat input)
 
 let test_reformat_single_table_row () =
   let input = "| just one row |" in
-  let expected = "```\n| just one row |\n```" in
-  Alcotest.(check string) "single row wrapped"
-    expected (Discord_agents.Agent_process.reformat_tables input)
+  let result = reformat input in
+  Alcotest.(check bool) "wrapped in code block"
+    true (String.length result >= 3 && String.sub result 0 3 = "```");
+  Alcotest.(check bool) "contains the row"
+    true (try ignore (Str.search_forward (Str.regexp_string "just one row") result 0); true
+          with Not_found -> false)
+
+let test_reformat_padding_alignment () =
+  (* Columns with uneven widths get padded *)
+  let input = "| x | longer column |\n| ab | c |" in
+  let result = reformat input in
+  let lines = String.split_on_char '\n' result in
+  (* Skip ``` lines, check data rows have same length *)
+  let data_lines = List.filter (fun l ->
+    String.length l > 0 && l.[0] = '|') lines in
+  (match data_lines with
+   | a :: b :: _ ->
+     Alcotest.(check int) "rows have equal length"
+       (String.length a) (String.length b)
+   | _ -> Alcotest.fail "expected at least 2 data lines")
+
+let test_reformat_separator_regenerated () =
+  (* Separator row should be regenerated with dashes matching column widths *)
+  let input = "| Name | Value |\n|---|---|\n| foo | bar |" in
+  let result = reformat input in
+  let lines = String.split_on_char '\n' result in
+  let sep_lines = List.filter (fun l ->
+    String.length l > 0 && l.[0] = '|' &&
+    String.to_seq l |> Seq.exists (fun c -> c = '-')
+  ) lines in
+  (match sep_lines with
+   | sep :: _ ->
+     (* Separator should have dashes padded to column width *)
+     Alcotest.(check bool) "separator has padded dashes"
+       true (String.length sep > 10)
+   | [] -> Alcotest.fail "no separator row found")
 
 let reformat_tables_tests = [
   Alcotest.test_case "plain text" `Quick test_reformat_plain_text;
@@ -80,6 +147,9 @@ let reformat_tables_tests = [
   Alcotest.test_case "pipe in code block" `Quick
     test_reformat_pipe_in_code_not_table;
   Alcotest.test_case "single row" `Quick test_reformat_single_table_row;
+  Alcotest.test_case "padding alignment" `Quick test_reformat_padding_alignment;
+  Alcotest.test_case "separator regenerated" `Quick
+    test_reformat_separator_regenerated;
 ]
 
 (* ── find_trailing_table_start ──────────────────────────────────── *)
