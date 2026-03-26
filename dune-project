@@ -38,4 +38,5 @@
    (>= 1.0))
   (logs
    (>= 0.7))
-  fmt))
+  fmt
+  (alcotest :with-test)))

@@ -23,6 +23,7 @@
           fmt
           uri
           mirage-crypto-rng
+          alcotest
         ];
       in
       {

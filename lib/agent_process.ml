@@ -44,6 +44,163 @@ let scan_fences text =
   done;
   (!in_code, !lang)
 
+(** Test whether a line looks like a markdown table row.
+    A table row starts with optional whitespace then '|'. *)
+let is_table_line line =
+  let s = String.trim line in
+  String.length s > 0 && s.[0] = '|'
+
+(** Reformat markdown tables in text for Discord display.
+    Discord doesn't render markdown tables, so we wrap them in code blocks
+    to preserve the pipe-aligned layout. Skips tables already inside
+    code blocks (``` fences). *)
+let reformat_tables text =
+  let lines = String.split_on_char '\n' text in
+  let buf = Buffer.create (String.length text) in
+  let in_code = ref false in
+  let in_table = ref false in
+  let first = ref true in
+  let add_line line =
+    if not !first then Buffer.add_char buf '\n';
+    first := false;
+    Buffer.add_string buf line
+  in
+  List.iter (fun line ->
+    (* Track code block state *)
+    let trimmed = String.trim line in
+    if String.length trimmed >= 3
+       && trimmed.[0] = '`' && trimmed.[1] = '`' && trimmed.[2] = '`' then
+      in_code := not !in_code;
+    if !in_code then begin
+      (* Inside a code block — pass through, close any open table *)
+      if !in_table then begin
+        add_line "```";
+        in_table := false
+      end;
+      add_line line
+    end else if is_table_line line then begin
+      (* Table row outside a code block — wrap in code block *)
+      if not !in_table then begin
+        add_line "```";
+        in_table := true
+      end;
+      add_line line
+    end else begin
+      (* Non-table line outside code block *)
+      if !in_table then begin
+        add_line "```";
+        in_table := false
+      end;
+      add_line line
+    end
+  ) lines;
+  (* Close unclosed table block *)
+  if !in_table then
+    add_line "```";
+  Buffer.contents buf
+
+(** Find the byte offset where a trailing table block begins.
+    Used by the streaming splitter to avoid breaking tables across messages.
+    Returns [Some offset] if the text ends with table lines (outside code
+    blocks) and there is non-table content before them.
+    Returns [None] if there's no trailing table or the entire text is
+    table content (nothing to split off). *)
+let find_trailing_table_start text =
+  let lines = String.split_on_char '\n' text in
+  let arr = Array.of_list lines in
+  let n = Array.length arr in
+  if n = 0 then None
+  else
+    (* Forward pass: compute byte offsets and table status per line,
+       tracking code block state so | inside ``` is not a table line. *)
+    let in_code = ref false in
+    let offsets = Array.make n 0 in
+    let is_tbl = Array.make n false in
+    let pos = ref 0 in
+    Array.iteri (fun i line ->
+      offsets.(i) <- !pos;
+      let trimmed = String.trim line in
+      if String.length trimmed >= 3
+         && trimmed.[0] = '`' && trimmed.[1] = '`' && trimmed.[2] = '`' then
+        in_code := not !in_code;
+      is_tbl.(i) <- (not !in_code && is_table_line line);
+      pos := !pos + String.length line + 1
+    ) arr;
+    (* Check if last non-empty line is a table line *)
+    let last = ref (n - 1) in
+    while !last >= 0 && arr.(!last) = "" do decr last done;
+    if !last < 0 || not is_tbl.(!last) then None
+    else
+      (* Walk backwards past table lines and empty lines within the block *)
+      let i = ref !last in
+      while !i > 0 && (is_tbl.(!i - 1) || arr.(!i - 1) = "") do decr i done;
+      (* Skip leading empty lines in the table block *)
+      while !i < n && arr.(!i) = "" do incr i done;
+      if !i = 0 then None  (* entire text is table — can't split *)
+      else Some offsets.(!i)
+
+(** Discord's maximum message length. *)
+let discord_max_len = 2000
+
+(** Default split threshold — leaves room for code block fences added
+    during splitting (closing "\n```" = 4 chars, opening "```lang\n" ≤ 24 chars). *)
+let default_split_max = 1900
+
+(** Split text into chunks for Discord's 2000-char limit.
+    Splits at paragraph breaks > newlines > spaces.
+    Handles code blocks by closing/reopening ``` with language hints
+    preserved (e.g. ```ocaml gets reopened as ```ocaml). *)
+let split_message ?(max_len=default_split_max) text =
+  let len = String.length text in
+  if len <= max_len then [text]
+  else
+    let find_split_point pos limit =
+      let try_find sep =
+        let sep_len = String.length sep in
+        let best = ref None in
+        let i = ref pos in
+        while !i + sep_len <= limit do
+          if String.sub text !i sep_len = sep then best := Some !i;
+          incr i
+        done;
+        !best
+      in
+      match try_find "\n\n" with
+      | Some p -> p + 2
+      | None ->
+        match try_find "\n" with
+        | Some p -> p + 1
+        | None ->
+          match try_find " " with
+          | Some p -> p + 1
+          | None -> limit
+    in
+    (* code_state: None = not in code block, Some lang = in code block.
+       lang may be "" for bare ``` fences. *)
+    let rec split pos code_state acc =
+      if pos >= len then List.rev acc
+      else
+        let remaining = len - pos in
+        let prefix = match code_state with
+          | None -> ""
+          | Some lang -> "```" ^ lang ^ "\n"
+        in
+        (* Reserve space for both the prefix and a potential closing "\n```" (4 chars) *)
+        let closing_reserve = 4 in
+        let effective_max = max_len - String.length prefix - closing_reserve in
+        if remaining <= effective_max then
+          List.rev ((prefix ^ String.sub text pos remaining) :: acc)
+        else
+          let split_at = find_split_point pos (pos + effective_max) in
+          let raw_chunk = String.sub text pos (split_at - pos) in
+          let chunk = prefix ^ raw_chunk in
+          let (ends_in_code, lang) = scan_fences chunk in
+          let chunk = if ends_in_code then chunk ^ "\n```" else chunk in
+          let next_state = if ends_in_code then Some lang else None in
+          split split_at next_state (chunk :: acc)
+    in
+    split 0 None []
+
 (** Sanitize a string for use inside Discord inline backticks.
     Replaces backticks with single quotes and newlines with spaces. *)
 let sanitize_for_inline_code s =

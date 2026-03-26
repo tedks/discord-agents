@@ -83,10 +83,8 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
   let tool_status_msg_id = ref None in
   let last_typing = ref (Unix.gettimeofday ()) in
   let last_edit = ref (Unix.gettimeofday ()) in
-  let flush_to_discord () =
-    let text = Buffer.contents current_msg_buf in
-    if String.length text = 0 then ()
-    else match !current_msg_id with
+  let send_single_message text =
+    match !current_msg_id with
     | None ->
       (match Discord_rest.create_message rest ~channel_id ~content:text () with
        | Ok sent -> current_msg_id := Some sent.Discord_types.id
@@ -96,10 +94,25 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
        | Ok _ -> ()
        | Error e -> Logs.warn (fun m -> m "agent_runner: edit error: %s" e))
   in
-  let start_new_message () =
-    (* Before flushing, check if buffer ends inside a code block.
-       If so, close it in this message so Discord renders it properly,
-       and remember to reopen it in the next message. *)
+  let flush_to_discord () =
+    let text = Agent_process.reformat_tables (Buffer.contents current_msg_buf) in
+    if String.length text = 0 then ()
+    else if String.length text <= Agent_process.discord_max_len then
+      send_single_message text
+    else
+      (* Table wrapping expanded text beyond Discord's limit — split it.
+         First chunk updates the existing message; overflow creates new ones. *)
+      let chunks = Agent_process.split_message text in
+      List.iteri (fun i chunk ->
+        if i = 0 then send_single_message chunk
+        else begin
+          current_msg_id := None;
+          send_single_message chunk
+        end
+      ) chunks
+  in
+  (* Flush the buffer as a single message, handling code block continuity. *)
+  let flush_and_reset () =
     let buf_text = Buffer.contents current_msg_buf in
     let (in_code, lang) = Agent_process.scan_fences buf_text in
     if in_code then
@@ -107,9 +120,33 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
     flush_to_discord ();
     Buffer.clear current_msg_buf;
     current_msg_id := None;
-    (* Reopen the code block in the next message *)
     if in_code then
       Buffer.add_string current_msg_buf ("```" ^ lang ^ "\n")
+  in
+  let start_new_message () =
+    let buf_text = Buffer.contents current_msg_buf in
+    (* Try to keep tables together: if the buffer ends mid-table,
+       split before the table so it starts fresh in the next message. *)
+    match Agent_process.find_trailing_table_start buf_text with
+    | Some pos when pos > 0 ->
+      let before = String.sub buf_text 0 pos in
+      let after = String.sub buf_text pos (String.length buf_text - pos) in
+      (* Flush the pre-table content *)
+      Buffer.clear current_msg_buf;
+      Buffer.add_string current_msg_buf before;
+      let (in_code, lang) = Agent_process.scan_fences before in
+      if in_code then
+        Buffer.add_string current_msg_buf "\n```";
+      flush_to_discord ();
+      (* Start new message with the table content *)
+      Buffer.clear current_msg_buf;
+      current_msg_id := None;
+      if in_code then
+        Buffer.add_string current_msg_buf ("```" ^ lang ^ "\n");
+      Buffer.add_string current_msg_buf after
+    | _ ->
+      (* No table boundary (or entire buffer is a table) — split normally *)
+      flush_and_reset ()
   in
   (* Flush accumulated tool status lines to a single Discord message.
      Consecutive tool calls get batched into one message, edited in-place. *)
@@ -131,10 +168,14 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
   let on_event = function
     | Agent_process.Text_delta text ->
       (* Transitioning from tool status to text — clear tool state.
-         No need to flush: the last Tool_use event already flushed. *)
+         The tool status message visually breaks continuity, so any
+         code block reopening prefix left in the buffer from before
+         the tool use would render the new text as monospace. *)
       if !tool_status_lines <> [] then begin
         tool_status_lines := [];
-        tool_status_msg_id := None
+        tool_status_msg_id := None;
+        Buffer.clear current_msg_buf;
+        current_msg_id := None
       end;
       Buffer.add_string result_buf text;
       (* Split at 1800-char boundaries, reserving space for closing ```
