@@ -246,6 +246,24 @@ let get_channel t ~(channel_id : Discord_types.channel_id) () =
      with exn -> Error (Printf.sprintf "get_channel: parse error: %s" (Printexc.to_string exn)))
   | Error e -> Error e
 
+(** Download a file from an arbitrary URL (e.g. Discord CDN).
+    Returns the raw bytes on success. *)
+let download_url t ~url () =
+  let uri = Uri.of_string url in
+  let headers = Http.Header.of_list [
+    ("User-Agent", "DiscordBot (discord-agents/0.1.0, OCaml)");
+  ] in
+  try
+    let (resp, body) =
+      Cohttp_eio.Client.call t.client ~sw:t.sw ~headers `GET uri in
+    let status = Http.Response.status resp in
+    let code = Http.Status.to_int status in
+    let body_str = read_body body in
+    if code >= 200 && code < 300 then Ok body_str
+    else Error (Printf.sprintf "download_url %s: HTTP %d" url code)
+  with exn ->
+    Error (Printf.sprintf "download_url %s: %s" url (Printexc.to_string exn))
+
 (** Get the gateway URL for WebSocket connection. *)
 let get_gateway t =
   match request t ~meth:`GET ~path:"/gateway/bot" () with
