@@ -311,6 +311,10 @@ TOOLS = [
                     "description": "Agent type: claude, codex, or gemini",
                     "default": "claude",
                     "enum": ["claude", "codex", "gemini"]
+                },
+                "thread_name": {
+                    "type": "string",
+                    "description": "Short descriptive name for the thread (max 100 chars). If omitted, uses a default name."
                 }
             },
             "required": ["project"]
@@ -456,7 +460,9 @@ def handle_tool_call(name, arguments, config, projects):
         if not channel_id:
             return f"No channel found for thread creation. Start the session manually."
 
-        thread_name = f"{agent} / {proj['name']}"
+        thread_name = arguments.get("thread_name", "").strip()
+        if not thread_name or len(thread_name) > 100:
+            thread_name = f"{agent} / {proj['name']}"
         result = discord_request("POST", f"/channels/{channel_id}/threads", token, {
             "name": thread_name,
             "type": 11,  # PUBLIC_THREAD

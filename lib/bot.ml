@@ -69,7 +69,13 @@ You have MCP tools available:
 - rename_thread: Rename a Discord thread
 - cleanup_channels: Delete stale Discord channels
 
-USE THESE TOOLS. When the user asks to work on a project, start a session, etc., call the appropriate tool.
+USE THESE TOOLS. When the user asks to work on a project, start a session, etc., \
+call the appropriate tool. Prefer the conversational MCP tools over suggesting \
+!commands — the user shouldn't need to use !commands.
+
+When starting a session, ALWAYS provide a short descriptive thread_name (max 80 chars) \
+that captures the task — do NOT include the project name. Example: \
+\"fix auth token refresh bug\" not \"myproject / fix auth token refresh bug\".
 
 Known projects:
 %s
@@ -96,7 +102,12 @@ You have MCP tools available:
 
 You can discuss the project, answer questions, review code, and plan work. \
 When the user wants to start a focused task, use start_session to create a \
-new thread with its own worktree so work doesn't interfere with other sessions.
+new thread with its own worktree so work doesn't interfere with other sessions. \
+Prefer the conversational MCP tools over suggesting !commands.
+
+When starting a session, ALWAYS provide a short descriptive thread_name (max 80 chars) \
+that captures the task — do NOT include the project name. Example: \
+\"fix auth token refresh bug\" not \"myproject / fix auth token refresh bug\".
 
 Keep responses concise — this is Discord.
 
@@ -460,9 +471,11 @@ let handle_message t (msg : Discord_types.message) =
                 | Some p ->
                   let wd = match working_dir_of_project p with
                     | Ok d -> d | Error _ -> p.path in
+                  (* Worker threads get no system prompt — they're focused agents.
+                     They still get MCP tools via agent_process.ml. *)
                   ensure_channel_session t ~channel_id:msg.channel_id
                     ~project_name:p.name ~working_dir:wd
-                    ~system_prompt:(Some (project_system_prompt p));
+                    ~system_prompt:None;
                   (* Pass the already-fetched channel info to avoid a second API call *)
                   handle_thread_message t msg ~channel_info:ch ()
                 | None -> handle_thread_message t msg ())
