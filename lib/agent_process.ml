@@ -99,6 +99,46 @@ let reformat_tables text =
     add_line "```";
   Buffer.contents buf
 
+(** Find the byte offset where a trailing table block begins.
+    Used by the streaming splitter to avoid breaking tables across messages.
+    Returns [Some offset] if the text ends with table lines (outside code
+    blocks) and there is non-table content before them.
+    Returns [None] if there's no trailing table or the entire text is
+    table content (nothing to split off). *)
+let find_trailing_table_start text =
+  let lines = String.split_on_char '\n' text in
+  let arr = Array.of_list lines in
+  let n = Array.length arr in
+  if n = 0 then None
+  else
+    (* Forward pass: compute byte offsets and table status per line,
+       tracking code block state so | inside ``` is not a table line. *)
+    let in_code = ref false in
+    let offsets = Array.make n 0 in
+    let is_tbl = Array.make n false in
+    let pos = ref 0 in
+    Array.iteri (fun i line ->
+      offsets.(i) <- !pos;
+      let trimmed = String.trim line in
+      if String.length trimmed >= 3
+         && trimmed.[0] = '`' && trimmed.[1] = '`' && trimmed.[2] = '`' then
+        in_code := not !in_code;
+      is_tbl.(i) <- (not !in_code && is_table_line line);
+      pos := !pos + String.length line + 1
+    ) arr;
+    (* Check if last non-empty line is a table line *)
+    let last = ref (n - 1) in
+    while !last >= 0 && arr.(!last) = "" do decr last done;
+    if !last < 0 || not is_tbl.(!last) then None
+    else
+      (* Walk backwards past table lines and empty lines within the block *)
+      let i = ref !last in
+      while !i > 0 && (is_tbl.(!i - 1) || arr.(!i - 1) = "") do decr i done;
+      (* Skip leading empty lines in the table block *)
+      while !i < n && arr.(!i) = "" do incr i done;
+      if !i = 0 then None  (* entire text is table — can't split *)
+      else Some offsets.(!i)
+
 (** Discord's maximum message length. *)
 let discord_max_len = 2000
 

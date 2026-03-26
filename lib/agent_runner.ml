@@ -111,10 +111,8 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
         end
       ) chunks
   in
-  let start_new_message () =
-    (* Before flushing, check if buffer ends inside a code block.
-       If so, close it in this message so Discord renders it properly,
-       and remember to reopen it in the next message. *)
+  (* Flush the buffer as a single message, handling code block continuity. *)
+  let flush_and_reset () =
     let buf_text = Buffer.contents current_msg_buf in
     let (in_code, lang) = Agent_process.scan_fences buf_text in
     if in_code then
@@ -122,9 +120,33 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
     flush_to_discord ();
     Buffer.clear current_msg_buf;
     current_msg_id := None;
-    (* Reopen the code block in the next message *)
     if in_code then
       Buffer.add_string current_msg_buf ("```" ^ lang ^ "\n")
+  in
+  let start_new_message () =
+    let buf_text = Buffer.contents current_msg_buf in
+    (* Try to keep tables together: if the buffer ends mid-table,
+       split before the table so it starts fresh in the next message. *)
+    match Agent_process.find_trailing_table_start buf_text with
+    | Some pos when pos > 0 ->
+      let before = String.sub buf_text 0 pos in
+      let after = String.sub buf_text pos (String.length buf_text - pos) in
+      (* Flush the pre-table content *)
+      Buffer.clear current_msg_buf;
+      Buffer.add_string current_msg_buf before;
+      let (in_code, lang) = Agent_process.scan_fences before in
+      if in_code then
+        Buffer.add_string current_msg_buf "\n```";
+      flush_to_discord ();
+      (* Start new message with the table content *)
+      Buffer.clear current_msg_buf;
+      current_msg_id := None;
+      if in_code then
+        Buffer.add_string current_msg_buf ("```" ^ lang ^ "\n");
+      Buffer.add_string current_msg_buf after
+    | _ ->
+      (* No table boundary (or entire buffer is a table) — split normally *)
+      flush_and_reset ()
   in
   (* Flush accumulated tool status lines to a single Discord message.
      Consecutive tool calls get batched into one message, edited in-place. *)
