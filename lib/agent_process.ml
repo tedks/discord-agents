@@ -44,6 +44,61 @@ let scan_fences text =
   done;
   (!in_code, !lang)
 
+(** Test whether a line looks like a markdown table row.
+    A table row starts with optional whitespace then '|'. *)
+let is_table_line line =
+  let s = String.trim line in
+  String.length s > 0 && s.[0] = '|'
+
+(** Reformat markdown tables in text for Discord display.
+    Discord doesn't render markdown tables, so we wrap them in code blocks
+    to preserve the pipe-aligned layout. Skips tables already inside
+    code blocks (``` fences). *)
+let reformat_tables text =
+  let lines = String.split_on_char '\n' text in
+  let buf = Buffer.create (String.length text) in
+  let in_code = ref false in
+  let in_table = ref false in
+  let first = ref true in
+  let add_line line =
+    if not !first then Buffer.add_char buf '\n';
+    first := false;
+    Buffer.add_string buf line
+  in
+  List.iter (fun line ->
+    (* Track code block state *)
+    let trimmed = String.trim line in
+    if String.length trimmed >= 3
+       && trimmed.[0] = '`' && trimmed.[1] = '`' && trimmed.[2] = '`' then
+      in_code := not !in_code;
+    if !in_code then begin
+      (* Inside a code block — pass through, close any open table *)
+      if !in_table then begin
+        add_line "```";
+        in_table := false
+      end;
+      add_line line
+    end else if is_table_line line then begin
+      (* Table row outside a code block — wrap in code block *)
+      if not !in_table then begin
+        add_line "```";
+        in_table := true
+      end;
+      add_line line
+    end else begin
+      (* Non-table line outside code block *)
+      if !in_table then begin
+        add_line "```";
+        in_table := false
+      end;
+      add_line line
+    end
+  ) lines;
+  (* Close unclosed table block *)
+  if !in_table then
+    add_line "```";
+  Buffer.contents buf
+
 (** Sanitize a string for use inside Discord inline backticks.
     Replaces backticks with single quotes and newlines with spaces. *)
 let sanitize_for_inline_code s =

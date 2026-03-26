@@ -132,6 +132,7 @@ let split_message ?(max_len=1900) text =
     split 0 None []
 
 let post_response rest ~channel_id text =
+  let text = Agent_process.reformat_tables text in
   List.iter (fun chunk ->
     match Discord_rest.create_message rest ~channel_id ~content:chunk () with
     | Ok _ -> ()

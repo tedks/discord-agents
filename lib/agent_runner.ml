@@ -84,7 +84,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
   let last_typing = ref (Unix.gettimeofday ()) in
   let last_edit = ref (Unix.gettimeofday ()) in
   let flush_to_discord () =
-    let text = Buffer.contents current_msg_buf in
+    let text = Agent_process.reformat_tables (Buffer.contents current_msg_buf) in
     if String.length text = 0 then ()
     else match !current_msg_id with
     | None ->
