@@ -369,6 +369,24 @@ TOOLS = [
         }
     },
     {
+        "name": "rename_thread",
+        "description": "Rename a Discord thread. Use from the control channel to rename any thread by ID, or specify the thread_id of the thread to rename.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "thread_id": {
+                    "type": "string",
+                    "description": "Discord thread ID (snowflake) to rename"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "New name for the thread (max 100 characters)"
+                }
+            },
+            "required": ["thread_id", "name"]
+        }
+    },
+    {
         "name": "cleanup_channels",
         "description": "Delete stale Discord channels that don't match any current project.",
         "inputSchema": {
@@ -548,6 +566,20 @@ def handle_tool_call(name, arguments, config, projects):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
         return "Build succeeded. New bot instance starting."
+
+    elif name == "rename_thread":
+        thread_id = arguments.get("thread_id", "")
+        new_name = arguments.get("name", "")
+        if not thread_id or not new_name:
+            return "Both thread_id and name are required."
+        if len(new_name) > 100:
+            new_name = new_name[:100]
+        result = discord_request("PATCH", f"/channels/{thread_id}", token, {
+            "name": new_name,
+        })
+        if "error" in result:
+            return f"Failed to rename thread: {result['error']}"
+        return f"Renamed thread <#{thread_id}> to **{new_name}**."
 
     elif name == "cleanup_channels":
         if not guild_id or not token:

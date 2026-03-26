@@ -238,6 +238,16 @@ let create_reaction t ~(channel_id : Discord_types.channel_id)
   | Ok _ -> Ok ()
   | Error e -> Error e
 
+(** Modify a channel/thread's properties (currently: name only). *)
+let modify_channel t ~(channel_id : Discord_types.channel_id) ~name () =
+  let body = `Assoc [("name", `String name)] in
+  match request t ~meth:`PATCH
+    ~path:(Printf.sprintf "/channels/%s" channel_id) ~body () with
+  | Ok json ->
+    (try Ok (channel_of_yojson json)
+     with exn -> Error (Printf.sprintf "modify_channel: parse error: %s" (Printexc.to_string exn)))
+  | Error e -> Error e
+
 (** Get a single channel by ID (works for threads too — returns parent_id). *)
 let get_channel t ~(channel_id : Discord_types.channel_id) () =
   match request t ~meth:`GET ~path:(Printf.sprintf "/channels/%s" channel_id) () with

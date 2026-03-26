@@ -51,6 +51,50 @@ let working_dir_of_project (p : Project.t) =
   else
     Ok p.path
 
+(** Generate a short thread name using Claude, then rename the thread.
+    Runs asynchronously — failures are logged but don't affect the session. *)
+let generate_thread_name ~sw ~env:_ rest ~thread_id ~project_name ~user_message =
+  Eio.Fiber.fork ~sw (fun () ->
+    let truncated_msg =
+      if String.length user_message > 200
+      then String.sub user_message 0 200
+      else user_message in
+    let prompt = Printf.sprintf
+      "Generate a very short thread name (max 80 chars, no quotes) for a Discord \
+       thread about the project \"%s\". The user's first message is:\n\n%s\n\n\
+       Reply with ONLY the thread name, nothing else."
+      project_name truncated_msg in
+    match Eio_unix.run_in_systhread (fun () ->
+      let open Unix in
+      let stdout_r, stdout_w = pipe ~cloexec:true () in
+      let stderr_r, stderr_w = pipe ~cloexec:true () in
+      let pid = create_process "claude"
+        [| "claude"; "-p"; "--max-turns"; "1"; prompt |]
+        stdin stdout_w stderr_w in
+      close stdout_w; close stderr_w;
+      let ic = in_channel_of_descr stdout_r in
+      let buf = Buffer.create 128 in
+      (try while true do Buffer.add_char buf (input_char ic) done
+       with End_of_file -> ());
+      close_in ic; close stderr_r;
+      let _, _ = waitpid [] pid in
+      Buffer.contents buf) with
+    | output ->
+      let name = String.trim output in
+      (* Discord thread names: 1-100 chars *)
+      if String.length name > 0 && String.length name <= 100 then begin
+        match Discord_rest.modify_channel rest ~channel_id:thread_id ~name () with
+        | Ok _ ->
+          Logs.info (fun m -> m "bot: renamed thread %s to \"%s\"" thread_id name)
+        | Error e ->
+          Logs.warn (fun m -> m "bot: thread rename failed: %s" e)
+      end else
+        Logs.warn (fun m -> m "bot: AI generated invalid thread name (%d chars): %s"
+          (String.length name) name)
+    | exception exn ->
+      Logs.warn (fun m -> m "bot: thread name generation failed: %s"
+        (Printexc.to_string exn)))
+
 (** System prompt for control channel Claude — knows about MCP tools. *)
 let control_system_prompt projects =
   let project_list = String.concat "\n" (List.mapi (fun i (p : Project.t) ->
@@ -66,6 +110,7 @@ You have MCP tools available:
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - resume_session: Resume an existing Claude session
 - restart_bot: Rebuild and restart the bot
+- rename_thread: Rename a Discord thread
 - cleanup_channels: Delete stale Discord channels
 
 USE THESE TOOLS. When the user asks to work on a project, start a session, etc., call the appropriate tool.
@@ -290,6 +335,14 @@ let handle_command t msg cmd =
       | `Restarting ->
         reply "Build succeeded. New instance starting.";
         Eio.Time.sleep (Eio.Stdenv.clock t.env) 30.0)
+  | Command.Rename_thread { thread_id; name } ->
+    let target_id = match thread_id with
+      | Some tid -> tid
+      | None -> channel_id  (* rename the current thread *)
+    in
+    (match Discord_rest.modify_channel t.rest ~channel_id:target_id ~name () with
+     | Ok _ -> reply (Printf.sprintf "Renamed to **%s**." name)
+     | Error e -> reply (Printf.sprintf "Rename failed: %s" e))
   | Command.Help ->
     reply (String.concat "\n" [
       "**Commands:**";
@@ -299,6 +352,7 @@ let handle_command t msg cmd =
       "`!start <project> [agent]` — start a session (defaults to claude)";
       "`!resume <session_id>` — resume a Claude session";
       "`!stop <thread_id>` — stop a session";
+      "`!rename [thread_id] <name>` — rename a thread";
       "`!cleanup` — delete stale channels";
       "`!restart` — rebuild and restart";
       "`!help` — this message";
@@ -415,6 +469,10 @@ let auto_create_thread t ~msg ~project =
       | Some b -> Printf.sprintf " on `%s`" b | None -> "" in
     Logs.info (fun m -> m "bot: auto-created thread for %s%s"
       project.name branch_str);
+    (* Fire-and-forget AI thread naming *)
+    generate_thread_name ~sw:t.sw ~env:t.env t.rest
+      ~thread_id:thread_ch.id ~project_name:project.name
+      ~user_message:msg.Discord_types.content;
     Some (thread_ch.Discord_types.id, session)
 
 (** Route an incoming Discord message. *)
