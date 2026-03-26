@@ -50,53 +50,106 @@ let is_table_line line =
   let s = String.trim line in
   String.length s > 0 && s.[0] = '|'
 
+(** Parse a table row into cells by splitting on '|'.
+    Strips the leading and trailing empty cells produced by the outer pipes. *)
+let parse_table_cells line =
+  let parts = String.split_on_char '|' line in
+  (* Drop leading empty from "| a | b |" → [""; " a "; " b "; ""] *)
+  let parts = match parts with "" :: rest -> rest | p -> p in
+  let parts = match List.rev parts with "" :: rest -> List.rev rest | _ -> parts in
+  List.map String.trim parts
+
+(** Test whether a row is a separator row (e.g. |---|---|).
+    Separator cells contain only dashes and colons. *)
+let is_separator_row cells =
+  cells <> [] && List.for_all (fun cell ->
+    String.length cell > 0 &&
+    String.to_seq cell |> Seq.for_all (fun c -> c = '-' || c = ':')
+  ) cells
+
+(** Render a table block with padded columns and wrap in a code block.
+    Each column is padded to the maximum cell width in that column.
+    Separator rows are regenerated to match the padded widths. *)
+let render_padded_table table_lines =
+  let parsed = List.map parse_table_cells table_lines in
+  (* Compute max width per column *)
+  let max_cols = List.fold_left (fun acc row -> max acc (List.length row)) 0 parsed in
+  let widths = Array.make max_cols 0 in
+  List.iter (fun cells ->
+    List.iteri (fun i cell ->
+      if i < max_cols && not (is_separator_row [cell]) then
+        widths.(i) <- max widths.(i) (String.length cell)
+    ) cells
+  ) parsed;
+  (* Ensure minimum width of 3 for separator dashes *)
+  Array.iteri (fun i w -> if w < 3 then widths.(i) <- 3) widths;
+  (* Render each row *)
+  let buf = Buffer.create 256 in
+  Buffer.add_string buf "```\n";
+  List.iter (fun cells ->
+    let is_sep = is_separator_row cells in
+    Buffer.add_char buf '|';
+    for i = 0 to max_cols - 1 do
+      let cell = if i < List.length cells then List.nth cells i else "" in
+      let w = widths.(i) in
+      if is_sep then begin
+        Buffer.add_char buf ' ';
+        for _ = 1 to w do Buffer.add_char buf '-' done;
+        Buffer.add_char buf ' '
+      end else begin
+        Buffer.add_char buf ' ';
+        Buffer.add_string buf cell;
+        for _ = 1 to w - String.length cell do Buffer.add_char buf ' ' done;
+        Buffer.add_char buf ' '
+      end;
+      Buffer.add_char buf '|'
+    done;
+    Buffer.add_char buf '\n'
+  ) parsed;
+  Buffer.add_string buf "```";
+  Buffer.contents buf
+
 (** Reformat markdown tables in text for Discord display.
     Discord doesn't render markdown tables, so we wrap them in code blocks
-    to preserve the pipe-aligned layout. Skips tables already inside
+    with padded columns for readable alignment. Skips tables already inside
     code blocks (``` fences). *)
 let reformat_tables text =
   let lines = String.split_on_char '\n' text in
   let buf = Buffer.create (String.length text) in
   let in_code = ref false in
-  let in_table = ref false in
+  let table_acc = ref [] in
   let first = ref true in
-  let add_line line =
+  let add_raw line =
     if not !first then Buffer.add_char buf '\n';
     first := false;
     Buffer.add_string buf line
   in
+  let flush_table () =
+    match !table_acc with
+    | [] -> ()
+    | rows ->
+      let rendered = render_padded_table (List.rev rows) in
+      if not !first then Buffer.add_char buf '\n';
+      first := false;
+      Buffer.add_string buf rendered;
+      table_acc := []
+  in
   List.iter (fun line ->
-    (* Track code block state *)
     let trimmed = String.trim line in
     if String.length trimmed >= 3
        && trimmed.[0] = '`' && trimmed.[1] = '`' && trimmed.[2] = '`' then
       in_code := not !in_code;
     if !in_code then begin
-      (* Inside a code block — pass through, close any open table *)
-      if !in_table then begin
-        add_line "```";
-        in_table := false
-      end;
-      add_line line
-    end else if is_table_line line then begin
-      (* Table row outside a code block — wrap in code block *)
-      if not !in_table then begin
-        add_line "```";
-        in_table := true
-      end;
-      add_line line
-    end else begin
-      (* Non-table line outside code block *)
-      if !in_table then begin
-        add_line "```";
-        in_table := false
-      end;
-      add_line line
+      flush_table ();
+      add_raw line
+    end else if is_table_line line then
+      table_acc := line :: !table_acc
+    else begin
+      flush_table ();
+      add_raw line
     end
   ) lines;
-  (* Close unclosed table block *)
-  if !in_table then
-    add_line "```";
+  flush_table ();
   Buffer.contents buf
 
 (** Find the byte offset where a trailing table block begins.
