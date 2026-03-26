@@ -51,50 +51,6 @@ let working_dir_of_project (p : Project.t) =
   else
     Ok p.path
 
-(** Generate a short thread name using Claude, then rename the thread.
-    Runs asynchronously — failures are logged but don't affect the session. *)
-let generate_thread_name ~sw ~env:_ rest ~thread_id ~project_name ~user_message =
-  Eio.Fiber.fork ~sw (fun () ->
-    let truncated_msg =
-      if String.length user_message > 200
-      then String.sub user_message 0 200
-      else user_message in
-    let prompt = Printf.sprintf
-      "Generate a very short thread name (max 80 chars, no quotes) for a Discord \
-       thread about the project \"%s\". The user's first message is:\n\n%s\n\n\
-       Reply with ONLY the thread name, nothing else."
-      project_name truncated_msg in
-    match Eio_unix.run_in_systhread (fun () ->
-      let open Unix in
-      let stdout_r, stdout_w = pipe ~cloexec:true () in
-      let stderr_r, stderr_w = pipe ~cloexec:true () in
-      let pid = create_process "claude"
-        [| "claude"; "-p"; "--max-turns"; "1"; prompt |]
-        stdin stdout_w stderr_w in
-      close stdout_w; close stderr_w;
-      let ic = in_channel_of_descr stdout_r in
-      let buf = Buffer.create 128 in
-      (try while true do Buffer.add_char buf (input_char ic) done
-       with End_of_file -> ());
-      close_in ic; close stderr_r;
-      let _, _ = waitpid [] pid in
-      Buffer.contents buf) with
-    | output ->
-      let name = String.trim output in
-      (* Discord thread names: 1-100 chars *)
-      if String.length name > 0 && String.length name <= 100 then begin
-        match Discord_rest.modify_channel rest ~channel_id:thread_id ~name () with
-        | Ok _ ->
-          Logs.info (fun m -> m "bot: renamed thread %s to \"%s\"" thread_id name)
-        | Error e ->
-          Logs.warn (fun m -> m "bot: thread rename failed: %s" e)
-      end else
-        Logs.warn (fun m -> m "bot: AI generated invalid thread name (%d chars): %s"
-          (String.length name) name)
-    | exception exn ->
-      Logs.warn (fun m -> m "bot: thread name generation failed: %s"
-        (Printexc.to_string exn)))
-
 (** System prompt for control channel Claude — knows about MCP tools. *)
 let control_system_prompt projects =
   let project_list = String.concat "\n" (List.mapi (fun i (p : Project.t) ->
@@ -118,7 +74,34 @@ USE THESE TOOLS. When the user asks to work on a project, start a session, etc.,
 Known projects:
 %s
 
-Keep responses concise — this is Discord." project_list
+Keep responses concise — this is Discord.
+
+IMPORTANT: When starting sessions, always create a fresh worktree so agents don't \
+stomp on each other's work." project_list
+
+(** System prompt for project channel Claude — scoped to one project. *)
+let project_system_prompt (project : Project.t) =
+  Printf.sprintf
+"You are the project overview agent for **%s** (at `%s`).
+
+You have MCP tools available:
+- start_session: Start a new agent session (creates a thread + worktree)
+- list_projects: List all discovered projects
+- list_sessions: List active bot sessions
+- list_claude_sessions: Find recent Claude Code sessions to resume
+- resume_session: Resume an existing Claude session
+- rename_thread: Rename a Discord thread
+- restart_bot: Rebuild and restart the bot
+- cleanup_channels: Delete stale Discord channels
+
+You can discuss the project, answer questions, review code, and plan work. \
+When the user wants to start a focused task, use start_session to create a \
+new thread with its own worktree so work doesn't interfere with other sessions.
+
+Keep responses concise — this is Discord.
+
+IMPORTANT: When starting sessions, always create a fresh worktree so agents don't \
+stomp on each other's work." project.name project.path
 
 (** Split text into chunks for Discord's 2000-char limit.
     Splits at paragraph breaks > newlines > spaces.
@@ -428,53 +411,6 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
     Session_store.add t.sessions ~thread_id:channel_id session;
     Logs.info (fun m -> m "bot: auto-created session for %s" project_name)
 
-(** Create a thread from a message in a project channel, set up a session
-    with a worktree, and return the thread's channel_id.
-    This is the core of "every message in a project channel starts a new session". *)
-let auto_create_thread t ~msg ~project =
-  let kind_str = "claude" in
-  let branch_name = Printf.sprintf "agent/%s-%s"
-    kind_str (String.sub (Resource.generate_uuid ()) 0 8) in
-  let working_dir, branch_info =
-    match Project.create_worktree project ~branch_name with
-    | Ok wt -> wt, Some branch_name
-    | Error e ->
-      Logs.warn (fun m -> m "bot: worktree failed: %s" e);
-      (match working_dir_of_project project with
-       | Ok wd -> wd, None | Error _ -> project.Project.path, None)
-  in
-  (* Create thread from the user's message *)
-  let thread_name = Printf.sprintf "%s — %s"
-    project.Project.name
-    (let content = msg.Discord_types.content in
-     if String.length content > 40
-     then String.sub content 0 40 ^ "..."
-     else content) in
-  match Discord_rest.create_thread t.rest
-          ~channel_id:msg.channel_id ~message_id:msg.id
-          ~name:thread_name () with
-  | Error e ->
-    Logs.warn (fun m -> m "bot: thread creation failed: %s" e);
-    None
-  | Ok thread_ch ->
-    let session : Session_store.session = {
-      project_name = project.name; working_dir;
-      agent_kind = Config.Claude;
-      session_id = Resource.generate_uuid ();
-      thread_id = thread_ch.Discord_types.id;
-      system_prompt = None; message_count = 0; processing = false;
-    } in
-    Session_store.add t.sessions ~thread_id:thread_ch.id session;
-    let branch_str = match branch_info with
-      | Some b -> Printf.sprintf " on `%s`" b | None -> "" in
-    Logs.info (fun m -> m "bot: auto-created thread for %s%s"
-      project.name branch_str);
-    (* Fire-and-forget AI thread naming *)
-    generate_thread_name ~sw:t.sw ~env:t.env t.rest
-      ~thread_id:thread_ch.id ~project_name:project.name
-      ~user_message:msg.Discord_types.content;
-    Some (thread_ch.Discord_types.id, session)
-
 (** Route an incoming Discord message. *)
 let handle_message t (msg : Discord_types.message) =
   Session_store.maybe_reload t.sessions;
@@ -493,21 +429,16 @@ let handle_message t (msg : Discord_types.message) =
       handle_thread_message t msg ()
     end else match project_for_channel with
     | Some proj_name ->
-      (* Message in a project channel — auto-create a thread for this conversation *)
+      (* Message in a project channel — persistent session (like control channel).
+         The project Claude can create threads via MCP tools when needed. *)
       let proj = List.find_opt (fun (p : Project.t) -> p.name = proj_name) t.projects in
       (match proj with
        | Some p ->
-         (match auto_create_thread t ~msg ~project:p with
-          | Some (thread_id, _session) ->
-            (* Route to the newly created thread *)
-            let thread_msg = { msg with Discord_types.channel_id = thread_id } in
-            handle_thread_message t thread_msg ()
-          | None ->
-            (* Fallback: respond in the channel directly *)
-            let wd = match working_dir_of_project p with Ok d -> d | Error _ -> p.path in
-            ensure_channel_session t ~channel_id:msg.channel_id
-              ~project_name:p.name ~working_dir:wd ~system_prompt:None;
-            handle_thread_message t msg ())
+         let wd = match working_dir_of_project p with Ok d -> d | Error _ -> p.path in
+         ensure_channel_session t ~channel_id:msg.channel_id
+           ~project_name:p.name ~working_dir:wd
+           ~system_prompt:(Some (project_system_prompt p));
+         handle_thread_message t msg ()
        | None -> ())
     | None ->
       (* Check if this is a thread under a project channel *)
@@ -530,7 +461,8 @@ let handle_message t (msg : Discord_types.message) =
                   let wd = match working_dir_of_project p with
                     | Ok d -> d | Error _ -> p.path in
                   ensure_channel_session t ~channel_id:msg.channel_id
-                    ~project_name:p.name ~working_dir:wd ~system_prompt:None;
+                    ~project_name:p.name ~working_dir:wd
+                    ~system_prompt:(Some (project_system_prompt p));
                   (* Pass the already-fetched channel info to avoid a second API call *)
                   handle_thread_message t msg ~channel_info:ch ()
                 | None -> handle_thread_message t msg ())

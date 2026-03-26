@@ -211,11 +211,10 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
   let args = match kind with
     | Config.Claude ->
       let base = claude_args ~session_id ~message_count ~prompt in
+      (* All Claude sessions get MCP tools for thread/session management *)
+      let base = base @ ["--mcp-config"; mcp_config] in
       let base = match system_prompt with
-        | Some sp ->
-          (* Control channel sessions get MCP tools + system prompt *)
-          base @ ["--append-system-prompt"; sp;
-                  "--mcp-config"; mcp_config]
+        | Some sp -> base @ ["--append-system-prompt"; sp]
         | None -> base
       in
       base
