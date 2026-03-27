@@ -66,14 +66,53 @@ You have MCP tools available:
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - resume_session: Resume an existing Claude session
 - restart_bot: Rebuild and restart the bot
+- rename_thread: Rename a Discord thread
 - cleanup_channels: Delete stale Discord channels
 
-USE THESE TOOLS. When the user asks to work on a project, start a session, etc., call the appropriate tool.
+USE THESE TOOLS. When the user asks to work on a project, start a session, etc., \
+call the appropriate tool. Prefer the conversational MCP tools over suggesting \
+!commands — the user shouldn't need to use !commands.
+
+When starting a session, ALWAYS provide a short descriptive thread_name (max 80 chars) \
+that captures the task — do NOT include the project name. Example: \
+\"fix auth token refresh bug\" not \"myproject / fix auth token refresh bug\".
 
 Known projects:
 %s
 
-Keep responses concise — this is Discord." project_list
+Keep responses concise — this is Discord.
+
+IMPORTANT: When starting sessions, always create a fresh worktree so agents don't \
+stomp on each other's work." project_list
+
+(** System prompt for project channel Claude — scoped to one project. *)
+let project_system_prompt (project : Project.t) =
+  Printf.sprintf
+"You are the project overview agent for **%s** (at `%s`).
+
+You have MCP tools available:
+- start_session: Start a new agent session (creates a thread + worktree)
+- list_projects: List all discovered projects
+- list_sessions: List active bot sessions
+- list_claude_sessions: Find recent Claude Code sessions to resume
+- resume_session: Resume an existing Claude session
+- rename_thread: Rename a Discord thread
+- restart_bot: Rebuild and restart the bot
+- cleanup_channels: Delete stale Discord channels
+
+You can discuss the project, answer questions, review code, and plan work. \
+When the user wants to start a focused task, use start_session to create a \
+new thread with its own worktree so work doesn't interfere with other sessions. \
+Prefer the conversational MCP tools over suggesting !commands.
+
+When starting a session, ALWAYS provide a short descriptive thread_name (max 80 chars) \
+that captures the task — do NOT include the project name. Example: \
+\"fix auth token refresh bug\" not \"myproject / fix auth token refresh bug\".
+
+Keep responses concise — this is Discord.
+
+IMPORTANT: When starting sessions, always create a fresh worktree so agents don't \
+stomp on each other's work." project.name project.path
 
 let post_response rest ~channel_id text =
   let text = Agent_process.reformat_tables text in
@@ -235,6 +274,14 @@ let handle_command t msg cmd =
       | `Restarting ->
         reply "Build succeeded. New instance starting.";
         Eio.Time.sleep (Eio.Stdenv.clock t.env) 30.0)
+  | Command.Rename_thread { thread_id; name } ->
+    let target_id = match thread_id with
+      | Some tid -> tid
+      | None -> channel_id  (* rename the current thread *)
+    in
+    (match Discord_rest.modify_channel t.rest ~channel_id:target_id ~name () with
+     | Ok _ -> reply (Printf.sprintf "Renamed to **%s**." name)
+     | Error e -> reply (Printf.sprintf "Rename failed: %s" e))
   | Command.Help ->
     reply (String.concat "\n" [
       "**Commands:**";
@@ -244,6 +291,7 @@ let handle_command t msg cmd =
       "`!start <project> [agent]` — start a session (defaults to claude)";
       "`!resume <session_id>` — resume a Claude session";
       "`!stop <thread_id>` — stop a session";
+      "`!rename [thread_id] <name>` — rename a thread";
       "`!cleanup` — delete stale channels";
       "`!restart` — rebuild and restart";
       "`!help` — this message";
@@ -320,49 +368,6 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
     Session_store.add t.sessions ~thread_id:channel_id session;
     Logs.info (fun m -> m "bot: auto-created session for %s" project_name)
 
-(** Create a thread from a message in a project channel, set up a session
-    with a worktree, and return the thread's channel_id.
-    This is the core of "every message in a project channel starts a new session". *)
-let auto_create_thread t ~msg ~project =
-  let kind_str = "claude" in
-  let branch_name = Printf.sprintf "agent/%s-%s"
-    kind_str (String.sub (Resource.generate_uuid ()) 0 8) in
-  let working_dir, branch_info =
-    match Project.create_worktree project ~branch_name with
-    | Ok wt -> wt, Some branch_name
-    | Error e ->
-      Logs.warn (fun m -> m "bot: worktree failed: %s" e);
-      (match working_dir_of_project project with
-       | Ok wd -> wd, None | Error _ -> project.Project.path, None)
-  in
-  (* Create thread from the user's message *)
-  let thread_name = Printf.sprintf "%s — %s"
-    project.Project.name
-    (let content = msg.Discord_types.content in
-     if String.length content > 40
-     then String.sub content 0 40 ^ "..."
-     else content) in
-  match Discord_rest.create_thread t.rest
-          ~channel_id:msg.channel_id ~message_id:msg.id
-          ~name:thread_name () with
-  | Error e ->
-    Logs.warn (fun m -> m "bot: thread creation failed: %s" e);
-    None
-  | Ok thread_ch ->
-    let session : Session_store.session = {
-      project_name = project.name; working_dir;
-      agent_kind = Config.Claude;
-      session_id = Resource.generate_uuid ();
-      thread_id = thread_ch.Discord_types.id;
-      system_prompt = None; message_count = 0; processing = false;
-    } in
-    Session_store.add t.sessions ~thread_id:thread_ch.id session;
-    let branch_str = match branch_info with
-      | Some b -> Printf.sprintf " on `%s`" b | None -> "" in
-    Logs.info (fun m -> m "bot: auto-created thread for %s%s"
-      project.name branch_str);
-    Some (thread_ch.Discord_types.id, session)
-
 (** Route an incoming Discord message. *)
 let handle_message t (msg : Discord_types.message) =
   Session_store.maybe_reload t.sessions;
@@ -381,21 +386,16 @@ let handle_message t (msg : Discord_types.message) =
       handle_thread_message t msg ()
     end else match project_for_channel with
     | Some proj_name ->
-      (* Message in a project channel — auto-create a thread for this conversation *)
+      (* Message in a project channel — persistent session (like control channel).
+         The project Claude can create threads via MCP tools when needed. *)
       let proj = List.find_opt (fun (p : Project.t) -> p.name = proj_name) t.projects in
       (match proj with
        | Some p ->
-         (match auto_create_thread t ~msg ~project:p with
-          | Some (thread_id, _session) ->
-            (* Route to the newly created thread *)
-            let thread_msg = { msg with Discord_types.channel_id = thread_id } in
-            handle_thread_message t thread_msg ()
-          | None ->
-            (* Fallback: respond in the channel directly *)
-            let wd = match working_dir_of_project p with Ok d -> d | Error _ -> p.path in
-            ensure_channel_session t ~channel_id:msg.channel_id
-              ~project_name:p.name ~working_dir:wd ~system_prompt:None;
-            handle_thread_message t msg ())
+         let wd = match working_dir_of_project p with Ok d -> d | Error _ -> p.path in
+         ensure_channel_session t ~channel_id:msg.channel_id
+           ~project_name:p.name ~working_dir:wd
+           ~system_prompt:(Some (project_system_prompt p));
+         handle_thread_message t msg ()
        | None -> ())
     | None ->
       (* Check if this is a thread under a project channel *)
@@ -417,8 +417,11 @@ let handle_message t (msg : Discord_types.message) =
                 | Some p ->
                   let wd = match working_dir_of_project p with
                     | Ok d -> d | Error _ -> p.path in
+                  (* Worker threads get no system prompt — they're focused agents.
+                     They still get MCP tools via agent_process.ml. *)
                   ensure_channel_session t ~channel_id:msg.channel_id
-                    ~project_name:p.name ~working_dir:wd ~system_prompt:None;
+                    ~project_name:p.name ~working_dir:wd
+                    ~system_prompt:None;
                   (* Pass the already-fetched channel info to avoid a second API call *)
                   handle_thread_message t msg ~channel_info:ch ()
                 | None -> handle_thread_message t msg ())

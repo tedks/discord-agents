@@ -12,6 +12,7 @@ type t =
   | Stop_session of { thread_id : string }
   | Cleanup_channels
   | Restart
+  | Rename_thread of { thread_id : string option; name : string }
   | Help
   | Unknown of string
 
@@ -42,6 +43,20 @@ let parse content =
   | ["resume"; session_id] -> Resume_session { session_id }
   | ["stop"; thread_id] -> Stop_session { thread_id }
   | ["cleanup-channels"] | ["cleanup"] -> Cleanup_channels
+  | "rename" :: rest when rest <> [] ->
+    (* !rename <name> — rename current thread
+       !rename <thread_id> <name> — rename a specific thread *)
+    let first = List.hd rest in
+    let rest_tail = List.tl rest in
+    (* If first token is all digits (a snowflake ID), treat it as thread_id *)
+    let is_snowflake s = String.length s > 10 && String.length s < 25
+      && String.for_all (fun c -> c >= '0' && c <= '9') s in
+    if is_snowflake first && rest_tail <> [] then
+      Rename_thread { thread_id = Some first;
+                      name = String.concat " " rest_tail }
+    else
+      Rename_thread { thread_id = None;
+                      name = String.concat " " rest }
   | ["restart"] -> Restart
   | ["help"] -> Help
   | _ -> Unknown content
