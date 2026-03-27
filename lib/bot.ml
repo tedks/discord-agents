@@ -100,15 +100,20 @@ You have MCP tools available:
 - restart_bot: Rebuild and restart the bot
 - cleanup_channels: Delete stale Discord channels
 
-You can discuss the project, answer questions, review code, and plan work. \
-When the user wants to start a focused task, use start_session to create a \
-new thread with its own worktree so work doesn't interfere with other sessions. \
-Prefer the conversational MCP tools over suggesting !commands.
+WHEN TO CREATE THREADS vs CHAT IN-CHANNEL:
+- **Chat in-channel** for: questions, discussion, planning, code review, \
+explaining things, brainstorming, status updates, or anything conversational.
+- **Create a thread** (start_session) ONLY when the user explicitly asks to \
+start working on something that needs its own worktree — e.g. \"start a session\", \
+\"work on X\", \"fix this bug\", \"implement this feature\". The key signal is that \
+code changes will be made.
+- When in doubt, just chat. The user will ask for a thread if they want one.
 
 When starting a session, ALWAYS provide a short descriptive thread_name (max 80 chars) \
 that captures the task — do NOT include the project name. Example: \
 \"fix auth token refresh bug\" not \"myproject / fix auth token refresh bug\".
 
+Prefer the conversational MCP tools over suggesting !commands.
 Keep responses concise — this is Discord.
 
 IMPORTANT: When starting sessions, always create a fresh worktree so agents don't \
@@ -282,6 +287,111 @@ let handle_command t msg cmd =
     (match Discord_rest.modify_channel t.rest ~channel_id:target_id ~name () with
      | Ok _ -> reply (Printf.sprintf "Renamed to **%s**." name)
      | Error e -> reply (Printf.sprintf "Rename failed: %s" e))
+  | Command.Status ->
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      let status_lines = Eio_unix.run_in_systhread (fun () ->
+        (* Bot process info *)
+        let pid = Unix.getpid () in
+        let uptime_str =
+          try
+            let ic = open_in (Printf.sprintf "/proc/%d/stat" pid) in
+            let line = input_line ic in
+            close_in ic;
+            let parts = String.split_on_char ' ' line in
+            let starttime = float_of_string (List.nth parts 21) in
+            let ticks_per_sec = 100.0 in
+            let boot_ic = open_in "/proc/stat" in
+            let rec find_btime () =
+              let l = input_line boot_ic in
+              if String.length l > 6 && String.sub l 0 6 = "btime " then
+                float_of_string (String.trim (String.sub l 6 (String.length l - 6)))
+              else find_btime ()
+            in
+            let btime = find_btime () in
+            close_in boot_ic;
+            let start_time = btime +. (starttime /. ticks_per_sec) in
+            let uptime = Unix.gettimeofday () -. start_time in
+            let hours = int_of_float (uptime /. 3600.0) in
+            let mins = int_of_float (mod_float (uptime /. 60.0) 60.0) in
+            Printf.sprintf "%dh %dm" hours mins
+          with _ -> "unknown"
+        in
+        (* Running claude processes *)
+        let claude_procs =
+          try
+            let ic = Unix.open_process_in
+              "ps -eo pid,etimes,args 2>/dev/null | grep 'claude.*stream-json' | grep -v grep" in
+            let lines = ref [] in
+            (try while true do lines := input_line ic :: !lines done
+             with End_of_file -> ());
+            ignore (Unix.close_process_in ic);
+            List.rev !lines
+          with _ -> []
+        in
+        let claude_lines = List.filter_map (fun line ->
+          let parts = String.split_on_char ' ' (String.trim line) in
+          let parts = List.filter (fun s -> s <> "") parts in
+          match parts with
+          | _pid :: elapsed_s :: _rest ->
+            let elapsed = try int_of_string elapsed_s with _ -> 0 in
+            let mins = elapsed / 60 in
+            (* Extract session ID if present *)
+            let sid = try
+              let re_start = "--resume " in
+              let idx = ref 0 in
+              let full = String.concat " " _rest in
+              let found = ref "" in
+              String.iteri (fun i _ ->
+                if i + String.length re_start <= String.length full
+                   && String.sub full i (String.length re_start) = re_start then
+                  let after = String.sub full (i + String.length re_start)
+                    (min 36 (String.length full - i - String.length re_start)) in
+                  let sid = List.hd (String.split_on_char ' ' after) in
+                  if !found = "" then (found := sid; idx := i)
+              ) full;
+              if !found <> "" then String.sub !found 0 (min 8 (String.length !found))
+              else "?"
+            with _ -> "?" in
+            Some (Printf.sprintf "  `%s` — %dm" sid mins)
+          | _ -> None
+        ) claude_procs in
+        (* Other bot instances *)
+        let other_bots =
+          try
+            let ic = Unix.open_process_in
+              "ps -eo pid,etimes,args 2>/dev/null | grep discord-agents | grep -v grep" in
+            let lines = ref [] in
+            (try while true do lines := input_line ic :: !lines done
+             with End_of_file -> ());
+            ignore (Unix.close_process_in ic);
+            let count = List.length (List.rev !lines) in
+            if count > 1 then
+              Printf.sprintf "\n**\xe2\x9a\xa0\xef\xb8\x8f %d bot instances running** (expected 1)" count
+            else ""
+          with _ -> ""
+        in
+        (* Session summary *)
+        let entries = Session_store.bindings t.sessions in
+        let total = List.length entries in
+        let with_msgs = List.length (List.filter (fun (_, (s : Session_store.session)) ->
+          s.message_count > 0) entries) in
+        let processing = List.length (List.filter (fun (_, (s : Session_store.session)) ->
+          s.processing) entries) in
+        let lines = [
+          Printf.sprintf "**Bot Status** (pid %d, up %s)" pid uptime_str;
+          Printf.sprintf "Sessions: %d total, %d active, %d processing" total with_msgs processing;
+          Printf.sprintf "Projects: %d discovered" (List.length t.projects);
+        ] in
+        let lines = if claude_lines <> [] then
+          lines @ [Printf.sprintf "**Running agents** (%d):" (List.length claude_lines)]
+          @ claude_lines
+        else
+          lines @ ["No running agent processes."]
+        in
+        let lines = if other_bots <> "" then lines @ [other_bots] else lines in
+        lines
+      ) in
+      reply (String.concat "\n" status_lines))
   | Command.Help ->
     reply (String.concat "\n" [
       "**Commands:**";
@@ -292,6 +402,7 @@ let handle_command t msg cmd =
       "`!resume <session_id>` — resume a Claude session";
       "`!stop <thread_id>` — stop a session";
       "`!rename [thread_id] <name>` — rename a thread";
+      "`!status` — bot status and running processes";
       "`!cleanup` — delete stale channels";
       "`!restart` — rebuild and restart";
       "`!help` — this message";
