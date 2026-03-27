@@ -298,11 +298,15 @@ let handle_command t msg cmd =
         let uptime_str = if hours > 0
           then Printf.sprintf "%dh %dm" hours minutes
           else Printf.sprintf "%dm" minutes in
-        (* Running claude processes *)
-        let claude_procs =
+        (* Running agent child processes — filter by PPID to only show
+           processes spawned by this bot, not unrelated Claude CLI usage *)
+        let my_pid_str = string_of_int pid in
+        let agent_procs =
           try
             let ic = Unix.open_process_in
-              "ps -eo pid,etimes,args 2>/dev/null | grep 'claude.*stream-json' | grep -v grep" in
+              (Printf.sprintf
+                "ps -eo pid,ppid,etimes,args 2>/dev/null | awk '$2 == %s' | grep -v grep"
+                my_pid_str) in
             let lines = ref [] in
             (try while true do lines := input_line ic :: !lines done
              with End_of_file -> ());
@@ -310,14 +314,21 @@ let handle_command t msg cmd =
             List.rev !lines
           with _ -> []
         in
-        let claude_lines = List.filter_map (fun line ->
+        let agent_lines = List.filter_map (fun line ->
           let parts = String.split_on_char ' ' (String.trim line) in
           let parts = List.filter (fun s -> s <> "") parts in
           match parts with
-          | _pid :: elapsed_s :: _rest ->
+          | _pid :: _ppid :: elapsed_s :: _rest ->
             let elapsed = try int_of_string elapsed_s with _ -> 0 in
             let mins = elapsed / 60 in
             let full = String.concat " " _rest in
+            (* Identify agent kind from command *)
+            let kind =
+              if String.length full > 0 then
+                let first_arg = List.hd (String.split_on_char ' ' full) in
+                Filename.basename first_arg
+              else "unknown"
+            in
             let sid =
               try
                 let re_start = "--resume " in
@@ -331,12 +342,14 @@ let handle_command t msg cmd =
                     if !found = "" then found := sid
                 ) full;
                 if !found <> "" then String.sub !found 0 (min 8 (String.length !found))
-                else "?"
-              with _ -> "?"
+                else ""
+              with _ -> ""
             in
-            Some (Printf.sprintf "  `%s` — %dm" sid mins)
+            let label = if sid <> "" then Printf.sprintf "%s `%s`" kind sid
+              else kind in
+            Some (Printf.sprintf "  %s — %dm" label mins)
           | _ -> None
-        ) claude_procs in
+        ) agent_procs in
         (* Detect multiple bot instances *)
         let other_bots =
           try
@@ -361,9 +374,9 @@ let handle_command t msg cmd =
           Printf.sprintf "Projects: %d  |  Channels: %d"
             (List.length t.projects) (Channel_manager.count t.channels);
         ] in
-        let lines = if claude_lines <> [] then
-          lines @ [Printf.sprintf "**Running agents** (%d):" (List.length claude_lines)]
-          @ claude_lines
+        let lines = if agent_lines <> [] then
+          lines @ [Printf.sprintf "**Running agents** (%d):" (List.length agent_lines)]
+          @ agent_lines
         else
           lines @ ["No running agent processes."]
         in
