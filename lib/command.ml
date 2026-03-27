@@ -13,7 +13,7 @@ type t =
   | Cleanup_channels
   | Restart
   | Rename_thread of { thread_id : string option; name : string }
-  | Version
+  | Status
   | Help
   | Unknown of string
 
@@ -59,7 +59,7 @@ let parse content =
       Rename_thread { thread_id = None;
                       name = String.concat " " rest }
   | ["restart"] -> Restart
-  | ["version"] | ["info"] -> Version
+  | ["status"] | ["version"] | ["info"] -> Status
   | ["help"] -> Help
   | _ -> Unknown content
 
