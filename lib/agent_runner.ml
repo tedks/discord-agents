@@ -127,7 +127,7 @@ let image_prompt_suffix downloaded_images =
     Handles message creation/editing, typing indicators, and splitting.
     Returns Ok () on success, Error msg on failure. *)
 let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
-    ~prompt ?(attachments=[]) ~author_name ~channel_name ~channel_type () =
+    ~prompt ?(attachments=[]) ~author_name ~channel_name ~channel_type ?on_pid () =
   (* Download any image attachments and append paths to the prompt *)
   let downloaded_images = download_images ~rest
     ~working_dir:session.Session_store.working_dir attachments in
@@ -306,7 +306,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
           ~session_id:session.session_id
           ~message_count:session.message_count
           ?system_prompt:session.system_prompt
-          ~prompt:context_prompt ~on_event () with
+          ~prompt:context_prompt ~on_event ?on_pid () with
   | Ok () ->
     flush_to_discord ();
     if Buffer.length result_buf = 0 then
