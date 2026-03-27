@@ -27,6 +27,8 @@ let project_root =
     with _ -> Sys.getcwd ()
   )
 
+module Pid_set = Set.Make(Int)
+
 type t = {
   config : Config.t;
   rest : Discord_rest.t;
@@ -36,7 +38,28 @@ type t = {
   channels : Channel_manager.t;
   env : Eio_unix.Stdenv.base;
   sw : Eio.Switch.t;
+  mutable draining : bool;
+  child_pids : (Pid_set.t ref * Mutex.t);
 }
+
+let register_child_pid t pid =
+  let (pids, mu) = t.child_pids in
+  Mutex.lock mu;
+  pids := Pid_set.add pid !pids;
+  Mutex.unlock mu
+
+let unregister_child_pid t pid =
+  let (pids, mu) = t.child_pids in
+  Mutex.lock mu;
+  pids := Pid_set.remove pid !pids;
+  Mutex.unlock mu
+
+let get_child_pids t =
+  let (pids, mu) = t.child_pids in
+  Mutex.lock mu;
+  let result = !pids in
+  Mutex.unlock mu;
+  result
 
 (** Find a usable working directory for a project. *)
 let working_dir_of_project (p : Project.t) =
@@ -259,8 +282,48 @@ let handle_command t msg cmd =
       | Ok 0 -> reply "No stale channels to clean up."
       | Ok n -> reply (Printf.sprintf "Cleaned up %d stale channels." n))
   | Command.Restart ->
-    reply "Rebuilding and restarting...";
     Eio.Fiber.fork ~sw:t.sw (fun () ->
+      (* Phase 1: Drain — stop accepting new messages and wait for in-flight ones *)
+      t.draining <- true;
+      let processing_count () =
+        List.length (List.filter (fun (_, (s : Session_store.session)) ->
+          s.processing) (Session_store.bindings t.sessions)) in
+      let active = processing_count () in
+      if active > 0 then begin
+        reply (Printf.sprintf "Draining %d active session(s)..." active);
+        (* Poll until all sessions finish or timeout (5 min) *)
+        let clock = Eio.Stdenv.clock t.env in
+        let deadline = Eio.Time.now clock +. 300.0 in
+        let rec wait () =
+          let n = processing_count () in
+          if n = 0 then ()
+          else if Eio.Time.now clock > deadline then begin
+            reply (Printf.sprintf "Timed out waiting for %d session(s). Proceeding." n)
+          end else begin
+            Eio.Time.sleep clock 1.0;
+            wait ()
+          end
+        in
+        wait ()
+      end;
+      (* Phase 2: Reap child processes *)
+      let pids = get_child_pids t in
+      if not (Pid_set.is_empty pids) then begin
+        reply (Printf.sprintf "Terminating %d child process(es)..." (Pid_set.cardinal pids));
+        Eio_unix.run_in_systhread (fun () ->
+          Pid_set.iter (fun pid ->
+            (try Unix.kill pid Sys.sigterm
+             with Unix.Unix_error _ -> ())
+          ) pids;
+          Unix.sleepf 2.0;
+          (* SIGKILL any that didn't exit *)
+          Pid_set.iter (fun pid ->
+            (try Unix.kill pid 0; Unix.kill pid Sys.sigkill
+             with Unix.Unix_error _ -> ())
+          ) pids)
+      end;
+      (* Phase 3: Build and restart *)
+      reply "Building...";
       match Eio_unix.run_in_systhread (fun () ->
         let root = Lazy.force project_root in
         let exit_code = Sys.command
@@ -275,7 +338,9 @@ let handle_command t msg cmd =
             Unix.stdin Unix.stdout Unix.stderr in
           `Restarting
         end) with
-      | `Build_failed -> reply "Build failed, not restarting."
+      | `Build_failed ->
+        t.draining <- false;
+        reply "Build failed, not restarting."
       | `Restarting ->
         reply "Build succeeded. New instance starting.";
         Eio.Time.sleep (Eio.Stdenv.clock t.env) 30.0)
@@ -438,6 +503,11 @@ let resolve_channel_context t ~(channel_id : Discord_types.channel_id)
 (** Handle a message in a session thread.
     [channel_info] is passed through when the caller already fetched it. *)
 let handle_thread_message t msg ?channel_info () =
+  if t.draining then begin
+    ignore (Discord_rest.create_message t.rest
+      ~channel_id:msg.Discord_types.channel_id
+      ~content:"Bot is restarting — waiting for active sessions to finish. Try again shortly." ())
+  end else
   match Session_store.find_opt t.sessions ~thread_id:msg.Discord_types.channel_id with
   | None -> ()
   | Some session ->
@@ -446,8 +516,12 @@ let handle_thread_message t msg ?channel_info () =
         ~channel_id:msg.channel_id ~content:"Still processing previous message..." ())
     else begin
       session.processing <- true;
+      let child_pid = ref None in
       Eio.Fiber.fork ~sw:t.sw (fun () ->
-        Fun.protect ~finally:(fun () -> session.processing <- false) (fun () ->
+        Fun.protect ~finally:(fun () ->
+          session.processing <- false;
+          Option.iter (unregister_child_pid t) !child_pid
+        ) (fun () ->
           let channel_id = msg.Discord_types.channel_id in
           ignore (Discord_rest.create_reaction t.rest ~channel_id
             ~message_id:msg.id ~emoji:"\xF0\x9F\x91\x80" ());
@@ -456,10 +530,14 @@ let handle_thread_message t msg ?channel_info () =
           let author_name = msg.author.username in
           let (channel_name, channel_type) =
             resolve_channel_context t ~channel_id ~session ?channel_info () in
+          let on_pid pid =
+            child_pid := Some pid;
+            register_child_pid t pid;
+            Logs.info (fun m -> m "bot: registered child pid %d" pid) in
           match Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
                   ~session ~channel_id ~prompt:msg.content
                   ~attachments:msg.attachments
-                  ~author_name ~channel_name ~channel_type () with
+                  ~author_name ~channel_name ~channel_type ~on_pid () with
           | Ok () ->
             Session_store.increment_message_count t.sessions session
           | Error _ -> ()))
@@ -555,7 +633,8 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
     ~intents:Discord_gateway.default_intents
     ~handler:(fun _event -> ())
   in
-  let bot = { config; rest; gateway; projects; sessions; channels; env; sw } in
+  let bot = { config; rest; gateway; projects; sessions; channels; env; sw;
+               draining = false; child_pids = (ref Pid_set.empty, Mutex.create ()) } in
   bot.gateway.handler <- (fun event ->
     match event with
     | Discord_gateway.Connected user ->
