@@ -283,6 +283,9 @@ let handle_command t msg cmd =
       | Ok 0 -> reply "No stale channels to clean up."
       | Ok n -> reply (Printf.sprintf "Cleaned up %d stale channels." n))
   | Command.Restart ->
+    if t.draining then
+      reply "Already restarting."
+    else
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       (* Phase 1: Drain — stop accepting new messages and wait for in-flight ones *)
       t.draining <- true;
@@ -292,22 +295,23 @@ let handle_command t msg cmd =
       let active = processing_count () in
       if active > 0 then begin
         reply (Printf.sprintf "Draining %d active session(s)..." active);
-        (* Poll until all sessions finish or timeout (5 min) *)
         let clock = Eio.Stdenv.clock t.env in
         let deadline = Eio.Time.now clock +. 300.0 in
         let rec wait () =
           let n = processing_count () in
           if n = 0 then ()
-          else if Eio.Time.now clock > deadline then begin
+          else if Eio.Time.now clock > deadline then
             reply (Printf.sprintf "Timed out waiting for %d session(s). Proceeding." n)
-          end else begin
+          else begin
             Eio.Time.sleep clock 1.0;
             wait ()
           end
         in
         wait ()
       end;
-      (* Phase 2: Reap child processes *)
+      (* Phase 2: Reap child processes.
+         Split SIGTERM and SIGKILL into separate systhread calls with
+         Eio.Time.sleep between to avoid blocking the systhread pool. *)
       let pids = get_child_pids t in
       if not (Pid_set.is_empty pids) then begin
         reply (Printf.sprintf "Terminating %d child process(es)..." (Pid_set.cardinal pids));
@@ -315,9 +319,9 @@ let handle_command t msg cmd =
           Pid_set.iter (fun pid ->
             (try Unix.kill pid Sys.sigterm
              with Unix.Unix_error _ -> ())
-          ) pids;
-          Unix.sleepf 2.0;
-          (* SIGKILL any that didn't exit *)
+          ) pids);
+        Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
+        Eio_unix.run_in_systhread (fun () ->
           Pid_set.iter (fun pid ->
             (try Unix.kill pid 0; Unix.kill pid Sys.sigkill
              with Unix.Unix_error _ -> ())
@@ -343,8 +347,13 @@ let handle_command t msg cmd =
         t.draining <- false;
         reply "Build failed, not restarting."
       | `Restarting ->
-        reply "Build succeeded. New instance starting.";
-        Eio.Time.sleep (Eio.Stdenv.clock t.env) 30.0)
+        reply "Build succeeded. New instance starting — shutting down in 30s.";
+        (* Wait for new instance to take over, then exit cleanly.
+           Reset draining as a safety net in case the new instance never starts. *)
+        Eio.Time.sleep (Eio.Stdenv.clock t.env) 30.0;
+        t.draining <- false;
+        Logs.info (fun m -> m "bot: restart handoff timeout, exiting");
+        exit 0)
   | Command.Rename_thread { thread_id; name } ->
     let target_id = match thread_id with
       | Some tid -> tid
@@ -554,6 +563,22 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
 let handle_message t (msg : Discord_types.message) =
   Session_store.maybe_reload t.sessions;
   match msg.author.bot with Some true -> () | _ ->
+  (* While draining, only allow read-only commands *)
+  if t.draining then begin
+    if Command.is_command msg.content then
+      match Command.parse msg.content with
+      | Command.Status | Command.List_projects | Command.List_sessions
+      | Command.List_claude_sessions | Command.Help ->
+        handle_command t msg (Command.parse msg.content)
+      | _ ->
+        ignore (Discord_rest.create_message t.rest
+          ~channel_id:msg.Discord_types.channel_id
+          ~content:"Bot is restarting. Try again shortly." ())
+    else
+      ignore (Discord_rest.create_message t.rest
+        ~channel_id:msg.Discord_types.channel_id
+        ~content:"Bot is restarting. Try again shortly." ())
+  end else
   if Command.is_command msg.content then
     handle_command t msg (Command.parse msg.content)
   else begin

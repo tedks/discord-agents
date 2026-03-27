@@ -553,25 +553,18 @@ def handle_tool_call(name, arguments, config, projects):
         return f"Resumed session `{full_sid[:8]}` in <#{thread_id}>."
 
     elif name == "restart_bot":
-        # Derive project root from this script's location
-        script_dir = Path(__file__).resolve().parent
-        project_root = script_dir.parent
-        result = subprocess.run(
-            ["nix", "develop", "--command", "dune", "build"],
-            capture_output=True, text=True, timeout=120,
-            cwd=str(project_root))
-        if result.returncode != 0:
-            output = (result.stdout + result.stderr)[-500:]
-            return f"Build failed:\n```\n{output}\n```"
-
-        # Spawn new instance (it kills the old via pidfile)
-        subprocess.Popen(
-            ["nix", "develop", "--command", "dune", "exec", "discord-agents"],
-            cwd=str(project_root),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL)
-        return "Build succeeded. New bot instance starting."
+        # Signal the bot to restart via its own !restart command flow,
+        # which handles draining active sessions and reaping child processes.
+        # Posting to the control channel ensures the bot's full restart
+        # pipeline runs (drain → reap → build → spawn).
+        if not control_channel:
+            return "No control channel configured — cannot signal restart."
+        result = discord_request("POST", f"/channels/{control_channel}/messages", token, {
+            "content": "!restart",
+        })
+        if "error" in result:
+            return f"Failed to signal restart: {result['error']}"
+        return "Restart signal sent. The bot will drain active sessions, then rebuild and restart."
 
     elif name == "rename_thread":
         thread_id = arguments.get("thread_id", "")
