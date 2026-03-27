@@ -4,3 +4,8 @@
  (libraries eio_main cohttp-eio tls-eio ca-certs mirage-crypto-rng.unix base64 yojson logs fmt uri)
  (preprocess
   (pps ppx_yojson_conv ppx_deriving.show ppx_deriving.eq)))
+
+(rule
+ (target build_info_data.ml)
+ (deps (universe) ../scripts/gen-build-info.sh)
+ (action (run sh %{project_root}/scripts/gen-build-info.sh %{target})))

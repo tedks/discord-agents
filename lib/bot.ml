@@ -36,6 +36,7 @@ type t = {
   channels : Channel_manager.t;
   env : Eio_unix.Stdenv.base;
   sw : Eio.Switch.t;
+  started_at : float;
 }
 
 (** Find a usable working directory for a project. *)
@@ -100,9 +101,12 @@ You have MCP tools available:
 - restart_bot: Rebuild and restart the bot
 - cleanup_channels: Delete stale Discord channels
 
-You can discuss the project, answer questions, review code, and plan work. \
-When the user wants to start a focused task, use start_session to create a \
-new thread with its own worktree so work doesn't interfere with other sessions. \
+You can discuss the project, answer questions, review code, and plan work \
+directly in this channel — no need to create a thread for conversation or planning.
+
+Only use start_session when the user explicitly asks to start a coding session \
+or work on a task that requires its own worktree (actual code changes). \
+Do NOT create threads for discussion, questions, or when the user just wants to chat. \
 Prefer the conversational MCP tools over suggesting !commands.
 
 When starting a session, ALWAYS provide a short descriptive thread_name (max 80 chars) \
@@ -282,6 +286,20 @@ let handle_command t msg cmd =
     (match Discord_rest.modify_channel t.rest ~channel_id:target_id ~name () with
      | Ok _ -> reply (Printf.sprintf "Renamed to **%s**." name)
      | Error e -> reply (Printf.sprintf "Rename failed: %s" e))
+  | Command.Version ->
+    let uptime_sec = int_of_float (Unix.gettimeofday () -. t.started_at) in
+    let hours = uptime_sec / 3600 in
+    let minutes = (uptime_sec mod 3600) / 60 in
+    let uptime_str = if hours > 0
+      then Printf.sprintf "%dh %dm" hours minutes
+      else Printf.sprintf "%dm" minutes in
+    reply (String.concat "\n" [
+      Printf.sprintf "**%s**" (Build_info.version_string ());
+      Printf.sprintf "Uptime: %s" uptime_str;
+      Printf.sprintf "Projects: %d" (List.length t.projects);
+      Printf.sprintf "Active sessions: %d" (Session_store.count t.sessions);
+      Printf.sprintf "Channels managed: %d" (Channel_manager.count t.channels);
+    ])
   | Command.Help ->
     reply (String.concat "\n" [
       "**Commands:**";
@@ -294,6 +312,7 @@ let handle_command t msg cmd =
       "`!rename [thread_id] <name>` — rename a thread";
       "`!cleanup` — delete stale channels";
       "`!restart` — rebuild and restart";
+      "`!version` — build info and runtime status";
       "`!help` — this message";
     ])
   | Command.Unknown _ -> ()
@@ -354,8 +373,8 @@ let handle_thread_message t msg ?channel_info () =
           | Error _ -> ()))
     end
 
-(** Ensure a session exists for a channel (control channel only).
-    Project channels use auto-thread creation instead. *)
+(** Ensure a session exists for a channel (control or project channels).
+    Creates a persistent Claude session so the channel can handle chat directly. *)
 let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prompt =
   match Session_store.find_opt t.sessions ~thread_id:channel_id with
   | Some _ -> ()
@@ -444,7 +463,8 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
     ~intents:Discord_gateway.default_intents
     ~handler:(fun _event -> ())
   in
-  let bot = { config; rest; gateway; projects; sessions; channels; env; sw } in
+  let bot = { config; rest; gateway; projects; sessions; channels; env; sw;
+               started_at = Unix.gettimeofday () } in
   bot.gateway.handler <- (fun event ->
     match event with
     | Discord_gateway.Connected user ->
