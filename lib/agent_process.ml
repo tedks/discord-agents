@@ -376,7 +376,7 @@ let claude_args ~session_id ~message_count ~prompt =
     if message_count = 0 then ["--session-id"; session_id]
     else ["--resume"; session_id]
   in
-  ["claude"; "-p"; "--output-format"; "stream-json"] @ session_flag @ [prompt]
+  ["claude"; "-p"; "--verbose"; "--output-format"; "stream-json"] @ session_flag @ [prompt]
 
 (** Spawn an agent and stream its output via a callback.
     The callback is called with each parsed event as it arrives.
