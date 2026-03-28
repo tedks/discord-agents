@@ -167,15 +167,22 @@ let () =
        | None -> ());
       Unix.close shutdown_r;
       Unix.close shutdown_w);
-    (* Fiber that waits for SIGUSR1 restart signal *)
+    (* Fiber that waits for SIGUSR1 restart signals.
+       Loops so that if a restart fails (build error), subsequent
+       SIGUSR1 signals can trigger another attempt. *)
     Eio.Fiber.fork ~sw (fun () ->
       let buf = Bytes.create 1 in
-      let _n = Eio_unix.run_in_systhread (fun () ->
-        Unix.read restart_r buf 0 1) in
-      Logs.info (fun m -> m "restart: SIGUSR1 received");
-      Unix.close restart_r;
-      Unix.close restart_w;
-      Discord_agents.Bot.trigger_restart bot ~notify:(fun msg ->
-        Logs.info (fun m -> m "restart: %s" msg)));
+      let rec loop () =
+        let n = Eio_unix.run_in_systhread (fun () ->
+          Unix.read restart_r buf 0 1) in
+        if n > 0 then begin
+          Logs.info (fun m -> m "restart: SIGUSR1 received");
+          Discord_agents.Bot.trigger_restart bot ~notify:(fun msg ->
+            Logs.info (fun m -> m "restart: %s" msg));
+          (* If we're still alive (restart failed), wait for next signal *)
+          loop ()
+        end
+      in
+      loop ());
     Discord_agents.Bot.run ~sw ~env bot
   end

@@ -155,6 +155,9 @@ let post_response rest ~channel_id text =
     Callable from command handler or signal handler.
     [notify] is called with status messages (may be a no-op for signal-triggered restarts). *)
 let trigger_restart t ~notify =
+  if t.draining then begin
+    notify "Already restarting.";
+  end else begin
   (* Set draining BEFORE forking to close the race window where
      a queued message could slip through before the flag flips. *)
   t.draining <- true;
@@ -228,6 +231,7 @@ let trigger_restart t ~notify =
         Eio.Time.sleep (Eio.Stdenv.clock t.env) 30.0;
         Logs.info (fun m -> m "bot: restart handoff timeout, exiting");
         exit 0))
+  end
 
 (** Handle a parsed command. *)
 let handle_command t msg cmd =
@@ -361,10 +365,7 @@ let handle_command t msg cmd =
       | Ok 0 -> reply "No stale channels to clean up."
       | Ok n -> reply (Printf.sprintf "Cleaned up %d stale channels." n))
   | Command.Restart ->
-    if t.draining then
-      reply "Already restarting."
-    else
-      trigger_restart t ~notify:reply
+    trigger_restart t ~notify:reply
   | Command.Rename_thread { thread_id; name } ->
     let target_id = match thread_id with
       | Some tid -> tid

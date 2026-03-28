@@ -556,16 +556,26 @@ def handle_tool_call(name, arguments, config, projects):
     elif name == "restart_bot":
         # Signal the bot to restart via SIGUSR1, which triggers the full
         # drain → reap → build → spawn pipeline in the bot process.
-        # Read the bot's PID from the pidfile and send the signal.
+        # Read the bot's PID from the pidfile and verify it's alive first
+        # (the pidfile persists after exit since we rely on lockf).
         pidfile = Path.home() / ".config/discord-agents/discord-agents.pid"
         try:
             pid = int(pidfile.read_text().strip())
-            os.kill(pid, signal.SIGUSR1)
-            return f"Restart signal (SIGUSR1) sent to bot (pid {pid}). It will drain active sessions, then rebuild and restart."
         except FileNotFoundError:
             return "Pidfile not found — is the bot running?"
+        except (ValueError, OSError) as e:
+            return f"Failed to read pidfile: {e}"
+        # Verify the process is alive before sending SIGUSR1
+        # (stale pidfile could contain a reused PID)
+        try:
+            os.kill(pid, 0)  # signal 0 = liveness check
         except ProcessLookupError:
-            return f"Bot process (pid {pid}) not found — it may have already exited."
+            return f"Bot process (pid {pid}) not found — pidfile is stale."
+        except PermissionError:
+            pass  # process exists but owned by another user (shouldn't happen)
+        try:
+            os.kill(pid, signal.SIGUSR1)
+            return f"Restart signal (SIGUSR1) sent to bot (pid {pid}). It will drain active sessions, then rebuild and restart."
         except Exception as e:
             return f"Failed to signal restart: {e}"
 
