@@ -36,6 +36,7 @@ type t = {
   channels : Channel_manager.t;
   env : Eio_unix.Stdenv.base;
   sw : Eio.Switch.t;
+  started_at : float;
 }
 
 (** Find a usable working directory for a project. *)
@@ -100,15 +101,20 @@ You have MCP tools available:
 - restart_bot: Rebuild and restart the bot
 - cleanup_channels: Delete stale Discord channels
 
-You can discuss the project, answer questions, review code, and plan work. \
-When the user wants to start a focused task, use start_session to create a \
-new thread with its own worktree so work doesn't interfere with other sessions. \
-Prefer the conversational MCP tools over suggesting !commands.
+WHEN TO CREATE THREADS vs CHAT IN-CHANNEL:
+- **Chat in-channel** for: questions, discussion, planning, code review, \
+explaining things, brainstorming, status updates, or anything conversational.
+- **Create a thread** (start_session) ONLY when the user explicitly asks to \
+start working on something that needs its own worktree — e.g. \"start a session\", \
+\"work on X\", \"fix this bug\", \"implement this feature\". The key signal is that \
+code changes will be made.
+- When in doubt, just chat. The user will ask for a thread if they want one.
 
 When starting a session, ALWAYS provide a short descriptive thread_name (max 80 chars) \
 that captures the task — do NOT include the project name. Example: \
 \"fix auth token refresh bug\" not \"myproject / fix auth token refresh bug\".
 
+Prefer the conversational MCP tools over suggesting !commands.
 Keep responses concise — this is Discord.
 
 IMPORTANT: When starting sessions, always create a fresh worktree so agents don't \
@@ -282,6 +288,102 @@ let handle_command t msg cmd =
     (match Discord_rest.modify_channel t.rest ~channel_id:target_id ~name () with
      | Ok _ -> reply (Printf.sprintf "Renamed to **%s**." name)
      | Error e -> reply (Printf.sprintf "Rename failed: %s" e))
+  | Command.Status ->
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      let status_lines = Eio_unix.run_in_systhread (fun () ->
+        let pid = Unix.getpid () in
+        let uptime_sec = int_of_float (Unix.gettimeofday () -. t.started_at) in
+        let hours = uptime_sec / 3600 in
+        let minutes = (uptime_sec mod 3600) / 60 in
+        let uptime_str = if hours > 0
+          then Printf.sprintf "%dh %dm" hours minutes
+          else Printf.sprintf "%dm" minutes in
+        (* Running agent child processes — filter by PPID to only show
+           processes spawned by this bot, not unrelated Claude CLI usage *)
+        let my_pid_str = string_of_int pid in
+        let agent_procs =
+          try
+            let ic = Unix.open_process_in
+              (Printf.sprintf
+                "ps -eo pid,ppid,etimes,args 2>/dev/null | awk '$2 == %s' | grep -v grep"
+                my_pid_str) in
+            let lines = ref [] in
+            (try while true do lines := input_line ic :: !lines done
+             with End_of_file -> ());
+            ignore (Unix.close_process_in ic);
+            List.rev !lines
+          with _ -> []
+        in
+        let agent_lines = List.filter_map (fun line ->
+          let parts = String.split_on_char ' ' (String.trim line) in
+          let parts = List.filter (fun s -> s <> "") parts in
+          match parts with
+          | _pid :: _ppid :: elapsed_s :: _rest ->
+            let elapsed = try int_of_string elapsed_s with _ -> 0 in
+            let mins = elapsed / 60 in
+            let full = String.concat " " _rest in
+            (* Identify agent kind from command *)
+            let kind =
+              if String.length full > 0 then
+                let first_arg = List.hd (String.split_on_char ' ' full) in
+                Filename.basename first_arg
+              else "unknown"
+            in
+            let sid =
+              try
+                let re_start = "--resume " in
+                let found = ref "" in
+                String.iteri (fun i _ ->
+                  if i + String.length re_start <= String.length full
+                     && String.sub full i (String.length re_start) = re_start then
+                    let after = String.sub full (i + String.length re_start)
+                      (min 36 (String.length full - i - String.length re_start)) in
+                    let sid = List.hd (String.split_on_char ' ' after) in
+                    if !found = "" then found := sid
+                ) full;
+                if !found <> "" then String.sub !found 0 (min 8 (String.length !found))
+                else ""
+              with _ -> ""
+            in
+            let label = if sid <> "" then Printf.sprintf "%s `%s`" kind sid
+              else kind in
+            Some (Printf.sprintf "  %s — %dm" label mins)
+          | _ -> None
+        ) agent_procs in
+        (* Detect multiple bot instances *)
+        let other_bots =
+          try
+            let ic = Unix.open_process_in
+              "ps -eo pid,args 2>/dev/null | grep discord-agents | grep -v grep" in
+            let lines = ref [] in
+            (try while true do lines := input_line ic :: !lines done
+             with End_of_file -> ());
+            ignore (Unix.close_process_in ic);
+            let count = List.length (List.rev !lines) in
+            if count > 1 then
+              Printf.sprintf "\n**\xe2\x9a\xa0\xef\xb8\x8f %d bot instances running** (expected 1)" count
+            else ""
+          with _ -> ""
+        in
+        let lines = [
+          Printf.sprintf "**%s** (pid %d, up %s)" (Build_info.version_string ()) pid uptime_str;
+          Printf.sprintf "Sessions: %d (%d processing)"
+            (Session_store.count t.sessions)
+            (List.length (List.filter (fun (_, (s : Session_store.session)) ->
+              s.processing) (Session_store.bindings t.sessions)));
+          Printf.sprintf "Projects: %d  |  Channels: %d"
+            (List.length t.projects) (Channel_manager.count t.channels);
+        ] in
+        let lines = if agent_lines <> [] then
+          lines @ [Printf.sprintf "**Running agents** (%d):" (List.length agent_lines)]
+          @ agent_lines
+        else
+          lines @ ["No running agent processes."]
+        in
+        let lines = if other_bots <> "" then lines @ [other_bots] else lines in
+        lines
+      ) in
+      reply (String.concat "\n" status_lines))
   | Command.Help ->
     reply (String.concat "\n" [
       "**Commands:**";
@@ -292,8 +394,10 @@ let handle_command t msg cmd =
       "`!resume <session_id>` — resume a Claude session";
       "`!stop <thread_id>` — stop a session";
       "`!rename [thread_id] <name>` — rename a thread";
+      "`!status` — bot status and running processes";
       "`!cleanup` — delete stale channels";
       "`!restart` — rebuild and restart";
+      "`!version` — build info and runtime status";
       "`!help` — this message";
     ])
   | Command.Unknown _ -> ()
@@ -354,8 +458,8 @@ let handle_thread_message t msg ?channel_info () =
           | Error _ -> ()))
     end
 
-(** Ensure a session exists for a channel (control channel only).
-    Project channels use auto-thread creation instead. *)
+(** Ensure a session exists for a channel (control or project channels).
+    Creates a persistent Claude session so the channel can handle chat directly. *)
 let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prompt =
   match Session_store.find_opt t.sessions ~thread_id:channel_id with
   | Some _ -> ()
@@ -444,7 +548,8 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
     ~intents:Discord_gateway.default_intents
     ~handler:(fun _event -> ())
   in
-  let bot = { config; rest; gateway; projects; sessions; channels; env; sw } in
+  let bot = { config; rest; gateway; projects; sessions; channels; env; sw;
+               started_at = Unix.gettimeofday () } in
   bot.gateway.handler <- (fun event ->
     match event with
     | Discord_gateway.Connected user ->
