@@ -380,9 +380,11 @@ let claude_args ~session_id ~message_count ~prompt =
 
 (** Spawn an agent and stream its output via a callback.
     The callback is called with each parsed event as it arrives.
+    [?on_pid] is called with the child PID immediately after spawn,
+    so the caller can track active subprocesses for cleanup.
     Returns when the process exits. *)
 let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
-    ?system_prompt ~prompt ~on_event () =
+    ?system_prompt ~prompt ~on_event ?on_pid () =
   let mgr = Eio.Stdenv.process_mgr env in
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
@@ -435,6 +437,7 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
   let stderr_r, stderr_w = Eio.Process.pipe ~sw mgr in
   let proc = Eio.Process.spawn ~sw mgr ~cwd
     ~stdout:stdout_w ~stderr:stderr_w args in
+  (match on_pid with Some f -> f (Eio.Process.pid proc) | None -> ());
   (* Close write ends so reads get EOF when process exits *)
   Eio.Resource.close stdout_w;
   Eio.Resource.close stderr_w;

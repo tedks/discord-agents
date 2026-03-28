@@ -27,6 +27,8 @@ let project_root =
     with _ -> Sys.getcwd ()
   )
 
+module Pid_set = Set.Make(Int)
+
 type t = {
   config : Config.t;
   rest : Discord_rest.t;
@@ -37,7 +39,28 @@ type t = {
   env : Eio_unix.Stdenv.base;
   sw : Eio.Switch.t;
   started_at : float;
+  mutable draining : bool;
+  child_pids : (Pid_set.t ref * Mutex.t);
 }
+
+let register_child_pid t pid =
+  let (pids, mu) = t.child_pids in
+  Mutex.lock mu;
+  pids := Pid_set.add pid !pids;
+  Mutex.unlock mu
+
+let unregister_child_pid t pid =
+  let (pids, mu) = t.child_pids in
+  Mutex.lock mu;
+  pids := Pid_set.remove pid !pids;
+  Mutex.unlock mu
+
+let get_child_pids t =
+  let (pids, mu) = t.child_pids in
+  Mutex.lock mu;
+  let result = !pids in
+  Mutex.unlock mu;
+  result
 
 (** Find a usable working directory for a project. *)
 let working_dir_of_project (p : Project.t) =
@@ -127,6 +150,88 @@ let post_response rest ~channel_id text =
     | Ok _ -> ()
     | Error e -> Logs.warn (fun m -> m "bot: post error: %s" e)
   ) (Agent_process.split_message text)
+
+(** Trigger a graceful restart: drain → reap → build → spawn.
+    Callable from command handler or signal handler.
+    [notify] is called with status messages (may be a no-op for signal-triggered restarts). *)
+let trigger_restart t ~notify =
+  if t.draining then begin
+    notify "Already restarting.";
+  end else begin
+  (* Set draining BEFORE forking to close the race window where
+     a queued message could slip through before the flag flips. *)
+  t.draining <- true;
+  Eio.Fiber.fork ~sw:t.sw (fun () ->
+    Fun.protect ~finally:(fun () ->
+      (* Safety net: always reset draining if we exit without exec'ing.
+         Covers unexpected exceptions, build failures, and handoff timeout. *)
+      t.draining <- false
+    ) (fun () ->
+      (* Phase 1: Drain — wait for in-flight sessions to complete *)
+      let processing_count () =
+        List.length (List.filter (fun (_, (s : Session_store.session)) ->
+          s.processing) (Session_store.bindings t.sessions)) in
+      let active = processing_count () in
+      if active > 0 then begin
+        notify (Printf.sprintf "Draining %d active session(s)..." active);
+        let clock = Eio.Stdenv.clock t.env in
+        let deadline = Eio.Time.now clock +. 300.0 in
+        let rec wait () =
+          let n = processing_count () in
+          if n = 0 then ()
+          else if Eio.Time.now clock > deadline then
+            notify (Printf.sprintf "Timed out waiting for %d session(s). Proceeding." n)
+          else begin
+            Eio.Time.sleep clock 1.0;
+            wait ()
+          end
+        in
+        wait ()
+      end;
+      (* Phase 2: Reap child processes.
+         Split SIGTERM and SIGKILL into separate systhread calls with
+         Eio.Time.sleep between to avoid blocking the systhread pool. *)
+      let pids = get_child_pids t in
+      if not (Pid_set.is_empty pids) then begin
+        notify (Printf.sprintf "Terminating %d child process(es)..." (Pid_set.cardinal pids));
+        Eio_unix.run_in_systhread (fun () ->
+          Pid_set.iter (fun pid ->
+            (try Unix.kill pid Sys.sigterm
+             with Unix.Unix_error _ -> ())
+          ) pids);
+        Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
+        Eio_unix.run_in_systhread (fun () ->
+          Pid_set.iter (fun pid ->
+            (try Unix.kill pid 0; Unix.kill pid Sys.sigkill
+             with Unix.Unix_error _ -> ())
+          ) pids)
+      end;
+      (* Phase 3: Build and restart *)
+      notify "Building...";
+      match Eio_unix.run_in_systhread (fun () ->
+        let root = Lazy.force project_root in
+        let exit_code = Sys.command
+          (Printf.sprintf "cd %s && nix develop --command dune build 2>&1"
+            (Filename.quote root)) in
+        if exit_code <> 0 then `Build_failed
+        else begin
+          let _pid = Unix.create_process "/bin/sh"
+            [| "/bin/sh"; "-c";
+               Printf.sprintf "cd %s && nix develop --command dune exec discord-agents &"
+                 (Filename.quote root) |]
+            Unix.stdin Unix.stdout Unix.stderr in
+          `Restarting
+        end) with
+      | `Build_failed ->
+        notify "Build failed, not restarting."
+        (* draining reset by Fun.protect finally *)
+      | `Restarting ->
+        notify "Build succeeded. New instance starting — shutting down in 30s.";
+        (* Wait for new instance to take over, then exit. *)
+        Eio.Time.sleep (Eio.Stdenv.clock t.env) 30.0;
+        Logs.info (fun m -> m "bot: restart handoff timeout, exiting");
+        exit 0))
+  end
 
 (** Handle a parsed command. *)
 let handle_command t msg cmd =
@@ -260,26 +365,7 @@ let handle_command t msg cmd =
       | Ok 0 -> reply "No stale channels to clean up."
       | Ok n -> reply (Printf.sprintf "Cleaned up %d stale channels." n))
   | Command.Restart ->
-    reply "Rebuilding and restarting...";
-    Eio.Fiber.fork ~sw:t.sw (fun () ->
-      match Eio_unix.run_in_systhread (fun () ->
-        let root = Lazy.force project_root in
-        let exit_code = Sys.command
-          (Printf.sprintf "cd %s && nix develop --command dune build 2>&1"
-            (Filename.quote root)) in
-        if exit_code <> 0 then `Build_failed
-        else begin
-          let _pid = Unix.create_process "/bin/sh"
-            [| "/bin/sh"; "-c";
-               Printf.sprintf "cd %s && nix develop --command dune exec discord-agents &"
-                 (Filename.quote root) |]
-            Unix.stdin Unix.stdout Unix.stderr in
-          `Restarting
-        end) with
-      | `Build_failed -> reply "Build failed, not restarting."
-      | `Restarting ->
-        reply "Build succeeded. New instance starting.";
-        Eio.Time.sleep (Eio.Stdenv.clock t.env) 30.0)
+    trigger_restart t ~notify:reply
   | Command.Rename_thread { thread_id; name } ->
     let target_id = match thread_id with
       | Some tid -> tid
@@ -431,6 +517,11 @@ let resolve_channel_context t ~(channel_id : Discord_types.channel_id)
 (** Handle a message in a session thread.
     [channel_info] is passed through when the caller already fetched it. *)
 let handle_thread_message t msg ?channel_info () =
+  if t.draining then begin
+    ignore (Discord_rest.create_message t.rest
+      ~channel_id:msg.Discord_types.channel_id
+      ~content:"Bot is restarting — waiting for active sessions to finish. Try again shortly." ())
+  end else
   match Session_store.find_opt t.sessions ~thread_id:msg.Discord_types.channel_id with
   | None -> ()
   | Some session ->
@@ -439,8 +530,12 @@ let handle_thread_message t msg ?channel_info () =
         ~channel_id:msg.channel_id ~content:"Still processing previous message..." ())
     else begin
       session.processing <- true;
+      let child_pid = ref None in
       Eio.Fiber.fork ~sw:t.sw (fun () ->
-        Fun.protect ~finally:(fun () -> session.processing <- false) (fun () ->
+        Fun.protect ~finally:(fun () ->
+          session.processing <- false;
+          Option.iter (unregister_child_pid t) !child_pid
+        ) (fun () ->
           let channel_id = msg.Discord_types.channel_id in
           ignore (Discord_rest.create_reaction t.rest ~channel_id
             ~message_id:msg.id ~emoji:"\xF0\x9F\x91\x80" ());
@@ -449,10 +544,14 @@ let handle_thread_message t msg ?channel_info () =
           let author_name = msg.author.username in
           let (channel_name, channel_type) =
             resolve_channel_context t ~channel_id ~session ?channel_info () in
+          let on_pid pid =
+            child_pid := Some pid;
+            register_child_pid t pid;
+            Logs.info (fun m -> m "bot: registered child pid %d" pid) in
           match Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
                   ~session ~channel_id ~prompt:msg.content
                   ~attachments:msg.attachments
-                  ~author_name ~channel_name ~channel_type () with
+                  ~author_name ~channel_name ~channel_type ~on_pid () with
           | Ok () ->
             Session_store.increment_message_count t.sessions session
           | Error _ -> ()))
@@ -476,6 +575,23 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
 let handle_message t (msg : Discord_types.message) =
   Session_store.maybe_reload t.sessions;
   match msg.author.bot with Some true -> () | _ ->
+  (* While draining, only allow read-only commands *)
+  if t.draining then begin
+    if Command.is_command msg.content then
+      let cmd = Command.parse msg.content in
+      match cmd with
+      | Command.Status | Command.List_projects | Command.List_sessions
+      | Command.List_claude_sessions | Command.Help ->
+        handle_command t msg cmd
+      | _ ->
+        ignore (Discord_rest.create_message t.rest
+          ~channel_id:msg.Discord_types.channel_id
+          ~content:"Bot is restarting. Try again shortly." ())
+    else
+      ignore (Discord_rest.create_message t.rest
+        ~channel_id:msg.Discord_types.channel_id
+        ~content:"Bot is restarting. Try again shortly." ())
+  end else
   if Command.is_command msg.content then
     handle_command t msg (Command.parse msg.content)
   else begin
@@ -549,7 +665,8 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
     ~handler:(fun _event -> ())
   in
   let bot = { config; rest; gateway; projects; sessions; channels; env; sw;
-               started_at = Unix.gettimeofday () } in
+               started_at = Unix.gettimeofday ();
+               draining = false; child_pids = (ref Pid_set.empty, Mutex.create ()) } in
   bot.gateway.handler <- (fun event ->
     match event with
     | Discord_gateway.Connected user ->

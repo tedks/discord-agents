@@ -10,6 +10,7 @@ Protocol: JSON-RPC 2.0 over stdio (MCP standard).
 
 import json
 import os
+import signal
 import sys
 import subprocess
 import urllib.request
@@ -553,25 +554,42 @@ def handle_tool_call(name, arguments, config, projects):
         return f"Resumed session `{full_sid[:8]}` in <#{thread_id}>."
 
     elif name == "restart_bot":
-        # Derive project root from this script's location
-        script_dir = Path(__file__).resolve().parent
-        project_root = script_dir.parent
-        result = subprocess.run(
-            ["nix", "develop", "--command", "dune", "build"],
-            capture_output=True, text=True, timeout=120,
-            cwd=str(project_root))
-        if result.returncode != 0:
-            output = (result.stdout + result.stderr)[-500:]
-            return f"Build failed:\n```\n{output}\n```"
-
-        # Spawn new instance (it kills the old via pidfile)
-        subprocess.Popen(
-            ["nix", "develop", "--command", "dune", "exec", "discord-agents"],
-            cwd=str(project_root),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL)
-        return "Build succeeded. New bot instance starting."
+        # Signal the bot to restart via SIGUSR1, which triggers the full
+        # drain → reap → build → spawn pipeline in the bot process.
+        # Read the bot's PID from the pidfile and verify it's alive first
+        # (the pidfile persists after exit since we rely on lockf).
+        pidfile = Path.home() / ".config/discord-agents/discord-agents.pid"
+        try:
+            pid = int(pidfile.read_text().strip())
+        except FileNotFoundError:
+            return "Pidfile not found — is the bot running?"
+        except (ValueError, OSError) as e:
+            return f"Failed to read pidfile: {e}"
+        # Reject invalid PIDs: 0 signals the process group, negative
+        # values signal other groups. Only accept positive integers.
+        if pid <= 0:
+            return f"Invalid PID in pidfile: {pid}"
+        # Verify the process is alive AND is actually discord-agents
+        # (stale pidfile could contain a reused PID)
+        try:
+            os.kill(pid, 0)  # signal 0 = liveness check
+        except ProcessLookupError:
+            return f"Bot process (pid {pid}) not found — pidfile is stale."
+        except PermissionError:
+            pass  # process exists but owned by another user (shouldn't happen)
+        # Verify the process is actually discord-agents, not an unrelated
+        # process that reused the PID after the bot exited
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", errors="replace")
+            if "discord-agents" not in cmdline:
+                return f"PID {pid} is not discord-agents (pidfile is stale)."
+        except OSError:
+            pass  # non-Linux or process just exited; proceed cautiously
+        try:
+            os.kill(pid, signal.SIGUSR1)
+            return f"Restart signal (SIGUSR1) sent to bot (pid {pid}). It will drain active sessions, then rebuild and restart."
+        except Exception as e:
+            return f"Failed to signal restart: {e}"
 
     elif name == "rename_thread":
         thread_id = arguments.get("thread_id", "")

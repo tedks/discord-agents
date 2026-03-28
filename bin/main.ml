@@ -149,6 +149,11 @@ let () =
     in
     Sys.set_signal Sys.sigint (Sys.Signal_handle handle_signal);
     Sys.set_signal Sys.sigterm (Sys.Signal_handle handle_signal);
+    (* SIGUSR1 triggers graceful restart via a separate pipe.
+       Used by the MCP server to signal restart without going through Discord. *)
+    let restart_r, restart_w = Unix.pipe ~cloexec:true () in
+    Sys.set_signal Sys.sigusr1 (Sys.Signal_handle (fun _signum ->
+      ignore (Unix.write_substring restart_w "!" 0 1)));
     (* Fiber that waits for the shutdown signal *)
     Eio.Fiber.fork ~sw (fun () ->
       let buf = Bytes.create 1 in
@@ -162,5 +167,22 @@ let () =
        | None -> ());
       Unix.close shutdown_r;
       Unix.close shutdown_w);
+    (* Fiber that waits for SIGUSR1 restart signals.
+       Loops so that if a restart fails (build error), subsequent
+       SIGUSR1 signals can trigger another attempt. *)
+    Eio.Fiber.fork ~sw (fun () ->
+      let buf = Bytes.create 1 in
+      let rec loop () =
+        let n = Eio_unix.run_in_systhread (fun () ->
+          Unix.read restart_r buf 0 1) in
+        if n > 0 then begin
+          Logs.info (fun m -> m "restart: SIGUSR1 received");
+          Discord_agents.Bot.trigger_restart bot ~notify:(fun msg ->
+            Logs.info (fun m -> m "restart: %s" msg));
+          (* If we're still alive (restart failed), wait for next signal *)
+          loop ()
+        end
+      in
+      loop ());
     Discord_agents.Bot.run ~sw ~env bot
   end
