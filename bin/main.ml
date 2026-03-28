@@ -52,19 +52,12 @@ let acquire_pidfile () =
   let pid_str = string_of_int (Unix.getpid ()) ^ "\n" in
   let _ = Unix.write_substring fd pid_str 0 (String.length pid_str) in
   (* Keep fd open — lock is held until process exits.
-     at_exit cleanup is best-effort. *)
-  let our_pid = Unix.getpid () in
+     Do NOT delete the pidfile on exit: the lockf serves as the
+     liveness indicator. Deleting it races with the replacement
+     instance which may have already written its PID. *)
   at_exit (fun () ->
     (try Unix.lockf fd Unix.F_ULOCK 0 with _ -> ());
-    (try Unix.close fd with _ -> ());
-    (* Only delete pidfile if it still contains our PID — a replacement
-       instance may have already written its own PID to this file. *)
-    (try
-      let ic = open_in path in
-      let file_pid = int_of_string (String.trim (input_line ic)) in
-      close_in ic;
-      if file_pid = our_pid then Sys.remove path
-    with _ -> ()));
+    (try Unix.close fd with _ -> ()));
   fd
 
 (** Smoke test: verify REST client works, optionally send a test message,
