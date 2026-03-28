@@ -10,6 +10,7 @@ Protocol: JSON-RPC 2.0 over stdio (MCP standard).
 
 import json
 import os
+import signal
 import sys
 import subprocess
 import urllib.request
@@ -553,18 +554,20 @@ def handle_tool_call(name, arguments, config, projects):
         return f"Resumed session `{full_sid[:8]}` in <#{thread_id}>."
 
     elif name == "restart_bot":
-        # Signal the bot to restart via its own !restart command flow,
-        # which handles draining active sessions and reaping child processes.
-        # Posting to the control channel ensures the bot's full restart
-        # pipeline runs (drain → reap → build → spawn).
-        if not control_channel:
-            return "No control channel configured — cannot signal restart."
-        result = discord_request("POST", f"/channels/{control_channel}/messages", token, {
-            "content": "!restart",
-        })
-        if "error" in result:
-            return f"Failed to signal restart: {result['error']}"
-        return "Restart signal sent. The bot will drain active sessions, then rebuild and restart."
+        # Signal the bot to restart via SIGUSR1, which triggers the full
+        # drain → reap → build → spawn pipeline in the bot process.
+        # Read the bot's PID from the pidfile and send the signal.
+        pidfile = Path.home() / ".config/discord-agents/discord-agents.pid"
+        try:
+            pid = int(pidfile.read_text().strip())
+            os.kill(pid, signal.SIGUSR1)
+            return f"Restart signal (SIGUSR1) sent to bot (pid {pid}). It will drain active sessions, then rebuild and restart."
+        except FileNotFoundError:
+            return "Pidfile not found — is the bot running?"
+        except ProcessLookupError:
+            return f"Bot process (pid {pid}) not found — it may have already exited."
+        except Exception as e:
+            return f"Failed to signal restart: {e}"
 
     elif name == "rename_thread":
         thread_id = arguments.get("thread_id", "")

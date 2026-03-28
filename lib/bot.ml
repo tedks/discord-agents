@@ -151,6 +151,84 @@ let post_response rest ~channel_id text =
     | Error e -> Logs.warn (fun m -> m "bot: post error: %s" e)
   ) (Agent_process.split_message text)
 
+(** Trigger a graceful restart: drain → reap → build → spawn.
+    Callable from command handler or signal handler.
+    [notify] is called with status messages (may be a no-op for signal-triggered restarts). *)
+let trigger_restart t ~notify =
+  (* Set draining BEFORE forking to close the race window where
+     a queued message could slip through before the flag flips. *)
+  t.draining <- true;
+  Eio.Fiber.fork ~sw:t.sw (fun () ->
+    Fun.protect ~finally:(fun () ->
+      (* Safety net: always reset draining if we exit without exec'ing.
+         Covers unexpected exceptions, build failures, and handoff timeout. *)
+      t.draining <- false
+    ) (fun () ->
+      (* Phase 1: Drain — wait for in-flight sessions to complete *)
+      let processing_count () =
+        List.length (List.filter (fun (_, (s : Session_store.session)) ->
+          s.processing) (Session_store.bindings t.sessions)) in
+      let active = processing_count () in
+      if active > 0 then begin
+        notify (Printf.sprintf "Draining %d active session(s)..." active);
+        let clock = Eio.Stdenv.clock t.env in
+        let deadline = Eio.Time.now clock +. 300.0 in
+        let rec wait () =
+          let n = processing_count () in
+          if n = 0 then ()
+          else if Eio.Time.now clock > deadline then
+            notify (Printf.sprintf "Timed out waiting for %d session(s). Proceeding." n)
+          else begin
+            Eio.Time.sleep clock 1.0;
+            wait ()
+          end
+        in
+        wait ()
+      end;
+      (* Phase 2: Reap child processes.
+         Split SIGTERM and SIGKILL into separate systhread calls with
+         Eio.Time.sleep between to avoid blocking the systhread pool. *)
+      let pids = get_child_pids t in
+      if not (Pid_set.is_empty pids) then begin
+        notify (Printf.sprintf "Terminating %d child process(es)..." (Pid_set.cardinal pids));
+        Eio_unix.run_in_systhread (fun () ->
+          Pid_set.iter (fun pid ->
+            (try Unix.kill pid Sys.sigterm
+             with Unix.Unix_error _ -> ())
+          ) pids);
+        Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
+        Eio_unix.run_in_systhread (fun () ->
+          Pid_set.iter (fun pid ->
+            (try Unix.kill pid 0; Unix.kill pid Sys.sigkill
+             with Unix.Unix_error _ -> ())
+          ) pids)
+      end;
+      (* Phase 3: Build and restart *)
+      notify "Building...";
+      match Eio_unix.run_in_systhread (fun () ->
+        let root = Lazy.force project_root in
+        let exit_code = Sys.command
+          (Printf.sprintf "cd %s && nix develop --command dune build 2>&1"
+            (Filename.quote root)) in
+        if exit_code <> 0 then `Build_failed
+        else begin
+          let _pid = Unix.create_process "/bin/sh"
+            [| "/bin/sh"; "-c";
+               Printf.sprintf "cd %s && nix develop --command dune exec discord-agents &"
+                 (Filename.quote root) |]
+            Unix.stdin Unix.stdout Unix.stderr in
+          `Restarting
+        end) with
+      | `Build_failed ->
+        notify "Build failed, not restarting."
+        (* draining reset by Fun.protect finally *)
+      | `Restarting ->
+        notify "Build succeeded. New instance starting — shutting down in 30s.";
+        (* Wait for new instance to take over, then exit. *)
+        Eio.Time.sleep (Eio.Stdenv.clock t.env) 30.0;
+        Logs.info (fun m -> m "bot: restart handoff timeout, exiting");
+        exit 0))
+
 (** Handle a parsed command. *)
 let handle_command t msg cmd =
   let channel_id = msg.Discord_types.channel_id in
@@ -286,74 +364,7 @@ let handle_command t msg cmd =
     if t.draining then
       reply "Already restarting."
     else
-    Eio.Fiber.fork ~sw:t.sw (fun () ->
-      (* Phase 1: Drain — stop accepting new messages and wait for in-flight ones *)
-      t.draining <- true;
-      let processing_count () =
-        List.length (List.filter (fun (_, (s : Session_store.session)) ->
-          s.processing) (Session_store.bindings t.sessions)) in
-      let active = processing_count () in
-      if active > 0 then begin
-        reply (Printf.sprintf "Draining %d active session(s)..." active);
-        let clock = Eio.Stdenv.clock t.env in
-        let deadline = Eio.Time.now clock +. 300.0 in
-        let rec wait () =
-          let n = processing_count () in
-          if n = 0 then ()
-          else if Eio.Time.now clock > deadline then
-            reply (Printf.sprintf "Timed out waiting for %d session(s). Proceeding." n)
-          else begin
-            Eio.Time.sleep clock 1.0;
-            wait ()
-          end
-        in
-        wait ()
-      end;
-      (* Phase 2: Reap child processes.
-         Split SIGTERM and SIGKILL into separate systhread calls with
-         Eio.Time.sleep between to avoid blocking the systhread pool. *)
-      let pids = get_child_pids t in
-      if not (Pid_set.is_empty pids) then begin
-        reply (Printf.sprintf "Terminating %d child process(es)..." (Pid_set.cardinal pids));
-        Eio_unix.run_in_systhread (fun () ->
-          Pid_set.iter (fun pid ->
-            (try Unix.kill pid Sys.sigterm
-             with Unix.Unix_error _ -> ())
-          ) pids);
-        Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
-        Eio_unix.run_in_systhread (fun () ->
-          Pid_set.iter (fun pid ->
-            (try Unix.kill pid 0; Unix.kill pid Sys.sigkill
-             with Unix.Unix_error _ -> ())
-          ) pids)
-      end;
-      (* Phase 3: Build and restart *)
-      reply "Building...";
-      match Eio_unix.run_in_systhread (fun () ->
-        let root = Lazy.force project_root in
-        let exit_code = Sys.command
-          (Printf.sprintf "cd %s && nix develop --command dune build 2>&1"
-            (Filename.quote root)) in
-        if exit_code <> 0 then `Build_failed
-        else begin
-          let _pid = Unix.create_process "/bin/sh"
-            [| "/bin/sh"; "-c";
-               Printf.sprintf "cd %s && nix develop --command dune exec discord-agents &"
-                 (Filename.quote root) |]
-            Unix.stdin Unix.stdout Unix.stderr in
-          `Restarting
-        end) with
-      | `Build_failed ->
-        t.draining <- false;
-        reply "Build failed, not restarting."
-      | `Restarting ->
-        reply "Build succeeded. New instance starting — shutting down in 30s.";
-        (* Wait for new instance to take over, then exit cleanly.
-           Reset draining as a safety net in case the new instance never starts. *)
-        Eio.Time.sleep (Eio.Stdenv.clock t.env) 30.0;
-        t.draining <- false;
-        Logs.info (fun m -> m "bot: restart handoff timeout, exiting");
-        exit 0)
+      trigger_restart t ~notify:reply
   | Command.Rename_thread { thread_id; name } ->
     let target_id = match thread_id with
       | Some tid -> tid
