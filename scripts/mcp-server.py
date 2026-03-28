@@ -565,7 +565,11 @@ def handle_tool_call(name, arguments, config, projects):
             return "Pidfile not found — is the bot running?"
         except (ValueError, OSError) as e:
             return f"Failed to read pidfile: {e}"
-        # Verify the process is alive before sending SIGUSR1
+        # Reject invalid PIDs: 0 signals the process group, negative
+        # values signal other groups. Only accept positive integers.
+        if pid <= 0:
+            return f"Invalid PID in pidfile: {pid}"
+        # Verify the process is alive AND is actually discord-agents
         # (stale pidfile could contain a reused PID)
         try:
             os.kill(pid, 0)  # signal 0 = liveness check
@@ -573,6 +577,14 @@ def handle_tool_call(name, arguments, config, projects):
             return f"Bot process (pid {pid}) not found — pidfile is stale."
         except PermissionError:
             pass  # process exists but owned by another user (shouldn't happen)
+        # Verify the process is actually discord-agents, not an unrelated
+        # process that reused the PID after the bot exited
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", errors="replace")
+            if "discord-agents" not in cmdline:
+                return f"PID {pid} is not discord-agents (pidfile is stale)."
+        except OSError:
+            pass  # non-Linux or process just exited; proceed cautiously
         try:
             os.kill(pid, signal.SIGUSR1)
             return f"Restart signal (SIGUSR1) sent to bot (pid {pid}). It will drain active sessions, then rebuild and restart."
