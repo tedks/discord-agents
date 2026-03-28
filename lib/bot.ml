@@ -578,10 +578,11 @@ let handle_message t (msg : Discord_types.message) =
   (* While draining, only allow read-only commands *)
   if t.draining then begin
     if Command.is_command msg.content then
-      match Command.parse msg.content with
+      let cmd = Command.parse msg.content in
+      match cmd with
       | Command.Status | Command.List_projects | Command.List_sessions
       | Command.List_claude_sessions | Command.Help ->
-        handle_command t msg (Command.parse msg.content)
+        handle_command t msg cmd
       | _ ->
         ignore (Discord_rest.create_message t.rest
           ~channel_id:msg.Discord_types.channel_id
