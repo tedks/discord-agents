@@ -14,6 +14,22 @@
 let typing_interval = 8.0
 
 (** Map tool names to emoji + verb for compact status display. *)
+(** Clean up an MCP tool name for display.
+    Strips the mcp__ prefix and server name, keeps the action part.
+    e.g. "mcp__discord-agents__restart_bot" -> "restart_bot" *)
+let clean_mcp_name name =
+  match String.split_on_char '_' name with
+  | "mcp" :: "" :: rest ->
+    (* Find the second __ delimiter — everything after it is the action *)
+    let rec find_action seen_delim = function
+      | "" :: tail when not seen_delim -> find_action true tail
+      | parts when seen_delim -> String.concat "_" parts
+      | _ :: tail -> find_action false tail
+      | [] -> name
+    in
+    find_action false rest
+  | _ -> name
+
 let tool_display_info name =
   match name with
   | "Read" -> "\xF0\x9F\x93\x96", "Reading"            (* 📖 *)
@@ -24,6 +40,8 @@ let tool_display_info name =
   | "Glob" -> "\xF0\x9F\x93\x82", "Finding files"       (* 📂 *)
   | "Agent" | "Task" -> "\xF0\x9F\xA4\x96", "Spawning agent"  (* 🤖 *)
   | "Skill" -> "\xE2\x9A\xA1", "Using skill"            (* ⚡ *)
+  | n when String.length n > 5 && String.sub n 0 5 = "mcp__" ->
+    "\xF0\x9F\x94\xA7", "Using " ^ clean_mcp_name n     (* 🔧 *)
   | _ -> "\xF0\x9F\x94\xA7", "Using " ^ name            (* 🔧 *)
 
 (** Format a tool use event as a descriptive status line with optional
