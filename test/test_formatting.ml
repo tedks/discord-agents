@@ -557,6 +557,41 @@ let tool_detail_tests = [
   Alcotest.test_case "lang_of_path" `Quick test_lang_of_path;
 ]
 
+(* ── escape_nested_fences ──────────────────────────────────────── *)
+
+let test_escape_nested_no_fences () =
+  let input = "plain text\nno fences here" in
+  Alcotest.(check string) "no fences unchanged"
+    input (Discord_agents.Agent_process.escape_nested_fences input)
+
+let test_escape_nested_normal_code_block () =
+  let input = "text\n```ocaml\nlet x = 1\n```\nmore text" in
+  Alcotest.(check string) "normal code block unchanged"
+    input (Discord_agents.Agent_process.escape_nested_fences input)
+
+let test_escape_nested_backticks_inside_code () =
+  let input = "```\nPrintf.sprintf \"```\\n%s\\n```\"\n```" in
+  let result = Discord_agents.Agent_process.escape_nested_fences input in
+  (* The outer fences should be preserved *)
+  Alcotest.(check bool) "starts with fence"
+    true (String.length result >= 3 && String.sub result 0 3 = "```");
+  (* The inner content should contain zero-width spaces (escaped fences) *)
+  Alcotest.(check bool) "contains zero-width space"
+    true (try ignore (Str.search_forward
+            (Str.regexp_string "\xE2\x80\x8B") result 0); true
+          with Not_found -> false);
+  (* Result should be longer than input due to ZWS insertions *)
+  Alcotest.(check bool) "result longer than input"
+    true (String.length result > String.length input)
+
+let escape_nested_fences_tests = [
+  Alcotest.test_case "no fences" `Quick test_escape_nested_no_fences;
+  Alcotest.test_case "normal code block" `Quick
+    test_escape_nested_normal_code_block;
+  Alcotest.test_case "backticks inside code" `Quick
+    test_escape_nested_backticks_inside_code;
+]
+
 (* ── runner ──────────────────────────────────────────────────────── *)
 
 let () =
@@ -570,4 +605,5 @@ let () =
     "table_width", table_width_tests;
     "command_parsing", command_tests;
     "tool_detail", tool_detail_tests;
+    "escape_nested_fences", escape_nested_fences_tests;
   ]

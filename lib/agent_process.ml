@@ -465,6 +465,50 @@ let escape_code_fences s =
     done;
     Buffer.contents buf
 
+(** Escape nested triple backticks in Discord message text.
+    Scans line by line tracking code block state. Lines that contain ```
+    while already inside a code block get their ``` escaped with a
+    zero-width space, preventing premature fence closure. Top-level
+    fence markers (that open/close code blocks) are left untouched. *)
+let escape_nested_fences text =
+  let lines = String.split_on_char '\n' text in
+  let in_code = ref false in
+  let buf = Buffer.create (String.length text) in
+  let first = ref true in
+  List.iter (fun line ->
+    if not !first then Buffer.add_char buf '\n';
+    first := false;
+    let trimmed = String.trim line in
+    let is_fence = String.length trimmed >= 3
+      && trimmed.[0] = '`' && trimmed.[1] = '`' && trimmed.[2] = '`' in
+    if is_fence && not !in_code then begin
+      (* Opening fence — pass through unchanged *)
+      in_code := true;
+      Buffer.add_string buf line
+    end else if is_fence && !in_code then begin
+      (* Could be a closing fence or a nested fence.
+         Check: a closing fence is just ``` (possibly with trailing space).
+         A nested fence would have content after it like ```ocaml or ```diff
+         but we can't reliably distinguish, so we check if the line is ONLY
+         backticks/whitespace — if so, it's a closing fence. *)
+      let only_backticks = String.for_all (fun c ->
+        c = '`' || c = ' ' || c = '\t') trimmed in
+      if only_backticks then begin
+        (* Closing fence — pass through, exit code block *)
+        in_code := false;
+        Buffer.add_string buf line
+      end else begin
+        (* Nested fence (e.g. ```ocaml inside a code block) — escape it *)
+        Buffer.add_string buf (escape_code_fences line)
+      end
+    end else if !in_code then
+      (* Inside code block — escape any ``` sequences in the content *)
+      Buffer.add_string buf (escape_code_fences line)
+    else
+      Buffer.add_string buf line
+  ) lines;
+  Buffer.contents buf
+
 (** Generate a syntax-highlighted code block showing tool content details.
     Returns "" if the tool doesn't have interesting content to show. *)
 let detail_of_tool_input name input =

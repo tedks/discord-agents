@@ -147,6 +147,7 @@ stomp on each other's work." project.name project.path
 let post_response rest ~channel_id ~wrap_width text =
   let text = Agent_process.reformat_tables ~max_width:wrap_width text in
   let text = Agent_process.wrap_text ~max_width:wrap_width text in
+  let text = Agent_process.escape_nested_fences text in
   List.iter (fun chunk ->
     match Discord_rest.create_message rest ~channel_id ~content:chunk () with
     | Ok _ -> ()

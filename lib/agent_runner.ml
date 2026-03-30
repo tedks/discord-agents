@@ -207,6 +207,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
     let text = Agent_process.reformat_tables ~max_width:wrap_width
       (Buffer.contents current_msg_buf) in
     let text = Agent_process.wrap_text ~max_width:wrap_width text in
+    let text = Agent_process.escape_nested_fences text in
     if String.length text = 0 then ()
     else if String.length text <= Agent_process.discord_max_len then
       send_single_message text
