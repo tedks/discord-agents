@@ -177,12 +177,19 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
   let last_edit = ref (Unix.gettimeofday ()) in
   (* Background fiber: continuously send typing indicators while processing.
      Discord typing indicators expire after ~10s, so we refresh every 8s.
-     This covers gaps during tool execution when no Text_delta events fire. *)
+     Polls every 1s so the fiber stops within 1s of processing completing,
+     preventing stale typing indicators after the checkmark appears. *)
   Eio.Fiber.fork ~sw (fun () ->
+    let last_sent = ref (Unix.gettimeofday ()) in
     while !typing_active do
-      Eio.Time.sleep (Eio.Stdenv.clock env) typing_interval;
-      if !typing_active then
-        ignore (Discord_rest.send_typing rest ~channel_id ())
+      Eio.Time.sleep (Eio.Stdenv.clock env) 1.0;
+      if !typing_active then begin
+        let now = Unix.gettimeofday () in
+        if now -. !last_sent >= typing_interval then begin
+          ignore (Discord_rest.send_typing rest ~channel_id ());
+          last_sent := now
+        end
+      end
     done
   );
   let send_single_message text =
