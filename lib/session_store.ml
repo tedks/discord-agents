@@ -6,6 +6,11 @@
 
 module SessionMap = Map.Make(String)
 
+type pending_message = {
+  msg : Discord_types.message;
+  channel_info : Discord_types.channel option;
+}
+
 type session = {
   project_name : string;
   working_dir : string;
@@ -15,6 +20,7 @@ type session = {
   system_prompt : string option;
   mutable message_count : int;
   mutable processing : bool;
+  pending_queue : pending_message Queue.t;
 }
 
 type t = {
@@ -61,6 +67,7 @@ let sessions_of_json json =
         system_prompt = j |> member "system_prompt" |> to_string_option;
         message_count = j |> member "message_count" |> to_int;
         processing = false;
+        pending_queue = Queue.create ();
       } in
       (thread_id, session)
     ) in

@@ -238,6 +238,16 @@ let create_reaction t ~(channel_id : Discord_types.channel_id)
   | Ok _ -> Ok ()
   | Error e -> Error e
 
+(** Remove own reaction from a message. *)
+let delete_own_reaction t ~(channel_id : Discord_types.channel_id)
+    ~(message_id : Discord_types.message_id) ~emoji () =
+  let encoded_emoji = Uri.pct_encode emoji in
+  match request t ~meth:`DELETE
+    ~path:(Printf.sprintf "/channels/%s/messages/%s/reactions/%s/@me"
+      channel_id message_id encoded_emoji) () with
+  | Ok _ -> Ok ()
+  | Error e -> Error e
+
 (** Modify a channel/thread's properties (currently: name only). *)
 let modify_channel t ~(channel_id : Discord_types.channel_id) ~name () =
   let body = `Assoc [("name", `String name)] in

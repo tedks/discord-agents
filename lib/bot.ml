@@ -41,6 +41,7 @@ type t = {
   started_at : float;
   mutable draining : bool;
   child_pids : (Pid_set.t ref * Mutex.t);
+  mutable wrap_width : int;
 }
 
 let register_child_pid t pid =
@@ -143,8 +144,9 @@ Keep responses concise — this is Discord.
 IMPORTANT: When starting sessions, always create a fresh worktree so agents don't \
 stomp on each other's work." project.name project.path
 
-let post_response rest ~channel_id text =
-  let text = Agent_process.reformat_tables text in
+let post_response rest ~channel_id ~wrap_width text =
+  let text = Agent_process.reformat_tables ~max_width:wrap_width text in
+  let text = Agent_process.wrap_text ~max_width:wrap_width text in
   List.iter (fun chunk ->
     match Discord_rest.create_message rest ~channel_id ~content:chunk () with
     | Ok _ -> ()
@@ -318,7 +320,7 @@ let handle_command t msg cmd =
              project_name = p.name; working_dir; agent_kind = kind;
              session_id = Resource.generate_uuid ();
              thread_id = thread_ch.Discord_types.id;
-             system_prompt = None; message_count = 0; processing = false;
+             system_prompt = None; message_count = 0; processing = false; pending_queue = Queue.create ();
            } in
            Session_store.add t.sessions ~thread_id:thread_ch.id session;
            let branch_str = match branch_info with
@@ -344,7 +346,7 @@ let handle_command t msg cmd =
             project_name = Filename.basename working_dir; working_dir;
             agent_kind = Config.Claude; session_id = full_sid;
             thread_id = thread_ch.Discord_types.id;
-            system_prompt = None; message_count = 1; processing = false;
+            system_prompt = None; message_count = 1; processing = false; pending_queue = Queue.create ();
           } in
           Session_store.add t.sessions ~thread_id:thread_ch.id session;
           ignore (Discord_rest.create_message t.rest ~channel_id:thread_ch.id
@@ -484,8 +486,24 @@ let handle_command t msg cmd =
       "`!cleanup` — delete stale channels";
       "`!restart` — rebuild and restart";
       "`!version` — build info and runtime status";
+      "`!desktop` — set wrapping to desktop width";
+      "`!mobile` — set wrapping to mobile width";
+      "`!wrapping [n]` — show or set line wrap width";
       "`!help` — this message";
     ])
+  | Command.Desktop ->
+    t.wrap_width <- Agent_process.desktop_width;
+    reply (Printf.sprintf "Wrapping set to desktop (%d chars)."
+      Agent_process.desktop_width)
+  | Command.Mobile ->
+    t.wrap_width <- Agent_process.mobile_width;
+    reply (Printf.sprintf "Wrapping set to mobile (%d chars)."
+      Agent_process.mobile_width)
+  | Command.Wrapping None ->
+    reply (Printf.sprintf "Current wrapping: %d chars." t.wrap_width)
+  | Command.Wrapping (Some w) ->
+    t.wrap_width <- w;
+    reply (Printf.sprintf "Wrapping set to %d chars." w)
   | Command.Unknown _ -> ()
 
 (** Resolve the channel name and type for context injection.
@@ -525,10 +543,13 @@ let handle_thread_message t msg ?channel_info () =
   match Session_store.find_opt t.sessions ~thread_id:msg.Discord_types.channel_id with
   | None -> ()
   | Some session ->
-    if session.processing then
-      ignore (Discord_rest.create_message t.rest
-        ~channel_id:msg.channel_id ~content:"Still processing previous message..." ())
-    else begin
+    if session.processing then begin
+      (* Queue the message and react with hourglass *)
+      Queue.add { Session_store.msg; channel_info } session.pending_queue;
+      ignore (Discord_rest.create_reaction t.rest
+        ~channel_id:msg.Discord_types.channel_id
+        ~message_id:msg.id ~emoji:"\xE2\x8F\xB3" ())
+    end else begin
       session.processing <- true;
       let child_pid = ref None in
       Eio.Fiber.fork ~sw:t.sw (fun () ->
@@ -536,25 +557,44 @@ let handle_thread_message t msg ?channel_info () =
           session.processing <- false;
           Option.iter (unregister_child_pid t) !child_pid
         ) (fun () ->
-          let channel_id = msg.Discord_types.channel_id in
-          ignore (Discord_rest.create_reaction t.rest ~channel_id
-            ~message_id:msg.id ~emoji:"\xF0\x9F\x91\x80" ());
-          Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
-            ~project_name:session.project_name t.channels;
-          let author_name = msg.author.username in
-          let (channel_name, channel_type) =
-            resolve_channel_context t ~channel_id ~session ?channel_info () in
-          let on_pid pid =
-            child_pid := Some pid;
-            register_child_pid t pid;
-            Logs.info (fun m -> m "bot: registered child pid %d" pid) in
-          match Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
-                  ~session ~channel_id ~prompt:msg.content
-                  ~attachments:msg.attachments
-                  ~author_name ~channel_name ~channel_type ~on_pid () with
-          | Ok () ->
-            Session_store.increment_message_count t.sessions session
-          | Error _ -> ()))
+          let rec process_message (msg : Discord_types.message) channel_info =
+            let channel_id = msg.channel_id in
+            let message_id = msg.id in
+            ignore (Discord_rest.create_reaction t.rest ~channel_id
+              ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
+            Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
+              ~project_name:session.project_name t.channels;
+            let author_name = msg.author.username in
+            let (channel_name, channel_type) =
+              resolve_channel_context t ~channel_id ~session ?channel_info () in
+            let on_pid pid =
+              child_pid := Some pid;
+              register_child_pid t pid;
+              Logs.info (fun m -> m "bot: registered child pid %d" pid) in
+            let result = Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
+                    ~session ~channel_id ~prompt:msg.content
+                    ~attachments:msg.attachments
+                    ~author_name ~channel_name ~channel_type
+                    ~wrap_width:t.wrap_width ~on_pid () in
+            ignore (Discord_rest.delete_own_reaction t.rest ~channel_id
+              ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
+            ignore (Discord_rest.create_reaction t.rest ~channel_id
+              ~message_id ~emoji:"\xE2\x9C\x85" ());
+            (match result with
+            | Ok () ->
+              Session_store.increment_message_count t.sessions session
+            | Error _ -> ());
+            (* Drain the queue: process next pending message if any *)
+            match Queue.take_opt session.pending_queue with
+            | None -> ()
+            | Some pending ->
+              (* Remove hourglass, will get eyes when processing starts *)
+              ignore (Discord_rest.delete_own_reaction t.rest
+                ~channel_id:pending.msg.channel_id
+                ~message_id:pending.msg.id ~emoji:"\xE2\x8F\xB3" ());
+              process_message pending.msg pending.channel_info
+          in
+          process_message msg channel_info))
     end
 
 (** Ensure a session exists for a channel (control or project channels).
@@ -566,7 +606,7 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
     let session : Session_store.session = {
       project_name; working_dir; agent_kind = Config.Claude;
       session_id = Resource.generate_uuid (); thread_id = channel_id;
-      system_prompt; message_count = 0; processing = false;
+      system_prompt; message_count = 0; processing = false; pending_queue = Queue.create ();
     } in
     Session_store.add t.sessions ~thread_id:channel_id session;
     Logs.info (fun m -> m "bot: auto-created session for %s" project_name)
@@ -666,7 +706,8 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
   in
   let bot = { config; rest; gateway; projects; sessions; channels; env; sw;
                started_at = Unix.gettimeofday ();
-               draining = false; child_pids = (ref Pid_set.empty, Mutex.create ()) } in
+               draining = false; child_pids = (ref Pid_set.empty, Mutex.create ());
+               wrap_width = Agent_process.desktop_width } in
   bot.gateway.handler <- (fun event ->
     match event with
     | Discord_gateway.Connected user ->
