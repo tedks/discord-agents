@@ -347,7 +347,8 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
           String.concat "\n" kept ^ "\n..."
         else content in
         let output_block = Printf.sprintf "```\n%s\n```"
-          (Agent_process.truncate_detail Agent_process.max_detail_len truncated) in
+          (Agent_process.escape_code_fences
+            (Agent_process.truncate_detail Agent_process.max_detail_len truncated)) in
         tool_status_lines := output_block :: !tool_status_lines;
         flush_tool_status ()
       end

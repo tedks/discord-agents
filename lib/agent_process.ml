@@ -443,15 +443,40 @@ let truncate_detail n s =
   if String.length s <= n then s
   else String.sub s 0 n ^ "\n..."
 
+(** Escape triple backticks in text destined for a Discord code block.
+    Discord has no escape mechanism inside code blocks, so we replace
+    ``` with `` ` (zero-width space before last backtick) to prevent
+    premature fence closure. *)
+let escape_code_fences s =
+  let len = String.length s in
+  if len < 3 then s
+  else
+    let buf = Buffer.create (len + 10) in
+    let i = ref 0 in
+    while !i < len do
+      if !i + 2 < len && s.[!i] = '`' && s.[!i+1] = '`' && s.[!i+2] = '`' then begin
+        (* Replace ``` with ``\u200B` — zero-width space breaks the fence *)
+        Buffer.add_string buf "``\xE2\x80\x8B`";
+        i := !i + 3
+      end else begin
+        Buffer.add_char buf s.[!i];
+        incr i
+      end
+    done;
+    Buffer.contents buf
+
 (** Generate a syntax-highlighted code block showing tool content details.
     Returns "" if the tool doesn't have interesting content to show. *)
 let detail_of_tool_input name input =
   let open Yojson.Safe.Util in
   let get key = input |> member key |> to_string_option in
+  (* Build a code block with fences escaped in the content *)
+  let code_block lang content =
+    Printf.sprintf "```%s\n%s\n```" lang
+      (escape_code_fences (truncate_detail max_detail_len content))
+  in
   match name with
   | "Edit" ->
-    let path = match get "file_path" with Some p -> p | None -> "" in
-    let lang = lang_of_path path in
     let old_s = match get "old_string" with Some s -> s | None -> "" in
     let new_s = match get "new_string" with Some s -> s | None -> "" in
     if old_s = "" && new_s = "" then ""
@@ -472,24 +497,21 @@ let detail_of_tool_input name input =
         else if new_s <> "" then new_s
         else old_s
       in
-      let _ = lang in (* lang available but diff is more readable *)
-      Printf.sprintf "```diff\n%s```" (truncate_detail max_detail_len content)
+      code_block "diff" content
   | "Bash" ->
     (match get "command" with
-     | Some cmd when String.length cmd > 0 ->
-       Printf.sprintf "```bash\n%s\n```" (truncate_detail max_detail_len cmd)
+     | Some cmd when String.length cmd > 0 -> code_block "bash" cmd
      | _ -> "")
   | "Write" ->
     let path = match get "file_path" with Some p -> p | None -> "" in
     let lang = lang_of_path path in
     (match get "content" with
-     | Some c when String.length c > 0 ->
-       Printf.sprintf "```%s\n%s\n```" lang (truncate_detail max_detail_len c)
+     | Some c when String.length c > 0 -> code_block lang c
      | _ -> "")
   | "Grep" ->
     (match get "pattern" with
      | Some pat when String.length pat > 0 ->
-       Printf.sprintf "```\n/%s/\n```" (truncate_detail 200 pat)
+       code_block "" ("/" ^ truncate_detail 200 pat ^ "/")
      | _ -> "")
   | _ -> ""
 
