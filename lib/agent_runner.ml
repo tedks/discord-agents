@@ -173,8 +173,18 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
   let current_msg_buf = Buffer.create 1900 in
   let tool_status_lines = ref [] in
   let tool_status_msg_id = ref None in
-  let last_typing = ref (Unix.gettimeofday ()) in
+  let typing_active = ref true in
   let last_edit = ref (Unix.gettimeofday ()) in
+  (* Background fiber: continuously send typing indicators while processing.
+     Discord typing indicators expire after ~10s, so we refresh every 8s.
+     This covers gaps during tool execution when no Text_delta events fire. *)
+  Eio.Fiber.fork ~sw (fun () ->
+    while !typing_active do
+      Eio.Time.sleep (Eio.Stdenv.clock env) typing_interval;
+      if !typing_active then
+        ignore (Discord_rest.send_typing rest ~channel_id ())
+    done
+  );
   let send_single_message text =
     match !current_msg_id with
     | None ->
@@ -292,10 +302,6 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       if now -. !last_edit > 2.0 && Buffer.length current_msg_buf > 0 then begin
         flush_to_discord ();
         last_edit := now
-      end;
-      if now -. !last_typing > typing_interval then begin
-        ignore (Discord_rest.send_typing rest ~channel_id ());
-        last_typing := now
       end
     | Agent_process.Result { text = _; session_id = _ } ->
       flush_tool_status ();
@@ -326,13 +332,15 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       Logs.warn (fun m -> m "agent_runner: error event: %s" e)
     | Agent_process.Other _ -> ()
   in
-  match Agent_process.run_streaming ~sw ~env
+  let result = Agent_process.run_streaming ~sw ~env
           ~working_dir:session.working_dir
           ~kind:session.agent_kind
           ~session_id:session.session_id
           ~message_count:session.message_count
           ?system_prompt:session.system_prompt
-          ~prompt:context_prompt ~on_event ?on_pid () with
+          ~prompt:context_prompt ~on_event ?on_pid () in
+  typing_active := false;
+  match result with
   | Ok () ->
     flush_to_discord ();
     if Buffer.length result_buf = 0 then
