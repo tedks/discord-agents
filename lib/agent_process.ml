@@ -14,6 +14,7 @@ type stream_event =
   | Text_delta of string   (** Incremental text from the agent *)
   | Result of { text: string; session_id: string option }
   | Tool_use of tool_info  (** Agent is using a tool *)
+  | Tool_result of { content: string }  (** Output from a tool execution *)
   | Error of string
   | Other of string        (** Unrecognized event type *)
 
@@ -520,6 +521,22 @@ let parse_stream_json_line line =
               let detail = detail_of_tool_input name input in
               Some (Tool_use { tool_name = name; tool_summary = summary;
                                tool_detail = detail })
+            | Some "tool_result" ->
+              (* Tool result content block — extract the output text *)
+              let content = match item |> member "content" with
+                | `String s -> s
+                | `List parts ->
+                  (* Content may be a list of {type: "text", text: "..."} *)
+                  let texts = List.filter_map (fun p ->
+                    match p |> member "type" |> to_string_option with
+                    | Some "text" -> p |> member "text" |> to_string_option
+                    | _ -> None
+                  ) parts in
+                  String.concat "\n" texts
+                | _ -> ""
+              in
+              if content = "" then None
+              else Some (Tool_result { content })
             | _ -> None
           ) items
         | _ -> []
@@ -530,6 +547,14 @@ let parse_stream_json_line line =
         |> Option.value ~default:"" in
       let session_id = json |> member "session_id" |> to_string_option in
       [Result { text = result_text; session_id }]
+    | Some "tool_result" ->
+      (* Top-level tool result event *)
+      let content = match json |> member "content" with
+        | `String s -> s
+        | _ -> json |> member "output" |> to_string_option
+               |> Option.value ~default:"" in
+      if content = "" then [Other line]
+      else [Tool_result { content }]
     | _ -> [Other line]
   with _ -> [Other line]
 

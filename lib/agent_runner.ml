@@ -335,9 +335,29 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       end;
       tool_status_lines := status :: !tool_status_lines;
       flush_tool_status ()
+    | Agent_process.Tool_result { content } ->
+      Logs.debug (fun m -> m "agent_runner: tool result: %d chars"
+        (String.length content));
+      (* Append truncated output to the tool status message *)
+      if !tool_status_lines <> [] then begin
+        let max_output_lines = 20 in
+        let lines = String.split_on_char '\n' content in
+        let truncated = if List.length lines > max_output_lines then
+          let kept = List.filteri (fun i _ -> i < max_output_lines) lines in
+          String.concat "\n" kept ^ "\n..."
+        else content in
+        let output_block = Printf.sprintf "```\n%s\n```"
+          (Agent_process.truncate_detail Agent_process.max_detail_len truncated) in
+        tool_status_lines := output_block :: !tool_status_lines;
+        flush_tool_status ()
+      end
     | Agent_process.Error e ->
       Logs.warn (fun m -> m "agent_runner: error event: %s" e)
-    | Agent_process.Other _ -> ()
+    | Agent_process.Other line ->
+      Logs.debug (fun m -> m "agent_runner: other event: %s"
+        (if String.length line > 200
+         then String.sub line 0 200 ^ "..."
+         else line))
   in
   let result = Agent_process.run_streaming ~sw ~env
           ~working_dir:session.working_dir
