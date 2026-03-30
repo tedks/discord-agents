@@ -75,26 +75,36 @@ let mobile_width = 60
 
 (** Wrap a single line at word boundaries to fit within [max_width].
     Returns a list of wrapped lines. Preserves leading whitespace. *)
+(** Count the number of unescaped backticks in a string. *)
+let count_backticks s =
+  let n = ref 0 in
+  String.iter (fun c -> if c = '`' then incr n) s;
+  !n
+
 let wrap_line ~max_width line =
   let len = String.length line in
   if len <= max_width then [line]
   else
     let words = String.split_on_char ' ' line in
-    let rec build current_line lines = function
+    let rec build current_line lines backtick_open = function
       | [] ->
         List.rev (current_line :: lines)
       | word :: rest ->
         let cur_len = String.length current_line in
         let word_len = String.length word in
+        let word_backticks = count_backticks word in
+        let new_open = if word_backticks mod 2 = 1 then not backtick_open
+                       else backtick_open in
         if cur_len = 0 then
           (* First word on the line — take it even if it exceeds max_width *)
-          build word lines rest
-        else if cur_len + 1 + word_len <= max_width then
-          build (current_line ^ " " ^ word) lines rest
+          build word lines new_open rest
+        else if cur_len + 1 + word_len <= max_width || backtick_open then
+          (* Fits, or we're inside a backtick span — don't break *)
+          build (current_line ^ " " ^ word) lines new_open rest
         else
-          build word (current_line :: lines) rest
+          build word (current_line :: lines) new_open rest
     in
-    build "" [] words
+    build "" [] false words
 
 (** Wrap lines in text that are outside code blocks to fit within [max_width].
     Lines inside code blocks (``` fences) are left unchanged. *)

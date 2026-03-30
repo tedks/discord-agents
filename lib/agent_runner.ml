@@ -361,14 +361,15 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
          then String.sub line 0 200 ^ "..."
          else line))
   in
-  let result = Agent_process.run_streaming ~sw ~env
+  let result =
+    Fun.protect ~finally:(fun () -> typing_active := false)
+      (fun () -> Agent_process.run_streaming ~sw ~env
           ~working_dir:session.working_dir
           ~kind:session.agent_kind
           ~session_id:session.session_id
           ~message_count:session.message_count
           ?system_prompt:session.system_prompt
-          ~prompt:context_prompt ~on_event ?on_pid () in
-  typing_active := false;
+          ~prompt:context_prompt ~on_event ?on_pid ()) in
   match result with
   | Ok () ->
     flush_to_discord ();

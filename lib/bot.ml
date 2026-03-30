@@ -579,12 +579,14 @@ let handle_thread_message t msg ?channel_info () =
                     ~wrap_width:t.wrap_width ~on_pid () in
             ignore (Discord_rest.delete_own_reaction t.rest ~channel_id
               ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
-            ignore (Discord_rest.create_reaction t.rest ~channel_id
-              ~message_id ~emoji:"\xE2\x9C\x85" ());
             (match result with
             | Ok () ->
+              ignore (Discord_rest.create_reaction t.rest ~channel_id
+                ~message_id ~emoji:"\xE2\x9C\x85" ());
               Session_store.increment_message_count t.sessions session
-            | Error _ -> ());
+            | Error _ ->
+              ignore (Discord_rest.create_reaction t.rest ~channel_id
+                ~message_id ~emoji:"\xE2\x9D\x8C" ()));
             (* Drain the queue: process next pending message if any *)
             match Queue.take_opt session.pending_queue with
             | None -> ()

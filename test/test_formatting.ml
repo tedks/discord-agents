@@ -311,10 +311,24 @@ let test_wrap_single_long_word () =
   Alcotest.(check (list string)) "long word kept intact"
     [word] result
 
+let test_wrap_preserves_inline_code () =
+  let input = "Use `git commit --amend --no-edit` to fix the last commit" in
+  let result = Discord_agents.Agent_process.wrap_line ~max_width:25 input in
+  (* The backtick span should not be split across lines *)
+  List.iter (fun line ->
+    let backticks = ref 0 in
+    String.iter (fun c -> if c = '`' then incr backticks) line;
+    Alcotest.(check bool)
+      (Printf.sprintf "balanced backticks in: %s" line)
+      true (!backticks mod 2 = 0)
+  ) result
+
 let wrap_line_tests = [
   Alcotest.test_case "short line" `Quick test_wrap_short_line;
   Alcotest.test_case "long line" `Quick test_wrap_long_line;
   Alcotest.test_case "single long word" `Quick test_wrap_single_long_word;
+  Alcotest.test_case "preserves inline code" `Quick
+    test_wrap_preserves_inline_code;
 ]
 
 (* ── wrap_text ──────────────────────────────────────────────────── *)
