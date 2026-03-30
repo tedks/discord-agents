@@ -7,6 +7,7 @@
 type tool_info = {
   tool_name: string;        (** Tool name (e.g. "Read", "Edit", "Bash") *)
   tool_summary: string;     (** Human-readable summary of what the tool is doing *)
+  tool_detail: string;      (** Syntax-highlighted code block for Discord display *)
 }
 
 type stream_event =
@@ -67,10 +68,64 @@ let is_separator_row cells =
     String.to_seq cell |> Seq.for_all (fun c -> c = '-' || c = ':')
   ) cells
 
+(** Default wrapping widths for desktop and mobile Discord clients. *)
+let desktop_width = 120
+let mobile_width = 60
+
+(** Wrap a single line at word boundaries to fit within [max_width].
+    Returns a list of wrapped lines. Preserves leading whitespace. *)
+let wrap_line ~max_width line =
+  let len = String.length line in
+  if len <= max_width then [line]
+  else
+    let words = String.split_on_char ' ' line in
+    let rec build current_line lines = function
+      | [] ->
+        List.rev (current_line :: lines)
+      | word :: rest ->
+        let cur_len = String.length current_line in
+        let word_len = String.length word in
+        if cur_len = 0 then
+          (* First word on the line — take it even if it exceeds max_width *)
+          build word lines rest
+        else if cur_len + 1 + word_len <= max_width then
+          build (current_line ^ " " ^ word) lines rest
+        else
+          build word (current_line :: lines) rest
+    in
+    build "" [] words
+
+(** Wrap lines in text that are outside code blocks to fit within [max_width].
+    Lines inside code blocks (``` fences) are left unchanged. *)
+let wrap_text ~max_width text =
+  let lines = String.split_on_char '\n' text in
+  let in_code = ref false in
+  let buf = Buffer.create (String.length text) in
+  let first = ref true in
+  let add_line line =
+    if not !first then Buffer.add_char buf '\n';
+    first := false;
+    Buffer.add_string buf line
+  in
+  List.iter (fun line ->
+    let trimmed = String.trim line in
+    if String.length trimmed >= 3
+       && trimmed.[0] = '`' && trimmed.[1] = '`' && trimmed.[2] = '`' then begin
+      in_code := not !in_code;
+      add_line line
+    end else if !in_code then
+      add_line line
+    else
+      List.iter add_line (wrap_line ~max_width line)
+  ) lines;
+  Buffer.contents buf
+
 (** Render a table block with padded columns and wrap in a code block.
     Each column is padded to the maximum cell width in that column.
+    If the table exceeds [max_width], column widths are shrunk proportionally
+    and cell contents are truncated to fit.
     Separator rows are regenerated to match the padded widths. *)
-let render_padded_table table_lines =
+let render_padded_table ?(max_width=desktop_width) table_lines =
   let parsed = List.map parse_table_cells table_lines in
   (* Compute max width per column *)
   let max_cols = List.fold_left (fun acc row -> max acc (List.length row)) 0 parsed in
@@ -83,6 +138,21 @@ let render_padded_table table_lines =
   ) parsed;
   (* Ensure minimum width of 3 for separator dashes *)
   Array.iteri (fun i w -> if w < 3 then widths.(i) <- 3) widths;
+  (* Constrain total width to max_width if needed.
+     Total row width = 1 (leading |) + sum_i(1 + w_i + 1 + 1) = 1 + 3*n + sum(w_i)
+     where n = max_cols.  We subtract the structural chars to get available space. *)
+  let structural = 1 + 3 * max_cols in
+  let total_content = Array.fold_left (+) 0 widths in
+  let total_row_width = structural + total_content in
+  if total_row_width > max_width && max_cols > 0 then begin
+    let available = max max_cols (max_width - structural) in
+    (* Shrink columns proportionally *)
+    let scale = float_of_int available /. float_of_int total_content in
+    if scale < 1.0 then
+      Array.iteri (fun i w ->
+        widths.(i) <- max 3 (int_of_float (float_of_int w *. scale))
+      ) widths
+  end;
   (* Render each row *)
   let buf = Buffer.create 256 in
   Buffer.add_string buf "```\n";
@@ -98,8 +168,11 @@ let render_padded_table table_lines =
         Buffer.add_char buf ' '
       end else begin
         Buffer.add_char buf ' ';
-        Buffer.add_string buf cell;
-        for _ = 1 to w - String.length cell do Buffer.add_char buf ' ' done;
+        let display = if String.length cell > w
+          then String.sub cell 0 w
+          else cell in
+        Buffer.add_string buf display;
+        for _ = 1 to w - String.length display do Buffer.add_char buf ' ' done;
         Buffer.add_char buf ' '
       end;
       Buffer.add_char buf '|'
@@ -113,7 +186,7 @@ let render_padded_table table_lines =
     Discord doesn't render markdown tables, so we wrap them in code blocks
     with padded columns for readable alignment. Skips tables already inside
     code blocks (``` fences). *)
-let reformat_tables text =
+let reformat_tables ?(max_width=desktop_width) text =
   let lines = String.split_on_char '\n' text in
   let buf = Buffer.create (String.length text) in
   let in_code = ref false in
@@ -128,7 +201,7 @@ let reformat_tables text =
     match !table_acc with
     | [] -> ()
     | rows ->
-      let rendered = render_padded_table (List.rev rows) in
+      let rendered = render_padded_table ~max_width (List.rev rows) in
       if not !first then Buffer.add_char buf '\n';
       first := false;
       Buffer.add_string buf rendered;
@@ -331,6 +404,94 @@ let summarize_tool_input name input =
     | k :: _ -> (match get k with Some v -> clean 60 v | None -> "")
     | [] -> ""
 
+(** Maximum length for tool detail code blocks in Discord.
+    Leaves room for the status line and other tool lines in the batch. *)
+let max_detail_len = 800
+
+(** Guess a syntax highlighting language from a file extension. *)
+let lang_of_path path =
+  match String.rindex_opt path '.' with
+  | None -> ""
+  | Some i ->
+    let ext = String.sub path (i + 1) (String.length path - i - 1) in
+    match String.lowercase_ascii ext with
+    | "ml" | "mli" -> "ocaml"
+    | "py" -> "python"
+    | "js" | "mjs" | "cjs" -> "javascript"
+    | "ts" | "tsx" -> "typescript"
+    | "rs" -> "rust"
+    | "go" -> "go"
+    | "rb" -> "ruby"
+    | "sh" | "bash" -> "bash"
+    | "json" -> "json"
+    | "yaml" | "yml" -> "yaml"
+    | "toml" -> "toml"
+    | "html" -> "html"
+    | "css" -> "css"
+    | "sql" -> "sql"
+    | "c" | "h" -> "c"
+    | "cpp" | "cc" | "hpp" -> "cpp"
+    | "java" -> "java"
+    | "md" -> "markdown"
+    | "nix" -> "nix"
+    | "ex" | "exs" -> "elixir"
+    | _ -> ""
+
+(** Truncate a string, adding "..." if truncated. *)
+let truncate_detail n s =
+  if String.length s <= n then s
+  else String.sub s 0 n ^ "\n..."
+
+(** Generate a syntax-highlighted code block showing tool content details.
+    Returns "" if the tool doesn't have interesting content to show. *)
+let detail_of_tool_input name input =
+  let open Yojson.Safe.Util in
+  let get key = input |> member key |> to_string_option in
+  match name with
+  | "Edit" ->
+    let path = match get "file_path" with Some p -> p | None -> "" in
+    let lang = lang_of_path path in
+    let old_s = match get "old_string" with Some s -> s | None -> "" in
+    let new_s = match get "new_string" with Some s -> s | None -> "" in
+    if old_s = "" && new_s = "" then ""
+    else
+      let content =
+        if old_s <> "" && new_s <> "" then
+          (* Show as diff-style *)
+          let old_lines = String.split_on_char '\n' old_s in
+          let new_lines = String.split_on_char '\n' new_s in
+          let buf = Buffer.create 256 in
+          List.iter (fun l ->
+            Buffer.add_string buf ("- " ^ l ^ "\n")
+          ) old_lines;
+          List.iter (fun l ->
+            Buffer.add_string buf ("+ " ^ l ^ "\n")
+          ) new_lines;
+          Buffer.contents buf
+        else if new_s <> "" then new_s
+        else old_s
+      in
+      let _ = lang in (* lang available but diff is more readable *)
+      Printf.sprintf "```diff\n%s```" (truncate_detail max_detail_len content)
+  | "Bash" ->
+    (match get "command" with
+     | Some cmd when String.length cmd > 0 ->
+       Printf.sprintf "```bash\n%s\n```" (truncate_detail max_detail_len cmd)
+     | _ -> "")
+  | "Write" ->
+    let path = match get "file_path" with Some p -> p | None -> "" in
+    let lang = lang_of_path path in
+    (match get "content" with
+     | Some c when String.length c > 0 ->
+       Printf.sprintf "```%s\n%s\n```" lang (truncate_detail max_detail_len c)
+     | _ -> "")
+  | "Grep" ->
+    (match get "pattern" with
+     | Some pat when String.length pat > 0 ->
+       Printf.sprintf "```\n/%s/\n```" (truncate_detail 200 pat)
+     | _ -> "")
+  | _ -> ""
+
 (** Parse a stream-json line into a list of events.
     Returns a list because a single assistant message can contain
     both text and tool_use content blocks. *)
@@ -356,7 +517,9 @@ let parse_stream_json_line line =
                 |> Option.value ~default:"unknown" in
               let input = item |> member "input" in
               let summary = summarize_tool_input name input in
-              Some (Tool_use { tool_name = name; tool_summary = summary })
+              let detail = detail_of_tool_input name input in
+              Some (Tool_use { tool_name = name; tool_summary = summary;
+                               tool_detail = detail })
             | _ -> None
           ) items
         | _ -> []

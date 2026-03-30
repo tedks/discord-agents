@@ -26,14 +26,19 @@ let tool_display_info name =
   | "Skill" -> "\xE2\x9A\xA1", "Using skill"            (* ⚡ *)
   | _ -> "\xF0\x9F\x94\xA7", "Using " ^ name            (* 🔧 *)
 
-(** Format a tool use event as a descriptive status line.
+(** Format a tool use event as a descriptive status line with optional
+    syntax-highlighted detail block.
     Shows enough detail to understand what the agent is doing. *)
 let format_tool_status (info : Agent_process.tool_info) =
   let emoji, verb = tool_display_info info.tool_name in
-  if info.tool_summary = "" then
-    Printf.sprintf "%s **%s**..." emoji verb
-  else
-    Printf.sprintf "%s **%s** `%s`" emoji verb info.tool_summary
+  let header =
+    if info.tool_summary = "" then
+      Printf.sprintf "%s **%s**..." emoji verb
+    else
+      Printf.sprintf "%s **%s** `%s`" emoji verb info.tool_summary
+  in
+  if info.tool_detail = "" then header
+  else header ^ "\n" ^ info.tool_detail
 
 (** Sanitize a metadata value for safe embedding in the context header.
     Removes newlines, control characters, and brackets to prevent
@@ -127,7 +132,8 @@ let image_prompt_suffix downloaded_images =
     Handles message creation/editing, typing indicators, and splitting.
     Returns Ok () on success, Error msg on failure. *)
 let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
-    ~prompt ?(attachments=[]) ~author_name ~channel_name ~channel_type ?on_pid () =
+    ~prompt ?(attachments=[]) ~author_name ~channel_name ~channel_type
+    ?(wrap_width=Agent_process.desktop_width) ?on_pid () =
   (* Download any image attachments and append paths to the prompt *)
   let downloaded_images = download_images ~rest
     ~working_dir:session.Session_store.working_dir attachments in
@@ -163,7 +169,9 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
        | Error e -> Logs.warn (fun m -> m "agent_runner: edit error: %s" e))
   in
   let flush_to_discord () =
-    let text = Agent_process.reformat_tables (Buffer.contents current_msg_buf) in
+    let text = Agent_process.reformat_tables ~max_width:wrap_width
+      (Buffer.contents current_msg_buf) in
+    let text = Agent_process.wrap_text ~max_width:wrap_width text in
     if String.length text = 0 then ()
     else if String.length text <= Agent_process.discord_max_len then
       send_single_message text
