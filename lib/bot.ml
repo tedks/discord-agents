@@ -108,7 +108,11 @@ Known projects:
 Keep responses concise — this is Discord.
 
 IMPORTANT: When starting sessions, always create a fresh worktree so agents don't \
-stomp on each other's work." project_list
+stomp on each other's work.
+
+IMPORTANT: When linking to GitHub PRs, issues, or commits, always use full URLs \
+(e.g. https://github.com/owner/repo/pull/1) — never shorthand like owner/repo#1. \
+Discord does not render GitHub shorthand as clickable links." project_list
 
 (** System prompt for project channel Claude — scoped to one project. *)
 let project_system_prompt (project : Project.t) =
@@ -140,6 +144,10 @@ that captures the task — do NOT include the project name. Example: \
 
 Prefer the conversational MCP tools over suggesting !commands.
 Keep responses concise — this is Discord.
+
+IMPORTANT: When linking to GitHub PRs, issues, or commits, always use full URLs \
+(e.g. https://github.com/owner/repo/pull/1) — never shorthand like owner/repo#1. \
+Discord does not render GitHub shorthand as clickable links.
 
 IMPORTANT: When starting sessions, always create a fresh worktree so agents don't \
 stomp on each other's work." project.name project.path
