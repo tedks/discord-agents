@@ -5,7 +5,7 @@ description:
   "A Discord bot that manages AI agent sessions across projects. Creates channels per project, threads per agent session, and bridges communication between Discord and agent subprocesses."
 maintainer: ["Ted Suzman"]
 authors: ["Ted Suzman"]
-license: "MIT"
+license: "AGPL-3.0-or-later"
 homepage: "https://github.com/tedks/discord-agents"
 bug-reports: "https://github.com/tedks/discord-agents/issues"
 depends: [

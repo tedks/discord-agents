@@ -11,7 +11,7 @@
 
 (maintainers "Ted Suzman")
 
-(license MIT)
+(license AGPL-3.0-or-later)
 
 (package
  (name discord_agents)
