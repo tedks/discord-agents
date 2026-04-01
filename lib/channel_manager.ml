@@ -120,6 +120,20 @@ let bump ~rest ~(guild_id : Discord_types.guild_id) ~project_name t =
       ignore (Discord_rest.modify_channel_position rest
         ~guild_id ~channel_id:ch_id ~position:0 ())
 
+(** Reorder project channels by activity. Takes a list of (project_name, score)
+    pairs sorted least-active first. Bumps each to position 0 in order, so the
+    most active project ends up at the top. *)
+let reorder_by_activity ~rest ~(guild_id : Discord_types.guild_id) t activity =
+  if guild_id = "" then ()
+  else
+    List.iter (fun (project_name, _score) ->
+      match find t ~project_name with
+      | None -> ()
+      | Some ch_id ->
+        ignore (Discord_rest.modify_channel_position rest
+          ~guild_id ~channel_id:ch_id ~position:0 ())
+    ) activity
+
 (** Delete channels that don't match any current project name.
     Also removes duplicates (keeps first per name). *)
 let cleanup ~rest ~(guild_id : Discord_types.guild_id) ~projects t =
