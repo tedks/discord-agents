@@ -623,14 +623,47 @@ let parse_stream_json_line line =
         |> Option.value ~default:"" in
       let session_id = json |> member "session_id" |> to_string_option in
       [Result { text = result_text; session_id }]
-    | Some "tool_result" ->
-      (* Top-level tool result event *)
-      let content = match json |> member "content" with
-        | `String s -> s
-        | _ -> json |> member "output" |> to_string_option
-               |> Option.value ~default:"" in
-      if content = "" then [Other line]
-      else [Tool_result { content }]
+    | Some "user" ->
+      (* User messages carry tool_result content blocks with tool output.
+         Also check tool_use_result for structured stdout/stderr. *)
+      let structured_output =
+        match json |> member "tool_use_result" with
+        | `Null -> None
+        | obj ->
+          let stdout = obj |> member "stdout" |> to_string_option
+            |> Option.value ~default:"" in
+          let stderr = obj |> member "stderr" |> to_string_option
+            |> Option.value ~default:"" in
+          let combined = match stdout, stderr with
+            | "", "" -> ""
+            | s, "" -> s
+            | "", e -> "STDERR:\n" ^ e
+            | s, e -> s ^ "\nSTDERR:\n" ^ e
+          in
+          if combined = "" then None else Some combined
+        | exception _ -> None
+      in
+      (match structured_output with
+       | Some content -> [Tool_result { content }]
+       | None ->
+         (* Fall back to content blocks *)
+         let msg = json |> member "message" in
+         let content = msg |> member "content" in
+         let results = match content with
+           | `List items ->
+             List.filter_map (fun item ->
+               match item |> member "type" |> to_string_option with
+               | Some "tool_result" ->
+                 let c = match item |> member "content" with
+                   | `String s -> s
+                   | _ -> "" in
+                 if c = "" then None
+                 else Some (Tool_result { content = c })
+               | _ -> None
+             ) items
+           | _ -> []
+         in
+         if results = [] then [Other line] else results)
     | _ -> [Other line]
   with _ -> [Other line]
 
