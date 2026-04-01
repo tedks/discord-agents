@@ -667,6 +667,8 @@ let handle_message t (msg : Discord_types.message) =
          ensure_channel_session t ~channel_id:msg.channel_id
            ~project_name:p.name ~working_dir:wd
            ~system_prompt:(Some (project_system_prompt p));
+         Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
+           ~project_name:p.name t.channels;
          handle_thread_message t msg ()
        | None -> ())
     | None ->
