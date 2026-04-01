@@ -43,14 +43,13 @@ let tool_display_info name =
     Shows enough detail to understand what the agent is doing. *)
 let format_tool_status (info : Agent_process.tool_info) =
   let emoji, verb = tool_display_info info.tool_name in
-  let header =
-    if info.tool_summary = "" then
-      Printf.sprintf "%s **%s**..." emoji verb
-    else
-      Printf.sprintf "%s **%s** `%s`" emoji verb info.tool_summary
-  in
-  if info.tool_detail = "" then header
-  else header ^ "\n" ^ info.tool_detail
+  if info.tool_detail <> "" then
+    (* Detail block has the full content — keep header short to avoid duplication *)
+    Printf.sprintf "%s **%s**\n%s" emoji verb info.tool_detail
+  else if info.tool_summary = "" then
+    Printf.sprintf "%s **%s**..." emoji verb
+  else
+    Printf.sprintf "%s **%s** `%s`" emoji verb info.tool_summary
 
 (** Sanitize a metadata value for safe embedding in the context header.
     Removes newlines, control characters, and brackets to prevent

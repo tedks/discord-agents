@@ -544,11 +544,10 @@ let resolve_channel_context t ~(channel_id : Discord_types.channel_id)
 (** Handle a message in a session thread.
     [channel_info] is passed through when the caller already fetched it. *)
 let handle_thread_message t msg ?channel_info () =
-  if t.draining then begin
+  if t.draining then
     ignore (Discord_rest.create_message t.rest
       ~channel_id:msg.Discord_types.channel_id
-      ~content:"Bot is restarting — waiting for active sessions to finish. Try again shortly." ())
-  end else
+      ~content:"Bot is restarting and will restart when there are no running processes. Sending more messages may delay restart." ());
   match Session_store.find_opt t.sessions ~thread_id:msg.Discord_types.channel_id with
   | None -> ()
   | Some session ->
@@ -560,41 +559,43 @@ let handle_thread_message t msg ?channel_info () =
         ~message_id:msg.id ~emoji:"\xE2\x8F\xB3" ())
     end else begin
       session.processing <- true;
-      let child_pid = ref None in
       Eio.Fiber.fork ~sw:t.sw (fun () ->
         Fun.protect ~finally:(fun () ->
-          session.processing <- false;
-          Option.iter (unregister_child_pid t) !child_pid
+          session.processing <- false
         ) (fun () ->
           let rec process_message (msg : Discord_types.message) channel_info =
-            let channel_id = msg.channel_id in
-            let message_id = msg.id in
-            ignore (Discord_rest.create_reaction t.rest ~channel_id
-              ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
-            Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
-              ~project_name:session.project_name t.channels;
-            let author_name = msg.author.username in
-            let (channel_name, channel_type) =
-              resolve_channel_context t ~channel_id ~session ?channel_info () in
-            let on_pid pid =
-              child_pid := Some pid;
-              register_child_pid t pid;
-              Logs.info (fun m -> m "bot: registered child pid %d" pid) in
-            let result = Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
-                    ~session ~channel_id ~prompt:msg.content
-                    ~attachments:msg.attachments
-                    ~author_name ~channel_name ~channel_type
-                    ~wrap_width:t.wrap_width ~on_pid () in
-            ignore (Discord_rest.delete_own_reaction t.rest ~channel_id
-              ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
-            (match result with
-            | Ok () ->
+            let child_pid = ref None in
+            Fun.protect ~finally:(fun () ->
+              Option.iter (unregister_child_pid t) !child_pid
+            ) (fun () ->
+              let channel_id = msg.channel_id in
+              let message_id = msg.id in
               ignore (Discord_rest.create_reaction t.rest ~channel_id
-                ~message_id ~emoji:"\xE2\x9C\x85" ());
-              Session_store.increment_message_count t.sessions session
-            | Error _ ->
-              ignore (Discord_rest.create_reaction t.rest ~channel_id
-                ~message_id ~emoji:"\xE2\x9D\x8C" ()));
+                ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
+              Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
+                ~project_name:session.project_name t.channels;
+              let author_name = msg.author.username in
+              let (channel_name, channel_type) =
+                resolve_channel_context t ~channel_id ~session ?channel_info () in
+              let on_pid pid =
+                child_pid := Some pid;
+                register_child_pid t pid;
+                Logs.info (fun m -> m "bot: registered child pid %d" pid) in
+              let result = Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
+                      ~session ~channel_id ~prompt:msg.content
+                      ~attachments:msg.attachments
+                      ~author_name ~channel_name ~channel_type
+                      ~wrap_width:t.wrap_width ~on_pid () in
+              ignore (Discord_rest.delete_own_reaction t.rest ~channel_id
+                ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
+              (match result with
+              | Ok () ->
+                ignore (Discord_rest.create_reaction t.rest ~channel_id
+                  ~message_id ~emoji:"\xE2\x9C\x85" ());
+                Session_store.increment_message_count t.sessions session
+              | Error _ ->
+                ignore (Discord_rest.create_reaction t.rest ~channel_id
+                  ~message_id ~emoji:"\xE2\x9D\x8C" ())));
             (* Drain the queue: process next pending message if any *)
             match Queue.take_opt session.pending_queue with
             | None -> ()
