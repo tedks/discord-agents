@@ -730,12 +730,12 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
         Eio.Fiber.fork ~sw (fun () ->
           Channel_manager.setup ~rest ~guild_id:config.guild_id ~projects bot.channels;
           (* Reorder channels by activity: projects with more messages float up.
-             Sort least-active first so the most active gets bumped to position 0 last. *)
+             Sort most-active first so they get the lowest position numbers. *)
           let activity = Session_store.bindings bot.sessions
             |> List.map (fun (_tid, (s : Session_store.session)) ->
               (s.project_name, s.message_count))
             |> List.sort_uniq (fun (n1, _) (n2, _) -> String.compare n1 n2)
-            |> List.sort (fun (_, c1) (_, c2) -> Int.compare c1 c2) in
+            |> List.sort (fun (_, c1) (_, c2) -> Int.compare c2 c1) in
           Channel_manager.reorder_by_activity ~rest ~guild_id:config.guild_id
             bot.channels activity;
           match config.control_channel_id with

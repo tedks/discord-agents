@@ -187,6 +187,21 @@ let modify_channel_position t ~(guild_id : Discord_types.guild_id)
   | Ok _ -> Ok ()
   | Error e -> Error e
 
+(** Set positions for multiple channels in a single API call.
+    Takes a list of (channel_id, position) pairs. This avoids
+    race conditions from sequential single-channel position updates. *)
+let batch_modify_channel_positions t ~(guild_id : Discord_types.guild_id)
+    ~positions () =
+  let body = `List (List.map (fun (channel_id, position) ->
+    `Assoc [
+      ("id", `String channel_id);
+      ("position", `Int position);
+    ]
+  ) positions) in
+  match request t ~meth:`PATCH ~path:(Printf.sprintf "/guilds/%s/channels" guild_id) ~body () with
+  | Ok _ -> Ok ()
+  | Error e -> Error e
+
 (** Create a thread from a message. *)
 let create_thread t ~(channel_id : Discord_types.channel_id)
     ~(message_id : Discord_types.message_id) ~name () =
