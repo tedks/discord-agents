@@ -41,6 +41,7 @@ type t = {
   started_at : float;
   mutable draining : bool;
   child_pids : (Pid_set.t ref * Mutex.t);
+  mutable wrap_width : int;
 }
 
 let register_child_pid t pid =
@@ -107,7 +108,11 @@ Known projects:
 Keep responses concise — this is Discord.
 
 IMPORTANT: When starting sessions, always create a fresh worktree so agents don't \
-stomp on each other's work." project_list
+stomp on each other's work.
+
+IMPORTANT: When linking to GitHub PRs, issues, or commits, always use full URLs \
+(e.g. https://github.com/owner/repo/pull/1) — never shorthand like owner/repo#1. \
+Discord does not render GitHub shorthand as clickable links." project_list
 
 (** System prompt for project channel Claude — scoped to one project. *)
 let project_system_prompt (project : Project.t) =
@@ -140,16 +145,12 @@ that captures the task — do NOT include the project name. Example: \
 Prefer the conversational MCP tools over suggesting !commands.
 Keep responses concise — this is Discord.
 
+IMPORTANT: When linking to GitHub PRs, issues, or commits, always use full URLs \
+(e.g. https://github.com/owner/repo/pull/1) — never shorthand like owner/repo#1. \
+Discord does not render GitHub shorthand as clickable links.
+
 IMPORTANT: When starting sessions, always create a fresh worktree so agents don't \
 stomp on each other's work." project.name project.path
-
-let post_response rest ~channel_id text =
-  let text = Agent_process.reformat_tables text in
-  List.iter (fun chunk ->
-    match Discord_rest.create_message rest ~channel_id ~content:chunk () with
-    | Ok _ -> ()
-    | Error e -> Logs.warn (fun m -> m "bot: post error: %s" e)
-  ) (Agent_process.split_message text)
 
 (** Trigger a graceful restart: drain → reap → build → spawn.
     Callable from command handler or signal handler.
@@ -188,6 +189,23 @@ let trigger_restart t ~notify =
         in
         wait ()
       end;
+      (* Clear any remaining queued messages and notify users *)
+      List.iter (fun (_tid, (s : Session_store.session)) ->
+        let dropped = ref 0 in
+        while not (Queue.is_empty s.pending_queue) do
+          let pending = Queue.pop s.pending_queue in
+          incr dropped;
+          ignore (Discord_rest.delete_own_reaction t.rest
+            ~channel_id:pending.msg.Discord_types.channel_id
+            ~message_id:pending.msg.id ~emoji:"\xE2\x8F\xB3" ());
+          ignore (Discord_rest.create_reaction t.rest
+            ~channel_id:pending.msg.Discord_types.channel_id
+            ~message_id:pending.msg.id ~emoji:"\xE2\x9D\x8C" ())
+        done;
+        if !dropped > 0 then
+          Logs.info (fun m -> m "bot: dropped %d queued message(s) for %s during restart"
+            !dropped s.project_name)
+      ) (Session_store.bindings t.sessions);
       (* Phase 2: Reap child processes.
          Split SIGTERM and SIGKILL into separate systhread calls with
          Eio.Time.sleep between to avoid blocking the systhread pool. *)
@@ -318,7 +336,7 @@ let handle_command t msg cmd =
              project_name = p.name; working_dir; agent_kind = kind;
              session_id = Resource.generate_uuid ();
              thread_id = thread_ch.Discord_types.id;
-             system_prompt = None; message_count = 0; processing = false;
+             system_prompt = None; message_count = 0; processing = false; pending_queue = Queue.create ();
            } in
            Session_store.add t.sessions ~thread_id:thread_ch.id session;
            let branch_str = match branch_info with
@@ -344,7 +362,7 @@ let handle_command t msg cmd =
             project_name = Filename.basename working_dir; working_dir;
             agent_kind = Config.Claude; session_id = full_sid;
             thread_id = thread_ch.Discord_types.id;
-            system_prompt = None; message_count = 1; processing = false;
+            system_prompt = None; message_count = 1; processing = false; pending_queue = Queue.create ();
           } in
           Session_store.add t.sessions ~thread_id:thread_ch.id session;
           ignore (Discord_rest.create_message t.rest ~channel_id:thread_ch.id
@@ -482,10 +500,26 @@ let handle_command t msg cmd =
       "`!rename [thread_id] <name>` — rename a thread";
       "`!status` — bot status and running processes";
       "`!cleanup` — delete stale channels";
-      "`!restart` — rebuild and restart";
+      "`!restart` — rebuild and restart (warns but doesn't block active sessions)";
       "`!version` — build info and runtime status";
+      "`!desktop` — set wrapping to desktop width";
+      "`!mobile` — set wrapping to mobile width";
+      "`!wrapping [n]` — show or set line wrap width";
       "`!help` — this message";
     ])
+  | Command.Desktop ->
+    t.wrap_width <- Agent_process.desktop_width;
+    reply (Printf.sprintf "Wrapping set to desktop (%d chars)."
+      Agent_process.desktop_width)
+  | Command.Mobile ->
+    t.wrap_width <- Agent_process.mobile_width;
+    reply (Printf.sprintf "Wrapping set to mobile (%d chars)."
+      Agent_process.mobile_width)
+  | Command.Wrapping None ->
+    reply (Printf.sprintf "Current wrapping: %d chars." t.wrap_width)
+  | Command.Wrapping (Some w) ->
+    t.wrap_width <- w;
+    reply (Printf.sprintf "Wrapping set to %d chars." w)
   | Command.Unknown _ -> ()
 
 (** Resolve the channel name and type for context injection.
@@ -515,46 +549,76 @@ let resolve_channel_context t ~(channel_id : Discord_types.channel_id)
       (name, "thread")
 
 (** Handle a message in a session thread.
-    [channel_info] is passed through when the caller already fetched it. *)
+    [channel_info] is passed through when the caller already fetched it.
+
+    During drain mode (restart pending), messages are still processed but
+    the user is warned. This is intentional: blocking messages during drain
+    would prevent using other sessions while a long-running task finishes.
+    The restart waits for all session.processing flags to go false. *)
 let handle_thread_message t msg ?channel_info () =
-  if t.draining then begin
+  if t.draining then
     ignore (Discord_rest.create_message t.rest
       ~channel_id:msg.Discord_types.channel_id
-      ~content:"Bot is restarting — waiting for active sessions to finish. Try again shortly." ())
-  end else
+      ~content:"Bot is restarting and will restart when there are no running processes. Sending more messages may delay restart." ());
   match Session_store.find_opt t.sessions ~thread_id:msg.Discord_types.channel_id with
   | None -> ()
   | Some session ->
-    if session.processing then
-      ignore (Discord_rest.create_message t.rest
-        ~channel_id:msg.channel_id ~content:"Still processing previous message..." ())
-    else begin
+    if session.processing then begin
+      (* Queue the message and react with hourglass *)
+      Queue.add { Session_store.msg; channel_info } session.pending_queue;
+      ignore (Discord_rest.create_reaction t.rest
+        ~channel_id:msg.Discord_types.channel_id
+        ~message_id:msg.id ~emoji:"\xE2\x8F\xB3" ())
+    end else begin
       session.processing <- true;
-      let child_pid = ref None in
       Eio.Fiber.fork ~sw:t.sw (fun () ->
         Fun.protect ~finally:(fun () ->
-          session.processing <- false;
-          Option.iter (unregister_child_pid t) !child_pid
+          session.processing <- false
         ) (fun () ->
-          let channel_id = msg.Discord_types.channel_id in
-          ignore (Discord_rest.create_reaction t.rest ~channel_id
-            ~message_id:msg.id ~emoji:"\xF0\x9F\x91\x80" ());
-          Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
-            ~project_name:session.project_name t.channels;
-          let author_name = msg.author.username in
-          let (channel_name, channel_type) =
-            resolve_channel_context t ~channel_id ~session ?channel_info () in
-          let on_pid pid =
-            child_pid := Some pid;
-            register_child_pid t pid;
-            Logs.info (fun m -> m "bot: registered child pid %d" pid) in
-          match Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
-                  ~session ~channel_id ~prompt:msg.content
-                  ~attachments:msg.attachments
-                  ~author_name ~channel_name ~channel_type ~on_pid () with
-          | Ok () ->
-            Session_store.increment_message_count t.sessions session
-          | Error _ -> ()))
+          let rec process_message (msg : Discord_types.message) channel_info =
+            let child_pid = ref None in
+            Fun.protect ~finally:(fun () ->
+              Option.iter (unregister_child_pid t) !child_pid
+            ) (fun () ->
+              let channel_id = msg.channel_id in
+              let message_id = msg.id in
+              ignore (Discord_rest.create_reaction t.rest ~channel_id
+                ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
+              Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
+                ~project_name:session.project_name t.channels;
+              let author_name = msg.author.username in
+              let (channel_name, channel_type) =
+                resolve_channel_context t ~channel_id ~session ?channel_info () in
+              let on_pid pid =
+                child_pid := Some pid;
+                register_child_pid t pid;
+                Logs.info (fun m -> m "bot: registered child pid %d" pid) in
+              let result = Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
+                      ~session ~channel_id ~prompt:msg.content
+                      ~attachments:msg.attachments
+                      ~author_name ~channel_name ~channel_type
+                      ~wrap_width:t.wrap_width ~on_pid () in
+              ignore (Discord_rest.delete_own_reaction t.rest ~channel_id
+                ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
+              (match result with
+              | Ok () ->
+                ignore (Discord_rest.create_reaction t.rest ~channel_id
+                  ~message_id ~emoji:"\xE2\x9C\x85" ());
+                Session_store.increment_message_count t.sessions session
+              | Error _ ->
+                ignore (Discord_rest.create_reaction t.rest ~channel_id
+                  ~message_id ~emoji:"\xE2\x9D\x8C" ())));
+            (* Drain the queue: process next pending message if any *)
+            match Queue.take_opt session.pending_queue with
+            | None -> ()
+            | Some pending ->
+              (* Remove hourglass, will get eyes when processing starts *)
+              ignore (Discord_rest.delete_own_reaction t.rest
+                ~channel_id:pending.msg.channel_id
+                ~message_id:pending.msg.id ~emoji:"\xE2\x8F\xB3" ());
+              process_message pending.msg pending.channel_info
+          in
+          process_message msg channel_info))
     end
 
 (** Ensure a session exists for a channel (control or project channels).
@@ -566,7 +630,7 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
     let session : Session_store.session = {
       project_name; working_dir; agent_kind = Config.Claude;
       session_id = Resource.generate_uuid (); thread_id = channel_id;
-      system_prompt; message_count = 0; processing = false;
+      system_prompt; message_count = 0; processing = false; pending_queue = Queue.create ();
     } in
     Session_store.add t.sessions ~thread_id:channel_id session;
     Logs.info (fun m -> m "bot: auto-created session for %s" project_name)
@@ -615,6 +679,8 @@ let handle_message t (msg : Discord_types.message) =
          ensure_channel_session t ~channel_id:msg.channel_id
            ~project_name:p.name ~working_dir:wd
            ~system_prompt:(Some (project_system_prompt p));
+         Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
+           ~project_name:p.name t.channels;
          handle_thread_message t msg ()
        | None -> ())
     | None ->
@@ -666,7 +732,8 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
   in
   let bot = { config; rest; gateway; projects; sessions; channels; env; sw;
                started_at = Unix.gettimeofday ();
-               draining = false; child_pids = (ref Pid_set.empty, Mutex.create ()) } in
+               draining = false; child_pids = (ref Pid_set.empty, Mutex.create ());
+               wrap_width = Agent_process.desktop_width } in
   bot.gateway.handler <- (fun event ->
     match event with
     | Discord_gateway.Connected user ->
@@ -674,6 +741,41 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
       if bot.channels.category_id = None then
         Eio.Fiber.fork ~sw (fun () ->
           Channel_manager.setup ~rest ~guild_id:config.guild_id ~projects bot.channels;
+          (* Reorder channels by activity. Primary: Discord message count from
+             sessions. Fallback: last git commit timestamp, so projects without
+             Discord activity still sort by recency. *)
+          let discord_scores =
+            let tbl = Hashtbl.create 32 in
+            List.iter (fun (_tid, (s : Session_store.session)) ->
+              let prev = try Hashtbl.find tbl s.project_name with Not_found -> 0 in
+              Hashtbl.replace tbl s.project_name (prev + s.message_count)
+            ) (Session_store.bindings bot.sessions);
+            tbl in
+          let git_timestamp project_path =
+            Eio_unix.run_in_systhread (fun () ->
+              try
+                let ic = Unix.open_process_in
+                  (Printf.sprintf "git -C %s log -1 --format=%%ct 2>/dev/null"
+                    (Filename.quote project_path)) in
+                let line = input_line ic in
+                ignore (Unix.close_process_in ic);
+                int_of_string line
+              with _ -> 0) in
+          (* Fetch git timestamps in parallel using Eio fibers *)
+          let indexed = List.mapi (fun i p -> (i, p)) projects in
+          let results = Array.make (List.length projects) ("", 0) in
+          Eio.Fiber.List.iter (fun (i, (p : Project.t)) ->
+            let discord = try Hashtbl.find discord_scores p.name with Not_found -> 0 in
+            let git_ts = git_timestamp p.path in
+            (* Score: discord messages * 1_000_000 + git timestamp.
+               This ensures any Discord activity dominates, with git
+               commit recency as tiebreaker for inactive projects. *)
+            results.(i) <- (p.name, discord * 1_000_000 + git_ts)
+          ) indexed;
+          let activity = Array.to_list results
+            |> List.sort (fun (_, s1) (_, s2) -> Int.compare s2 s1) in
+          Channel_manager.reorder_by_activity ~rest ~guild_id:config.guild_id
+            bot.channels activity;
           match config.control_channel_id with
           | Some ch_id ->
             let text = Printf.sprintf "Bot online. %d projects, %d channels, %d sessions."

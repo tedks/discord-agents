@@ -14,6 +14,9 @@ type t =
   | Restart
   | Rename_thread of { thread_id : string option; name : string }
   | Status
+  | Desktop
+  | Mobile
+  | Wrapping of int option
   | Help
   | Unknown of string
 
@@ -60,6 +63,13 @@ let parse content =
                       name = String.concat " " rest }
   | ["restart"] -> Restart
   | ["status"] | ["version"] | ["info"] -> Status
+  | ["desktop"] -> Desktop
+  | ["mobile"] -> Mobile
+  | ["wrapping"] -> Wrapping None
+  | ["wrapping"; n] ->
+    (match int_of_string_opt n with
+     | Some w when w > 0 -> Wrapping (Some w)
+     | _ -> Unknown content)
   | ["help"] -> Help
   | _ -> Unknown content
 

@@ -14,6 +14,18 @@
 let typing_interval = 8.0
 
 (** Map tool names to emoji + verb for compact status display. *)
+(** Escape underscores in a tool name for Discord display.
+    Discord interprets __ as underline and _ as italic, so we
+    prefix each underscore with a backslash. *)
+let escape_discord_underscores s =
+  let len = String.length s in
+  let buf = Buffer.create (len + 8) in
+  String.iter (fun c ->
+    if c = '_' then Buffer.add_string buf "\\_"
+    else Buffer.add_char buf c
+  ) s;
+  Buffer.contents buf
+
 let tool_display_info name =
   match name with
   | "Read" -> "\xF0\x9F\x93\x96", "Reading"            (* 📖 *)
@@ -24,13 +36,17 @@ let tool_display_info name =
   | "Glob" -> "\xF0\x9F\x93\x82", "Finding files"       (* 📂 *)
   | "Agent" | "Task" -> "\xF0\x9F\xA4\x96", "Spawning agent"  (* 🤖 *)
   | "Skill" -> "\xE2\x9A\xA1", "Using skill"            (* ⚡ *)
-  | _ -> "\xF0\x9F\x94\xA7", "Using " ^ name            (* 🔧 *)
+  | _ -> "\xF0\x9F\x94\xA7", "Using " ^ escape_discord_underscores name  (* 🔧 *)
 
-(** Format a tool use event as a descriptive status line.
+(** Format a tool use event as a descriptive status line with optional
+    syntax-highlighted detail block.
     Shows enough detail to understand what the agent is doing. *)
 let format_tool_status (info : Agent_process.tool_info) =
   let emoji, verb = tool_display_info info.tool_name in
-  if info.tool_summary = "" then
+  if info.tool_detail <> "" then
+    (* Detail block has the full content — keep header short to avoid duplication *)
+    Printf.sprintf "%s **%s**\n%s" emoji verb info.tool_detail
+  else if info.tool_summary = "" then
     Printf.sprintf "%s **%s**..." emoji verb
   else
     Printf.sprintf "%s **%s** `%s`" emoji verb info.tool_summary
@@ -127,7 +143,8 @@ let image_prompt_suffix downloaded_images =
     Handles message creation/editing, typing indicators, and splitting.
     Returns Ok () on success, Error msg on failure. *)
 let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
-    ~prompt ?(attachments=[]) ~author_name ~channel_name ~channel_type ?on_pid () =
+    ~prompt ?(attachments=[]) ~author_name ~channel_name ~channel_type
+    ?(wrap_width=Agent_process.desktop_width) ?on_pid () =
   (* Download any image attachments and append paths to the prompt *)
   let downloaded_images = download_images ~rest
     ~working_dir:session.Session_store.working_dir attachments in
@@ -149,8 +166,25 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
   let current_msg_buf = Buffer.create 1900 in
   let tool_status_lines = ref [] in
   let tool_status_msg_id = ref None in
-  let last_typing = ref (Unix.gettimeofday ()) in
+  let typing_active = ref true in
   let last_edit = ref (Unix.gettimeofday ()) in
+  (* Background fiber: continuously send typing indicators while processing.
+     Discord typing indicators expire after ~10s, so we refresh every 8s.
+     Polls every 1s so the fiber stops within 1s of processing completing,
+     preventing stale typing indicators after the checkmark appears. *)
+  Eio.Fiber.fork ~sw (fun () ->
+    let last_sent = ref (Unix.gettimeofday ()) in
+    while !typing_active do
+      Eio.Time.sleep (Eio.Stdenv.clock env) 1.0;
+      if !typing_active then begin
+        let now = Unix.gettimeofday () in
+        if now -. !last_sent >= typing_interval then begin
+          ignore (Discord_rest.send_typing rest ~channel_id ());
+          last_sent := now
+        end
+      end
+    done
+  );
   let send_single_message text =
     match !current_msg_id with
     | None ->
@@ -163,7 +197,10 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
        | Error e -> Logs.warn (fun m -> m "agent_runner: edit error: %s" e))
   in
   let flush_to_discord () =
-    let text = Agent_process.reformat_tables (Buffer.contents current_msg_buf) in
+    let text = Agent_process.reformat_tables ~max_width:wrap_width
+      (Buffer.contents current_msg_buf) in
+    let text = Agent_process.wrap_text ~max_width:wrap_width text in
+    let text = Agent_process.escape_nested_fences text in
     if String.length text = 0 then ()
     else if String.length text <= Agent_process.discord_max_len then
       send_single_message text
@@ -266,10 +303,6 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       if now -. !last_edit > 2.0 && Buffer.length current_msg_buf > 0 then begin
         flush_to_discord ();
         last_edit := now
-      end;
-      if now -. !last_typing > typing_interval then begin
-        ignore (Discord_rest.send_typing rest ~channel_id ());
-        last_typing := now
       end
     | Agent_process.Result { text = _; session_id = _ } ->
       flush_tool_status ();
@@ -296,17 +329,41 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       end;
       tool_status_lines := status :: !tool_status_lines;
       flush_tool_status ()
+    | Agent_process.Tool_result { content } ->
+      Logs.debug (fun m -> m "agent_runner: tool result: %d chars"
+        (String.length content));
+      (* Append truncated output to the tool status message *)
+      if !tool_status_lines <> [] then begin
+        let max_output_lines = 20 in
+        let lines = String.split_on_char '\n' content in
+        let truncated = if List.length lines > max_output_lines then
+          let kept = List.filteri (fun i _ -> i < max_output_lines) lines in
+          String.concat "\n" kept ^ "\n..."
+        else content in
+        let output_block = Printf.sprintf "```\n%s\n```"
+          (Agent_process.escape_code_fences
+            (Agent_process.truncate_detail Agent_process.max_detail_len truncated)) in
+        tool_status_lines := output_block :: !tool_status_lines;
+        flush_tool_status ()
+      end
     | Agent_process.Error e ->
       Logs.warn (fun m -> m "agent_runner: error event: %s" e)
-    | Agent_process.Other _ -> ()
+    | Agent_process.Other line ->
+      Logs.debug (fun m -> m "agent_runner: other event: %s"
+        (if String.length line > 200
+         then String.sub line 0 200 ^ "..."
+         else line))
   in
-  match Agent_process.run_streaming ~sw ~env
+  let result =
+    Fun.protect ~finally:(fun () -> typing_active := false)
+      (fun () -> Agent_process.run_streaming ~sw ~env
           ~working_dir:session.working_dir
           ~kind:session.agent_kind
           ~session_id:session.session_id
           ~message_count:session.message_count
           ?system_prompt:session.system_prompt
-          ~prompt:context_prompt ~on_event ?on_pid () with
+          ~prompt:context_prompt ~on_event ?on_pid ()) in
+  match result with
   | Ok () ->
     flush_to_discord ();
     if Buffer.length result_buf = 0 then
