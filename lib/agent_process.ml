@@ -73,14 +73,16 @@ let is_separator_row cells =
 let desktop_width = 120
 let mobile_width = 60
 
-(** Wrap a single line at word boundaries to fit within [max_width].
-    Returns a list of wrapped lines. Preserves leading whitespace. *)
-(** Count the number of unescaped backticks in a string. *)
+(** Count backticks in a string, used to track inline code span state. *)
 let count_backticks s =
   let n = ref 0 in
   String.iter (fun c -> if c = '`' then incr n) s;
   !n
 
+(** Wrap a single line at word boundaries to fit within [max_width].
+    Returns a list of wrapped lines. Does not break inside inline code
+    spans (backtick pairs). Note: splits on spaces only, so leading
+    indentation with tabs or multiple consecutive spaces is not preserved. *)
 let wrap_line ~max_width line =
   let len = String.length line in
   if len <= max_width then [line]
@@ -479,7 +481,13 @@ let escape_code_fences s =
     Scans line by line tracking code block state. Lines that contain ```
     while already inside a code block get their ``` escaped with a
     zero-width space, preventing premature fence closure. Top-level
-    fence markers (that open/close code blocks) are left untouched. *)
+    fence markers (that open/close code blocks) are left untouched.
+
+    Limitation: a bare ``` line inside a code block is ambiguous — it
+    could be literal content or a closing fence. We treat lines that are
+    only backticks and whitespace as closing fences. This is inherent to
+    markdown: there is no escape mechanism inside code blocks, and Discord
+    does not support 4+ backtick fences as an alternative delimiter. *)
 let escape_nested_fences text =
   let lines = String.split_on_char '\n' text in
   let in_code = ref false in

@@ -152,16 +152,6 @@ Discord does not render GitHub shorthand as clickable links.
 IMPORTANT: When starting sessions, always create a fresh worktree so agents don't \
 stomp on each other's work." project.name project.path
 
-let post_response rest ~channel_id ~wrap_width text =
-  let text = Agent_process.reformat_tables ~max_width:wrap_width text in
-  let text = Agent_process.wrap_text ~max_width:wrap_width text in
-  let text = Agent_process.escape_nested_fences text in
-  List.iter (fun chunk ->
-    match Discord_rest.create_message rest ~channel_id ~content:chunk () with
-    | Ok _ -> ()
-    | Error e -> Logs.warn (fun m -> m "bot: post error: %s" e)
-  ) (Agent_process.split_message text)
-
 (** Trigger a graceful restart: drain → reap → build → spawn.
     Callable from command handler or signal handler.
     [notify] is called with status messages (may be a no-op for signal-triggered restarts). *)
@@ -199,6 +189,23 @@ let trigger_restart t ~notify =
         in
         wait ()
       end;
+      (* Clear any remaining queued messages and notify users *)
+      List.iter (fun (_tid, (s : Session_store.session)) ->
+        let dropped = ref 0 in
+        while not (Queue.is_empty s.pending_queue) do
+          let pending = Queue.pop s.pending_queue in
+          incr dropped;
+          ignore (Discord_rest.delete_own_reaction t.rest
+            ~channel_id:pending.msg.Discord_types.channel_id
+            ~message_id:pending.msg.id ~emoji:"\xE2\x8F\xB3" ());
+          ignore (Discord_rest.create_reaction t.rest
+            ~channel_id:pending.msg.Discord_types.channel_id
+            ~message_id:pending.msg.id ~emoji:"\xE2\x9D\x8C" ())
+        done;
+        if !dropped > 0 then
+          Logs.info (fun m -> m "bot: dropped %d queued message(s) for %s during restart"
+            !dropped s.project_name)
+      ) (Session_store.bindings t.sessions);
       (* Phase 2: Reap child processes.
          Split SIGTERM and SIGKILL into separate systhread calls with
          Eio.Time.sleep between to avoid blocking the systhread pool. *)
@@ -493,7 +500,7 @@ let handle_command t msg cmd =
       "`!rename [thread_id] <name>` — rename a thread";
       "`!status` — bot status and running processes";
       "`!cleanup` — delete stale channels";
-      "`!restart` — rebuild and restart";
+      "`!restart` — rebuild and restart (warns but doesn't block active sessions)";
       "`!version` — build info and runtime status";
       "`!desktop` — set wrapping to desktop width";
       "`!mobile` — set wrapping to mobile width";
@@ -542,7 +549,12 @@ let resolve_channel_context t ~(channel_id : Discord_types.channel_id)
       (name, "thread")
 
 (** Handle a message in a session thread.
-    [channel_info] is passed through when the caller already fetched it. *)
+    [channel_info] is passed through when the caller already fetched it.
+
+    During drain mode (restart pending), messages are still processed but
+    the user is warned. This is intentional: blocking messages during drain
+    would prevent using other sessions while a long-running task finishes.
+    The restart waits for all session.processing flags to go false. *)
 let handle_thread_message t msg ?channel_info () =
   if t.draining then
     ignore (Discord_rest.create_message t.rest
@@ -740,22 +752,27 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
             ) (Session_store.bindings bot.sessions);
             tbl in
           let git_timestamp project_path =
-            try
-              let ic = Unix.open_process_in
-                (Printf.sprintf "git -C %s log -1 --format=%%ct 2>/dev/null"
-                  (Filename.quote project_path)) in
-              let line = input_line ic in
-              ignore (Unix.close_process_in ic);
-              int_of_string line
-            with _ -> 0 in
-          let activity = List.map (fun (p : Project.t) ->
+            Eio_unix.run_in_systhread (fun () ->
+              try
+                let ic = Unix.open_process_in
+                  (Printf.sprintf "git -C %s log -1 --format=%%ct 2>/dev/null"
+                    (Filename.quote project_path)) in
+                let line = input_line ic in
+                ignore (Unix.close_process_in ic);
+                int_of_string line
+              with _ -> 0) in
+          (* Fetch git timestamps in parallel using Eio fibers *)
+          let indexed = List.mapi (fun i p -> (i, p)) projects in
+          let results = Array.make (List.length projects) ("", 0) in
+          Eio.Fiber.List.iter (fun (i, (p : Project.t)) ->
             let discord = try Hashtbl.find discord_scores p.name with Not_found -> 0 in
+            let git_ts = git_timestamp p.path in
             (* Score: discord messages * 1_000_000 + git timestamp.
                This ensures any Discord activity dominates, with git
                commit recency as tiebreaker for inactive projects. *)
-            let git_ts = git_timestamp p.path in
-            (p.name, discord * 1_000_000 + git_ts)
-          ) projects
+            results.(i) <- (p.name, discord * 1_000_000 + git_ts)
+          ) indexed;
+          let activity = Array.to_list results
             |> List.sort (fun (_, s1) (_, s2) -> Int.compare s2 s1) in
           Channel_manager.reorder_by_activity ~rest ~guild_id:config.guild_id
             bot.channels activity;
