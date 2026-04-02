@@ -8,6 +8,8 @@ discord-agents is intended to be a simple interface to agentic coding on your pe
 
 Only tested on GNU+Linux. Environment managed by Nix. Built with OCaml 5.3.
 
+![discord-agents screenshot](docs/screenshot.png)
+
 ## Quickstart
 
 ```bash
@@ -62,6 +64,8 @@ All commands use a `!` prefix:
 | `!help` | Command reference |
 
 All channels -- control and project -- have the same capabilities. The agent knows which channel it's in and has context about the associated project. Non-command messages are routed to the channel's Claude session automatically.
+
+File attachments (screenshots, code, logs, PDFs, etc.) are downloaded and passed to the agent, which can read them directly.
 
 ## Testing
 
