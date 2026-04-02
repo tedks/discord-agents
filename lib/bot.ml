@@ -729,13 +729,34 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
       if bot.channels.category_id = None then
         Eio.Fiber.fork ~sw (fun () ->
           Channel_manager.setup ~rest ~guild_id:config.guild_id ~projects bot.channels;
-          (* Reorder channels by activity: projects with more messages float up.
-             Sort most-active first so they get the lowest position numbers. *)
-          let activity = Session_store.bindings bot.sessions
-            |> List.map (fun (_tid, (s : Session_store.session)) ->
-              (s.project_name, s.message_count))
-            |> List.sort_uniq (fun (n1, _) (n2, _) -> String.compare n1 n2)
-            |> List.sort (fun (_, c1) (_, c2) -> Int.compare c2 c1) in
+          (* Reorder channels by activity. Primary: Discord message count from
+             sessions. Fallback: last git commit timestamp, so projects without
+             Discord activity still sort by recency. *)
+          let discord_scores =
+            let tbl = Hashtbl.create 32 in
+            List.iter (fun (_tid, (s : Session_store.session)) ->
+              let prev = try Hashtbl.find tbl s.project_name with Not_found -> 0 in
+              Hashtbl.replace tbl s.project_name (prev + s.message_count)
+            ) (Session_store.bindings bot.sessions);
+            tbl in
+          let git_timestamp project_path =
+            try
+              let ic = Unix.open_process_in
+                (Printf.sprintf "git -C %s log -1 --format=%%ct 2>/dev/null"
+                  (Filename.quote project_path)) in
+              let line = input_line ic in
+              ignore (Unix.close_process_in ic);
+              int_of_string line
+            with _ -> 0 in
+          let activity = List.map (fun (p : Project.t) ->
+            let discord = try Hashtbl.find discord_scores p.name with Not_found -> 0 in
+            (* Score: discord messages * 1_000_000 + git timestamp.
+               This ensures any Discord activity dominates, with git
+               commit recency as tiebreaker for inactive projects. *)
+            let git_ts = git_timestamp p.path in
+            (p.name, discord * 1_000_000 + git_ts)
+          ) projects
+            |> List.sort (fun (_, s1) (_, s2) -> Int.compare s2 s1) in
           Channel_manager.reorder_by_activity ~rest ~guild_id:config.guild_id
             bot.channels activity;
           match config.control_channel_id with
