@@ -75,30 +75,10 @@ let build_context_header ~(session : Session_store.session) ~author_name
     channel_type
     (sanitize_context_value author_name)
 
-(** Check if a content_type string indicates an image. *)
-let is_image_content_type = function
-  | Some ct ->
-    let ct = String.lowercase_ascii ct in
-    String.length ct >= 6 && String.sub ct 0 6 = "image/"
-  | None -> false
-
-(** Check if a filename has an image extension. *)
-let is_image_filename filename =
-  let lf = String.lowercase_ascii filename in
-  List.exists (fun ext -> Filename.check_suffix lf ext)
-    [".png"; ".jpg"; ".jpeg"; ".gif"; ".webp"; ".bmp"; ".svg"]
-
-(** Filter attachments to only images, by content_type or filename. *)
-let image_attachments (attachments : Discord_types.attachment list) =
-  List.filter (fun (a : Discord_types.attachment) ->
-    is_image_content_type a.content_type || is_image_filename a.filename
-  ) attachments
-
-(** Download image attachments to temp files in the working directory.
-    Returns a list of (filename, local_path) for successfully downloaded images. *)
-let download_images ~rest ~working_dir
+(** Download attachments to temp files in the working directory.
+    Returns a list of (filename, local_path) for successfully downloaded files. *)
+let download_attachments ~rest ~working_dir
     (attachments : Discord_types.attachment list) =
-  let images = image_attachments attachments in
   List.filter_map (fun (a : Discord_types.attachment) ->
     (* Cap at 25MB to avoid huge downloads *)
     if a.size > 25 * 1024 * 1024 then begin
@@ -125,18 +105,18 @@ let download_images ~rest ~working_dir
         Logs.warn (fun m -> m "agent_runner: failed to download %s: %s"
           a.filename e);
         None
-  ) images
+  ) attachments
 
-(** Build a prompt suffix describing downloaded image attachments.
+(** Build a prompt suffix describing downloaded attachments.
     Tells the agent where to find the files so it can use Read to view them. *)
-let image_prompt_suffix downloaded_images =
-  match downloaded_images with
+let attachment_prompt_suffix downloaded =
+  match downloaded with
   | [] -> ""
-  | images ->
+  | files ->
     let lines = List.map (fun (filename, path) ->
       Printf.sprintf "- %s: %s" filename path
-    ) images in
-    Printf.sprintf "\n\n[Attached images — use the Read tool to view them]\n%s"
+    ) files in
+    Printf.sprintf "\n\n[Attached files — use the Read tool to view them]\n%s"
       (String.concat "\n" lines)
 
 (** Run an agent and stream its output to a Discord channel.
@@ -145,10 +125,10 @@ let image_prompt_suffix downloaded_images =
 let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
     ~prompt ?(attachments=[]) ~author_name ~channel_name ~channel_type
     ?(wrap_width=Agent_process.desktop_width) ?on_pid () =
-  (* Download any image attachments and append paths to the prompt *)
-  let downloaded_images = download_images ~rest
+  (* Download attachments and append paths to the prompt *)
+  let downloaded = download_attachments ~rest
     ~working_dir:session.Session_store.working_dir attachments in
-  let full_prompt = prompt ^ image_prompt_suffix downloaded_images in
+  let full_prompt = prompt ^ attachment_prompt_suffix downloaded in
   let context_prompt =
     build_context_header ~session ~author_name ~channel_name ~channel_type
     ^ full_prompt
