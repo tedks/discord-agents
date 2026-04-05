@@ -316,6 +316,10 @@ TOOLS = [
                 "thread_name": {
                     "type": "string",
                     "description": "Short descriptive name for the thread (max 100 chars). If omitted, uses a default name."
+                },
+                "initial_prompt": {
+                    "type": "string",
+                    "description": "Context for the new session agent about what task to work on. Passed to the agent on its first interaction. Keep it concise — describe the goal, not step-by-step instructions."
                 }
             },
             "required": ["project"]
@@ -476,15 +480,19 @@ def handle_tool_call(name, arguments, config, projects):
         session_id = str(uuid.uuid4())
 
         # Add to sessions
+        initial_prompt = arguments.get("initial_prompt", "").strip() or None
         sessions = load_sessions()
-        sessions.append({
+        session_entry = {
             "project_name": proj["name"],
             "working_dir": worktree_path,
             "agent_kind": agent,
             "session_id": session_id,
             "thread_id": thread_id,
             "message_count": 0,
-        })
+        }
+        if initial_prompt:
+            session_entry["initial_prompt"] = initial_prompt
+        sessions.append(session_entry)
         save_sessions(sessions)
 
         # Post welcome message

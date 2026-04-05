@@ -98,9 +98,13 @@ USE THESE TOOLS. When the user asks to work on a project, start a session, etc.,
 call the appropriate tool. Prefer the conversational MCP tools over suggesting \
 !commands — the user shouldn't need to use !commands.
 
-When starting a session, ALWAYS provide a short descriptive thread_name (max 80 chars) \
-that captures the task — do NOT include the project name. Example: \
-\"fix auth token refresh bug\" not \"myproject / fix auth token refresh bug\".
+When starting a session, ALWAYS provide:
+- A short descriptive thread_name (max 80 chars) that captures the task — \
+do NOT include the project name. Example: \"fix auth token refresh bug\"
+- An initial_prompt that gives the new agent context about what to do. \
+Summarize the user's request and any relevant context from the conversation. \
+Keep it concise — the agent should be able to start working immediately, \
+but hand control back to the user quickly rather than acting autonomously.
 
 Known projects:
 %s
@@ -138,9 +142,13 @@ start working on something that needs its own worktree — e.g. \"start a sessio
 code changes will be made.
 - When in doubt, just chat. The user will ask for a thread if they want one.
 
-When starting a session, ALWAYS provide a short descriptive thread_name (max 80 chars) \
-that captures the task — do NOT include the project name. Example: \
-\"fix auth token refresh bug\" not \"myproject / fix auth token refresh bug\".
+When starting a session, ALWAYS provide:
+- A short descriptive thread_name (max 80 chars) that captures the task — \
+do NOT include the project name. Example: \"fix auth token refresh bug\"
+- An initial_prompt that gives the new agent context about what to do. \
+Summarize the user's request and any relevant context from the conversation. \
+Keep it concise — the agent should be able to start working immediately, \
+but hand control back to the user quickly rather than acting autonomously.
 
 Prefer the conversational MCP tools over suggesting !commands.
 Keep responses concise — this is Discord.
@@ -336,7 +344,8 @@ let handle_command t msg cmd =
              project_name = p.name; working_dir; agent_kind = kind;
              session_id = Resource.generate_uuid ();
              thread_id = thread_ch.Discord_types.id;
-             system_prompt = None; message_count = 0; processing = false; pending_queue = Queue.create ();
+             system_prompt = None; message_count = 0; processing = false;
+             pending_queue = Queue.create (); initial_prompt = None;
            } in
            Session_store.add t.sessions ~thread_id:thread_ch.id session;
            let branch_str = match branch_info with
@@ -362,7 +371,8 @@ let handle_command t msg cmd =
             project_name = Filename.basename working_dir; working_dir;
             agent_kind = Config.Claude; session_id = full_sid;
             thread_id = thread_ch.Discord_types.id;
-            system_prompt = None; message_count = 1; processing = false; pending_queue = Queue.create ();
+            system_prompt = None; message_count = 1; processing = false;
+            pending_queue = Queue.create (); initial_prompt = None;
           } in
           Session_store.add t.sessions ~thread_id:thread_ch.id session;
           ignore (Discord_rest.create_message t.rest ~channel_id:thread_ch.id
@@ -593,8 +603,19 @@ let handle_thread_message t msg ?channel_info () =
                 child_pid := Some pid;
                 register_child_pid t pid;
                 Logs.info (fun m -> m "bot: registered child pid %d" pid) in
+              (* On the first message, prepend any initial context from the
+                 session creator (e.g. the project channel agent that started
+                 this thread). Consumed once, then cleared. *)
+              let prompt = match session.initial_prompt with
+                | Some ctx ->
+                  session.initial_prompt <- None;
+                  Session_store.save t.sessions;
+                  Printf.sprintf "[Session context from the creating agent: %s]\n\n%s"
+                    ctx msg.content
+                | None -> msg.content
+              in
               let result = Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
-                      ~session ~channel_id ~prompt:msg.content
+                      ~session ~channel_id ~prompt
                       ~attachments:msg.attachments
                       ~author_name ~channel_name ~channel_type
                       ~wrap_width:t.wrap_width ~on_pid () in
@@ -630,7 +651,8 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
     let session : Session_store.session = {
       project_name; working_dir; agent_kind = Config.Claude;
       session_id = Resource.generate_uuid (); thread_id = channel_id;
-      system_prompt; message_count = 0; processing = false; pending_queue = Queue.create ();
+      system_prompt; message_count = 0; processing = false;
+      pending_queue = Queue.create (); initial_prompt = None;
     } in
     Session_store.add t.sessions ~thread_id:channel_id session;
     Logs.info (fun m -> m "bot: auto-created session for %s" project_name)
