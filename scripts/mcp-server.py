@@ -165,6 +165,14 @@ TOOLS = [
             "type": "object",
             "properties": {}
         }
+    },
+    {
+        "name": "refresh_projects",
+        "description": "Re-scan for new projects without restarting the bot. Use when a new project has been added to the base directories.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
     }
 ]
 
@@ -174,6 +182,8 @@ def handle_tool_call(name, arguments):
     """Forward tool call to the bot's control API and format the response."""
 
     if name == "list_projects":
+        # Always refresh so newly added projects are visible
+        control_request("refresh_projects")
         result = control_request("list_projects")
         if "error" in result:
             return result["error"]
@@ -211,6 +221,10 @@ def handle_tool_call(name, arguments):
 
     elif name == "start_session":
         result = control_request("start_session", arguments, timeout=120)
+        if "error" in result and "no project matching" in result["error"].lower():
+            # Project not found — try refreshing project list first
+            control_request("refresh_projects")
+            result = control_request("start_session", arguments, timeout=120)
         if "error" in result:
             return result["error"]
         tid = result.get("thread_id", "")
@@ -243,6 +257,16 @@ def handle_tool_call(name, arguments):
         if "error" in result:
             return result["error"]
         return result.get("message", "Done.")
+
+    elif name == "refresh_projects":
+        result = control_request("refresh_projects")
+        if "error" in result:
+            return result["error"]
+        total = result.get("total", 0)
+        delta = result.get("delta", 0)
+        if delta > 0:
+            return f"Refreshed: found {delta} new project{'s' if delta != 1 else ''} ({total} total)."
+        return f"Refreshed: no new projects ({total} total)."
 
     return f"Unknown tool: {name}"
 
