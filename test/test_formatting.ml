@@ -541,16 +541,17 @@ let test_detail_unknown_tool () =
   let result = detail "SomeTool" input in
   Alcotest.(check string) "unknown tool has no detail" "" result
 
-let test_detail_truncation () =
+let test_detail_no_truncation () =
   let long_cmd = String.make 1500 'x' in
   let input = `Assoc [("command", `String long_cmd)] in
   let result = detail "Bash" input in
-  Alcotest.(check bool) "truncated with ..."
-    true (try ignore (Str.search_forward (Str.regexp_string "...") result 0);
+  (* Full content should be preserved — no truncation *)
+  Alcotest.(check bool) "contains full command"
+    true (try ignore (Str.search_forward (Str.regexp_string long_cmd) result 0);
               true with Not_found -> false);
-  (* Total should be well under 2000 chars *)
-  Alcotest.(check bool) "total under 1000"
-    true (String.length result < 1000)
+  (* Result includes code fences around the full command *)
+  Alcotest.(check bool) "total includes full content"
+    true (String.length result > 1500)
 
 let test_lang_of_path () =
   let lang = Discord_agents.Agent_process.lang_of_path in
@@ -568,7 +569,7 @@ let tool_detail_tests = [
   Alcotest.test_case "read empty" `Quick test_detail_read_empty;
   Alcotest.test_case "grep pattern" `Quick test_detail_grep;
   Alcotest.test_case "unknown tool" `Quick test_detail_unknown_tool;
-  Alcotest.test_case "truncation" `Quick test_detail_truncation;
+  Alcotest.test_case "no truncation" `Quick test_detail_no_truncation;
   Alcotest.test_case "lang_of_path" `Quick test_lang_of_path;
 ]
 

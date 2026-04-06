@@ -418,8 +418,8 @@ let summarize_tool_input name input =
     | [] -> ""
 
 (** Maximum length for tool detail code blocks in Discord.
-    Leaves room for the status line and other tool lines in the batch. *)
-let max_detail_len = 800
+    No truncation — full content is shown, split across messages as needed. *)
+let max_detail_len = max_int
 
 (** Guess a syntax highlighting language from a file extension. *)
 let lang_of_path path =
