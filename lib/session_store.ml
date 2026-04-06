@@ -130,6 +130,18 @@ let increment_message_count t session =
   session.message_count <- session.message_count + 1;
   save t
 
+(** Force-reload sessions from disk, bypassing the rate limit.
+    Merges new sessions from disk without overwriting in-memory state.
+    Use when a message arrives for an unknown thread that may have been
+    created externally (e.g. by the MCP server). *)
+let force_reload t =
+  let loaded = load_from_disk () in
+  SessionMap.iter (fun tid session ->
+    if not (SessionMap.mem tid t.sessions) then
+      t.sessions <- SessionMap.add tid session t.sessions
+  ) loaded;
+  t.last_reload <- Unix.gettimeofday ()
+
 (** Reload sessions from disk if the file changed.
     Rate-limited to once per 5 seconds. Merges new sessions
     from disk without overwriting in-memory state. *)

@@ -315,11 +315,13 @@ TOOLS = [
                 },
                 "thread_name": {
                     "type": "string",
-                    "description": "Short descriptive name for the thread (max 100 chars). If omitted, uses a default name."
+                    "description": "Short descriptive name for the thread (max 80 chars). If omitted, uses a default name.",
+                    "maxLength": 80
                 },
                 "initial_prompt": {
                     "type": "string",
-                    "description": "Context for the new session agent about what task to work on. Passed to the agent on its first interaction. Keep it concise — describe the goal, not step-by-step instructions."
+                    "description": "Context for the new session agent about what task to work on. Passed to the agent on its first interaction. Keep it concise — describe the goal, not step-by-step instructions.",
+                    "maxLength": 4000
                 }
             },
             "required": ["project"]
@@ -466,7 +468,7 @@ def handle_tool_call(name, arguments, config, projects):
             return f"No channel found for thread creation. Start the session manually."
 
         thread_name = arguments.get("thread_name", "").strip()
-        if not thread_name or len(thread_name) > 100:
+        if not thread_name or len(thread_name) > 80:
             thread_name = f"{agent} / {proj['name']}"
         result = discord_request("POST", f"/channels/{channel_id}/threads", token, {
             "name": thread_name,
@@ -480,7 +482,7 @@ def handle_tool_call(name, arguments, config, projects):
         session_id = str(uuid.uuid4())
 
         # Add to sessions
-        initial_prompt = arguments.get("initial_prompt", "").strip() or None
+        initial_prompt = arguments.get("initial_prompt", "").strip()[:4000] or None
         sessions = load_sessions()
         session_entry = {
             "project_name": proj["name"],

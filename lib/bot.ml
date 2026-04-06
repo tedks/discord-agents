@@ -606,10 +606,9 @@ let handle_thread_message t msg ?channel_info () =
               (* On the first message, prepend any initial context from the
                  session creator (e.g. the project channel agent that started
                  this thread). Consumed once, then cleared. *)
+              let had_initial_prompt = Option.is_some session.initial_prompt in
               let prompt = match session.initial_prompt with
                 | Some ctx ->
-                  session.initial_prompt <- None;
-                  Session_store.save t.sessions;
                   Printf.sprintf "[Session context from the creating agent: %s]\n\n%s"
                     ctx msg.content
                 | None -> msg.content
@@ -625,6 +624,12 @@ let handle_thread_message t msg ?channel_info () =
               | Ok () ->
                 ignore (Discord_rest.create_reaction t.rest ~channel_id
                   ~message_id ~emoji:"\xE2\x9C\x85" ());
+                (* Clear initial_prompt only after successful run so it
+                   survives failures and retries *)
+                if had_initial_prompt then begin
+                  session.initial_prompt <- None;
+                  Session_store.save t.sessions
+                end;
                 Session_store.increment_message_count t.sessions session
               | Error _ ->
                 ignore (Discord_rest.create_reaction t.rest ~channel_id
@@ -706,10 +711,19 @@ let handle_message t (msg : Discord_types.message) =
          handle_thread_message t msg ()
        | None -> ())
     | None ->
-      (* Check if this is a thread under a project channel *)
-      (match Session_store.find_opt t.sessions ~thread_id:msg.channel_id with
-       | Some _ -> handle_thread_message t msg ()
-       | None ->
+      (* Check if this is a thread under a project channel.
+         If not found, force-reload from disk in case the MCP server
+         just created this session (avoids 5-second reload race). *)
+      let session_found =
+        match Session_store.find_opt t.sessions ~thread_id:msg.channel_id with
+        | Some _ -> true
+        | None ->
+          Session_store.force_reload t.sessions;
+          Option.is_some (Session_store.find_opt t.sessions ~thread_id:msg.channel_id)
+      in
+      (match session_found with
+       | true -> handle_thread_message t msg ()
+       | false ->
          (* Look up the channel to find its parent *)
          (match Discord_rest.get_channel t.rest ~channel_id:msg.channel_id () with
           | Ok ch ->
