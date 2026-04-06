@@ -77,6 +77,16 @@ let working_dir_of_project (p : Project.t) =
     Ok p.path
 
 (** System prompt for control channel Claude — knows about MCP tools. *)
+(** Shared instructions for agents that can start sessions. *)
+let session_starting_instructions =
+  "When starting a session, ALWAYS provide:\n\
+   - A short descriptive thread_name (max 80 chars) that captures the task — \
+   do NOT include the project name. Example: \"fix auth token refresh bug\"\n\
+   - An initial_prompt that gives the new agent context about what to do. \
+   Summarize the user's request and any relevant context from the conversation. \
+   Keep it concise — the agent should be able to start working immediately, \
+   but hand control back to the user quickly rather than acting autonomously."
+
 let control_system_prompt projects =
   let project_list = String.concat "\n" (List.mapi (fun i (p : Project.t) ->
     Printf.sprintf "  %d. %s (%s)" (i+1) p.name p.path
@@ -98,13 +108,7 @@ USE THESE TOOLS. When the user asks to work on a project, start a session, etc.,
 call the appropriate tool. Prefer the conversational MCP tools over suggesting \
 !commands — the user shouldn't need to use !commands.
 
-When starting a session, ALWAYS provide:
-- A short descriptive thread_name (max 80 chars) that captures the task — \
-do NOT include the project name. Example: \"fix auth token refresh bug\"
-- An initial_prompt that gives the new agent context about what to do. \
-Summarize the user's request and any relevant context from the conversation. \
-Keep it concise — the agent should be able to start working immediately, \
-but hand control back to the user quickly rather than acting autonomously.
+%s
 
 Known projects:
 %s
@@ -116,7 +120,8 @@ stomp on each other's work.
 
 IMPORTANT: When linking to GitHub PRs, issues, or commits, always use full URLs \
 (e.g. https://github.com/owner/repo/pull/1) — never shorthand like owner/repo#1. \
-Discord does not render GitHub shorthand as clickable links." project_list
+Discord does not render GitHub shorthand as clickable links."
+  session_starting_instructions project_list
 
 (** System prompt for project channel Claude — scoped to one project. *)
 let project_system_prompt (project : Project.t) =
@@ -142,13 +147,7 @@ start working on something that needs its own worktree — e.g. \"start a sessio
 code changes will be made.
 - When in doubt, just chat. The user will ask for a thread if they want one.
 
-When starting a session, ALWAYS provide:
-- A short descriptive thread_name (max 80 chars) that captures the task — \
-do NOT include the project name. Example: \"fix auth token refresh bug\"
-- An initial_prompt that gives the new agent context about what to do. \
-Summarize the user's request and any relevant context from the conversation. \
-Keep it concise — the agent should be able to start working immediately, \
-but hand control back to the user quickly rather than acting autonomously.
+%s
 
 Prefer the conversational MCP tools over suggesting !commands.
 Keep responses concise — this is Discord.
@@ -158,7 +157,8 @@ IMPORTANT: When linking to GitHub PRs, issues, or commits, always use full URLs 
 Discord does not render GitHub shorthand as clickable links.
 
 IMPORTANT: When starting sessions, always create a fresh worktree so agents don't \
-stomp on each other's work." project.name project.path
+stomp on each other's work."
+  project.name project.path session_starting_instructions
 
 (** Trigger a graceful restart: drain → reap → build → spawn.
     Callable from command handler or signal handler.
@@ -609,7 +609,7 @@ let handle_thread_message t msg ?channel_info () =
               let had_initial_prompt = Option.is_some session.initial_prompt in
               let prompt = match session.initial_prompt with
                 | Some ctx ->
-                  Printf.sprintf "[Session context from the creating agent: %s]\n\n%s"
+                  Printf.sprintf "<session-context>\n%s\n</session-context>\n\n%s"
                     ctx msg.content
                 | None -> msg.content
               in

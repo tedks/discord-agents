@@ -45,6 +45,7 @@ def _with_sessions_lock(fn):
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 def load_sessions():
+    """Load sessions (read-only). Lock held only during read."""
     def _load():
         if SESSIONS_FILE.exists():
             try:
@@ -54,13 +55,31 @@ def load_sessions():
         return []
     return _with_sessions_lock(_load)
 
+def _save_sessions_unlocked(sessions):
+    """Write sessions to disk. Caller must hold the lock."""
+    tmp = SESSIONS_FILE.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(sessions, indent=2) + "\n")
+    tmp.rename(SESSIONS_FILE)
+
 def save_sessions(sessions):
     """Atomic write with file locking."""
-    def _save():
-        tmp = SESSIONS_FILE.with_suffix('.json.tmp')
-        tmp.write_text(json.dumps(sessions, indent=2) + "\n")
-        tmp.rename(SESSIONS_FILE)
-    _with_sessions_lock(_save)
+    _with_sessions_lock(lambda: _save_sessions_unlocked(sessions))
+
+def modify_sessions(fn):
+    """Atomically load, modify, and save sessions under a single lock.
+    fn receives the session list and must return the modified list."""
+    def _modify():
+        if SESSIONS_FILE.exists():
+            try:
+                sessions = json.loads(SESSIONS_FILE.read_text())
+            except json.JSONDecodeError:
+                sessions = []
+        else:
+            sessions = []
+        result = fn(sessions)
+        _save_sessions_unlocked(result)
+        return result
+    return _with_sessions_lock(_modify)
 
 # --- Discord REST helpers ---
 
@@ -481,9 +500,8 @@ def handle_tool_call(name, arguments, config, projects):
         thread_id = result.get("id", "")
         session_id = str(uuid.uuid4())
 
-        # Add to sessions
+        # Add to sessions (atomic load+modify+save to avoid races)
         initial_prompt = arguments.get("initial_prompt", "").strip()[:4000] or None
-        sessions = load_sessions()
         session_entry = {
             "project_name": proj["name"],
             "working_dir": worktree_path,
@@ -494,8 +512,7 @@ def handle_tool_call(name, arguments, config, projects):
         }
         if initial_prompt:
             session_entry["initial_prompt"] = initial_prompt
-        sessions.append(session_entry)
-        save_sessions(sessions)
+        modify_sessions(lambda ss: ss + [session_entry])
 
         # Post welcome message
         discord_request("POST", f"/channels/{thread_id}/messages", token, {
@@ -544,16 +561,14 @@ def handle_tool_call(name, arguments, config, projects):
 
         thread_id = result.get("id", "")
 
-        sessions = load_sessions()
-        sessions.append({
+        modify_sessions(lambda ss: ss + [{
             "project_name": Path(working_dir).name,
             "working_dir": working_dir,
             "agent_kind": "claude",
             "session_id": full_sid,
             "thread_id": thread_id,
             "message_count": 1,  # >0 so bot uses --resume
-        })
-        save_sessions(sessions)
+        }])
 
         discord_request("POST", f"/channels/{thread_id}/messages", token, {
             "content": f"**Resumed** Claude session `{full_sid[:8]}`\n"
