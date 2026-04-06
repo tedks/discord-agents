@@ -12,6 +12,7 @@ type t =
   | Stop_session of { thread_id : string }
   | Cleanup_channels
   | Restart
+  | Refresh
   | Rename_thread of { thread_id : string option; name : string }
   | Status
   | Desktop
@@ -62,6 +63,7 @@ let parse content =
       Rename_thread { thread_id = None;
                       name = String.concat " " rest }
   | ["restart"] -> Restart
+  | ["refresh"] -> Refresh
   | ["status"] | ["version"] | ["info"] -> Status
   | ["desktop"] -> Desktop
   | ["mobile"] -> Mobile

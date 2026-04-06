@@ -33,7 +33,7 @@ type t = {
   config : Config.t;
   rest : Discord_rest.t;
   gateway : Discord_gateway.t;
-  projects : Project.t list;
+  mutable projects : Project.t list;
   sessions : Session_store.t;
   channels : Channel_manager.t;
   env : Eio_unix.Stdenv.base;
@@ -258,6 +258,19 @@ let trigger_restart t ~notify =
         exit 0))
   end
 
+(** Re-run project discovery and update channel mappings.
+    Returns the number of new projects found. *)
+let rediscover_projects t =
+  let old_count = List.length t.projects in
+  let new_projects = Project.discover ~base_directories:t.config.base_directories in
+  t.projects <- new_projects;
+  (* Re-run channel setup to map any new project channels *)
+  Channel_manager.setup ~rest:t.rest ~guild_id:t.config.guild_id
+    ~projects:new_projects t.channels;
+  let new_count = List.length new_projects in
+  Logs.info (fun m -> m "bot: rediscovered projects: %d -> %d" old_count new_count);
+  new_count - old_count
+
 (** Handle a parsed command. *)
 let handle_command t msg cmd =
   let channel_id = msg.Discord_types.channel_id in
@@ -420,6 +433,15 @@ let handle_command t msg cmd =
       | Ok n -> reply (Printf.sprintf "Cleaned up %d stale channels." n))
   | Command.Restart ->
     trigger_restart t ~notify:reply
+  | Command.Refresh ->
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      let delta = Eio_unix.run_in_systhread (fun () -> rediscover_projects t) in
+      let total = List.length t.projects in
+      if delta > 0 then
+        reply (Printf.sprintf "Refreshed: found %d new project%s (%d total)."
+          delta (if delta = 1 then "" else "s") total)
+      else
+        reply (Printf.sprintf "Refreshed: no new projects (%d total)." total))
   | Command.Rename_thread { thread_id; name } ->
     let target_id = match thread_id with
       | Some tid -> tid
@@ -535,6 +557,7 @@ let handle_command t msg cmd =
       "`!stop <thread_id>` — stop a session";
       "`!rename [thread_id] <name>` — rename a thread";
       "`!status` — bot status and running processes";
+      "`!refresh` — re-scan for new projects";
       "`!cleanup` — delete stale channels";
       "`!restart` — rebuild and restart (warns but doesn't block active sessions)";
       "`!version` — build info and runtime status";
