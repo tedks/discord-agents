@@ -418,8 +418,11 @@ let summarize_tool_input name input =
     | [] -> ""
 
 (** Maximum length for tool detail code blocks in Discord.
-    No truncation — full content is shown, split across messages as needed. *)
-let max_detail_len = max_int
+    Full content is shown up to this safety cap, split across messages
+    as needed.  50 KB is ~26 Discord messages — enough for any reasonable
+    tool output while preventing runaway message spam from pathological
+    cases (e.g. cat of a binary or huge log). *)
+let max_detail_len = 50_000
 
 (** Guess a syntax highlighting language from a file extension. *)
 let lang_of_path path =
@@ -532,10 +535,12 @@ let escape_nested_fences text =
 let detail_of_tool_input name input =
   let open Yojson.Safe.Util in
   let get key = input |> member key |> to_string_option in
-  (* Build a code block with fences escaped in the content *)
+  (* Build a code block with fences escaped and capped at max_detail_len *)
   let code_block lang content =
-    Printf.sprintf "```%s\n%s\n```" lang
-      (escape_code_fences (truncate_detail max_detail_len content))
+    let capped = if String.length content > max_detail_len
+      then String.sub content 0 max_detail_len ^ "\n... (truncated)"
+      else content in
+    Printf.sprintf "```%s\n%s\n```" lang (escape_code_fences capped)
   in
   match name with
   | "Edit" ->
