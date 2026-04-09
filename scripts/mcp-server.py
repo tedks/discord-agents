@@ -546,12 +546,35 @@ def handle_tool_call(name, arguments, config, projects):
         # Resolve working dir from project dir name
         working_dir = resolve_project_dir(proj_dir_name)
 
-        channel_id = control_channel or ""
-        if not channel_id:
-            return "No control channel configured."
+        # Match working directory to a known project for channel routing
+        matched_project = None
+        for p in projects:
+            if working_dir == p["path"] or working_dir.startswith(p["path"] + "/"):
+                matched_project = p
+                break
+
+        # Route thread to project channel (like start_session does)
+        target_channel = control_channel or ""
+        if matched_project and guild_id and token:
+            channels = discord_request("GET", f"/guilds/{guild_id}/channels", token)
+            if isinstance(channels, list):
+                for ch in channels:
+                    if (ch.get("name", "").lower() == matched_project["name"].lower()
+                            and ch.get("type") == 0):
+                        target_channel = ch["id"]
+                        break
+
+        if not target_channel:
+            return "No channel found for thread creation."
+
+        # If working_dir is a bare repo root, use the main worktree instead
+        if matched_project and matched_project["is_bare"] and working_dir == matched_project["path"]:
+            working_dir = find_working_dir(matched_project)
+
+        project_name = matched_project["name"] if matched_project else Path(working_dir).name
 
         thread_name = f"resume / {full_sid[:8]}"
-        result = discord_request("POST", f"/channels/{channel_id}/threads", token, {
+        result = discord_request("POST", f"/channels/{target_channel}/threads", token, {
             "name": thread_name,
             "type": 11,
             "auto_archive_duration": 1440,
@@ -562,7 +585,7 @@ def handle_tool_call(name, arguments, config, projects):
         thread_id = result.get("id", "")
 
         modify_sessions(lambda ss: ss + [{
-            "project_name": Path(working_dir).name,
+            "project_name": project_name,
             "working_dir": working_dir,
             "agent_kind": "claude",
             "session_id": full_sid,

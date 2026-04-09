@@ -361,14 +361,41 @@ let handle_command t msg cmd =
         Claude_sessions.find_by_prefix session_id) in
       match found with
       | None -> reply (Printf.sprintf "No Claude session matching `%s`." session_id)
-      | Some (full_sid, working_dir) ->
+      | Some (full_sid, raw_working_dir) ->
         let sid_short = String.sub full_sid 0 (min 8 (String.length full_sid)) in
-        match Discord_rest.create_thread_no_message t.rest
-                ~channel_id ~name:(Printf.sprintf "resume / %s" sid_short) () with
+        (* Match working directory to a known project for channel routing *)
+        let matched_project = List.find_opt (fun (p : Project.t) ->
+          raw_working_dir = p.path
+          || (String.length raw_working_dir > String.length p.path + 1
+              && String.sub raw_working_dir 0 (String.length p.path + 1)
+                 = p.path ^ "/")
+        ) t.projects in
+        let thread_parent = match matched_project with
+          | Some p ->
+            (match Channel_manager.find_or_create ~rest:t.rest
+                     ~guild_id:t.config.guild_id ~project:p t.channels with
+             | Some ch_id -> ch_id
+             | None -> channel_id)
+          | None -> channel_id
+        in
+        (* If working_dir is a bare repo root, use the main worktree instead *)
+        let working_dir = match matched_project with
+          | Some p when p.is_bare && raw_working_dir = p.path ->
+            (match working_dir_of_project p with
+             | Ok wd -> wd
+             | Error _ -> raw_working_dir)
+          | _ -> raw_working_dir
+        in
+        let project_name = match matched_project with
+          | Some p -> p.name
+          | None -> Filename.basename raw_working_dir
+        in
+        (match Discord_rest.create_thread_no_message t.rest
+                ~channel_id:thread_parent ~name:(Printf.sprintf "resume / %s" sid_short) () with
         | Error e -> reply (Printf.sprintf "Failed to create thread: %s" e)
         | Ok thread_ch ->
           let session : Session_store.session = {
-            project_name = Filename.basename working_dir; working_dir;
+            project_name; working_dir;
             agent_kind = Config.Claude; session_id = full_sid;
             thread_id = thread_ch.Discord_types.id;
             system_prompt = None; message_count = 1; processing = false;
@@ -378,7 +405,7 @@ let handle_command t msg cmd =
           ignore (Discord_rest.create_message t.rest ~channel_id:thread_ch.id
             ~content:(Printf.sprintf
               "**Resumed** Claude session `%s`\nWorking in: `%s`\nSend a message to continue."
-              sid_short working_dir) ()))
+              sid_short working_dir) ())))
   | Command.Stop_session { thread_id } ->
     (match Session_store.find_opt t.sessions ~thread_id with
      | None -> reply "Session not found."
