@@ -652,11 +652,10 @@ let handle_thread_message t msg ?channel_info () =
                 ignore (Discord_rest.create_reaction t.rest ~channel_id
                   ~message_id ~emoji:"\xE2\x9C\x85" ());
                 (* Clear initial_prompt only after successful run so it
-                   survives failures and retries *)
-                if had_initial_prompt then begin
+                   survives failures and retries. Cleared before
+                   increment_message_count to persist in a single save. *)
+                if had_initial_prompt then
                   session.initial_prompt <- None;
-                  Session_store.save t.sessions
-                end;
                 Session_store.increment_message_count t.sessions session
               | Error _ ->
                 ignore (Discord_rest.create_reaction t.rest ~channel_id
@@ -738,19 +737,10 @@ let handle_message t (msg : Discord_types.message) =
          handle_thread_message t msg ()
        | None -> ())
     | None ->
-      (* Check if this is a thread under a project channel.
-         If not found, force-reload from disk in case the MCP server
-         just created this session (avoids 5-second reload race). *)
-      let session_found =
-        match Session_store.find_opt t.sessions ~thread_id:msg.channel_id with
-        | Some _ -> true
-        | None ->
-          Session_store.force_reload t.sessions;
-          Option.is_some (Session_store.find_opt t.sessions ~thread_id:msg.channel_id)
-      in
-      (match session_found with
-       | true -> handle_thread_message t msg ()
-       | false ->
+      (* Check if this is a thread under a project channel *)
+      (match Session_store.find_opt t.sessions ~thread_id:msg.channel_id with
+       | Some _ -> handle_thread_message t msg ()
+       | None ->
          (* Look up the channel to find its parent *)
          (match Discord_rest.get_channel t.rest ~channel_id:msg.channel_id () with
           | Ok ch ->
@@ -760,20 +750,29 @@ let handle_message t (msg : Discord_types.message) =
             in
             (match parent_project with
              | Some proj_name ->
-               let proj = List.find_opt (fun (p : Project.t) ->
-                 p.name = proj_name) t.projects in
-               (match proj with
-                | Some p ->
-                  let wd = match working_dir_of_project p with
-                    | Ok d -> d | Error _ -> p.path in
-                  (* Worker threads get no system prompt — they're focused agents.
-                     They still get MCP tools via agent_process.ml. *)
-                  ensure_channel_session t ~channel_id:msg.channel_id
-                    ~project_name:p.name ~working_dir:wd
-                    ~system_prompt:None;
-                  (* Pass the already-fetched channel info to avoid a second API call *)
+               (* This is a thread under a project channel. If no session
+                  exists, it may have just been created by the MCP server.
+                  Force-reload from disk before auto-creating, to avoid
+                  racing with the MCP server and creating a duplicate
+                  session with wrong session_id/working_dir/initial_prompt. *)
+               Session_store.force_reload t.sessions;
+               (match Session_store.find_opt t.sessions ~thread_id:msg.channel_id with
+                | Some _ ->
                   handle_thread_message t msg ~channel_info:ch ()
-                | None -> handle_thread_message t msg ())
+                | None ->
+                  (* Still not found after reload — genuinely new thread
+                     (e.g. manually created in Discord). Auto-create. *)
+                  let proj = List.find_opt (fun (p : Project.t) ->
+                    p.name = proj_name) t.projects in
+                  (match proj with
+                   | Some p ->
+                     let wd = match working_dir_of_project p with
+                       | Ok d -> d | Error _ -> p.path in
+                     ensure_channel_session t ~channel_id:msg.channel_id
+                       ~project_name:p.name ~working_dir:wd
+                       ~system_prompt:None;
+                     handle_thread_message t msg ~channel_info:ch ()
+                   | None -> handle_thread_message t msg ()))
              | None -> handle_thread_message t msg ())
           | Error e ->
             Logs.warn (fun m -> m "bot: channel lookup failed for %s: %s"

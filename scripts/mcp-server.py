@@ -35,14 +35,16 @@ import fcntl
 
 def _with_sessions_lock(fn):
     """Execute fn while holding an exclusive lock on sessions.json.lock.
-    Prevents lost-update races between the bot and MCP server."""
+    Prevents lost-update races between the bot and MCP server.
+    Uses fcntl.lockf (POSIX record locks) to match the OCaml side's
+    Unix.lockf — flock and lockf are independent lock families on Linux. """
     SESSIONS_LOCK.parent.mkdir(parents=True, exist_ok=True)
     with open(SESSIONS_LOCK, 'w') as lock_fd:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        fcntl.lockf(lock_fd, fcntl.LOCK_EX)
         try:
             return fn()
         finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            fcntl.lockf(lock_fd, fcntl.LOCK_UN)
 
 def load_sessions():
     """Load sessions (read-only). Lock held only during read."""
