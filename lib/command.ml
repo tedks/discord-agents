@@ -18,6 +18,8 @@ type t =
   | Desktop
   | Mobile
   | Wrapping of int option
+  | Lines of int option
+  | Scroll of int
   | Help
   | Unknown of string
 
@@ -71,6 +73,16 @@ let parse content =
   | ["wrapping"; n] ->
     (match int_of_string_opt n with
      | Some w when w > 0 -> Wrapping (Some w)
+     | _ -> Unknown content)
+  | ["lines"] -> Lines None
+  | ["lines"; n] ->
+    (match int_of_string_opt n with
+     | Some l when l > 0 -> Lines (Some l)
+     | _ -> Unknown content)
+  | ["scroll"] -> Scroll 1
+  | ["scroll"; n] ->
+    (match int_of_string_opt n with
+     | Some s when s <> 0 -> Scroll s
      | _ -> Unknown content)
   | ["help"] -> Help
   | _ -> Unknown content

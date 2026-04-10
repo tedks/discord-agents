@@ -73,6 +73,10 @@ let is_separator_row cells =
 let desktop_width = 120
 let mobile_width = 60
 
+(** Default number of lines to show for tool/code output.
+    Users can adjust with !lines. *)
+let default_output_lines = 40
+
 (** Count backticks in a string, used to track inline code span state. *)
 let count_backticks s =
   let n = ref 0 in

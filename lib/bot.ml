@@ -38,6 +38,13 @@ type project_state = {
   channels : Channel_manager.t;
 }
 
+(** Scroll state for a thread: full output text and current page index. *)
+type scroll_state = {
+  full_content : string;
+  total_lines : int;
+  mutable page : int;
+}
+
 type t = {
   config : Config.t;
   rest : Discord_rest.t;
@@ -51,6 +58,8 @@ type t = {
   child_pids : (Pid_set.t ref * Mutex.t);
   mutable wrap_width : int;
   mutable refreshing : bool;
+  mutable output_lines : int;
+  scroll_states : (Discord_types.channel_id, scroll_state) Hashtbl.t;
 }
 
 (** Convenience accessors for the current project state snapshot. *)
@@ -613,6 +622,8 @@ let handle_command t msg cmd =
       "`!desktop` — set wrapping to desktop width";
       "`!mobile` — set wrapping to mobile width";
       "`!wrapping [n]` — show or set line wrap width";
+      "`!lines [n]` — show or set output lines for tool/code display";
+      "`!scroll [n]` — scroll through last tool output (default: forward 1 page, negative: backward)";
       "`!help` — this message";
     ])
   | Command.Desktop ->
@@ -628,6 +639,34 @@ let handle_command t msg cmd =
   | Command.Wrapping (Some w) ->
     t.wrap_width <- w;
     reply (Printf.sprintf "Wrapping set to %d chars." w)
+  | Command.Lines None ->
+    reply (Printf.sprintf "Output lines: %d." t.output_lines)
+  | Command.Lines (Some n) ->
+    t.output_lines <- n;
+    reply (Printf.sprintf "Output lines set to %d." n)
+  | Command.Scroll delta ->
+    let channel_id = msg.channel_id in
+    (match Hashtbl.find_opt t.scroll_states channel_id with
+     | None ->
+       reply "No scrollable output in this thread."
+     | Some state ->
+       let max_page =
+         (state.total_lines + t.output_lines - 1) / t.output_lines - 1 in
+       let new_page = max 0 (min max_page (state.page + delta)) in
+       state.page <- new_page;
+       let lines = String.split_on_char '\n' state.full_content in
+       let start = new_page * t.output_lines in
+       let window = List.filteri
+         (fun i _ -> i >= start && i < start + t.output_lines) lines in
+       let display = String.concat "\n" window in
+       let page_info = Printf.sprintf
+         "*Page %d/%d (lines %d\u{2013}%d of %d)*"
+         (new_page + 1) (max_page + 1)
+         (start + 1)
+         (min (start + t.output_lines) state.total_lines)
+         state.total_lines in
+       reply (Printf.sprintf "```\n%s\n```\n%s"
+         (Agent_process.escape_code_fences display) page_info))
   | Command.Unknown _ -> ()
 
 (** Resolve the channel name and type for context injection.
@@ -711,11 +750,19 @@ let handle_thread_message t msg ?channel_info () =
                     ctx msg.content
                 | None -> msg.content
               in
+              let on_scroll_content content =
+                let lines = String.split_on_char '\n' content in
+                Hashtbl.replace t.scroll_states channel_id
+                  { full_content = content;
+                    total_lines = List.length lines;
+                    page = 0 } in
               let result = Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
                       ~session ~channel_id ~prompt
                       ~attachments:msg.attachments
                       ~author_name ~channel_name ~channel_type
-                      ~wrap_width:t.wrap_width ~on_pid () in
+                      ~wrap_width:t.wrap_width
+                      ~output_lines:t.output_lines
+                      ~on_scroll_content ~on_pid () in
               ignore (Discord_rest.delete_own_reaction t.rest ~channel_id
                 ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
               (match result with
@@ -865,7 +912,9 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
                started_at = Unix.gettimeofday ();
                draining = false; child_pids = (ref Pid_set.empty, Mutex.create ());
                wrap_width = Agent_process.desktop_width;
-               refreshing = false } in
+               refreshing = false;
+               output_lines = Agent_process.default_output_lines;
+               scroll_states = Hashtbl.create 64 } in
   bot.gateway.handler <- (fun event ->
     match event with
     | Discord_gateway.Connected user ->

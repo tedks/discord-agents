@@ -417,6 +417,9 @@ let cmd_testable =
       | Mobile -> "Mobile"
       | Wrapping None -> "Wrapping(None)"
       | Wrapping (Some n) -> Printf.sprintf "Wrapping(Some %d)" n
+      | Lines None -> "Lines(None)"
+      | Lines (Some n) -> Printf.sprintf "Lines(Some %d)" n
+      | Scroll n -> Printf.sprintf "Scroll(%d)" n
       | Help -> "Help"
       | Unknown s -> "Unknown(" ^ s ^ ")"
     in
@@ -468,6 +471,45 @@ let test_parse_wrapping_negative () =
     Alcotest.(check pass) "negative wrapping is Unknown" () ()
   | _ -> Alcotest.fail "expected Unknown for negative wrapping"
 
+let test_parse_lines_no_arg () =
+  Alcotest.(check cmd_testable) "lines without arg"
+    (Discord_agents.Command.Lines None)
+    (Discord_agents.Command.parse "!lines")
+
+let test_parse_lines_with_arg () =
+  Alcotest.(check cmd_testable) "lines with arg"
+    (Discord_agents.Command.Lines (Some 60))
+    (Discord_agents.Command.parse "!lines 60")
+
+let test_parse_lines_invalid () =
+  let result = Discord_agents.Command.parse "!lines abc" in
+  match result with
+  | Discord_agents.Command.Unknown _ ->
+    Alcotest.(check pass) "invalid lines is Unknown" () ()
+  | _ -> Alcotest.fail "expected Unknown for invalid lines arg"
+
+let test_parse_scroll_no_arg () =
+  Alcotest.(check cmd_testable) "scroll without arg"
+    (Discord_agents.Command.Scroll 1)
+    (Discord_agents.Command.parse "!scroll")
+
+let test_parse_scroll_forward () =
+  Alcotest.(check cmd_testable) "scroll forward"
+    (Discord_agents.Command.Scroll 3)
+    (Discord_agents.Command.parse "!scroll 3")
+
+let test_parse_scroll_backward () =
+  Alcotest.(check cmd_testable) "scroll backward"
+    (Discord_agents.Command.Scroll (-2))
+    (Discord_agents.Command.parse "!scroll -2")
+
+let test_parse_scroll_zero () =
+  let result = Discord_agents.Command.parse "!scroll 0" in
+  match result with
+  | Discord_agents.Command.Unknown _ ->
+    Alcotest.(check pass) "zero scroll is Unknown" () ()
+  | _ -> Alcotest.fail "expected Unknown for zero scroll"
+
 let command_tests = [
   Alcotest.test_case "desktop" `Quick test_parse_desktop;
   Alcotest.test_case "mobile" `Quick test_parse_mobile;
@@ -476,6 +518,13 @@ let command_tests = [
   Alcotest.test_case "wrapping invalid" `Quick test_parse_wrapping_invalid;
   Alcotest.test_case "wrapping zero" `Quick test_parse_wrapping_zero;
   Alcotest.test_case "wrapping negative" `Quick test_parse_wrapping_negative;
+  Alcotest.test_case "lines no arg" `Quick test_parse_lines_no_arg;
+  Alcotest.test_case "lines with arg" `Quick test_parse_lines_with_arg;
+  Alcotest.test_case "lines invalid" `Quick test_parse_lines_invalid;
+  Alcotest.test_case "scroll no arg" `Quick test_parse_scroll_no_arg;
+  Alcotest.test_case "scroll forward" `Quick test_parse_scroll_forward;
+  Alcotest.test_case "scroll backward" `Quick test_parse_scroll_backward;
+  Alcotest.test_case "scroll zero" `Quick test_parse_scroll_zero;
 ]
 
 (* ── tool detail formatting ────────────────────────────────────── *)

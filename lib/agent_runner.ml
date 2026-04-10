@@ -124,7 +124,9 @@ let attachment_prompt_suffix downloaded =
     Returns Ok () on success, Error msg on failure. *)
 let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
     ~prompt ?(attachments=[]) ~author_name ~channel_name ~channel_type
-    ?(wrap_width=Agent_process.desktop_width) ?on_pid () =
+    ?(wrap_width=Agent_process.desktop_width)
+    ?(output_lines=Agent_process.default_output_lines)
+    ?on_scroll_content ?on_pid () =
   (* Download attachments and append paths to the prompt *)
   let downloaded = download_attachments ~rest
     ~working_dir:session.Session_store.working_dir attachments in
@@ -234,48 +236,26 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       (* No table boundary (or entire buffer is a table) — split normally *)
       flush_and_reset ()
   in
-  (* Flush accumulated tool status lines to Discord message(s).
-     Consecutive tool calls get batched into one message, edited in-place.
-     If the combined text exceeds Discord's limit, it's split across messages.
-
-     Single-chunk flush: preserves accumulator and msg_id so subsequent
-     tool calls can batch into the same message via edit.
-
-     Multi-chunk flush: clears accumulator and msg_id so the next batch
-     starts a fresh message — prevents re-sending already-committed lines
-     and avoids editing a stale overflow message. *)
+  (* Flush accumulated tool status lines to a single Discord message.
+     Consecutive tool calls get batched into one message, edited in-place. *)
   let flush_tool_status () =
     match !tool_status_lines with
     | [] -> ()
     | lines ->
       let text = String.concat "\n" (List.rev lines) in
-      let chunks = Agent_process.split_message text in
-      let n_chunks = List.length chunks in
-      List.iteri (fun i chunk ->
-        if i = 0 then
-          (match !tool_status_msg_id with
-           | None ->
-             (match Discord_rest.create_message rest ~channel_id ~content:chunk () with
-              | Ok sent -> tool_status_msg_id := Some sent.Discord_types.id
-              | Error e -> Logs.warn (fun m -> m "agent_runner: tool status error: %s" e))
-           | Some mid ->
-             (match Discord_rest.edit_message rest ~channel_id ~message_id:mid ~content:chunk () with
-              | Ok _ -> ()
-              | Error e -> Logs.warn (fun m -> m "agent_runner: tool status edit error: %s" e)))
-        else begin
-          (* Brief pause between overflow messages to respect Discord rate limits
-             (5 messages per 5 seconds per channel). *)
-          Eio.Time.sleep (Eio.Stdenv.clock env) 1.1;
-          (match Discord_rest.create_message rest ~channel_id ~content:chunk () with
-           | Ok _sent -> ()
-           | Error e -> Logs.warn (fun m -> m "agent_runner: tool status overflow error: %s" e))
-        end
-      ) chunks;
-      if n_chunks > 1 then begin
-        (* Multi-chunk: clear state so next batch starts fresh *)
-        tool_status_lines := [];
-        tool_status_msg_id := None
-      end
+      (* Truncate to Discord limit if needed *)
+      let text = if String.length text > Agent_process.discord_max_len - 100
+        then String.sub text 0 (Agent_process.discord_max_len - 100) ^ "\n..."
+        else text in
+      (match !tool_status_msg_id with
+       | None ->
+         (match Discord_rest.create_message rest ~channel_id ~content:text () with
+          | Ok sent -> tool_status_msg_id := Some sent.Discord_types.id
+          | Error e -> Logs.warn (fun m -> m "agent_runner: tool status error: %s" e))
+       | Some mid ->
+         (match Discord_rest.edit_message rest ~channel_id ~message_id:mid ~content:text () with
+          | Ok _ -> ()
+          | Error e -> Logs.warn (fun m -> m "agent_runner: tool status edit error: %s" e)))
   in
   let on_event = function
     | Agent_process.Text_delta text ->
@@ -340,16 +320,20 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
     | Agent_process.Tool_result { content } ->
       Logs.debug (fun m -> m "agent_runner: tool result: %d chars"
         (String.length content));
-      (* Append full output to the tool status message.
-         Uses in_tool_mode since tool_status_lines may have been cleared
-         by a multi-chunk flush of the preceding Tool_use detail. *)
+      (* Truncate output to output_lines, storing full content for !scroll *)
       if !in_tool_mode then begin
-        let capped = if String.length content > Agent_process.max_detail_len
-          then String.sub content 0 Agent_process.max_detail_len
-               ^ "\n... (truncated)"
-          else content in
+        let lines = String.split_on_char '\n' content in
+        let total = List.length lines in
+        let truncated = if total > output_lines then
+          let kept = List.filteri (fun i _ -> i < output_lines) lines in
+          let display = String.concat "\n" kept in
+          (* Store full content for scroll access *)
+          Option.iter (fun cb -> cb content) on_scroll_content;
+          Printf.sprintf "%s\n*... (%d/%d lines — use `!scroll` for more)*"
+            display output_lines total
+        else content in
         let output_block = Printf.sprintf "```\n%s\n```"
-          (Agent_process.escape_code_fences capped) in
+          (Agent_process.escape_code_fences truncated) in
         tool_status_lines := output_block :: !tool_status_lines;
         flush_tool_status ()
       end
