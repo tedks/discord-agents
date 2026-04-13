@@ -340,6 +340,18 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
           else text in
         let output_block = Printf.sprintf "```\n%s\n```"
           (Agent_process.escape_code_fences display_text) in
+        (* Size guard: if adding the output block would exceed Discord's
+           limit, flush the existing status first so the output gets its
+           own message. Same logic as the Tool_use overflow guard. *)
+        let projected_len =
+          let existing = List.fold_left (fun acc l -> acc + String.length l + 1)
+            0 !tool_status_lines in
+          existing + String.length output_block in
+        if projected_len > 1800 && !tool_status_lines <> [] then begin
+          flush_tool_status ();
+          tool_status_lines := [];
+          tool_status_msg_id := None
+        end;
         tool_status_lines := output_block :: !tool_status_lines;
         flush_tool_status ()
       end

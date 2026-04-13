@@ -291,13 +291,21 @@ let max_output_display_chars = 1700
 
 (** Truncate lines for Discord display: respects both a line limit and
     a character budget.  Returns (display_lines, shown_count, total_count).
-    [display_lines] is the list of lines that fit. *)
+    [display_lines] is the list of lines that fit.  If even a single line
+    exceeds max_chars, it is char-truncated so the user always sees
+    something rather than an empty block. *)
 let truncate_for_display ~max_lines ~max_chars (lines : string list) =
   let total = List.length lines in
   let limit = min max_lines total in
   (* Take up to limit lines, then trim further if chars overflow *)
   let rec fit n =
-    if n <= 0 then ([], 0)
+    if n <= 0 then
+      (* Every line exceeded the budget — char-truncate the first line *)
+      match lines with
+      | [] -> ([], 0)
+      | first :: _ ->
+        let truncated = String.sub first 0 (min (String.length first) max_chars) in
+        ([truncated], 1)
     else
       let kept = List.filteri (fun i _ -> i < n) lines in
       let len = List.fold_left (fun acc s -> acc + String.length s + 1) 0 kept in

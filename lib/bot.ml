@@ -42,7 +42,7 @@ type project_state = {
 type output_block = {
   lines : string array;          (** Pre-split lines for fast windowing *)
   output_lines_used : int;       (** Line count at truncation time — paging uses this *)
-  mutable window : int;          (** Current window index (0 = initial display already shown) *)
+  mutable next_line : int;       (** Next line to display (starts at output_lines_used) *)
 }
 
 (** Per-thread scroll state: a stack of truncated output blocks (most recent first)
@@ -677,16 +677,13 @@ let handle_command t msg cmd =
            let block = List.nth state.blocks (idx - 1) in
            let total = Array.length block.lines in
            let page_size = block.output_lines_used in
-           (* Advance window. Window 0 = initial display (already shown).
-              Each !scroll shows the next page_size lines. *)
-           let start = (block.window + 1) * page_size in
+           let start = block.next_line in
            if start >= total then begin
-             block.window <- 0;
+             block.next_line <- block.output_lines_used;
              reply (Printf.sprintf
                "*End of block %d/%d (%d lines). Wrapped to start.*"
                idx n_blocks total)
            end else begin
-             block.window <- block.window + 1;
              let remaining = Array.sub block.lines start
                (min page_size (total - start)) in
              let (display_lines, shown, _) =
@@ -694,6 +691,9 @@ let handle_command t msg cmd =
                  ~max_lines:(Array.length remaining)
                  ~max_chars:Agent_process.max_output_display_chars
                  (Array.to_list remaining) in
+             (* Advance by exactly the number of lines shown, so no
+                lines are skipped when char truncation reduces the count *)
+             block.next_line <- start + shown;
              let end_line = start + shown in
              let display = String.concat "\n" display_lines in
              let info = Printf.sprintf
@@ -794,7 +794,7 @@ let handle_thread_message t msg ?channel_info () =
                 let lines = String.split_on_char '\n' capped in
                 let block = { lines = Array.of_list lines;
                               output_lines_used = lines_used;
-                              window = 0 } in
+                              next_line = lines_used } in
                 let state = match Hashtbl.find_opt t.scroll_states channel_id with
                   | Some s -> s
                   | None -> { blocks = []; current_block = 1 } in

@@ -592,7 +592,7 @@ let test_detail_unknown_tool () =
   Alcotest.(check string) "unknown tool has no detail" "" result
 
 let test_detail_no_truncation () =
-  (* 1500 chars is well under the 50KB cap — should be preserved in full *)
+  (* 1500 chars is under the 1600-char cap — should be preserved in full *)
   let long_cmd = String.make 1500 'x' in
   let input = `Assoc [("command", `String long_cmd)] in
   let result = detail "Bash" input in
