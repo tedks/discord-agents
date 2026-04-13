@@ -45,8 +45,8 @@ let handle_health (bot : Bot.t) =
   ok_response [
     ("uptime_seconds", `Int uptime);
     ("sessions", `Int (Session_store.count bot.sessions));
-    ("projects", `Int (List.length bot.projects));
-    ("channels", `Int (Channel_manager.count bot.channels));
+    ("projects", `Int (List.length (Bot.projects bot)));
+    ("channels", `Int (Channel_manager.count (Bot.channels bot)));
   ]
 
 let handle_list_projects (bot : Bot.t) =
@@ -56,7 +56,7 @@ let handle_list_projects (bot : Bot.t) =
       ("path", `String p.path);
       ("is_bare", `Bool p.is_bare);
     ]
-  ) bot.projects in
+  ) (Bot.projects bot) in
   ok_response [("projects", `List projects)]
 
 let handle_list_sessions (bot : Bot.t) =
@@ -112,7 +112,7 @@ let handle_start_session (bot : Bot.t) params =
         then String.sub s 0 4000 else s in
       if s = "" then None else Some s
     | None -> None in
-  match Command.find_project_fuzzy bot.projects project_str with
+  match Command.find_project_fuzzy (Bot.projects bot) project_str with
   | None -> error_response (Printf.sprintf "No project matching '%s'." project_str)
   | Some p ->
     let kind_str = Config.string_of_agent_kind kind in
@@ -138,7 +138,7 @@ let handle_start_session (bot : Bot.t) params =
       in
       let thread_parent =
         match Channel_manager.find_or_create ~rest:bot.rest
-                ~guild_id:bot.config.guild_id ~project:p bot.channels with
+                ~guild_id:bot.config.guild_id ~project:p (Bot.channels bot) with
         | Some ch_id -> ch_id
         | None ->
           (match bot.config.control_channel_id with
@@ -190,11 +190,11 @@ let handle_resume_session (bot : Bot.t) params =
       || (String.length raw_working_dir > String.length p.path + 1
           && String.sub raw_working_dir 0 (String.length p.path + 1)
              = p.path ^ "/")
-    ) bot.projects in
+    ) (Bot.projects bot) in
     let thread_parent = match matched_project with
       | Some p ->
         (match Channel_manager.find_or_create ~rest:bot.rest
-                 ~guild_id:bot.config.guild_id ~project:p bot.channels with
+                 ~guild_id:bot.config.guild_id ~project:p (Bot.channels bot) with
          | Some ch_id -> ch_id
          | None ->
            (match bot.config.control_channel_id with
@@ -264,7 +264,7 @@ let handle_refresh_projects (bot : Bot.t) =
 
 let handle_cleanup_channels (bot : Bot.t) =
   match Channel_manager.cleanup ~rest:bot.rest
-          ~guild_id:bot.config.guild_id ~projects:bot.projects bot.channels with
+          ~guild_id:bot.config.guild_id ~projects:(Bot.projects bot) (Bot.channels bot) with
   | Error e -> error_response (Printf.sprintf "Cleanup failed: %s" e)
   | Ok 0 -> ok_response [("deleted", `Int 0); ("message", `String "No stale channels.")]
   | Ok n -> ok_response [("deleted", `Int n);

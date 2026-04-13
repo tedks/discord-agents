@@ -29,13 +29,21 @@ let project_root =
 
 module Pid_set = Set.Make(Int)
 
+(** Snapshot of project-related state. Projects and their channel mappings
+    must always be consistent with each other, so they're bundled into a
+    single immutable record and swapped atomically. This prevents any fiber
+    from observing new projects with old channel mappings or vice versa. *)
+type project_state = {
+  projects : Project.t list;
+  channels : Channel_manager.t;
+}
+
 type t = {
   config : Config.t;
   rest : Discord_rest.t;
   gateway : Discord_gateway.t;
-  mutable projects : Project.t list;
+  mutable project_state : project_state;
   sessions : Session_store.t;
-  channels : Channel_manager.t;
   env : Eio_unix.Stdenv.base;
   sw : Eio.Switch.t;
   started_at : float;
@@ -43,6 +51,10 @@ type t = {
   child_pids : (Pid_set.t ref * Mutex.t);
   mutable wrap_width : int;
 }
+
+(** Convenience accessors for the current project state snapshot. *)
+let projects t = t.project_state.projects
+let channels t = t.project_state.channels
 
 let register_child_pid t pid =
   let (pids, mu) = t.child_pids in
@@ -260,21 +272,31 @@ let trigger_restart t ~notify =
         exit 0))
   end
 
-(** Re-run project discovery and update all derived state.
+(** Re-run project discovery and update all derived state atomically.
     Separates blocking I/O (filesystem/git scanning) from Eio I/O
     (Discord REST for channel setup). Must be called from an Eio fiber.
+
+    Builds a complete new project_state snapshot (projects + channel map)
+    and swaps it in one assignment. No fiber can observe an intermediate
+    state where projects and channels disagree.
+
     Returns (old_count, new_count). *)
 let refresh_projects t =
-  let old_count = List.length t.projects in
+  let old_count = List.length (projects t) in
   (* Phase 1: Blocking filesystem scan — runs in a system thread
      to avoid stalling the Eio event loop *)
   let new_projects = Eio_unix.run_in_systhread (fun () ->
     Project.discover ~base_directories:t.config.base_directories) in
-  (* Phase 2: Update derived state — must run in Eio context
-     because Channel_manager.setup uses Discord REST (cohttp-eio) *)
-  t.projects <- new_projects;
-  Channel_manager.rebuild ~rest:t.rest ~guild_id:t.config.guild_id
-    ~projects:new_projects t.channels;
+  (* Phase 2: Build new channel mappings in a fresh manager.
+     Must run in Eio context because Channel_manager.setup uses
+     Discord REST (cohttp-eio). The old project_state stays valid
+     for any concurrent message handling during this call. *)
+  let new_channels = Channel_manager.create () in
+  new_channels.category_id <- (channels t).category_id;
+  Channel_manager.setup ~rest:t.rest ~guild_id:t.config.guild_id
+    ~projects:new_projects new_channels;
+  (* Phase 3: Atomic swap — single assignment, no intermediate state *)
+  t.project_state <- { projects = new_projects; channels = new_channels };
   let new_count = List.length new_projects in
   Logs.info (fun m -> m "bot: refreshed projects: %d -> %d" old_count new_count);
   (old_count, new_count)
@@ -289,7 +311,7 @@ let handle_command t msg cmd =
     let lines = List.mapi (fun i (p : Project.t) ->
       Printf.sprintf "`%d.` **%s** — `%s`%s"
         (i + 1) p.name p.path (if p.is_bare then " [bare]" else "")
-    ) t.projects in
+    ) (projects t) in
     reply (if lines = [] then "No projects found."
       else "**Projects** (use `!start <name>` or `!start <number>`):\n"
            ^ String.concat "\n" lines)
@@ -320,7 +342,7 @@ let handle_command t msg cmd =
         else "**Recent Claude sessions** (last 24h):\n" ^ String.concat "\n" lines
              ^ "\n\nUse `!resume <session_id_prefix>` to attach."))
   | Command.Start_agent { project; kind } ->
-    let proj = Command.find_project_fuzzy t.projects project in
+    let proj = Command.find_project_fuzzy (projects t) project in
     (match proj with
      | None ->
        let q = String.lowercase_ascii project in
@@ -329,7 +351,7 @@ let handle_command t msg cmd =
          let rec has i = if i + String.length q > String.length name then false
            else if String.sub name i (String.length q) = q then true
            else has (i + 1) in has 0
-       ) t.projects in
+       ) (projects t) in
        (match suggestions with
         | [] -> reply (Printf.sprintf "No project matching `%s`. Try `!projects`." project)
         | _ -> reply (Printf.sprintf "No unique match for `%s`. Did you mean:\n%s" project
@@ -351,7 +373,7 @@ let handle_command t msg cmd =
        if working_dir <> "" then begin
          let thread_parent =
            match Channel_manager.find_or_create ~rest:t.rest
-                   ~guild_id:t.config.guild_id ~project:p t.channels with
+                   ~guild_id:t.config.guild_id ~project:p (channels t) with
            | Some ch_id -> ch_id
            | None -> channel_id
          in
@@ -389,11 +411,11 @@ let handle_command t msg cmd =
           || (String.length raw_working_dir > String.length p.path + 1
               && String.sub raw_working_dir 0 (String.length p.path + 1)
                  = p.path ^ "/")
-        ) t.projects in
+        ) (projects t) in
         let thread_parent = match matched_project with
           | Some p ->
             (match Channel_manager.find_or_create ~rest:t.rest
-                     ~guild_id:t.config.guild_id ~project:p t.channels with
+                     ~guild_id:t.config.guild_id ~project:p (channels t) with
              | Some ch_id -> ch_id
              | None -> channel_id)
           | None -> channel_id
@@ -435,7 +457,7 @@ let handle_command t msg cmd =
   | Command.Cleanup_channels ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       match Channel_manager.cleanup ~rest:t.rest
-              ~guild_id:t.config.guild_id ~projects:t.projects t.channels with
+              ~guild_id:t.config.guild_id ~projects:(projects t) (channels t) with
       | Error e -> reply (Printf.sprintf "Cleanup failed: %s" e)
       | Ok 0 -> reply "No stale channels to clean up."
       | Ok n -> reply (Printf.sprintf "Cleaned up %d stale channels." n))
@@ -545,7 +567,7 @@ let handle_command t msg cmd =
             (List.length (List.filter (fun (_, (s : Session_store.session)) ->
               s.processing) (Session_store.bindings t.sessions)));
           Printf.sprintf "Projects: %d  |  Channels: %d"
-            (List.length t.projects) (Channel_manager.count t.channels);
+            (List.length (projects t)) (Channel_manager.count (channels t));
         ] in
         let lines = if agent_lines <> [] then
           lines @ [Printf.sprintf "**Running agents** (%d):" (List.length agent_lines)]
@@ -602,7 +624,7 @@ let resolve_channel_context t ~(channel_id : Discord_types.channel_id)
   if is_control then ("control", "control-channel")
   else
     (* Check if this is a project channel (not a thread) *)
-    match Channel_manager.project_for_channel t.channels ~channel_id with
+    match Channel_manager.project_for_channel (channels t) ~channel_id with
     | Some _ -> (session.project_name, "project-channel")
     | None ->
       (* It's a thread — use pre-fetched info or look it up *)
@@ -655,7 +677,7 @@ let handle_thread_message t msg ?channel_info () =
               ignore (Discord_rest.create_reaction t.rest ~channel_id
                 ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
               Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
-                ~project_name:session.project_name t.channels;
+                ~project_name:session.project_name (channels t);
               let author_name = msg.author.username in
               let (channel_name, channel_type) =
                 resolve_channel_context t ~channel_id ~session ?channel_info () in
@@ -748,17 +770,17 @@ let handle_message t (msg : Discord_types.message) =
     let is_control = match t.config.control_channel_id with
       | Some ctl_id -> msg.channel_id = ctl_id | None -> false in
     let project_for_channel =
-      Channel_manager.project_for_channel t.channels ~channel_id:msg.channel_id in
+      Channel_manager.project_for_channel (channels t) ~channel_id:msg.channel_id in
     if is_control then begin
       ensure_channel_session t ~channel_id:msg.channel_id
         ~project_name:"control" ~working_dir:(Sys.getcwd ())
-        ~system_prompt:(Some (control_system_prompt t.projects));
+        ~system_prompt:(Some (control_system_prompt (projects t)));
       handle_thread_message t msg ()
     end else match project_for_channel with
     | Some proj_name ->
       (* Message in a project channel — persistent session (like control channel).
          The project Claude can create threads via MCP tools when needed. *)
-      let proj = List.find_opt (fun (p : Project.t) -> p.name = proj_name) t.projects in
+      let proj = List.find_opt (fun (p : Project.t) -> p.name = proj_name) (projects t) in
       (match proj with
        | Some p ->
          let wd = match working_dir_of_project p with Ok d -> d | Error _ -> p.path in
@@ -766,7 +788,7 @@ let handle_message t (msg : Discord_types.message) =
            ~project_name:p.name ~working_dir:wd
            ~system_prompt:(Some (project_system_prompt p));
          Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
-           ~project_name:p.name t.channels;
+           ~project_name:p.name (channels t);
          handle_thread_message t msg ()
        | None -> ())
     | None ->
@@ -780,7 +802,7 @@ let handle_message t (msg : Discord_types.message) =
          (match Discord_rest.get_channel t.rest ~channel_id:msg.channel_id () with
           | Ok ch ->
             let parent_project = match ch.Discord_types.parent_id with
-              | Some pid -> Channel_manager.project_for_channel t.channels ~channel_id:pid
+              | Some pid -> Channel_manager.project_for_channel (channels t) ~channel_id:pid
               | None -> None
             in
             (match parent_project with
@@ -788,7 +810,7 @@ let handle_message t (msg : Discord_types.message) =
                (* Thread under a project channel with no session —
                   auto-create one (e.g. manually created in Discord). *)
                let proj = List.find_opt (fun (p : Project.t) ->
-                 p.name = proj_name) t.projects in
+                 p.name = proj_name) (projects t) in
                (match proj with
                 | Some p ->
                   let wd = match working_dir_of_project p with
@@ -817,7 +839,8 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
     ~intents:Discord_gateway.default_intents
     ~handler:(fun _event -> ())
   in
-  let bot = { config; rest; gateway; projects; sessions; channels; env; sw;
+  let project_state = { projects; channels } in
+  let bot = { config; rest; gateway; project_state; sessions; env; sw;
                started_at = Unix.gettimeofday ();
                draining = false; child_pids = (ref Pid_set.empty, Mutex.create ());
                wrap_width = Agent_process.desktop_width } in
@@ -825,9 +848,10 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
     match event with
     | Discord_gateway.Connected user ->
       Logs.info (fun m -> m "bot: connected as %s" user.Discord_types.username);
-      if bot.channels.category_id = None then
+      if bot.project_state.channels.category_id = None then
         Eio.Fiber.fork ~sw (fun () ->
-          Channel_manager.setup ~rest ~guild_id:config.guild_id ~projects bot.channels;
+          Channel_manager.setup ~rest ~guild_id:config.guild_id
+            ~projects:bot.project_state.projects bot.project_state.channels;
           (* Reorder channels by activity. Primary: Discord message count from
              sessions. Fallback: last git commit timestamp, so projects without
              Discord activity still sort by recency. *)
@@ -862,11 +886,12 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
           let activity = Array.to_list results
             |> List.sort (fun (_, s1) (_, s2) -> Int.compare s2 s1) in
           Channel_manager.reorder_by_activity ~rest ~guild_id:config.guild_id
-            bot.channels activity;
+            bot.project_state.channels activity;
           match config.control_channel_id with
           | Some ch_id ->
             let text = Printf.sprintf "Bot online. %d projects, %d channels, %d sessions."
-              (List.length projects) (Channel_manager.count bot.channels)
+              (List.length bot.project_state.projects)
+              (Channel_manager.count bot.project_state.channels)
               (Session_store.count bot.sessions) in
             ignore (Discord_rest.create_message rest ~channel_id:ch_id ~content:text ())
           | None -> ())
@@ -879,8 +904,8 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
   bot
 
 let run ~sw:_ ~(env : Eio_unix.Stdenv.base) bot =
-  Logs.info (fun m -> m "bot: discovered %d projects" (List.length bot.projects));
+  Logs.info (fun m -> m "bot: discovered %d projects" (List.length bot.project_state.projects));
   List.iter (fun (p : Project.t) ->
     Logs.info (fun m -> m "  - %s (%s)" p.name p.path)
-  ) bot.projects;
+  ) bot.project_state.projects;
   Discord_gateway.connect ~sw:bot.sw ~env bot.gateway
