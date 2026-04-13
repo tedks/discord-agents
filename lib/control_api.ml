@@ -256,17 +256,10 @@ let handle_rename_thread (bot : Bot.t) params =
   | Error e -> error_response (Printf.sprintf "Rename failed: %s" e)
 
 let handle_refresh_projects (bot : Bot.t) =
-  let old_count = List.length bot.projects in
-  let new_projects = Project.discover ~base_directories:bot.config.base_directories in
-  bot.projects <- new_projects;
-  Channel_manager.setup ~rest:bot.rest ~guild_id:bot.config.guild_id
-    ~projects:new_projects bot.channels;
-  let new_count = List.length new_projects in
-  Logs.info (fun m -> m "control_api: refreshed projects: %d -> %d" old_count new_count);
-  let delta = new_count - old_count in
+  let (old_count, new_count) = Bot.refresh_projects bot in
   ok_response [
     ("total", `Int new_count);
-    ("delta", `Int delta);
+    ("delta", `Int (new_count - old_count));
   ]
 
 let handle_cleanup_channels (bot : Bot.t) =

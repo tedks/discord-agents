@@ -71,6 +71,13 @@ let setup ~rest ~(guild_id : Discord_types.guild_id) ~projects t =
       end
   end
 
+(** Clear and rebuild channel mappings from Discord.
+    Unlike [setup], this clears stale mappings first so removed/renamed
+    projects don't leave phantom entries that shadow the new state. *)
+let rebuild ~rest ~guild_id ~projects t =
+  t.channels <- ChannelMap.empty;
+  setup ~rest ~guild_id ~projects t
+
 (** Find or create a channel for a project. Returns the channel ID.
     Checks Discord's actual channels first to avoid creating duplicates
     (e.g. if the MCP server or another session already created one). *)

@@ -102,6 +102,7 @@ You have MCP tools available:
 - restart_bot: Rebuild and restart the bot
 - rename_thread: Rename a Discord thread
 - cleanup_channels: Delete stale Discord channels
+- refresh_projects: Re-scan for new projects without restarting
 
 USE THESE TOOLS. When the user asks to work on a project, start a session, etc., \
 call the appropriate tool. Prefer the conversational MCP tools over suggesting \
@@ -136,6 +137,7 @@ You have MCP tools available:
 - rename_thread: Rename a Discord thread
 - restart_bot: Rebuild and restart the bot
 - cleanup_channels: Delete stale Discord channels
+- refresh_projects: Re-scan for new projects without restarting
 
 WHEN TO CREATE THREADS vs CHAT IN-CHANNEL:
 - **Chat in-channel** for: questions, discussion, planning, code review, \
@@ -258,18 +260,24 @@ let trigger_restart t ~notify =
         exit 0))
   end
 
-(** Re-run project discovery and update channel mappings.
-    Returns the number of new projects found. *)
-let rediscover_projects t =
+(** Re-run project discovery and update all derived state.
+    Separates blocking I/O (filesystem/git scanning) from Eio I/O
+    (Discord REST for channel setup). Must be called from an Eio fiber.
+    Returns (old_count, new_count). *)
+let refresh_projects t =
   let old_count = List.length t.projects in
-  let new_projects = Project.discover ~base_directories:t.config.base_directories in
+  (* Phase 1: Blocking filesystem scan — runs in a system thread
+     to avoid stalling the Eio event loop *)
+  let new_projects = Eio_unix.run_in_systhread (fun () ->
+    Project.discover ~base_directories:t.config.base_directories) in
+  (* Phase 2: Update derived state — must run in Eio context
+     because Channel_manager.setup uses Discord REST (cohttp-eio) *)
   t.projects <- new_projects;
-  (* Re-run channel setup to map any new project channels *)
-  Channel_manager.setup ~rest:t.rest ~guild_id:t.config.guild_id
+  Channel_manager.rebuild ~rest:t.rest ~guild_id:t.config.guild_id
     ~projects:new_projects t.channels;
   let new_count = List.length new_projects in
-  Logs.info (fun m -> m "bot: rediscovered projects: %d -> %d" old_count new_count);
-  new_count - old_count
+  Logs.info (fun m -> m "bot: refreshed projects: %d -> %d" old_count new_count);
+  (old_count, new_count)
 
 (** Handle a parsed command. *)
 let handle_command t msg cmd =
@@ -435,13 +443,16 @@ let handle_command t msg cmd =
     trigger_restart t ~notify:reply
   | Command.Refresh ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
-      let delta = Eio_unix.run_in_systhread (fun () -> rediscover_projects t) in
-      let total = List.length t.projects in
+      let (old_count, new_count) = refresh_projects t in
+      let delta = new_count - old_count in
       if delta > 0 then
         reply (Printf.sprintf "Refreshed: found %d new project%s (%d total)."
-          delta (if delta = 1 then "" else "s") total)
+          delta (if delta = 1 then "" else "s") new_count)
+      else if delta < 0 then
+        reply (Printf.sprintf "Refreshed: %d project%s removed (%d total)."
+          (abs delta) (if abs delta = 1 then "" else "s") new_count)
       else
-        reply (Printf.sprintf "Refreshed: no new projects (%d total)." total))
+        reply (Printf.sprintf "Refreshed: no changes (%d total)." new_count))
   | Command.Rename_thread { thread_id; name } ->
     let target_id = match thread_id with
       | Some tid -> tid
