@@ -38,11 +38,18 @@ type project_state = {
   channels : Channel_manager.t;
 }
 
-(** Scroll state for a thread: full output text and current page index. *)
-type scroll_state = {
+(** A single truncated output block, stored for !scroll access. *)
+type output_block = {
   full_content : string;
-  total_lines : int;
-  mutable page : int;
+  lines : string array;       (** Pre-split lines for fast windowing *)
+  mutable window : int;       (** Current window position (0 = first hidden window) *)
+}
+
+(** Per-thread scroll state: a stack of truncated output blocks (most recent first)
+    and which block is currently targeted by !scroll. *)
+type scroll_state = {
+  mutable blocks : output_block list;
+  mutable current_block : int;  (** 1-indexed from most recent, set by !scroll N *)
 }
 
 type t = {
@@ -623,7 +630,7 @@ let handle_command t msg cmd =
       "`!mobile` — set wrapping to mobile width";
       "`!wrapping [n]` — show or set line wrap width";
       "`!lines [n]` — show or set output lines for tool/code display";
-      "`!scroll [n]` — scroll through last tool output (default: forward 1 page, negative: backward)";
+      "`!scroll [n]` — view truncated output (n=block: 1=last, 2=2nd last; repeats advance)";
       "`!help` — this message";
     ])
   | Command.Desktop ->
@@ -644,29 +651,48 @@ let handle_command t msg cmd =
   | Command.Lines (Some n) ->
     t.output_lines <- n;
     reply (Printf.sprintf "Output lines set to %d." n)
-  | Command.Scroll delta ->
+  | Command.Scroll block_num ->
     let channel_id = msg.channel_id in
     (match Hashtbl.find_opt t.scroll_states channel_id with
      | None ->
        reply "No scrollable output in this thread."
      | Some state ->
-       let max_page =
-         (state.total_lines + t.output_lines - 1) / t.output_lines - 1 in
-       let new_page = max 0 (min max_page (state.page + delta)) in
-       state.page <- new_page;
-       let lines = String.split_on_char '\n' state.full_content in
-       let start = new_page * t.output_lines in
-       let window = List.filteri
-         (fun i _ -> i >= start && i < start + t.output_lines) lines in
-       let display = String.concat "\n" window in
-       let page_info = Printf.sprintf
-         "*Page %d/%d (lines %d\u{2013}%d of %d)*"
-         (new_page + 1) (max_page + 1)
-         (start + 1)
-         (min (start + t.output_lines) state.total_lines)
-         state.total_lines in
-       reply (Printf.sprintf "```\n%s\n```\n%s"
-         (Agent_process.escape_code_fences display) page_info))
+       let n_blocks = List.length state.blocks in
+       if n_blocks = 0 then
+         reply "No scrollable output in this thread."
+       else
+         (* Resolve block index: positive counts from most recent (1 = last),
+            negative counts from oldest (-1 = last, -2 = second-to-last).
+            Both 1 and -1 refer to the most recent block. *)
+         let idx = if block_num > 0 then block_num
+                   else n_blocks + 1 + block_num in
+         if idx < 1 || idx > n_blocks then
+           reply (Printf.sprintf "Only %d output block(s) available." n_blocks)
+         else begin
+           state.current_block <- idx;
+           let block = List.nth state.blocks (idx - 1) in
+           let total = Array.length block.lines in
+           (* Each !scroll call advances the window by one page.
+              Window 0 = lines output_lines..2*output_lines-1
+              (lines 0..output_lines-1 were already shown in the initial display) *)
+           let start = (block.window + 1) * t.output_lines in
+           if start >= total then begin
+             block.window <- 0;
+             reply (Printf.sprintf
+               "*End of output block %d/%d (%d lines). Wrapped to start.*"
+               idx n_blocks total)
+           end else begin
+             block.window <- block.window + 1;
+             let end_line = min (start + t.output_lines) total in
+             let window = Array.sub block.lines start (end_line - start) in
+             let display = String.concat "\n" (Array.to_list window) in
+             let info = Printf.sprintf
+               "*Block %d/%d \u{2014} lines %d\u{2013}%d of %d*"
+               idx n_blocks (start + 1) end_line total in
+             reply (Printf.sprintf "```\n%s\n```\n%s"
+               (Agent_process.escape_code_fences display) info)
+           end
+         end)
   | Command.Unknown _ -> ()
 
 (** Resolve the channel name and type for context injection.
@@ -752,10 +778,19 @@ let handle_thread_message t msg ?channel_info () =
               in
               let on_scroll_content content =
                 let lines = String.split_on_char '\n' content in
-                Hashtbl.replace t.scroll_states channel_id
-                  { full_content = content;
-                    total_lines = List.length lines;
-                    page = 0 } in
+                let block = { full_content = content;
+                              lines = Array.of_list lines;
+                              window = 0 } in
+                let state = match Hashtbl.find_opt t.scroll_states channel_id with
+                  | Some s -> s
+                  | None -> { blocks = []; current_block = 1 } in
+                (* Push new block to front (most recent first), cap at 20 *)
+                let blocks = block :: (if List.length state.blocks >= 20
+                  then List.filteri (fun i _ -> i < 19) state.blocks
+                  else state.blocks) in
+                state.blocks <- blocks;
+                state.current_block <- 1;
+                Hashtbl.replace t.scroll_states channel_id state in
               let result = Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
                       ~session ~channel_id ~prompt
                       ~attachments:msg.attachments
