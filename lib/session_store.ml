@@ -21,6 +21,7 @@ type session = {
   mutable message_count : int;
   mutable processing : bool;
   pending_queue : pending_message Queue.t;
+  mutable initial_prompt : string option;  (* One-shot context for the first message *)
 }
 
 type t = {
@@ -47,6 +48,9 @@ let sessions_to_json sessions =
       ("message_count", `Int s.message_count);
     ] @ (match s.system_prompt with
          | Some sp -> [("system_prompt", `String sp)]
+         | None -> [])
+      @ (match s.initial_prompt with
+         | Some ip -> [("initial_prompt", `String ip)]
          | None -> []))
   ) entries)
 
@@ -68,6 +72,7 @@ let sessions_of_json json =
         message_count = j |> member "message_count" |> to_int;
         processing = false;
         pending_queue = Queue.create ();
+        initial_prompt = j |> member "initial_prompt" |> to_string_option;
       } in
       (thread_id, session)
     ) in
@@ -127,7 +132,10 @@ let increment_message_count t session =
 
 (** Reload sessions from disk if the file changed.
     Rate-limited to once per 5 seconds. Merges new sessions
-    from disk without overwriting in-memory state. *)
+    from disk without overwriting in-memory state.
+    NOTE: With the control API, the bot is the sole session writer.
+    This is kept for crash recovery (loading persisted state on startup)
+    but is no longer needed for cross-process synchronization. *)
 let maybe_reload t =
   let now = Unix.gettimeofday () in
   if now -. t.last_reload >= 5.0 then begin

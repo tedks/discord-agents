@@ -15,3 +15,4 @@ module Claude_sessions = Claude_sessions
 module Session = Session
 module Websocket = Websocket
 module Bot = Bot
+module Control_api = Control_api

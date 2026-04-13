@@ -76,7 +76,16 @@ let working_dir_of_project (p : Project.t) =
   else
     Ok p.path
 
-(** System prompt for control channel Claude — knows about MCP tools. *)
+(** Shared instructions for agents that can start sessions. *)
+let session_starting_instructions =
+  "When starting a session, ALWAYS provide:\n\
+   - A short descriptive thread_name (max 80 chars) that captures the task — \
+   do NOT include the project name. Example: \"fix auth token refresh bug\"\n\
+   - An initial_prompt that gives the new agent context about what to do. \
+   Summarize the user's request and any relevant context from the conversation. \
+   Keep it concise — the agent should be able to start working immediately, \
+   but hand control back to the user quickly rather than acting autonomously."
+
 let control_system_prompt projects =
   let project_list = String.concat "\n" (List.mapi (fun i (p : Project.t) ->
     Printf.sprintf "  %d. %s (%s)" (i+1) p.name p.path
@@ -98,9 +107,7 @@ USE THESE TOOLS. When the user asks to work on a project, start a session, etc.,
 call the appropriate tool. Prefer the conversational MCP tools over suggesting \
 !commands — the user shouldn't need to use !commands.
 
-When starting a session, ALWAYS provide a short descriptive thread_name (max 80 chars) \
-that captures the task — do NOT include the project name. Example: \
-\"fix auth token refresh bug\" not \"myproject / fix auth token refresh bug\".
+%s
 
 Known projects:
 %s
@@ -112,7 +119,8 @@ stomp on each other's work.
 
 IMPORTANT: When linking to GitHub PRs, issues, or commits, always use full URLs \
 (e.g. https://github.com/owner/repo/pull/1) — never shorthand like owner/repo#1. \
-Discord does not render GitHub shorthand as clickable links." project_list
+Discord does not render GitHub shorthand as clickable links."
+  session_starting_instructions project_list
 
 (** System prompt for project channel Claude — scoped to one project. *)
 let project_system_prompt (project : Project.t) =
@@ -138,9 +146,7 @@ start working on something that needs its own worktree — e.g. \"start a sessio
 code changes will be made.
 - When in doubt, just chat. The user will ask for a thread if they want one.
 
-When starting a session, ALWAYS provide a short descriptive thread_name (max 80 chars) \
-that captures the task — do NOT include the project name. Example: \
-\"fix auth token refresh bug\" not \"myproject / fix auth token refresh bug\".
+%s
 
 Prefer the conversational MCP tools over suggesting !commands.
 Keep responses concise — this is Discord.
@@ -150,7 +156,8 @@ IMPORTANT: When linking to GitHub PRs, issues, or commits, always use full URLs 
 Discord does not render GitHub shorthand as clickable links.
 
 IMPORTANT: When starting sessions, always create a fresh worktree so agents don't \
-stomp on each other's work." project.name project.path
+stomp on each other's work."
+  project.name project.path session_starting_instructions
 
 (** Trigger a graceful restart: drain → reap → build → spawn.
     Callable from command handler or signal handler.
@@ -336,7 +343,8 @@ let handle_command t msg cmd =
              project_name = p.name; working_dir; agent_kind = kind;
              session_id = Resource.generate_uuid ();
              thread_id = thread_ch.Discord_types.id;
-             system_prompt = None; message_count = 0; processing = false; pending_queue = Queue.create ();
+             system_prompt = None; message_count = 0; processing = false;
+             pending_queue = Queue.create (); initial_prompt = None;
            } in
            Session_store.add t.sessions ~thread_id:thread_ch.id session;
            let branch_str = match branch_info with
@@ -352,23 +360,51 @@ let handle_command t msg cmd =
         Claude_sessions.find_by_prefix session_id) in
       match found with
       | None -> reply (Printf.sprintf "No Claude session matching `%s`." session_id)
-      | Some (full_sid, working_dir) ->
+      | Some (full_sid, raw_working_dir) ->
         let sid_short = String.sub full_sid 0 (min 8 (String.length full_sid)) in
-        match Discord_rest.create_thread_no_message t.rest
-                ~channel_id ~name:(Printf.sprintf "resume / %s" sid_short) () with
+        (* Match working directory to a known project for channel routing *)
+        let matched_project = List.find_opt (fun (p : Project.t) ->
+          raw_working_dir = p.path
+          || (String.length raw_working_dir > String.length p.path + 1
+              && String.sub raw_working_dir 0 (String.length p.path + 1)
+                 = p.path ^ "/")
+        ) t.projects in
+        let thread_parent = match matched_project with
+          | Some p ->
+            (match Channel_manager.find_or_create ~rest:t.rest
+                     ~guild_id:t.config.guild_id ~project:p t.channels with
+             | Some ch_id -> ch_id
+             | None -> channel_id)
+          | None -> channel_id
+        in
+        (* If working_dir is a bare repo root, use the main worktree instead *)
+        let working_dir = match matched_project with
+          | Some p when p.is_bare && raw_working_dir = p.path ->
+            (match working_dir_of_project p with
+             | Ok wd -> wd
+             | Error _ -> raw_working_dir)
+          | _ -> raw_working_dir
+        in
+        let project_name = match matched_project with
+          | Some p -> p.name
+          | None -> Filename.basename raw_working_dir
+        in
+        (match Discord_rest.create_thread_no_message t.rest
+                ~channel_id:thread_parent ~name:(Printf.sprintf "resume / %s" sid_short) () with
         | Error e -> reply (Printf.sprintf "Failed to create thread: %s" e)
         | Ok thread_ch ->
           let session : Session_store.session = {
-            project_name = Filename.basename working_dir; working_dir;
+            project_name; working_dir;
             agent_kind = Config.Claude; session_id = full_sid;
             thread_id = thread_ch.Discord_types.id;
-            system_prompt = None; message_count = 1; processing = false; pending_queue = Queue.create ();
+            system_prompt = None; message_count = 1; processing = false;
+            pending_queue = Queue.create (); initial_prompt = None;
           } in
           Session_store.add t.sessions ~thread_id:thread_ch.id session;
           ignore (Discord_rest.create_message t.rest ~channel_id:thread_ch.id
             ~content:(Printf.sprintf
               "**Resumed** Claude session `%s`\nWorking in: `%s`\nSend a message to continue."
-              sid_short working_dir) ()))
+              sid_short working_dir) ())))
   | Command.Stop_session { thread_id } ->
     (match Session_store.find_opt t.sessions ~thread_id with
      | None -> reply "Session not found."
@@ -593,8 +629,18 @@ let handle_thread_message t msg ?channel_info () =
                 child_pid := Some pid;
                 register_child_pid t pid;
                 Logs.info (fun m -> m "bot: registered child pid %d" pid) in
+              (* On the first message, prepend any initial context from the
+                 session creator (e.g. the project channel agent that started
+                 this thread). Consumed once, then cleared. *)
+              let had_initial_prompt = Option.is_some session.initial_prompt in
+              let prompt = match session.initial_prompt with
+                | Some ctx ->
+                  Printf.sprintf "<session-context>\n%s\n</session-context>\n\n%s"
+                    ctx msg.content
+                | None -> msg.content
+              in
               let result = Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
-                      ~session ~channel_id ~prompt:msg.content
+                      ~session ~channel_id ~prompt
                       ~attachments:msg.attachments
                       ~author_name ~channel_name ~channel_type
                       ~wrap_width:t.wrap_width ~on_pid () in
@@ -604,6 +650,11 @@ let handle_thread_message t msg ?channel_info () =
               | Ok () ->
                 ignore (Discord_rest.create_reaction t.rest ~channel_id
                   ~message_id ~emoji:"\xE2\x9C\x85" ());
+                (* Clear initial_prompt only after successful run so it
+                   survives failures and retries. Cleared before
+                   increment_message_count to persist in a single save. *)
+                if had_initial_prompt then
+                  session.initial_prompt <- None;
                 Session_store.increment_message_count t.sessions session
               | Error _ ->
                 ignore (Discord_rest.create_reaction t.rest ~channel_id
@@ -630,7 +681,8 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
     let session : Session_store.session = {
       project_name; working_dir; agent_kind = Config.Claude;
       session_id = Resource.generate_uuid (); thread_id = channel_id;
-      system_prompt; message_count = 0; processing = false; pending_queue = Queue.create ();
+      system_prompt; message_count = 0; processing = false;
+      pending_queue = Queue.create (); initial_prompt = None;
     } in
     Session_store.add t.sessions ~thread_id:channel_id session;
     Logs.info (fun m -> m "bot: auto-created session for %s" project_name)
@@ -684,7 +736,9 @@ let handle_message t (msg : Discord_types.message) =
          handle_thread_message t msg ()
        | None -> ())
     | None ->
-      (* Check if this is a thread under a project channel *)
+      (* Check if this is a thread under a project channel.
+         Since the control API creates sessions directly in bot memory,
+         no disk reload is needed — sessions are always authoritative. *)
       (match Session_store.find_opt t.sessions ~thread_id:msg.channel_id with
        | Some _ -> handle_thread_message t msg ()
        | None ->
@@ -697,18 +751,17 @@ let handle_message t (msg : Discord_types.message) =
             in
             (match parent_project with
              | Some proj_name ->
+               (* Thread under a project channel with no session —
+                  auto-create one (e.g. manually created in Discord). *)
                let proj = List.find_opt (fun (p : Project.t) ->
                  p.name = proj_name) t.projects in
                (match proj with
                 | Some p ->
                   let wd = match working_dir_of_project p with
                     | Ok d -> d | Error _ -> p.path in
-                  (* Worker threads get no system prompt — they're focused agents.
-                     They still get MCP tools via agent_process.ml. *)
                   ensure_channel_session t ~channel_id:msg.channel_id
                     ~project_name:p.name ~working_dir:wd
                     ~system_prompt:None;
-                  (* Pass the already-fetched channel info to avoid a second API call *)
                   handle_thread_message t msg ~channel_info:ch ()
                 | None -> handle_thread_message t msg ())
              | None -> handle_thread_message t msg ())
