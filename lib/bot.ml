@@ -465,16 +465,20 @@ let handle_command t msg cmd =
     trigger_restart t ~notify:reply
   | Command.Refresh ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
-      let (old_count, new_count) = refresh_projects t in
-      let delta = new_count - old_count in
-      if delta > 0 then
-        reply (Printf.sprintf "Refreshed: found %d new project%s (%d total)."
-          delta (if delta = 1 then "" else "s") new_count)
-      else if delta < 0 then
-        reply (Printf.sprintf "Refreshed: %d project%s removed (%d total)."
-          (abs delta) (if abs delta = 1 then "" else "s") new_count)
-      else
-        reply (Printf.sprintf "Refreshed: no changes (%d total)." new_count))
+      match refresh_projects t with
+      | (old_count, new_count) ->
+        let delta = new_count - old_count in
+        if delta > 0 then
+          reply (Printf.sprintf "Refreshed: found %d new project%s (%d total)."
+            delta (if delta = 1 then "" else "s") new_count)
+        else if delta < 0 then
+          reply (Printf.sprintf "Refreshed: %d project%s removed (%d total)."
+            (abs delta) (if abs delta = 1 then "" else "s") new_count)
+        else
+          reply (Printf.sprintf "Refreshed: no changes (%d total)." new_count)
+      | exception exn ->
+        Logs.warn (fun m -> m "bot: refresh failed: %s" (Printexc.to_string exn));
+        reply (Printf.sprintf "Refresh failed: %s" (Printexc.to_string exn)))
   | Command.Rename_thread { thread_id; name } ->
     let target_id = match thread_id with
       | Some tid -> tid
@@ -831,15 +835,20 @@ let handle_message t (msg : Discord_types.message) =
 
 let create ~sw ~(env : Eio_unix.Stdenv.base) config =
   let rest = Discord_rest.create ~sw ~env ~token:config.Config.discord_token in
-  let projects = Project.discover ~base_directories:config.base_directories in
+  (* Local bindings deliberately named to avoid shadowing the accessor
+     functions [projects] and [channels]. If a closure accidentally uses
+     these names, the stale data is obvious. Using [projects] without
+     [bot] resolves to the accessor, producing a type error — catching
+     stale-closure bugs at compile time. *)
+  let discovered_projects = Project.discover ~base_directories:config.base_directories in
   let sessions = Session_store.create () in
-  let channels = Channel_manager.create () in
+  let initial_channels = Channel_manager.create () in
   let gateway = Discord_gateway.create
     ~token:config.discord_token
     ~intents:Discord_gateway.default_intents
     ~handler:(fun _event -> ())
   in
-  let project_state = { projects; channels } in
+  let project_state = { projects = discovered_projects; channels = initial_channels } in
   let bot = { config; rest; gateway; project_state; sessions; env; sw;
                started_at = Unix.gettimeofday ();
                draining = false; child_pids = (ref Pid_set.empty, Mutex.create ());
@@ -873,8 +882,9 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
                 int_of_string line
               with _ -> 0) in
           (* Fetch git timestamps in parallel using Eio fibers *)
-          let indexed = List.mapi (fun i p -> (i, p)) projects in
-          let results = Array.make (List.length projects) ("", 0) in
+          let current_projects = projects bot in
+          let indexed = List.mapi (fun i p -> (i, p)) current_projects in
+          let results = Array.make (List.length current_projects) ("", 0) in
           Eio.Fiber.List.iter (fun (i, (p : Project.t)) ->
             let discord = try Hashtbl.find discord_scores p.name with Not_found -> 0 in
             let git_ts = git_timestamp p.path in

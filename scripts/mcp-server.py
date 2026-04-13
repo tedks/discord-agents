@@ -182,8 +182,6 @@ def handle_tool_call(name, arguments):
     """Forward tool call to the bot's control API and format the response."""
 
     if name == "list_projects":
-        # Always refresh so newly added projects are visible
-        control_request("refresh_projects")
         result = control_request("list_projects")
         if "error" in result:
             return result["error"]

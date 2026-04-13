@@ -71,17 +71,6 @@ let setup ~rest ~(guild_id : Discord_types.guild_id) ~projects t =
       end
   end
 
-(** Rebuild channel mappings from Discord atomically.
-    Builds a fresh map in a temporary, then swaps it in. The old map
-    stays valid during the Discord API call so concurrent message
-    handling isn't disrupted by an empty map window. *)
-let rebuild ~rest ~guild_id ~projects t =
-  let fresh = create () in
-  fresh.category_id <- t.category_id;
-  setup ~rest ~guild_id ~projects fresh;
-  t.channels <- fresh.channels;
-  t.category_id <- fresh.category_id
-
 (** Find or create a channel for a project. Returns the channel ID.
     Checks Discord's actual channels first to avoid creating duplicates
     (e.g. if the MCP server or another session already created one). *)
