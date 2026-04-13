@@ -71,12 +71,16 @@ let setup ~rest ~(guild_id : Discord_types.guild_id) ~projects t =
       end
   end
 
-(** Clear and rebuild channel mappings from Discord.
-    Unlike [setup], this clears stale mappings first so removed/renamed
-    projects don't leave phantom entries that shadow the new state. *)
+(** Rebuild channel mappings from Discord atomically.
+    Builds a fresh map in a temporary, then swaps it in. The old map
+    stays valid during the Discord API call so concurrent message
+    handling isn't disrupted by an empty map window. *)
 let rebuild ~rest ~guild_id ~projects t =
-  t.channels <- ChannelMap.empty;
-  setup ~rest ~guild_id ~projects t
+  let fresh = create () in
+  fresh.category_id <- t.category_id;
+  setup ~rest ~guild_id ~projects fresh;
+  t.channels <- fresh.channels;
+  t.category_id <- fresh.category_id
 
 (** Find or create a channel for a project. Returns the channel ID.
     Checks Discord's actual channels first to avoid creating duplicates
