@@ -319,22 +319,27 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
     | Agent_process.Tool_result { content } ->
       Logs.debug (fun m -> m "agent_runner: tool result: %d chars"
         (String.length content));
-      (* Truncate output to output_lines for display, always storing
-         full content for !scroll access. *)
+      (* Truncate output for display (both line count and char budget),
+         storing full content for !scroll when truncated. *)
       if !in_tool_mode then begin
         let lines = String.split_on_char '\n' content in
-        let total = List.length lines in
-        (* Always store for scroll — even non-truncated output may be
-           useful to scroll back to later *)
-        Option.iter (fun cb -> cb content output_lines) on_scroll_content;
-        let truncated = if total > output_lines then
-          let kept = List.filteri (fun i _ -> i < output_lines) lines in
-          let display = String.concat "\n" kept in
-          Printf.sprintf "%s\n*... (%d/%d lines \u{2014} use `!scroll` for more)*"
-            display output_lines total
-        else content in
+        let (display_lines, shown, total) =
+          Agent_process.truncate_for_display
+            ~max_lines:output_lines
+            ~max_chars:Agent_process.max_output_display_chars
+            lines in
+        let was_truncated = shown < total in
+        (* Only store for scroll when there's hidden content *)
+        if was_truncated then
+          Option.iter (fun cb -> cb content output_lines) on_scroll_content;
+        let display_text =
+          let text = String.concat "\n" display_lines in
+          if was_truncated then
+            Printf.sprintf "%s\n*... (%d/%d lines \u{2014} use `!scroll` for more)*"
+              text shown total
+          else text in
         let output_block = Printf.sprintf "```\n%s\n```"
-          (Agent_process.escape_code_fences truncated) in
+          (Agent_process.escape_code_fences display_text) in
         tool_status_lines := output_block :: !tool_status_lines;
         flush_tool_status ()
       end

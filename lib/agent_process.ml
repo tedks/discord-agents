@@ -285,6 +285,28 @@ let find_trailing_table_start text =
 (** Discord's maximum message length. *)
 let discord_max_len = 2000
 
+(** Maximum characters for tool output content displayed in a Discord
+    code block.  Leaves room for fences, status headers, and hints. *)
+let max_output_display_chars = 1700
+
+(** Truncate lines for Discord display: respects both a line limit and
+    a character budget.  Returns (display_lines, shown_count, total_count).
+    [display_lines] is the list of lines that fit. *)
+let truncate_for_display ~max_lines ~max_chars (lines : string list) =
+  let total = List.length lines in
+  let limit = min max_lines total in
+  (* Take up to limit lines, then trim further if chars overflow *)
+  let rec fit n =
+    if n <= 0 then ([], 0)
+    else
+      let kept = List.filteri (fun i _ -> i < n) lines in
+      let len = List.fold_left (fun acc s -> acc + String.length s + 1) 0 kept in
+      if len <= max_chars then (kept, n)
+      else fit (n - 1)
+  in
+  let (display, shown) = fit limit in
+  (display, shown, total)
+
 (** Default split threshold — leaves room for code block fences added
     during splitting (closing "\n```" = 4 chars, opening "```lang\n" ≤ 24 chars). *)
 let default_split_max = 1900

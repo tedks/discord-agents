@@ -668,7 +668,7 @@ let handle_command t msg cmd =
          let idx = match target with
            | None -> state.current_block
            | Some n when n > 0 -> n
-           | Some n -> n_blocks + 1 + n  (* -1 → n_blocks, -2 → n_blocks-1 *)
+           | Some n -> -n  (* Python-style: -1 → 1 (most recent), -2 → 2 *)
          in
          if idx < 1 || idx > n_blocks then
            reply (Printf.sprintf "Only %d output block(s) available." n_blocks)
@@ -687,9 +687,15 @@ let handle_command t msg cmd =
                idx n_blocks total)
            end else begin
              block.window <- block.window + 1;
-             let end_line = min (start + page_size) total in
-             let window = Array.sub block.lines start (end_line - start) in
-             let display = String.concat "\n" (Array.to_list window) in
+             let remaining = Array.sub block.lines start
+               (min page_size (total - start)) in
+             let (display_lines, shown, _) =
+               Agent_process.truncate_for_display
+                 ~max_lines:(Array.length remaining)
+                 ~max_chars:Agent_process.max_output_display_chars
+                 (Array.to_list remaining) in
+             let end_line = start + shown in
+             let display = String.concat "\n" display_lines in
              let info = Printf.sprintf
                "*Block %d/%d \u{2014} lines %d\u{2013}%d of %d*"
                idx n_blocks (start + 1) end_line total in
@@ -781,7 +787,11 @@ let handle_thread_message t msg ?channel_info () =
                 | None -> msg.content
               in
               let on_scroll_content content lines_used =
-                let lines = String.split_on_char '\n' content in
+                (* Cap stored content at 100KB to prevent memory bloat *)
+                let capped = if String.length content > 100_000
+                  then String.sub content 0 100_000
+                  else content in
+                let lines = String.split_on_char '\n' capped in
                 let block = { lines = Array.of_list lines;
                               output_lines_used = lines_used;
                               window = 0 } in
