@@ -38,11 +38,11 @@ type project_state = {
   channels : Channel_manager.t;
 }
 
-(** A single truncated output block, stored for !scroll access. *)
+(** A single output block, stored for !scroll access. *)
 type output_block = {
-  full_content : string;
-  lines : string array;       (** Pre-split lines for fast windowing *)
-  mutable window : int;       (** Current window position (0 = first hidden window) *)
+  lines : string array;          (** Pre-split lines for fast windowing *)
+  output_lines_used : int;       (** Line count at truncation time — paging uses this *)
+  mutable window : int;          (** Current window index (0 = initial display already shown) *)
 }
 
 (** Per-thread scroll state: a stack of truncated output blocks (most recent first)
@@ -479,6 +479,7 @@ let handle_command t msg cmd =
      | None -> reply "Session not found."
      | Some session ->
        Session_store.remove t.sessions ~thread_id;
+       Hashtbl.remove t.scroll_states thread_id;
        reply (Printf.sprintf "Stopped session for **%s**." session.project_name))
   | Command.Cleanup_channels ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
@@ -651,7 +652,7 @@ let handle_command t msg cmd =
   | Command.Lines (Some n) ->
     t.output_lines <- n;
     reply (Printf.sprintf "Output lines set to %d." n)
-  | Command.Scroll block_num ->
+  | Command.Scroll target ->
     let channel_id = msg.channel_id in
     (match Hashtbl.find_opt t.scroll_states channel_id with
      | None ->
@@ -661,29 +662,32 @@ let handle_command t msg cmd =
        if n_blocks = 0 then
          reply "No scrollable output in this thread."
        else
-         (* Resolve block index: positive counts from most recent (1 = last),
-            negative counts from oldest (-1 = last, -2 = second-to-last).
-            Both 1 and -1 refer to the most recent block. *)
-         let idx = if block_num > 0 then block_num
-                   else n_blocks + 1 + block_num in
+         (* Resolve block index.  None = continue current block.
+            Positive counts from most recent (1 = last).
+            Negative uses Python-style indexing (-1 = most recent). *)
+         let idx = match target with
+           | None -> state.current_block
+           | Some n when n > 0 -> n
+           | Some n -> n_blocks + 1 + n  (* -1 → n_blocks, -2 → n_blocks-1 *)
+         in
          if idx < 1 || idx > n_blocks then
            reply (Printf.sprintf "Only %d output block(s) available." n_blocks)
          else begin
            state.current_block <- idx;
            let block = List.nth state.blocks (idx - 1) in
            let total = Array.length block.lines in
-           (* Each !scroll call advances the window by one page.
-              Window 0 = lines output_lines..2*output_lines-1
-              (lines 0..output_lines-1 were already shown in the initial display) *)
-           let start = (block.window + 1) * t.output_lines in
+           let page_size = block.output_lines_used in
+           (* Advance window. Window 0 = initial display (already shown).
+              Each !scroll shows the next page_size lines. *)
+           let start = (block.window + 1) * page_size in
            if start >= total then begin
              block.window <- 0;
              reply (Printf.sprintf
-               "*End of output block %d/%d (%d lines). Wrapped to start.*"
+               "*End of block %d/%d (%d lines). Wrapped to start.*"
                idx n_blocks total)
            end else begin
              block.window <- block.window + 1;
-             let end_line = min (start + t.output_lines) total in
+             let end_line = min (start + page_size) total in
              let window = Array.sub block.lines start (end_line - start) in
              let display = String.concat "\n" (Array.to_list window) in
              let info = Printf.sprintf
@@ -776,10 +780,10 @@ let handle_thread_message t msg ?channel_info () =
                     ctx msg.content
                 | None -> msg.content
               in
-              let on_scroll_content content =
+              let on_scroll_content content lines_used =
                 let lines = String.split_on_char '\n' content in
-                let block = { full_content = content;
-                              lines = Array.of_list lines;
+                let block = { lines = Array.of_list lines;
+                              output_lines_used = lines_used;
                               window = 0 } in
                 let state = match Hashtbl.find_opt t.scroll_states channel_id with
                   | Some s -> s

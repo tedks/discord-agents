@@ -419,7 +419,8 @@ let cmd_testable =
       | Wrapping (Some n) -> Printf.sprintf "Wrapping(Some %d)" n
       | Lines None -> "Lines(None)"
       | Lines (Some n) -> Printf.sprintf "Lines(Some %d)" n
-      | Scroll n -> Printf.sprintf "Scroll(%d)" n
+      | Scroll None -> "Scroll(None)"
+      | Scroll (Some n) -> Printf.sprintf "Scroll(Some %d)" n
       | Help -> "Help"
       | Unknown s -> "Unknown(" ^ s ^ ")"
     in
@@ -490,17 +491,17 @@ let test_parse_lines_invalid () =
 
 let test_parse_scroll_no_arg () =
   Alcotest.(check cmd_testable) "scroll without arg"
-    (Discord_agents.Command.Scroll 1)
+    (Discord_agents.Command.Scroll None)
     (Discord_agents.Command.parse "!scroll")
 
 let test_parse_scroll_forward () =
   Alcotest.(check cmd_testable) "scroll forward"
-    (Discord_agents.Command.Scroll 3)
+    (Discord_agents.Command.Scroll (Some 3))
     (Discord_agents.Command.parse "!scroll 3")
 
 let test_parse_scroll_backward () =
   Alcotest.(check cmd_testable) "scroll backward"
-    (Discord_agents.Command.Scroll (-2))
+    (Discord_agents.Command.Scroll (Some (-2)))
     (Discord_agents.Command.parse "!scroll -2")
 
 let test_parse_scroll_zero () =
@@ -602,16 +603,16 @@ let test_detail_no_truncation () =
     true (String.length result > 1500)
 
 let test_detail_safety_cap () =
-  (* Content exceeding max_detail_len (50KB) should be truncated *)
-  let huge_cmd = String.make 60_000 'y' in
+  (* Content exceeding max_detail_len (1600) should be truncated *)
+  let huge_cmd = String.make 3000 'y' in
   let input = `Assoc [("command", `String huge_cmd)] in
   let result = detail "Bash" input in
   Alcotest.(check bool) "truncated marker present"
     true (try ignore (Str.search_forward (Str.regexp_string "... (truncated)") result 0);
               true with Not_found -> false);
-  (* Result should be capped near max_detail_len, not the full 60K *)
-  Alcotest.(check bool) "result under 55000 chars"
-    true (String.length result < 55_000)
+  (* Result should be capped near max_detail_len, not the full 3000 *)
+  Alcotest.(check bool) "result under 2000 chars"
+    true (String.length result < 2000)
 
 let test_lang_of_path () =
   let lang = Discord_agents.Agent_process.lang_of_path in

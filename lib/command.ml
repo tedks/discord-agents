@@ -19,7 +19,7 @@ type t =
   | Mobile
   | Wrapping of int option
   | Lines of int option
-  | Scroll of int
+  | Scroll of int option  (** None = continue current block, Some n = target block n *)
   | Help
   | Unknown of string
 
@@ -79,10 +79,10 @@ let parse content =
     (match int_of_string_opt n with
      | Some l when l > 0 -> Lines (Some l)
      | _ -> Unknown content)
-  | ["scroll"] -> Scroll 1
+  | ["scroll"] -> Scroll None
   | ["scroll"; n] ->
     (match int_of_string_opt n with
-     | Some s when s <> 0 -> Scroll s
+     | Some s when s <> 0 -> Scroll (Some s)
      | _ -> Unknown content)
   | ["help"] -> Help
   | _ -> Unknown content

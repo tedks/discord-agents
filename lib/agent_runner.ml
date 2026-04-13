@@ -243,10 +243,6 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
     | [] -> ()
     | lines ->
       let text = String.concat "\n" (List.rev lines) in
-      (* Truncate to Discord limit if needed *)
-      let text = if String.length text > Agent_process.discord_max_len - 100
-        then String.sub text 0 (Agent_process.discord_max_len - 100) ^ "\n..."
-        else text in
       (match !tool_status_msg_id with
        | None ->
          (match Discord_rest.create_message rest ~channel_id ~content:text () with
@@ -313,23 +309,28 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
           0 !tool_status_lines in
         existing + String.length status
       in
-      if projected_len > 1800 && !tool_status_lines <> [] then
+      if projected_len > 1800 && !tool_status_lines <> [] then begin
         flush_tool_status ();
+        tool_status_lines := [];
+        tool_status_msg_id := None
+      end;
       tool_status_lines := status :: !tool_status_lines;
       flush_tool_status ()
     | Agent_process.Tool_result { content } ->
       Logs.debug (fun m -> m "agent_runner: tool result: %d chars"
         (String.length content));
-      (* Truncate output to output_lines, storing full content for !scroll *)
+      (* Truncate output to output_lines for display, always storing
+         full content for !scroll access. *)
       if !in_tool_mode then begin
         let lines = String.split_on_char '\n' content in
         let total = List.length lines in
+        (* Always store for scroll — even non-truncated output may be
+           useful to scroll back to later *)
+        Option.iter (fun cb -> cb content output_lines) on_scroll_content;
         let truncated = if total > output_lines then
           let kept = List.filteri (fun i _ -> i < output_lines) lines in
           let display = String.concat "\n" kept in
-          (* Store full content for scroll access *)
-          Option.iter (fun cb -> cb content) on_scroll_content;
-          Printf.sprintf "%s\n*... (%d/%d lines — use `!scroll` for more)*"
+          Printf.sprintf "%s\n*... (%d/%d lines \u{2014} use `!scroll` for more)*"
             display output_lines total
         else content in
         let output_block = Printf.sprintf "```\n%s\n```"

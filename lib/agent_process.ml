@@ -421,12 +421,13 @@ let summarize_tool_input name input =
     | k :: _ -> (match get k with Some v -> clean 60 v | None -> "")
     | [] -> ""
 
-(** Maximum length for tool detail code blocks in Discord.
-    Full content is shown up to this safety cap, split across messages
-    as needed.  50 KB is ~26 Discord messages — enough for any reasonable
-    tool output while preventing runaway message spam from pathological
-    cases (e.g. cat of a binary or huge log). *)
-let max_detail_len = 50_000
+(** Maximum length for tool input detail code blocks shown inline in
+    Discord status messages.  Must fit within a single Discord message
+    (~2000 chars) alongside the status header.  Doubled from the original
+    800 to show more context for diffs and commands.
+    Tool *output* uses line-based truncation with !scroll pagination
+    instead of this character cap. *)
+let max_detail_len = 1_600
 
 (** Guess a syntax highlighting language from a file extension. *)
 let lang_of_path path =
