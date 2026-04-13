@@ -184,5 +184,8 @@ let () =
         end
       in
       loop ());
+    (* Start control API server on Unix domain socket *)
+    Eio.Fiber.fork ~sw (fun () ->
+      Discord_agents.Control_api.start ~bot ~sw ~env);
     Discord_agents.Bot.run ~sw ~env bot
   end

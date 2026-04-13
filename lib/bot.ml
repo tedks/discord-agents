@@ -76,7 +76,6 @@ let working_dir_of_project (p : Project.t) =
   else
     Ok p.path
 
-(** System prompt for control channel Claude — knows about MCP tools. *)
 (** Shared instructions for agents that can start sessions. *)
 let session_starting_instructions =
   "When starting a session, ALWAYS provide:\n\
@@ -737,7 +736,9 @@ let handle_message t (msg : Discord_types.message) =
          handle_thread_message t msg ()
        | None -> ())
     | None ->
-      (* Check if this is a thread under a project channel *)
+      (* Check if this is a thread under a project channel.
+         Since the control API creates sessions directly in bot memory,
+         no disk reload is needed — sessions are always authoritative. *)
       (match Session_store.find_opt t.sessions ~thread_id:msg.channel_id with
        | Some _ -> handle_thread_message t msg ()
        | None ->
@@ -750,29 +751,19 @@ let handle_message t (msg : Discord_types.message) =
             in
             (match parent_project with
              | Some proj_name ->
-               (* This is a thread under a project channel. If no session
-                  exists, it may have just been created by the MCP server.
-                  Force-reload from disk before auto-creating, to avoid
-                  racing with the MCP server and creating a duplicate
-                  session with wrong session_id/working_dir/initial_prompt. *)
-               Session_store.force_reload t.sessions;
-               (match Session_store.find_opt t.sessions ~thread_id:msg.channel_id with
-                | Some _ ->
+               (* Thread under a project channel with no session —
+                  auto-create one (e.g. manually created in Discord). *)
+               let proj = List.find_opt (fun (p : Project.t) ->
+                 p.name = proj_name) t.projects in
+               (match proj with
+                | Some p ->
+                  let wd = match working_dir_of_project p with
+                    | Ok d -> d | Error _ -> p.path in
+                  ensure_channel_session t ~channel_id:msg.channel_id
+                    ~project_name:p.name ~working_dir:wd
+                    ~system_prompt:None;
                   handle_thread_message t msg ~channel_info:ch ()
-                | None ->
-                  (* Still not found after reload — genuinely new thread
-                     (e.g. manually created in Discord). Auto-create. *)
-                  let proj = List.find_opt (fun (p : Project.t) ->
-                    p.name = proj_name) t.projects in
-                  (match proj with
-                   | Some p ->
-                     let wd = match working_dir_of_project p with
-                       | Ok d -> d | Error _ -> p.path in
-                     ensure_channel_session t ~channel_id:msg.channel_id
-                       ~project_name:p.name ~working_dir:wd
-                       ~system_prompt:None;
-                     handle_thread_message t msg ~channel_info:ch ()
-                   | None -> handle_thread_message t msg ()))
+                | None -> handle_thread_message t msg ())
              | None -> handle_thread_message t msg ())
           | Error e ->
             Logs.warn (fun m -> m "bot: channel lookup failed for %s: %s"
