@@ -62,6 +62,7 @@ Commands require a `!` prefix:
 - `mobile` — set wrapping to mobile width (60 chars)
 - `wrapping [n]` — show or set line wrap width
 - `status` — bot status and running processes
+- `refresh` — re-scan for new projects without restarting
 - `cleanup` — delete stale project channels
 - `restart` — rebuild and restart the bot
 - `help` — command reference

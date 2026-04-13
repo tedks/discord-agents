@@ -410,6 +410,7 @@ let cmd_testable =
       | Stop_session { thread_id } -> "Stop_session(" ^ thread_id ^ ")"
       | Cleanup_channels -> "Cleanup_channels"
       | Restart -> "Restart"
+      | Refresh -> "Refresh"
       | Rename_thread _ -> "Rename_thread"
       | Status -> "Status"
       | Desktop -> "Desktop"

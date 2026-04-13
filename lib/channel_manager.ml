@@ -13,6 +13,9 @@ type t = {
 
 let create () = { channels = ChannelMap.empty; category_id = None }
 
+let category_id t = t.category_id
+let set_category_id t id = t.category_id <- id
+
 (** Find a project's channel ID. *)
 let find t ~project_name =
   ChannelMap.find_opt project_name t.channels
