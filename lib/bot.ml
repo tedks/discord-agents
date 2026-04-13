@@ -50,6 +50,7 @@ type t = {
   mutable draining : bool;
   child_pids : (Pid_set.t ref * Mutex.t);
   mutable wrap_width : int;
+  mutable refreshing : bool;
 }
 
 (** Convenience accessors for the current project state snapshot. *)
@@ -280,26 +281,35 @@ let trigger_restart t ~notify =
     and swaps it in one assignment. No fiber can observe an intermediate
     state where projects and channels disagree.
 
-    Returns (old_count, new_count). *)
+    Returns (old_count, new_count), or None if a refresh is already
+    in progress (single-flight: concurrent callers are rejected). *)
 let refresh_projects t =
-  let old_count = List.length (projects t) in
-  (* Phase 1: Blocking filesystem scan — runs in a system thread
-     to avoid stalling the Eio event loop *)
-  let new_projects = Eio_unix.run_in_systhread (fun () ->
-    Project.discover ~base_directories:t.config.base_directories) in
-  (* Phase 2: Build new channel mappings in a fresh manager.
-     Must run in Eio context because Channel_manager.setup uses
-     Discord REST (cohttp-eio). The old project_state stays valid
-     for any concurrent message handling during this call. *)
-  let new_channels = Channel_manager.create () in
-  new_channels.category_id <- (channels t).category_id;
-  Channel_manager.setup ~rest:t.rest ~guild_id:t.config.guild_id
-    ~projects:new_projects new_channels;
-  (* Phase 3: Atomic swap — single assignment, no intermediate state *)
-  t.project_state <- { projects = new_projects; channels = new_channels };
-  let new_count = List.length new_projects in
-  Logs.info (fun m -> m "bot: refreshed projects: %d -> %d" old_count new_count);
-  (old_count, new_count)
+  if t.refreshing then begin
+    Logs.info (fun m -> m "bot: refresh already in progress, skipping");
+    None
+  end else begin
+    t.refreshing <- true;
+    Fun.protect ~finally:(fun () -> t.refreshing <- false) (fun () ->
+      let old_count = List.length (projects t) in
+      (* Phase 1: Blocking filesystem scan — runs in a system thread
+         to avoid stalling the Eio event loop *)
+      let new_projects = Eio_unix.run_in_systhread (fun () ->
+        Project.discover ~base_directories:t.config.base_directories) in
+      (* Phase 2: Build new channel mappings in a fresh manager.
+         Must run in Eio context because Channel_manager.setup uses
+         Discord REST (cohttp-eio). The old project_state stays valid
+         for any concurrent message handling during this call. *)
+      let new_channels = Channel_manager.create () in
+      Channel_manager.set_category_id new_channels
+        (Channel_manager.category_id (channels t));
+      Channel_manager.setup ~rest:t.rest ~guild_id:t.config.guild_id
+        ~projects:new_projects new_channels;
+      (* Phase 3: Atomic swap — single assignment, no intermediate state *)
+      t.project_state <- { projects = new_projects; channels = new_channels };
+      let new_count = List.length new_projects in
+      Logs.info (fun m -> m "bot: refreshed projects: %d -> %d" old_count new_count);
+      Some (old_count, new_count))
+  end
 
 (** Handle a parsed command. *)
 let handle_command t msg cmd =
@@ -466,7 +476,9 @@ let handle_command t msg cmd =
   | Command.Refresh ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       match refresh_projects t with
-      | (old_count, new_count) ->
+      | None ->
+        reply "Refresh already in progress."
+      | Some (old_count, new_count) ->
         let delta = new_count - old_count in
         if delta > 0 then
           reply (Printf.sprintf "Refreshed: found %d new project%s (%d total)."
@@ -852,12 +864,13 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
   let bot = { config; rest; gateway; project_state; sessions; env; sw;
                started_at = Unix.gettimeofday ();
                draining = false; child_pids = (ref Pid_set.empty, Mutex.create ());
-               wrap_width = Agent_process.desktop_width } in
+               wrap_width = Agent_process.desktop_width;
+               refreshing = false } in
   bot.gateway.handler <- (fun event ->
     match event with
     | Discord_gateway.Connected user ->
       Logs.info (fun m -> m "bot: connected as %s" user.Discord_types.username);
-      if bot.project_state.channels.category_id = None then
+      if Channel_manager.category_id bot.project_state.channels = None then
         Eio.Fiber.fork ~sw (fun () ->
           Channel_manager.setup ~rest ~guild_id:config.guild_id
             ~projects:bot.project_state.projects bot.project_state.channels;

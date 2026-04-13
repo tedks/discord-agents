@@ -256,11 +256,13 @@ let handle_rename_thread (bot : Bot.t) params =
   | Error e -> error_response (Printf.sprintf "Rename failed: %s" e)
 
 let handle_refresh_projects (bot : Bot.t) =
-  let (old_count, new_count) = Bot.refresh_projects bot in
-  ok_response [
-    ("total", `Int new_count);
-    ("delta", `Int (new_count - old_count));
-  ]
+  match Bot.refresh_projects bot with
+  | None -> error_response "Refresh already in progress."
+  | Some (old_count, new_count) ->
+    ok_response [
+      ("total", `Int new_count);
+      ("delta", `Int (new_count - old_count));
+    ]
 
 let handle_cleanup_channels (bot : Bot.t) =
   match Channel_manager.cleanup ~rest:bot.rest
