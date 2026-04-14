@@ -289,6 +289,29 @@ let discord_max_len = 2000
     code block.  Leaves room for fences, status headers, and hints. *)
 let max_output_display_chars = 1700
 
+(** Split a single long line into chunks that each fit within max_chars.
+    Lines shorter than max_chars are returned unchanged.  This makes long
+    single-line output (e.g. minified JSON) navigable via paging. *)
+let chunk_long_line ~max_chars line =
+  let n = String.length line in
+  if n <= max_chars then [line]
+  else
+    let chunks = ref [] in
+    let pos = ref 0 in
+    while !pos < n do
+      let len = min max_chars (n - !pos) in
+      chunks := String.sub line !pos len :: !chunks;
+      pos := !pos + len
+    done;
+    List.rev !chunks
+
+(** Split text into lines, then split any oversized lines into chunks.
+    This produces a uniform list where every entry fits within max_chars,
+    so paging by index always lands on a Discord-displayable unit. *)
+let split_into_chunks ~max_chars text =
+  List.concat_map (chunk_long_line ~max_chars)
+    (String.split_on_char '\n' text)
+
 (** Truncate lines for Discord display: respects both a line limit and
     a character budget.  Returns (display_lines, shown_count, total_count).
     [display_lines] is the list of lines that fit.  If even a single line

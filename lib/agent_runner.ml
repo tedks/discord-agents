@@ -322,16 +322,20 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       (* Truncate output for display (both line count and char budget),
          storing full content for !scroll when truncated. *)
       if !in_tool_mode then begin
-        let lines = String.split_on_char '\n' content in
+        (* Chunk long lines first so the inline display and the stored
+           scroll state share a single line-indexing scheme. *)
+        let chunks = Agent_process.split_into_chunks
+          ~max_chars:Agent_process.max_output_display_chars content in
         let (display_lines, shown, total) =
           Agent_process.truncate_for_display
             ~max_lines:output_lines
             ~max_chars:Agent_process.max_output_display_chars
-            lines in
+            chunks in
         let was_truncated = shown < total in
-        (* Only store for scroll when there's hidden content *)
+        (* Pass the actual shown count to scroll storage so paging starts
+           exactly where the inline display left off. *)
         if was_truncated then
-          Option.iter (fun cb -> cb content output_lines) on_scroll_content;
+          Option.iter (fun cb -> cb content shown) on_scroll_content;
         let display_text =
           let text = String.concat "\n" display_lines in
           if was_truncated then

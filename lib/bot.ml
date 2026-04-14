@@ -677,31 +677,30 @@ let handle_command t msg cmd =
            let block = List.nth state.blocks (idx - 1) in
            let total = Array.length block.lines in
            let page_size = block.output_lines_used in
-           let start = block.next_line in
-           if start >= total then begin
-             block.next_line <- block.output_lines_used;
-             reply (Printf.sprintf
-               "*End of block %d/%d (%d lines). Wrapped to start.*"
-               idx n_blocks total)
-           end else begin
-             let remaining = Array.sub block.lines start
-               (min page_size (total - start)) in
-             let (display_lines, shown, _) =
-               Agent_process.truncate_for_display
-                 ~max_lines:(Array.length remaining)
-                 ~max_chars:Agent_process.max_output_display_chars
-                 (Array.to_list remaining) in
-             (* Advance by exactly the number of lines shown, so no
-                lines are skipped when char truncation reduces the count *)
-             block.next_line <- start + shown;
-             let end_line = start + shown in
-             let display = String.concat "\n" display_lines in
-             let info = Printf.sprintf
-               "*Block %d/%d \u{2014} lines %d\u{2013}%d of %d*"
-               idx n_blocks (start + 1) end_line total in
-             reply (Printf.sprintf "```\n%s\n```\n%s"
-               (Agent_process.escape_code_fences display) info)
-           end
+           (* If we've hit the end, wrap back to start and show the first
+              hidden page (not just a "wrapped" notice with no content). *)
+           let start = if block.next_line >= total
+             then block.output_lines_used
+             else block.next_line in
+           let wrapped = block.next_line >= total in
+           let remaining = Array.sub block.lines start
+             (min page_size (total - start)) in
+           let (display_lines, shown, _) =
+             Agent_process.truncate_for_display
+               ~max_lines:(Array.length remaining)
+               ~max_chars:Agent_process.max_output_display_chars
+               (Array.to_list remaining) in
+           (* Advance by exactly the number of lines shown, so no
+              lines are skipped when char truncation reduces the count *)
+           block.next_line <- start + shown;
+           let end_line = start + shown in
+           let display = String.concat "\n" display_lines in
+           let prefix = if wrapped then "*(wrapped to start)* " else "" in
+           let info = Printf.sprintf
+             "%s*Block %d/%d \u{2014} lines %d\u{2013}%d of %d*"
+             prefix idx n_blocks (start + 1) end_line total in
+           reply (Printf.sprintf "```\n%s\n```\n%s"
+             (Agent_process.escape_code_fences display) info)
          end)
   | Command.Unknown _ -> ()
 
@@ -791,8 +790,11 @@ let handle_thread_message t msg ?channel_info () =
                 let capped = if String.length content > 100_000
                   then String.sub content 0 100_000
                   else content in
-                let lines = String.split_on_char '\n' capped in
-                let block = { lines = Array.of_list lines;
+                (* Use the same chunking as the inline display so
+                   lines_used (= shown) indexes correctly into our array. *)
+                let chunks = Agent_process.split_into_chunks
+                  ~max_chars:Agent_process.max_output_display_chars capped in
+                let block = { lines = Array.of_list chunks;
                               output_lines_used = lines_used;
                               next_line = lines_used } in
                 let state = match Hashtbl.find_opt t.scroll_states channel_id with
