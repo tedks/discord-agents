@@ -324,9 +324,12 @@ let walk_to_budget ~start ~budget s =
   while not !stop && !i < n do
     let is_triple = !i + 2 < n
       && s.[!i] = '`' && s.[!i+1] = '`' && s.[!i+2] = '`' in
-    let cost, step =
-      if is_triple then (6, 3)
-      else (utf8_step s !i, utf8_step s !i) in
+    let raw_step = if is_triple then 3 else utf8_step s !i in
+    (* Clamp step to buffer so a malformed lead byte claiming more bytes
+       than remain (e.g. lone 0xF0 at end of subprocess stdout) can't
+       produce an offset past the buffer end. *)
+    let step = min raw_step (n - !i) in
+    let cost = if is_triple then 6 else step in
     if !consumed + cost > budget then stop := true
     else begin
       consumed := !consumed + cost;
@@ -352,10 +355,12 @@ let take_fitting_prefix ?(start=0) ~max_chars s =
     let (next, _) = walk_to_budget ~start ~budget:max_chars s in
     if next > start then next - start
     else
-      (* Single unit at [start] exceeds budget — emit it anyway *)
+      (* Single unit at [start] exceeds budget — emit it anyway,
+         clamped to the buffer in case of malformed UTF-8 lead bytes *)
       let is_triple = start + 2 < n
         && s.[start] = '`' && s.[start+1] = '`' && s.[start+2] = '`' in
-      if is_triple then 3 else utf8_step s start
+      let raw_step = if is_triple then 3 else utf8_step s start in
+      min raw_step (n - start)
 
 (** Split a single line into chunks each fitting within [max_chars]
     post-escape.  Short lines pass through unchanged. *)

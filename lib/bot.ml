@@ -672,8 +672,14 @@ let handle_command t msg cmd =
   | Command.Lines None ->
     reply (Printf.sprintf "Output lines: %d." t.output_lines)
   | Command.Lines (Some n) ->
-    t.output_lines <- n;
-    reply (Printf.sprintf "Output lines set to %d." n)
+    if n > 1000 then
+      reply (Printf.sprintf
+        "Output lines must be \u{2264}1000 (got %d) \u{2014} larger \
+         values would scan huge tool results unnecessarily." n)
+    else begin
+      t.output_lines <- n;
+      reply (Printf.sprintf "Output lines set to %d." n)
+    end
   | Command.Scroll target ->
     let channel_id = msg.channel_id in
     (match Hashtbl.find_opt t.scroll_states channel_id with
@@ -715,7 +721,7 @@ let handle_command t msg cmd =
            let end_line = start + t.shown in
            let display = String.concat "\n" t.display in
            let prefix = if wrapped
-             then "*(back to first page)* "
+             then "*(looped back)* "
              else "" in
            let info = Printf.sprintf
              "%s*Block %d/%d \u{2014} lines %d\u{2013}%d of %d*"
@@ -807,21 +813,26 @@ let handle_thread_message t msg ?channel_info () =
                 | None -> msg.content
               in
               let on_scroll_content chunks lines_used =
-                (* Cap stored content at 100KB total bytes to prevent
-                   memory bloat from pathological tool output. *)
-                let rec take_bytes budget = function
-                  | [] -> []
-                  | _ when budget <= 0 -> []
+                (* Cap stored content at ~100KB to prevent memory bloat.
+                   The cap is a budget for take_fitting_prefix (which is
+                   fence-aware: ``` costs 6); for fence-free text this
+                   matches raw bytes within ±a single chunk. Tail-recursive
+                   to avoid stack growth on highly fragmented output. *)
+                let rec take_bytes budget acc = function
+                  | [] -> List.rev acc
+                  | _ when budget <= 0 -> List.rev acc
                   | c :: rest ->
                     let len = String.length c in
                     if len >= budget then
-                      [String.sub c 0
-                         (Agent_process.take_fitting_prefix
-                            ~max_chars:budget c)]
+                      List.rev (
+                        String.sub c 0
+                          (Agent_process.take_fitting_prefix
+                             ~max_chars:budget c)
+                        :: acc)
                     else
-                      c :: take_bytes (budget - len - 1) rest
+                      take_bytes (budget - len - 1) (c :: acc) rest
                 in
-                let capped = take_bytes 100_000 chunks in
+                let capped = take_bytes 100_000 [] chunks in
                 let block = { lines = Array.of_list capped;
                               output_lines_used = lines_used;
                               next_line = lines_used } in

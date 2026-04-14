@@ -489,13 +489,12 @@ let test_parse_lines_invalid () =
     Alcotest.(check pass) "invalid lines is Unknown" () ()
   | _ -> Alcotest.fail "expected Unknown for invalid lines arg"
 
-let test_parse_lines_too_large () =
-  (* Huge values are rejected to prevent DoS via O(n) truncation scans *)
-  let result = Discord_agents.Command.parse "!lines 100000" in
-  match result with
-  | Discord_agents.Command.Unknown _ ->
-    Alcotest.(check pass) "huge lines value is Unknown" () ()
-  | _ -> Alcotest.fail "expected Unknown for !lines 100000"
+let test_parse_lines_large () =
+  (* Parser accepts any positive int; the handler enforces the upper
+     bound so the user gets a friendly message instead of silent rejection. *)
+  Alcotest.(check cmd_testable) "huge lines value parses"
+    (Discord_agents.Command.Lines (Some 100000))
+    (Discord_agents.Command.parse "!lines 100000")
 
 let test_parse_scroll_no_arg () =
   Alcotest.(check cmd_testable) "scroll without arg"
@@ -530,7 +529,7 @@ let command_tests = [
   Alcotest.test_case "lines no arg" `Quick test_parse_lines_no_arg;
   Alcotest.test_case "lines with arg" `Quick test_parse_lines_with_arg;
   Alcotest.test_case "lines invalid" `Quick test_parse_lines_invalid;
-  Alcotest.test_case "lines too large" `Quick test_parse_lines_too_large;
+  Alcotest.test_case "lines large parses" `Quick test_parse_lines_large;
   Alcotest.test_case "scroll no arg" `Quick test_parse_scroll_no_arg;
   Alcotest.test_case "scroll forward" `Quick test_parse_scroll_forward;
   Alcotest.test_case "scroll backward" `Quick test_parse_scroll_backward;
@@ -663,6 +662,19 @@ let test_take_fitting_prefix_fences () =
   let elen = Discord_agents.Agent_process.escaped_length prefix in
   Alcotest.(check bool) "escaped length within budget" true (elen <= 1700)
 
+let test_take_fitting_prefix_malformed_utf8 () =
+  (* Lone 4-byte lead byte at end of buffer must not cause overrun.
+     Tool output from subprocess stdout can contain arbitrary bytes,
+     so this case reaches production. *)
+  let s = "\xF0" in  (* 4-byte lead, but only 1 byte available *)
+  let taken = Discord_agents.Agent_process.take_fitting_prefix
+    ~max_chars:10 s in
+  Alcotest.(check bool) "prefix bounded by buffer length"
+    true (taken <= String.length s);
+  (* Must not raise *)
+  let _ = String.sub s 0 taken in
+  ()
+
 let test_take_fitting_prefix_utf8 () =
   (* Emoji (4-byte UTF-8) should never be split mid-codepoint. *)
   let emoji = "\xF0\x9F\x98\x80" in  (* 😀 *)
@@ -706,6 +718,7 @@ let tool_detail_tests = [
   Alcotest.test_case "take_fitting_prefix plain" `Quick test_take_fitting_prefix_plain;
   Alcotest.test_case "take_fitting_prefix fences" `Quick test_take_fitting_prefix_fences;
   Alcotest.test_case "take_fitting_prefix utf8" `Quick test_take_fitting_prefix_utf8;
+  Alcotest.test_case "take_fitting_prefix malformed" `Quick test_take_fitting_prefix_malformed_utf8;
   Alcotest.test_case "truncate single pass" `Quick test_truncate_for_display_single_pass;
   Alcotest.test_case "lang_of_path" `Quick test_lang_of_path;
 ]
