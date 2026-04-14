@@ -614,6 +614,26 @@ let test_detail_safety_cap () =
   Alcotest.(check bool) "result under 2000 chars"
     true (String.length result < 2000)
 
+let test_detail_fence_heavy () =
+  (* Fence-heavy content (many ```) must not overflow Discord's 2000-char
+     limit after escape_code_fences expands each ``` to 6 bytes. *)
+  let fence_bomb = String.concat "" (List.init 500 (fun _ -> "```")) in
+  let input = `Assoc [("command", `String fence_bomb)] in
+  let result = Discord_agents.Agent_process.detail_of_tool_input "Bash" input in
+  Alcotest.(check bool) "fence-heavy payload stays under Discord limit"
+    true (String.length result < 2000)
+
+let test_truncate_for_display_fence_heavy () =
+  (* truncate_for_display must also account for fence expansion. *)
+  let fence_line = String.concat "" (List.init 200 (fun _ -> "```")) in
+  let lines = [fence_line; fence_line; fence_line] in
+  let (display, _, _) = Discord_agents.Agent_process.truncate_for_display
+    ~max_lines:10 ~max_chars:1700 lines in
+  let text = String.concat "\n" display in
+  let escaped = Discord_agents.Agent_process.escape_code_fences text in
+  Alcotest.(check bool) "escaped text fits in budget"
+    true (String.length escaped <= 1700)
+
 let test_lang_of_path () =
   let lang = Discord_agents.Agent_process.lang_of_path in
   Alcotest.(check string) "ocaml" "ocaml" (lang "lib/foo.ml");
@@ -632,6 +652,8 @@ let tool_detail_tests = [
   Alcotest.test_case "unknown tool" `Quick test_detail_unknown_tool;
   Alcotest.test_case "no truncation" `Quick test_detail_no_truncation;
   Alcotest.test_case "safety cap" `Quick test_detail_safety_cap;
+  Alcotest.test_case "fence heavy" `Quick test_detail_fence_heavy;
+  Alcotest.test_case "truncate fence heavy" `Quick test_truncate_for_display_fence_heavy;
   Alcotest.test_case "lang_of_path" `Quick test_lang_of_path;
 ]
 
