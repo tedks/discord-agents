@@ -76,8 +76,11 @@ let parse content =
      | _ -> Unknown content)
   | ["lines"] -> Lines None
   | ["lines"; n] ->
+    (* Cap at 1000: a huge value would make truncate_for_display walk
+       thousands of lines per tool result even when the char budget
+       would have cut us off much sooner. *)
     (match int_of_string_opt n with
-     | Some l when l > 0 -> Lines (Some l)
+     | Some l when l > 0 && l <= 1000 -> Lines (Some l)
      | _ -> Unknown content)
   | ["scroll"] -> Scroll None
   | ["scroll"; n] ->

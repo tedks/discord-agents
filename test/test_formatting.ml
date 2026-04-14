@@ -489,6 +489,14 @@ let test_parse_lines_invalid () =
     Alcotest.(check pass) "invalid lines is Unknown" () ()
   | _ -> Alcotest.fail "expected Unknown for invalid lines arg"
 
+let test_parse_lines_too_large () =
+  (* Huge values are rejected to prevent DoS via O(n) truncation scans *)
+  let result = Discord_agents.Command.parse "!lines 100000" in
+  match result with
+  | Discord_agents.Command.Unknown _ ->
+    Alcotest.(check pass) "huge lines value is Unknown" () ()
+  | _ -> Alcotest.fail "expected Unknown for !lines 100000"
+
 let test_parse_scroll_no_arg () =
   Alcotest.(check cmd_testable) "scroll without arg"
     (Discord_agents.Command.Scroll None)
@@ -522,6 +530,7 @@ let command_tests = [
   Alcotest.test_case "lines no arg" `Quick test_parse_lines_no_arg;
   Alcotest.test_case "lines with arg" `Quick test_parse_lines_with_arg;
   Alcotest.test_case "lines invalid" `Quick test_parse_lines_invalid;
+  Alcotest.test_case "lines too large" `Quick test_parse_lines_too_large;
   Alcotest.test_case "scroll no arg" `Quick test_parse_scroll_no_arg;
   Alcotest.test_case "scroll forward" `Quick test_parse_scroll_forward;
   Alcotest.test_case "scroll backward" `Quick test_parse_scroll_backward;
@@ -627,12 +636,52 @@ let test_truncate_for_display_fence_heavy () =
   (* truncate_for_display must also account for fence expansion. *)
   let fence_line = String.concat "" (List.init 200 (fun _ -> "```")) in
   let lines = [fence_line; fence_line; fence_line] in
-  let (display, _, _) = Discord_agents.Agent_process.truncate_for_display
+  let t = Discord_agents.Agent_process.truncate_for_display
     ~max_lines:10 ~max_chars:1700 lines in
-  let text = String.concat "\n" display in
+  let text = String.concat "\n" t.display in
   let escaped = Discord_agents.Agent_process.escape_code_fences text in
   Alcotest.(check bool) "escaped text fits in budget"
     true (String.length escaped <= 1700)
+
+let test_take_fitting_prefix_plain () =
+  let s = String.make 5000 'a' in
+  let taken = Discord_agents.Agent_process.take_fitting_prefix
+    ~max_chars:1700 s in
+  Alcotest.(check int) "takes exactly budget" 1700 taken
+
+let test_take_fitting_prefix_fences () =
+  (* 1700 ``` sequences = 5100 raw bytes, 10200 escaped bytes.
+     A budget of 1700 should take 283 complete fences (283*6=1698)
+     plus no partial (next ``` would be 6 more = 1704 > 1700). *)
+  let s = String.concat "" (List.init 1700 (fun _ -> "```")) in
+  let taken = Discord_agents.Agent_process.take_fitting_prefix
+    ~max_chars:1700 s in
+  (* Should be a multiple of 3 (complete triples) *)
+  Alcotest.(check int) "lands on triple boundary" 0 (taken mod 3);
+  (* And the escaped length of that prefix should be <= 1700 *)
+  let prefix = String.sub s 0 taken in
+  let elen = Discord_agents.Agent_process.escaped_length prefix in
+  Alcotest.(check bool) "escaped length within budget" true (elen <= 1700)
+
+let test_take_fitting_prefix_utf8 () =
+  (* Emoji (4-byte UTF-8) should never be split mid-codepoint. *)
+  let emoji = "\xF0\x9F\x98\x80" in  (* 😀 *)
+  let s = String.concat "" (List.init 500 (fun _ -> emoji)) in
+  let taken = Discord_agents.Agent_process.take_fitting_prefix
+    ~max_chars:100 s in
+  Alcotest.(check int) "prefix lands on codepoint boundary" 0 (taken mod 4);
+  Alcotest.(check bool) "prefix under budget" true (taken <= 100)
+
+let test_truncate_for_display_single_pass () =
+  (* A huge line count (10000) should not cause quadratic work.
+     The single-pass algorithm must terminate quickly and return
+     a shown count capped by max_lines. *)
+  let lines = List.init 10000 (fun i -> Printf.sprintf "line %d" i) in
+  let t = Discord_agents.Agent_process.truncate_for_display
+    ~max_lines:40 ~max_chars:1700 lines in
+  Alcotest.(check bool) "shown at most max_lines" true (t.shown <= 40);
+  Alcotest.(check int) "total counted" 10000 t.total;
+  Alcotest.(check bool) "marked truncated" true t.was_truncated
 
 let test_lang_of_path () =
   let lang = Discord_agents.Agent_process.lang_of_path in
@@ -654,6 +703,10 @@ let tool_detail_tests = [
   Alcotest.test_case "safety cap" `Quick test_detail_safety_cap;
   Alcotest.test_case "fence heavy" `Quick test_detail_fence_heavy;
   Alcotest.test_case "truncate fence heavy" `Quick test_truncate_for_display_fence_heavy;
+  Alcotest.test_case "take_fitting_prefix plain" `Quick test_take_fitting_prefix_plain;
+  Alcotest.test_case "take_fitting_prefix fences" `Quick test_take_fitting_prefix_fences;
+  Alcotest.test_case "take_fitting_prefix utf8" `Quick test_take_fitting_prefix_utf8;
+  Alcotest.test_case "truncate single pass" `Quick test_truncate_for_display_single_pass;
   Alcotest.test_case "lang_of_path" `Quick test_lang_of_path;
 ]
 

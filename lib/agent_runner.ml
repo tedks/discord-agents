@@ -326,21 +326,19 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
            scroll state share a single line-indexing scheme. *)
         let chunks = Agent_process.split_into_chunks
           ~max_chars:Agent_process.max_output_display_chars content in
-        let (display_lines, shown, total) =
-          Agent_process.truncate_for_display
-            ~max_lines:output_lines
-            ~max_chars:Agent_process.max_output_display_chars
-            chunks in
-        let was_truncated = shown < total in
-        (* Pass the actual shown count to scroll storage so paging starts
-           exactly where the inline display left off. *)
-        if was_truncated then
-          Option.iter (fun cb -> cb content shown) on_scroll_content;
+        let t = Agent_process.truncate_for_display
+          ~max_lines:output_lines
+          ~max_chars:Agent_process.max_output_display_chars
+          chunks in
+        (* Pass pre-computed chunks and actual-shown count so storage
+           doesn't re-chunk and paging starts exactly where display left off. *)
+        if t.was_truncated then
+          Option.iter (fun cb -> cb chunks t.shown) on_scroll_content;
         let display_text =
-          let text = String.concat "\n" display_lines in
-          if was_truncated then
+          let text = String.concat "\n" t.display in
+          if t.was_truncated then
             Printf.sprintf "%s\n*... (%d/%d lines \u{2014} use `!scroll` for more)*"
-              text shown total
+              text t.shown t.total
           else text in
         let output_block = Printf.sprintf "```\n%s\n```"
           (Agent_process.escape_code_fences display_text) in

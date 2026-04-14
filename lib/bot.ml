@@ -73,6 +73,18 @@ type t = {
 let projects t = t.project_state.projects
 let channels t = t.project_state.channels
 
+(** Drop scroll-state entries for threads that no longer have an active
+    session.  Called when sessions are removed wholesale (e.g. after
+    Channel_manager.cleanup), since per-session removal goes through
+    [Stop_session] which already prunes its own entry. *)
+let prune_stale_scroll_states t =
+  let stale = Hashtbl.fold (fun tid _ acc ->
+    match Session_store.find_opt t.sessions ~thread_id:tid with
+    | Some _ -> acc
+    | None -> tid :: acc) t.scroll_states [] in
+  List.iter (Hashtbl.remove t.scroll_states) stale;
+  List.length stale
+
 let register_child_pid t pid =
   let (pids, mu) = t.child_pids in
   Mutex.lock mu;
@@ -486,8 +498,18 @@ let handle_command t msg cmd =
       match Channel_manager.cleanup ~rest:t.rest
               ~guild_id:t.config.guild_id ~projects:(projects t) (channels t) with
       | Error e -> reply (Printf.sprintf "Cleanup failed: %s" e)
-      | Ok 0 -> reply "No stale channels to clean up."
-      | Ok n -> reply (Printf.sprintf "Cleaned up %d stale channels." n))
+      | Ok 0 ->
+        let pruned = prune_stale_scroll_states t in
+        reply (Printf.sprintf "No stale channels to clean up.%s"
+          (if pruned > 0
+           then Printf.sprintf " Pruned %d orphaned scroll state(s)." pruned
+           else ""))
+      | Ok n ->
+        let pruned = prune_stale_scroll_states t in
+        reply (Printf.sprintf "Cleaned up %d stale channels.%s" n
+          (if pruned > 0
+           then Printf.sprintf " Pruned %d orphaned scroll state(s)." pruned
+           else "")))
   | Command.Restart ->
     trigger_restart t ~notify:reply
   | Command.Refresh ->
@@ -677,25 +699,24 @@ let handle_command t msg cmd =
            let block = List.nth state.blocks (idx - 1) in
            let total = Array.length block.lines in
            let page_size = block.output_lines_used in
-           (* If we've hit the end, wrap back to start and show the first
-              hidden page (not just a "wrapped" notice with no content). *)
-           let start = if block.next_line >= total
-             then block.output_lines_used
-             else block.next_line in
+           (* If we've hit the end, wrap back to the first hidden page
+              and surface content — not just a notice. *)
            let wrapped = block.next_line >= total in
+           let start = if wrapped then block.output_lines_used
+                       else block.next_line in
            let remaining = Array.sub block.lines start
              (min page_size (total - start)) in
-           let (display_lines, shown, _) =
-             Agent_process.truncate_for_display
-               ~max_lines:(Array.length remaining)
-               ~max_chars:Agent_process.max_output_display_chars
-               (Array.to_list remaining) in
-           (* Advance by exactly the number of lines shown, so no
-              lines are skipped when char truncation reduces the count *)
-           block.next_line <- start + shown;
-           let end_line = start + shown in
-           let display = String.concat "\n" display_lines in
-           let prefix = if wrapped then "*(wrapped to start)* " else "" in
+           let t = Agent_process.truncate_for_display
+             ~max_lines:(Array.length remaining)
+             ~max_chars:Agent_process.max_output_display_chars
+             (Array.to_list remaining) in
+           (* Advance by exactly the lines shown so nothing is skipped. *)
+           block.next_line <- start + t.shown;
+           let end_line = start + t.shown in
+           let display = String.concat "\n" t.display in
+           let prefix = if wrapped
+             then "*(back to first page)* "
+             else "" in
            let info = Printf.sprintf
              "%s*Block %d/%d \u{2014} lines %d\u{2013}%d of %d*"
              prefix idx n_blocks (start + 1) end_line total in
@@ -785,16 +806,23 @@ let handle_thread_message t msg ?channel_info () =
                     ctx msg.content
                 | None -> msg.content
               in
-              let on_scroll_content content lines_used =
-                (* Cap stored content at 100KB to prevent memory bloat *)
-                let capped = if String.length content > 100_000
-                  then String.sub content 0 100_000
-                  else content in
-                (* Use the same chunking as the inline display so
-                   lines_used (= shown) indexes correctly into our array. *)
-                let chunks = Agent_process.split_into_chunks
-                  ~max_chars:Agent_process.max_output_display_chars capped in
-                let block = { lines = Array.of_list chunks;
+              let on_scroll_content chunks lines_used =
+                (* Cap stored content at 100KB total bytes to prevent
+                   memory bloat from pathological tool output. *)
+                let rec take_bytes budget = function
+                  | [] -> []
+                  | _ when budget <= 0 -> []
+                  | c :: rest ->
+                    let len = String.length c in
+                    if len >= budget then
+                      [String.sub c 0
+                         (Agent_process.take_fitting_prefix
+                            ~max_chars:budget c)]
+                    else
+                      c :: take_bytes (budget - len - 1) rest
+                in
+                let capped = take_bytes 100_000 chunks in
+                let block = { lines = Array.of_list capped;
                               output_lines_used = lines_used;
                               next_line = lines_used } in
                 let state = match Hashtbl.find_opt t.scroll_states channel_id with

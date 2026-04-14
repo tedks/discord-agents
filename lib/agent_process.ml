@@ -289,29 +289,76 @@ let discord_max_len = 2000
     code block.  Leaves room for fences, status headers, and hints. *)
 let max_output_display_chars = 1700
 
-(** Post-escape byte length: each triple-backtick ``` gets rewritten to
-    ``\u200B` (adds 3 bytes per occurrence) by [escape_code_fences].
-    All Discord-size budgets must be evaluated against this length, not
-    raw length, or a fence-heavy payload will overflow the 2000-char
-    message limit after escaping. *)
-let escaped_length s =
-  let len = String.length s in
-  if len < 3 then len
-  else
-    let count = ref 0 in
-    let i = ref 0 in
-    while !i < len do
-      if !i + 2 < len && s.[!i] = '`' && s.[!i+1] = '`' && s.[!i+2] = '`' then begin
-        incr count;
-        i := !i + 3
-      end else incr i
-    done;
-    len + 3 * !count
+(* ── Discord size budgeting ────────────────────────────────────────
 
-(** Split a single long line into chunks that each fit within max_chars
-    *after* fence escaping.  Lines shorter than max_chars are returned
-    unchanged.  This makes long single-line output (e.g. minified JSON)
-    navigable via paging, even when the content is fence-heavy. *)
+   All budget checks below operate on *escaped* length: each triple-
+   backtick ``` gets rewritten to ``\u200B` by escape_code_fences,
+   adding 3 bytes per occurrence. UTF-8 multi-byte sequences are
+   preserved whole — we never split a codepoint.
+
+   The single primitive below (walk_to_budget) powers every truncation
+   site so there is one cost model to audit. *)
+
+(** Length of a UTF-8 codepoint starting at byte position [i] in [s].
+    For malformed bytes (including stray continuation bytes) returns 1
+    so progress is guaranteed. *)
+let utf8_step s i =
+  let c = Char.code s.[i] in
+  if c < 0x80 then 1         (* ASCII *)
+  else if c < 0xC0 then 1    (* continuation byte — malformed context *)
+  else if c < 0xE0 then 2    (* 2-byte sequence *)
+  else if c < 0xF0 then 3    (* 3-byte sequence *)
+  else 4                     (* 4-byte sequence *)
+
+(** Walk forward from byte [start] in [s], advancing one unit at a time
+    (a triple-backtick counts as 6 budget bytes / 3 source bytes; any
+    other UTF-8 codepoint costs its raw byte length).  Returns the byte
+    offset one past the last unit that fit within [budget], along with
+    the budget consumed.  The returned offset is always on a codepoint
+    boundary, so [String.sub s start (result - start)] is valid UTF-8. *)
+let walk_to_budget ~start ~budget s =
+  let n = String.length s in
+  let consumed = ref 0 in
+  let i = ref start in
+  let stop = ref false in
+  while not !stop && !i < n do
+    let is_triple = !i + 2 < n
+      && s.[!i] = '`' && s.[!i+1] = '`' && s.[!i+2] = '`' in
+    let cost, step =
+      if is_triple then (6, 3)
+      else (utf8_step s !i, utf8_step s !i) in
+    if !consumed + cost > budget then stop := true
+    else begin
+      consumed := !consumed + cost;
+      i := !i + step
+    end
+  done;
+  (!i, !consumed)
+
+(** Post-escape byte length of [s]: len + 3 per ``` occurrence. *)
+let escaped_length s =
+  let (_, consumed) = walk_to_budget ~start:0 ~budget:max_int s in
+  consumed
+
+(** Largest prefix of [s] (starting at [start]) whose escaped length is
+    at most [max_chars].  Returns the byte count to take, guaranteed to
+    land on a UTF-8 codepoint boundary.  Always advances at least one
+    codepoint to prevent infinite loops, even if a single unit exceeds
+    the budget. *)
+let take_fitting_prefix ?(start=0) ~max_chars s =
+  let n = String.length s in
+  if start >= n then 0
+  else
+    let (next, _) = walk_to_budget ~start ~budget:max_chars s in
+    if next > start then next - start
+    else
+      (* Single unit at [start] exceeds budget — emit it anyway *)
+      let is_triple = start + 2 < n
+        && s.[start] = '`' && s.[start+1] = '`' && s.[start+2] = '`' in
+      if is_triple then 3 else utf8_step s start
+
+(** Split a single line into chunks each fitting within [max_chars]
+    post-escape.  Short lines pass through unchanged. *)
 let chunk_long_line ~max_chars line =
   if escaped_length line <= max_chars then [line]
   else
@@ -319,84 +366,67 @@ let chunk_long_line ~max_chars line =
     let chunks = ref [] in
     let pos = ref 0 in
     while !pos < n do
-      (* Walk forward tracking the escaped length of the current chunk.
-         Stop when adding the next byte would exceed max_chars, or at EOL. *)
-      let start = !pos in
-      let elen = ref 0 in  (* escaped length of chunk so far *)
-      let i = ref start in
-      let stop = ref false in
-      while not !stop && !i < n do
-        (* Each ``` occurrence costs 3 extra bytes after escape *)
-        let is_triple = !i + 2 < n
-          && line.[!i] = '`' && line.[!i+1] = '`' && line.[!i+2] = '`' in
-        let cost = if is_triple then 6 else 1 in
-        let step = if is_triple then 3 else 1 in
-        if !elen + cost > max_chars && !i > start then stop := true
-        else begin
-          elen := !elen + cost;
-          i := !i + step
-        end
-      done;
-      let chunk_len = !i - start in
-      (* Always make forward progress, even for a single triple-backtick
-         that wouldn't fit by itself — emit it anyway to avoid an infinite loop *)
-      let chunk_len = if chunk_len = 0 then min 3 (n - start) else chunk_len in
-      chunks := String.sub line start chunk_len :: !chunks;
-      pos := start + chunk_len
+      let len = take_fitting_prefix ~start:!pos ~max_chars line in
+      chunks := String.sub line !pos len :: !chunks;
+      pos := !pos + len
     done;
     List.rev !chunks
 
 (** Split text into lines, then split any oversized lines into chunks.
-    This produces a uniform list where every entry fits within max_chars,
+    Produces a uniform list where every entry fits within max_chars,
     so paging by index always lands on a Discord-displayable unit. *)
 let split_into_chunks ~max_chars text =
   List.concat_map (chunk_long_line ~max_chars)
     (String.split_on_char '\n' text)
 
-(** Truncate lines for Discord display: respects both a line limit and
-    a character budget.  Returns (display_lines, shown_count, total_count).
-    [display_lines] is the list of lines that fit.  The character budget
-    is evaluated against the post-escape length so fence-heavy payloads
-    cannot silently overflow Discord's 2000-char message limit.
-    If even a single line exceeds max_chars, it is char-truncated so the
-    user always sees something rather than an empty block. *)
+(** Truncation result: the displayable lines, how many were shown,
+    the total line count, and whether anything was hidden (either lines
+    dropped OR a line char-truncated by the single-line fallback). *)
+type truncation = {
+  display : string list;
+  shown : int;
+  total : int;
+  was_truncated : bool;
+}
+
+(** Truncate lines for Discord display in a single O(n) pass.
+    Respects both [max_lines] and [max_chars] (evaluated against the
+    post-escape length).  If the first line alone exceeds [max_chars],
+    it is char-truncated so the user always sees something.
+
+    Invariant: [String.concat "\n" display |> escape_code_fences] has
+    length at most [max_chars] bytes. *)
 let truncate_for_display ~max_lines ~max_chars (lines : string list) =
-  let total = List.length lines in
-  let limit = min max_lines total in
-  let rec fit n =
-    if n <= 0 then
-      (* Every line exceeded the budget — char-truncate the first line *)
-      match lines with
-      | [] -> ([], 0)
-      | first :: _ ->
-        (* Take as many bytes as fit within max_chars *after* escape.
-           Each ``` costs 6 bytes (3 raw + 3 from zero-width space). *)
-        let n_src = String.length first in
-        let elen = ref 0 in
-        let i = ref 0 in
-        let stop = ref false in
-        while not !stop && !i < n_src do
-          let is_triple = !i + 2 < n_src
-            && first.[!i] = '`' && first.[!i+1] = '`' && first.[!i+2] = '`' in
-          let cost = if is_triple then 6 else 1 in
-          let step = if is_triple then 3 else 1 in
-          if !elen + cost > max_chars then stop := true
-          else begin
-            elen := !elen + cost;
-            i := !i + step
-          end
-        done;
-        ([String.sub first 0 !i], 1)
-    else
-      let kept = List.filteri (fun i _ -> i < n) lines in
-      (* Escaped length + one newline separator per line *)
-      let len = List.fold_left
-        (fun acc s -> acc + escaped_length s + 1) 0 kept in
-      if len <= max_chars then (kept, n)
-      else fit (n - 1)
+  (* Walk the input once: accumulate lines while line count and escaped
+     char budget both allow it. Remaining lines are counted but not kept. *)
+  let rec loop lines shown elen acc =
+    match lines with
+    | [] -> { display = List.rev acc; shown; total = shown;
+              was_truncated = false }
+    | l :: rest ->
+      if shown >= max_lines then
+        { display = List.rev acc; shown;
+          total = shown + 1 + List.length rest;
+          was_truncated = true }
+      else
+        let sep = if shown > 0 then 1 else 0 in
+        let new_elen = elen + escaped_length l + sep in
+        if new_elen <= max_chars then
+          loop rest (shown + 1) new_elen (l :: acc)
+        else if shown = 0 then
+          (* First line alone exceeds budget — char-truncate it so the
+             user always sees something rather than an empty block. *)
+          let taken = take_fitting_prefix ~max_chars l in
+          let trimmed = String.sub l 0 taken in
+          { display = [trimmed]; shown = 1;
+            total = 1 + List.length rest;
+            was_truncated = true }
+        else
+          { display = List.rev acc; shown;
+            total = shown + 1 + List.length rest;
+            was_truncated = true }
   in
-  let (display, shown) = fit limit in
-  (display, shown, total)
+  loop lines 0 0 []
 
 (** Default split threshold — leaves room for code block fences added
     during splitting (closing "\n```" = 4 chars, opening "```lang\n" ≤ 24 chars). *)
@@ -654,28 +684,13 @@ let detail_of_tool_input name input =
   let open Yojson.Safe.Util in
   let get key = input |> member key |> to_string_option in
   (* Build a code block with fences escaped and capped at max_detail_len.
-     Cap is evaluated against escaped length so fence-heavy payloads can't
-     overflow Discord's 2000-char message limit. *)
+     Cap is evaluated against escaped length (fence-aware, UTF-8 safe). *)
   let code_block lang content =
     let capped =
       if escaped_length content <= max_detail_len then content
       else
-        let n_src = String.length content in
-        let elen = ref 0 in
-        let i = ref 0 in
-        let stop = ref false in
-        while not !stop && !i < n_src do
-          let is_triple = !i + 2 < n_src
-            && content.[!i] = '`' && content.[!i+1] = '`' && content.[!i+2] = '`' in
-          let cost = if is_triple then 6 else 1 in
-          let step = if is_triple then 3 else 1 in
-          if !elen + cost > max_detail_len then stop := true
-          else begin
-            elen := !elen + cost;
-            i := !i + step
-          end
-        done;
-        String.sub content 0 !i ^ "\n... (truncated)"
+        let taken = take_fitting_prefix ~max_chars:max_detail_len content in
+        String.sub content 0 taken ^ "\n... (truncated)"
     in
     Printf.sprintf "```%s\n%s\n```" lang (escape_code_fences capped)
   in
