@@ -124,7 +124,9 @@ let attachment_prompt_suffix downloaded =
     Returns Ok () on success, Error msg on failure. *)
 let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
     ~prompt ?(attachments=[]) ~author_name ~channel_name ~channel_type
-    ?(wrap_width=Agent_process.desktop_width) ?on_pid () =
+    ?(wrap_width=Agent_process.desktop_width)
+    ?(output_lines=Agent_process.default_output_lines)
+    ?on_scroll_content ?on_pid () =
   (* Download attachments and append paths to the prompt *)
   let downloaded = download_attachments ~rest
     ~working_dir:session.Session_store.working_dir attachments in
@@ -146,6 +148,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
   let current_msg_buf = Buffer.create 1900 in
   let tool_status_lines = ref [] in
   let tool_status_msg_id = ref None in
+  let in_tool_mode = ref false in
   let typing_active = ref true in
   let last_edit = ref (Unix.gettimeofday ()) in
   (* Background fiber: continuously send typing indicators while processing.
@@ -255,8 +258,11 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       (* Transitioning from tool status to text — clear tool state.
          The tool status message visually breaks continuity, so any
          code block reopening prefix left in the buffer from before
-         the tool use would render the new text as monospace. *)
-      if !tool_status_lines <> [] then begin
+         the tool use would render the new text as monospace.
+         Uses in_tool_mode flag since tool_status_lines may have been
+         cleared by a multi-chunk flush. *)
+      if !in_tool_mode then begin
+        in_tool_mode := false;
         tool_status_lines := [];
         tool_status_msg_id := None;
         Buffer.clear current_msg_buf;
@@ -290,6 +296,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
     | Agent_process.Tool_use info ->
       Logs.debug (fun m -> m "agent_runner: tool: %s (%s)"
         info.tool_name info.tool_summary);
+      in_tool_mode := true;
       (* Flush any pending text before showing tool status *)
       if Buffer.length current_msg_buf > 0 then
         start_new_message ();
@@ -312,17 +319,41 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
     | Agent_process.Tool_result { content } ->
       Logs.debug (fun m -> m "agent_runner: tool result: %d chars"
         (String.length content));
-      (* Append truncated output to the tool status message *)
-      if !tool_status_lines <> [] then begin
-        let max_output_lines = 20 in
-        let lines = String.split_on_char '\n' content in
-        let truncated = if List.length lines > max_output_lines then
-          let kept = List.filteri (fun i _ -> i < max_output_lines) lines in
-          String.concat "\n" kept ^ "\n..."
-        else content in
+      (* Truncate output for display (both line count and char budget),
+         storing full content for !scroll when truncated. *)
+      if !in_tool_mode then begin
+        (* Chunk long lines first so the inline display and the stored
+           scroll state share a single line-indexing scheme. *)
+        let chunks = Agent_process.split_into_chunks
+          ~max_chars:Agent_process.max_output_display_chars content in
+        let t = Agent_process.truncate_for_display
+          ~max_lines:output_lines
+          ~max_chars:Agent_process.max_output_display_chars
+          chunks in
+        (* Pass pre-computed chunks and actual-shown count so storage
+           doesn't re-chunk and paging starts exactly where display left off. *)
+        if t.was_truncated then
+          Option.iter (fun cb -> cb chunks t.shown) on_scroll_content;
+        let display_text =
+          let text = String.concat "\n" t.display in
+          if t.was_truncated then
+            Printf.sprintf "%s\n*... (%d/%d lines \u{2014} use `!scroll` for more)*"
+              text t.shown t.total
+          else text in
         let output_block = Printf.sprintf "```\n%s\n```"
-          (Agent_process.escape_code_fences
-            (Agent_process.truncate_detail Agent_process.max_detail_len truncated)) in
+          (Agent_process.escape_code_fences display_text) in
+        (* Size guard: if adding the output block would exceed Discord's
+           limit, flush the existing status first so the output gets its
+           own message. Same logic as the Tool_use overflow guard. *)
+        let projected_len =
+          let existing = List.fold_left (fun acc l -> acc + String.length l + 1)
+            0 !tool_status_lines in
+          existing + String.length output_block in
+        if projected_len > 1800 && !tool_status_lines <> [] then begin
+          flush_tool_status ();
+          tool_status_lines := [];
+          tool_status_msg_id := None
+        end;
         tool_status_lines := output_block :: !tool_status_lines;
         flush_tool_status ()
       end

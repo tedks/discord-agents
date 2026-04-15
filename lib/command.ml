@@ -18,6 +18,8 @@ type t =
   | Desktop
   | Mobile
   | Wrapping of int option
+  | Lines of int option
+  | Scroll of int option  (** None = continue current block, Some n = target block n *)
   | Help
   | Unknown of string
 
@@ -71,6 +73,19 @@ let parse content =
   | ["wrapping"; n] ->
     (match int_of_string_opt n with
      | Some w when w > 0 -> Wrapping (Some w)
+     | _ -> Unknown content)
+  | ["lines"] -> Lines None
+  | ["lines"; n] ->
+    (* Accept any positive int here; the handler enforces the upper
+       bound (currently 1000) so the user gets a friendly message
+       rather than silent rejection. *)
+    (match int_of_string_opt n with
+     | Some l when l > 0 -> Lines (Some l)
+     | _ -> Unknown content)
+  | ["scroll"] -> Scroll None
+  | ["scroll"; n] ->
+    (match int_of_string_opt n with
+     | Some s when s <> 0 -> Scroll (Some s)
      | _ -> Unknown content)
   | ["help"] -> Help
   | _ -> Unknown content

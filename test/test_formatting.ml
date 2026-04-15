@@ -417,6 +417,10 @@ let cmd_testable =
       | Mobile -> "Mobile"
       | Wrapping None -> "Wrapping(None)"
       | Wrapping (Some n) -> Printf.sprintf "Wrapping(Some %d)" n
+      | Lines None -> "Lines(None)"
+      | Lines (Some n) -> Printf.sprintf "Lines(Some %d)" n
+      | Scroll None -> "Scroll(None)"
+      | Scroll (Some n) -> Printf.sprintf "Scroll(Some %d)" n
       | Help -> "Help"
       | Unknown s -> "Unknown(" ^ s ^ ")"
     in
@@ -468,6 +472,52 @@ let test_parse_wrapping_negative () =
     Alcotest.(check pass) "negative wrapping is Unknown" () ()
   | _ -> Alcotest.fail "expected Unknown for negative wrapping"
 
+let test_parse_lines_no_arg () =
+  Alcotest.(check cmd_testable) "lines without arg"
+    (Discord_agents.Command.Lines None)
+    (Discord_agents.Command.parse "!lines")
+
+let test_parse_lines_with_arg () =
+  Alcotest.(check cmd_testable) "lines with arg"
+    (Discord_agents.Command.Lines (Some 60))
+    (Discord_agents.Command.parse "!lines 60")
+
+let test_parse_lines_invalid () =
+  let result = Discord_agents.Command.parse "!lines abc" in
+  match result with
+  | Discord_agents.Command.Unknown _ ->
+    Alcotest.(check pass) "invalid lines is Unknown" () ()
+  | _ -> Alcotest.fail "expected Unknown for invalid lines arg"
+
+let test_parse_lines_large () =
+  (* Parser accepts any positive int; the handler enforces the upper
+     bound so the user gets a friendly message instead of silent rejection. *)
+  Alcotest.(check cmd_testable) "huge lines value parses"
+    (Discord_agents.Command.Lines (Some 100000))
+    (Discord_agents.Command.parse "!lines 100000")
+
+let test_parse_scroll_no_arg () =
+  Alcotest.(check cmd_testable) "scroll without arg"
+    (Discord_agents.Command.Scroll None)
+    (Discord_agents.Command.parse "!scroll")
+
+let test_parse_scroll_forward () =
+  Alcotest.(check cmd_testable) "scroll forward"
+    (Discord_agents.Command.Scroll (Some 3))
+    (Discord_agents.Command.parse "!scroll 3")
+
+let test_parse_scroll_backward () =
+  Alcotest.(check cmd_testable) "scroll backward"
+    (Discord_agents.Command.Scroll (Some (-2)))
+    (Discord_agents.Command.parse "!scroll -2")
+
+let test_parse_scroll_zero () =
+  let result = Discord_agents.Command.parse "!scroll 0" in
+  match result with
+  | Discord_agents.Command.Unknown _ ->
+    Alcotest.(check pass) "zero scroll is Unknown" () ()
+  | _ -> Alcotest.fail "expected Unknown for zero scroll"
+
 let command_tests = [
   Alcotest.test_case "desktop" `Quick test_parse_desktop;
   Alcotest.test_case "mobile" `Quick test_parse_mobile;
@@ -476,6 +526,14 @@ let command_tests = [
   Alcotest.test_case "wrapping invalid" `Quick test_parse_wrapping_invalid;
   Alcotest.test_case "wrapping zero" `Quick test_parse_wrapping_zero;
   Alcotest.test_case "wrapping negative" `Quick test_parse_wrapping_negative;
+  Alcotest.test_case "lines no arg" `Quick test_parse_lines_no_arg;
+  Alcotest.test_case "lines with arg" `Quick test_parse_lines_with_arg;
+  Alcotest.test_case "lines invalid" `Quick test_parse_lines_invalid;
+  Alcotest.test_case "lines large parses" `Quick test_parse_lines_large;
+  Alcotest.test_case "scroll no arg" `Quick test_parse_scroll_no_arg;
+  Alcotest.test_case "scroll forward" `Quick test_parse_scroll_forward;
+  Alcotest.test_case "scroll backward" `Quick test_parse_scroll_backward;
+  Alcotest.test_case "scroll zero" `Quick test_parse_scroll_zero;
 ]
 
 (* ── tool detail formatting ────────────────────────────────────── *)
@@ -541,16 +599,101 @@ let test_detail_unknown_tool () =
   let result = detail "SomeTool" input in
   Alcotest.(check string) "unknown tool has no detail" "" result
 
-let test_detail_truncation () =
+let test_detail_no_truncation () =
+  (* 1500 chars is under the 1600-char cap — should be preserved in full *)
   let long_cmd = String.make 1500 'x' in
   let input = `Assoc [("command", `String long_cmd)] in
   let result = detail "Bash" input in
-  Alcotest.(check bool) "truncated with ..."
-    true (try ignore (Str.search_forward (Str.regexp_string "...") result 0);
+  Alcotest.(check bool) "contains full command"
+    true (try ignore (Str.search_forward (Str.regexp_string long_cmd) result 0);
               true with Not_found -> false);
-  (* Total should be well under 2000 chars *)
-  Alcotest.(check bool) "total under 1000"
-    true (String.length result < 1000)
+  Alcotest.(check bool) "total includes full content"
+    true (String.length result > 1500)
+
+let test_detail_safety_cap () =
+  (* Content exceeding max_detail_len (1600) should be truncated *)
+  let huge_cmd = String.make 3000 'y' in
+  let input = `Assoc [("command", `String huge_cmd)] in
+  let result = detail "Bash" input in
+  Alcotest.(check bool) "truncated marker present"
+    true (try ignore (Str.search_forward (Str.regexp_string "... (truncated)") result 0);
+              true with Not_found -> false);
+  (* Result should be capped near max_detail_len, not the full 3000 *)
+  Alcotest.(check bool) "result under 2000 chars"
+    true (String.length result < 2000)
+
+let test_detail_fence_heavy () =
+  (* Fence-heavy content (many ```) must not overflow Discord's 2000-char
+     limit after escape_code_fences expands each ``` to 6 bytes. *)
+  let fence_bomb = String.concat "" (List.init 500 (fun _ -> "```")) in
+  let input = `Assoc [("command", `String fence_bomb)] in
+  let result = Discord_agents.Agent_process.detail_of_tool_input "Bash" input in
+  Alcotest.(check bool) "fence-heavy payload stays under Discord limit"
+    true (String.length result < 2000)
+
+let test_truncate_for_display_fence_heavy () =
+  (* truncate_for_display must also account for fence expansion. *)
+  let fence_line = String.concat "" (List.init 200 (fun _ -> "```")) in
+  let lines = [fence_line; fence_line; fence_line] in
+  let t = Discord_agents.Agent_process.truncate_for_display
+    ~max_lines:10 ~max_chars:1700 lines in
+  let text = String.concat "\n" t.display in
+  let escaped = Discord_agents.Agent_process.escape_code_fences text in
+  Alcotest.(check bool) "escaped text fits in budget"
+    true (String.length escaped <= 1700)
+
+let test_take_fitting_prefix_plain () =
+  let s = String.make 5000 'a' in
+  let taken = Discord_agents.Agent_process.take_fitting_prefix
+    ~max_chars:1700 s in
+  Alcotest.(check int) "takes exactly budget" 1700 taken
+
+let test_take_fitting_prefix_fences () =
+  (* 1700 ``` sequences = 5100 raw bytes, 10200 escaped bytes.
+     A budget of 1700 should take 283 complete fences (283*6=1698)
+     plus no partial (next ``` would be 6 more = 1704 > 1700). *)
+  let s = String.concat "" (List.init 1700 (fun _ -> "```")) in
+  let taken = Discord_agents.Agent_process.take_fitting_prefix
+    ~max_chars:1700 s in
+  (* Should be a multiple of 3 (complete triples) *)
+  Alcotest.(check int) "lands on triple boundary" 0 (taken mod 3);
+  (* And the escaped length of that prefix should be <= 1700 *)
+  let prefix = String.sub s 0 taken in
+  let elen = Discord_agents.Agent_process.escaped_length prefix in
+  Alcotest.(check bool) "escaped length within budget" true (elen <= 1700)
+
+let test_take_fitting_prefix_malformed_utf8 () =
+  (* Lone 4-byte lead byte at end of buffer must not cause overrun.
+     Tool output from subprocess stdout can contain arbitrary bytes,
+     so this case reaches production. *)
+  let s = "\xF0" in  (* 4-byte lead, but only 1 byte available *)
+  let taken = Discord_agents.Agent_process.take_fitting_prefix
+    ~max_chars:10 s in
+  Alcotest.(check bool) "prefix bounded by buffer length"
+    true (taken <= String.length s);
+  (* Must not raise *)
+  let _ = String.sub s 0 taken in
+  ()
+
+let test_take_fitting_prefix_utf8 () =
+  (* Emoji (4-byte UTF-8) should never be split mid-codepoint. *)
+  let emoji = "\xF0\x9F\x98\x80" in  (* 😀 *)
+  let s = String.concat "" (List.init 500 (fun _ -> emoji)) in
+  let taken = Discord_agents.Agent_process.take_fitting_prefix
+    ~max_chars:100 s in
+  Alcotest.(check int) "prefix lands on codepoint boundary" 0 (taken mod 4);
+  Alcotest.(check bool) "prefix under budget" true (taken <= 100)
+
+let test_truncate_for_display_single_pass () =
+  (* A huge line count (10000) should not cause quadratic work.
+     The single-pass algorithm must terminate quickly and return
+     a shown count capped by max_lines. *)
+  let lines = List.init 10000 (fun i -> Printf.sprintf "line %d" i) in
+  let t = Discord_agents.Agent_process.truncate_for_display
+    ~max_lines:40 ~max_chars:1700 lines in
+  Alcotest.(check bool) "shown at most max_lines" true (t.shown <= 40);
+  Alcotest.(check int) "total counted" 10000 t.total;
+  Alcotest.(check bool) "marked truncated" true t.was_truncated
 
 let test_lang_of_path () =
   let lang = Discord_agents.Agent_process.lang_of_path in
@@ -568,7 +711,15 @@ let tool_detail_tests = [
   Alcotest.test_case "read empty" `Quick test_detail_read_empty;
   Alcotest.test_case "grep pattern" `Quick test_detail_grep;
   Alcotest.test_case "unknown tool" `Quick test_detail_unknown_tool;
-  Alcotest.test_case "truncation" `Quick test_detail_truncation;
+  Alcotest.test_case "no truncation" `Quick test_detail_no_truncation;
+  Alcotest.test_case "safety cap" `Quick test_detail_safety_cap;
+  Alcotest.test_case "fence heavy" `Quick test_detail_fence_heavy;
+  Alcotest.test_case "truncate fence heavy" `Quick test_truncate_for_display_fence_heavy;
+  Alcotest.test_case "take_fitting_prefix plain" `Quick test_take_fitting_prefix_plain;
+  Alcotest.test_case "take_fitting_prefix fences" `Quick test_take_fitting_prefix_fences;
+  Alcotest.test_case "take_fitting_prefix utf8" `Quick test_take_fitting_prefix_utf8;
+  Alcotest.test_case "take_fitting_prefix malformed" `Quick test_take_fitting_prefix_malformed_utf8;
+  Alcotest.test_case "truncate single pass" `Quick test_truncate_for_display_single_pass;
   Alcotest.test_case "lang_of_path" `Quick test_lang_of_path;
 ]
 

@@ -38,6 +38,20 @@ type project_state = {
   channels : Channel_manager.t;
 }
 
+(** A single output block, stored for !scroll access. *)
+type output_block = {
+  lines : string array;          (** Pre-split lines for fast windowing *)
+  output_lines_used : int;       (** Line count at truncation time — paging uses this *)
+  mutable next_line : int;       (** Next line to display (starts at output_lines_used) *)
+}
+
+(** Per-thread scroll state: a stack of truncated output blocks (most recent first)
+    and which block is currently targeted by !scroll. *)
+type scroll_state = {
+  mutable blocks : output_block list;
+  mutable current_block : int;  (** 1-indexed from most recent, set by !scroll N *)
+}
+
 type t = {
   config : Config.t;
   rest : Discord_rest.t;
@@ -51,11 +65,25 @@ type t = {
   child_pids : (Pid_set.t ref * Mutex.t);
   mutable wrap_width : int;
   mutable refreshing : bool;
+  mutable output_lines : int;
+  scroll_states : (Discord_types.channel_id, scroll_state) Hashtbl.t;
 }
 
 (** Convenience accessors for the current project state snapshot. *)
 let projects t = t.project_state.projects
 let channels t = t.project_state.channels
+
+(** Drop scroll-state entries for threads that no longer have an active
+    session.  Called when sessions are removed wholesale (e.g. after
+    Channel_manager.cleanup), since per-session removal goes through
+    [Stop_session] which already prunes its own entry. *)
+let prune_stale_scroll_states t =
+  let stale = Hashtbl.fold (fun tid _ acc ->
+    match Session_store.find_opt t.sessions ~thread_id:tid with
+    | Some _ -> acc
+    | None -> tid :: acc) t.scroll_states [] in
+  List.iter (Hashtbl.remove t.scroll_states) stale;
+  List.length stale
 
 let register_child_pid t pid =
   let (pids, mu) = t.child_pids in
@@ -463,14 +491,25 @@ let handle_command t msg cmd =
      | None -> reply "Session not found."
      | Some session ->
        Session_store.remove t.sessions ~thread_id;
+       Hashtbl.remove t.scroll_states thread_id;
        reply (Printf.sprintf "Stopped session for **%s**." session.project_name))
   | Command.Cleanup_channels ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       match Channel_manager.cleanup ~rest:t.rest
               ~guild_id:t.config.guild_id ~projects:(projects t) (channels t) with
       | Error e -> reply (Printf.sprintf "Cleanup failed: %s" e)
-      | Ok 0 -> reply "No stale channels to clean up."
-      | Ok n -> reply (Printf.sprintf "Cleaned up %d stale channels." n))
+      | Ok 0 ->
+        let pruned = prune_stale_scroll_states t in
+        reply (Printf.sprintf "No stale channels to clean up.%s"
+          (if pruned > 0
+           then Printf.sprintf " Pruned %d orphaned scroll state(s)." pruned
+           else ""))
+      | Ok n ->
+        let pruned = prune_stale_scroll_states t in
+        reply (Printf.sprintf "Cleaned up %d stale channels.%s" n
+          (if pruned > 0
+           then Printf.sprintf " Pruned %d orphaned scroll state(s)." pruned
+           else "")))
   | Command.Restart ->
     trigger_restart t ~notify:reply
   | Command.Refresh ->
@@ -613,6 +652,8 @@ let handle_command t msg cmd =
       "`!desktop` — set wrapping to desktop width";
       "`!mobile` — set wrapping to mobile width";
       "`!wrapping [n]` — show or set line wrap width";
+      "`!lines [n]` — show or set output lines for tool/code display";
+      "`!scroll [n]` — view truncated output (n=block: 1=last, 2=2nd last; repeats advance)";
       "`!help` — this message";
     ])
   | Command.Desktop ->
@@ -628,6 +669,66 @@ let handle_command t msg cmd =
   | Command.Wrapping (Some w) ->
     t.wrap_width <- w;
     reply (Printf.sprintf "Wrapping set to %d chars." w)
+  | Command.Lines None ->
+    reply (Printf.sprintf "Output lines: %d." t.output_lines)
+  | Command.Lines (Some n) ->
+    if n > 1000 then
+      reply (Printf.sprintf
+        "Output lines must be \u{2264}1000 (got %d) \u{2014} larger \
+         values would scan huge tool results unnecessarily." n)
+    else begin
+      t.output_lines <- n;
+      reply (Printf.sprintf "Output lines set to %d." n)
+    end
+  | Command.Scroll target ->
+    let channel_id = msg.channel_id in
+    (match Hashtbl.find_opt t.scroll_states channel_id with
+     | None ->
+       reply "No scrollable output in this thread."
+     | Some state ->
+       let n_blocks = List.length state.blocks in
+       if n_blocks = 0 then
+         reply "No scrollable output in this thread."
+       else
+         (* Resolve block index.  None = continue current block.
+            Positive counts from most recent (1 = last).
+            Negative uses Python-style indexing (-1 = most recent). *)
+         let idx = match target with
+           | None -> state.current_block
+           | Some n when n > 0 -> n
+           | Some n -> -n  (* Python-style: -1 → 1 (most recent), -2 → 2 *)
+         in
+         if idx < 1 || idx > n_blocks then
+           reply (Printf.sprintf "Only %d output block(s) available." n_blocks)
+         else begin
+           state.current_block <- idx;
+           let block = List.nth state.blocks (idx - 1) in
+           let total = Array.length block.lines in
+           let page_size = block.output_lines_used in
+           (* If we've hit the end, wrap back to the first hidden page
+              and surface content — not just a notice. *)
+           let wrapped = block.next_line >= total in
+           let start = if wrapped then block.output_lines_used
+                       else block.next_line in
+           let remaining = Array.sub block.lines start
+             (min page_size (total - start)) in
+           let t = Agent_process.truncate_for_display
+             ~max_lines:(Array.length remaining)
+             ~max_chars:Agent_process.max_output_display_chars
+             (Array.to_list remaining) in
+           (* Advance by exactly the lines shown so nothing is skipped. *)
+           block.next_line <- start + t.shown;
+           let end_line = start + t.shown in
+           let display = String.concat "\n" t.display in
+           let prefix = if wrapped
+             then "*(looped back)* "
+             else "" in
+           let info = Printf.sprintf
+             "%s*Block %d/%d \u{2014} lines %d\u{2013}%d of %d*"
+             prefix idx n_blocks (start + 1) end_line total in
+           reply (Printf.sprintf "```\n%s\n```\n%s"
+             (Agent_process.escape_code_fences display) info)
+         end)
   | Command.Unknown _ -> ()
 
 (** Resolve the channel name and type for context injection.
@@ -711,11 +812,47 @@ let handle_thread_message t msg ?channel_info () =
                     ctx msg.content
                 | None -> msg.content
               in
+              let on_scroll_content chunks lines_used =
+                (* Cap stored content at ~100KB to prevent memory bloat.
+                   The cap is a budget for take_fitting_prefix (which is
+                   fence-aware: ``` costs 6); for fence-free text this
+                   matches raw bytes within ±a single chunk. Tail-recursive
+                   to avoid stack growth on highly fragmented output. *)
+                let rec take_bytes budget acc = function
+                  | [] -> List.rev acc
+                  | _ when budget <= 0 -> List.rev acc
+                  | c :: rest ->
+                    let len = String.length c in
+                    if len >= budget then
+                      List.rev (
+                        String.sub c 0
+                          (Agent_process.take_fitting_prefix
+                             ~max_chars:budget c)
+                        :: acc)
+                    else
+                      take_bytes (budget - len - 1) (c :: acc) rest
+                in
+                let capped = take_bytes 100_000 [] chunks in
+                let block = { lines = Array.of_list capped;
+                              output_lines_used = lines_used;
+                              next_line = lines_used } in
+                let state = match Hashtbl.find_opt t.scroll_states channel_id with
+                  | Some s -> s
+                  | None -> { blocks = []; current_block = 1 } in
+                (* Push new block to front (most recent first), cap at 20 *)
+                let blocks = block :: (if List.length state.blocks >= 20
+                  then List.filteri (fun i _ -> i < 19) state.blocks
+                  else state.blocks) in
+                state.blocks <- blocks;
+                state.current_block <- 1;
+                Hashtbl.replace t.scroll_states channel_id state in
               let result = Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
                       ~session ~channel_id ~prompt
                       ~attachments:msg.attachments
                       ~author_name ~channel_name ~channel_type
-                      ~wrap_width:t.wrap_width ~on_pid () in
+                      ~wrap_width:t.wrap_width
+                      ~output_lines:t.output_lines
+                      ~on_scroll_content ~on_pid () in
               ignore (Discord_rest.delete_own_reaction t.rest ~channel_id
                 ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
               (match result with
@@ -865,7 +1002,9 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
                started_at = Unix.gettimeofday ();
                draining = false; child_pids = (ref Pid_set.empty, Mutex.create ());
                wrap_width = Agent_process.desktop_width;
-               refreshing = false } in
+               refreshing = false;
+               output_lines = Agent_process.default_output_lines;
+               scroll_states = Hashtbl.create 64 } in
   bot.gateway.handler <- (fun event ->
     match event with
     | Discord_gateway.Connected user ->
