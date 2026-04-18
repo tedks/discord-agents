@@ -342,8 +342,13 @@ let refresh_projects t =
 (** Handle a parsed command. *)
 let handle_command t msg cmd =
   let channel_id = msg.Discord_types.channel_id in
+  (* Chunk to Discord's 2000-char limit. Without this, long command replies
+     (e.g. !projects when many projects are discovered) are silently dropped:
+     Discord rejects the POST and the Error result is ignored. *)
   let reply text =
-    ignore (Discord_rest.create_message t.rest ~channel_id ~content:text ()) in
+    List.iter (fun chunk ->
+      ignore (Discord_rest.create_message t.rest ~channel_id ~content:chunk ())
+    ) (Agent_process.split_message text) in
   match cmd with
   | Command.List_projects ->
     let lines = List.mapi (fun i (p : Project.t) ->
