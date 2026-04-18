@@ -157,7 +157,12 @@ let deduplicate projects =
   (* Rename URL-matched projects to their remote repo name. For cluster
      repos (name contains "/" from nested discovery), keep the parent
      prefix so "books/rust" with remote "foo/rust-learn" becomes
-     "books/rust-learn", preserving the grouping context. *)
+     "books/rust-learn", preserving the grouping context.
+
+     We take only the first slash because discovery currently recurses
+     exactly one level (so at most one slash exists in the name). If
+     discovery is ever extended to deeper recursion, revisit this to
+     preserve the full parent path. *)
   let url_projects = UrlMap.bindings !by_url |> List.map (fun (_, p) ->
     match p.remote_url with
     | Some url ->

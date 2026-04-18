@@ -122,9 +122,13 @@ let request t ~meth ~path ?body () =
       if String.length body_str = 0 then Ok `Null
       else Ok (Yojson.Safe.from_string body_str)
     end else begin
+      (* Full body goes to the central log (authoritative record). The
+         Error string carries only the status + path so callers that
+         surface it to users (e.g. "Failed to create thread: <error>")
+         stay concise and callers that also log the Error don't duplicate
+         the body in logs. *)
       log_non_2xx code body_str;
-      Error (Printf.sprintf "discord REST %s %s: %d %s"
-        meth_str path code (truncate_for_log body_str))
+      Error (Printf.sprintf "discord REST %s %s: HTTP %d" meth_str path code)
     end
   in
   try
@@ -145,10 +149,11 @@ let request t ~meth ~path ?body () =
     end else
       handle_response (resp, resp_body)
   with exn ->
+    (* Full exception detail goes to the central log; Error string stays
+       concise (same rationale as the non-2xx case above). *)
     let exn_str = truncate_for_log (Printexc.to_string exn) in
     Logs.warn (fun m -> m "REST %s %s: exception %s" meth_str path exn_str);
-    Error (Printf.sprintf "discord REST %s %s: exception %s"
-      meth_str path exn_str)
+    Error (Printf.sprintf "discord REST %s %s: exception" meth_str path)
 
 (** Plan the chunks for a [create_message] call. Pure function, separated
     from I/O so it can be unit-tested. Content fitting in a single Discord
