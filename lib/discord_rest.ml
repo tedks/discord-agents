@@ -70,10 +70,28 @@ let read_body (body : Cohttp_eio.Body.t) =
   loop ()
 
 (** Truncate a body string for log output. Discord error responses are
-    normally short JSON objects, but we bound length to keep logs sane. *)
+    normally short JSON objects, but we bound length to keep logs sane.
+
+    UTF-8 safe: when the byte at [max_len] would split a multi-byte
+    sequence, walk back to the last leading byte so the truncation lands
+    on a codepoint boundary and the logged string remains valid UTF-8. *)
 let truncate_for_log ?(max_len = 500) s =
-  if String.length s <= max_len then s
-  else String.sub s 0 max_len ^ "... (truncated)"
+  let len = String.length s in
+  if len <= max_len then s
+  else begin
+    (* A UTF-8 continuation byte matches 10xxxxxx. Walk back past any
+       continuation bytes to the last leading byte. Bound the walk to
+       keep truncation O(1) in the pathological case where the tail of
+       [s] is all continuation bytes (ignore encoding, cut at max_len). *)
+    let is_continuation b = Char.code b land 0xC0 = 0x80 in
+    let rec find_boundary i steps_left =
+      if i = 0 || steps_left = 0 then i
+      else if is_continuation s.[i] then find_boundary (i - 1) (steps_left - 1)
+      else i
+    in
+    let cut = find_boundary max_len 4 in
+    String.sub s 0 cut ^ "... (truncated)"
+  end
 
 (** Low-level HTTP request. Returns parsed JSON or error string.
     On 429 (rate limited), sleeps Retry-After seconds and retries once.
@@ -127,10 +145,10 @@ let request t ~meth ~path ?body () =
     end else
       handle_response (resp, resp_body)
   with exn ->
-    Logs.warn (fun m -> m "REST %s %s: exception %s"
-      meth_str path (Printexc.to_string exn));
+    let exn_str = truncate_for_log (Printexc.to_string exn) in
+    Logs.warn (fun m -> m "REST %s %s: exception %s" meth_str path exn_str);
     Error (Printf.sprintf "discord REST %s %s: exception %s"
-      meth_str path (Printexc.to_string exn))
+      meth_str path exn_str)
 
 (** Plan the chunks for a [create_message] call. Pure function, separated
     from I/O so it can be unit-tested. Content fitting in a single Discord
@@ -154,7 +172,12 @@ let plan_message_chunks ?reply_to content =
 
     If a follow-up chunk fails, we stop and return Error so the caller
     knows delivery was incomplete, rather than silently returning Ok
-    with missing content in the middle. *)
+    with missing content in the middle.
+
+    Partial-delivery semantics: Error does NOT imply nothing was
+    delivered — the first chunk (and possibly several follow-ups) may
+    already be visible in the channel. There is no automatic rollback;
+    callers that need "all-or-nothing" must clean up themselves. *)
 let create_message t ~(channel_id : Discord_types.channel_id) ~content
     ?(reply_to : Discord_types.message_id option) () =
   let post_one (chunk, chunk_reply_to) =

@@ -334,6 +334,52 @@ let test_plan_boundary_2000 () =
   Alcotest.(check int) "1950 chars stays as one chunk (no 1901-2000 orphan)"
     1 (List.length plan_under)
 
+(* A standalone UTF-8 validity check so tests don't need an external lib.
+   Walks the bytes, verifying every leading byte is followed by the
+   right number of continuation bytes. Returns true only for valid UTF-8. *)
+let is_valid_utf8 s =
+  let n = String.length s in
+  let rec loop i =
+    if i >= n then true
+    else
+      let b = Char.code s.[i] in
+      let continuations =
+        if b < 0x80 then 0
+        else if b < 0xC0 then -1  (* stray continuation byte *)
+        else if b < 0xE0 then 1
+        else if b < 0xF0 then 2
+        else if b < 0xF8 then 3
+        else -1
+      in
+      if continuations < 0 || i + continuations >= n then false
+      else
+        let rec check_cont k =
+          if k > continuations then true
+          else if Char.code s.[i + k] land 0xC0 <> 0x80 then false
+          else check_cont (k + 1)
+        in
+        if check_cont 1 then loop (i + continuations + 1) else false
+  in
+  loop 0
+
+let test_truncate_for_log_utf8_boundary () =
+  (* "世界" is 6 bytes (two 3-byte codepoints). Place it so that a byte-
+     based cut at max_len=4 would land inside the first codepoint. The
+     function must walk back to a leading byte, not emit broken UTF-8. *)
+  let input = "hi " ^ "世界" ^ " tail" in
+  let truncated = Discord_agents.Discord_rest.truncate_for_log ~max_len:4 input in
+  Alcotest.(check bool) "truncated output is valid UTF-8"
+    true (is_valid_utf8 truncated);
+  (* And an ASCII-only case still truncates to exactly max_len bytes. *)
+  let ascii = String.make 100 'a' in
+  let trunc_ascii = Discord_agents.Discord_rest.truncate_for_log ~max_len:10 ascii in
+  Alcotest.(check int) "ASCII truncation cuts at max_len"
+    10 (String.length trunc_ascii - String.length "... (truncated)");
+  (* Under max_len: unchanged. *)
+  let short = "short" in
+  Alcotest.(check string) "under max_len unchanged"
+    short (Discord_agents.Discord_rest.truncate_for_log ~max_len:100 short)
+
 let split_message_tests = [
   Alcotest.test_case "short message" `Quick test_split_short;
   Alcotest.test_case "split at paragraph" `Quick test_split_long_at_paragraph;
@@ -351,6 +397,8 @@ let split_message_tests = [
     test_plan_no_reply_to;
   Alcotest.test_case "plan: 1901-2000 char range not split" `Quick
     test_plan_boundary_2000;
+  Alcotest.test_case "truncate_for_log UTF-8 safe" `Quick
+    test_truncate_for_log_utf8_boundary;
 ]
 
 (* ── scan_fences ────────────────────────────────────────────────── *)
