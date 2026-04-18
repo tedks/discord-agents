@@ -380,6 +380,39 @@ let test_truncate_for_log_utf8_boundary () =
   Alcotest.(check string) "under max_len unchanged"
     short (Discord_agents.Discord_rest.truncate_for_log ~max_len:100 short)
 
+let test_truncate_for_log_4byte_codepoint () =
+  (* "🙂" is F0 9F 99 82 — a 4-byte codepoint. Cut inside it: the walk-
+     back must handle >3 bytes of continuation without losing track. *)
+  let input = "a" ^ "🙂" ^ "b" in
+  (* max_len=2 lands inside the emoji (byte 0x9F). *)
+  let truncated = Discord_agents.Discord_rest.truncate_for_log ~max_len:2 input in
+  Alcotest.(check bool) "4-byte codepoint truncation stays valid UTF-8"
+    true (is_valid_utf8 truncated);
+  (* max_len=4 lands on the emoji's last continuation byte. *)
+  let t4 = Discord_agents.Discord_rest.truncate_for_log ~max_len:4 input in
+  Alcotest.(check bool) "4-byte codepoint truncation at last byte stays valid"
+    true (is_valid_utf8 t4)
+
+let test_truncate_for_log_invalid_utf8 () =
+  (* Pathological invalid UTF-8: a string of stray continuation bytes.
+     Regression for a bug Codex found in v3 review — the old 4-step
+     walk-back bound left [cut] still pointing at a continuation byte,
+     emitting invalid UTF-8. The unbounded walk-back should fall back
+     to position 0 and produce an empty prefix rather than bad bytes. *)
+  let bad = String.make 20 '\x80' in
+  let truncated = Discord_agents.Discord_rest.truncate_for_log ~max_len:10 bad in
+  Alcotest.(check bool) "invalid-UTF-8 input yields valid UTF-8 output"
+    true (is_valid_utf8 truncated)
+
+let test_body_snippet_trims () =
+  let long = String.make 500 'x' in
+  let snippet = Discord_agents.Discord_rest.body_snippet ~max_len:100 long in
+  Alcotest.(check bool) "snippet bounded by max_len + suffix"
+    true (String.length snippet <= 100 + 20);
+  let short = "only short text" in
+  Alcotest.(check string) "short body unchanged"
+    short (Discord_agents.Discord_rest.body_snippet short)
+
 let split_message_tests = [
   Alcotest.test_case "short message" `Quick test_split_short;
   Alcotest.test_case "split at paragraph" `Quick test_split_long_at_paragraph;
@@ -399,6 +432,12 @@ let split_message_tests = [
     test_plan_boundary_2000;
   Alcotest.test_case "truncate_for_log UTF-8 safe" `Quick
     test_truncate_for_log_utf8_boundary;
+  Alcotest.test_case "truncate_for_log handles 4-byte codepoint" `Quick
+    test_truncate_for_log_4byte_codepoint;
+  Alcotest.test_case "truncate_for_log invalid UTF-8 input safe" `Quick
+    test_truncate_for_log_invalid_utf8;
+  Alcotest.test_case "body_snippet trims long bodies" `Quick
+    test_body_snippet_trims;
 ]
 
 (* ── scan_fences ────────────────────────────────────────────────── *)

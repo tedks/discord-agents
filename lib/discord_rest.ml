@@ -69,29 +69,37 @@ let read_body (body : Cohttp_eio.Body.t) =
   in
   loop ()
 
-(** Truncate a body string for log output. Discord error responses are
-    normally short JSON objects, but we bound length to keep logs sane.
-
-    UTF-8 safe: when the byte at [max_len] would split a multi-byte
-    sequence, walk back to the last leading byte so the truncation lands
-    on a codepoint boundary and the logged string remains valid UTF-8. *)
+(** Truncate a byte string at (or before) [max_len] so the result is valid
+    UTF-8 whenever the input was. For valid UTF-8 input, walks back past
+    any continuation bytes at the cut point to land on a codepoint
+    boundary. For invalid input (stray continuation bytes, e.g. from a
+    malformed Printexc output), walks back until a leading byte or the
+    start of the string is reached — possibly cutting to empty, but
+    never emitting an invalid sequence. *)
 let truncate_for_log ?(max_len = 500) s =
   let len = String.length s in
   if len <= max_len then s
   else begin
-    (* A UTF-8 continuation byte matches 10xxxxxx. Walk back past any
-       continuation bytes to the last leading byte. Bound the walk to
-       keep truncation O(1) in the pathological case where the tail of
-       [s] is all continuation bytes (ignore encoding, cut at max_len). *)
     let is_continuation b = Char.code b land 0xC0 = 0x80 in
-    let rec find_boundary i steps_left =
-      if i = 0 || steps_left = 0 then i
-      else if is_continuation s.[i] then find_boundary (i - 1) (steps_left - 1)
+    (* Walk back without a step bound. Worst-case O(max_len), which is
+       fine — we already paid O(len) to receive the string. The previous
+       4-step bound was incorrect for invalid UTF-8 (an all-continuation-
+       bytes tail would leave cut still pointing inside a sequence). *)
+    let rec find_boundary i =
+      if i = 0 then 0
+      else if is_continuation s.[i] then find_boundary (i - 1)
       else i
     in
-    let cut = find_boundary max_len 4 in
+    let cut = find_boundary max_len in
     String.sub s 0 cut ^ "... (truncated)"
   end
+
+(** Return at most [max_len] bytes from the head of a body, UTF-8 safe.
+    Used for embedding a short excerpt of a Discord error body in
+    user-facing Error strings without risking invalid UTF-8. *)
+let body_snippet ?(max_len = 150) s =
+  if String.length s <= max_len then s
+  else truncate_for_log ~max_len s
 
 (** Low-level HTTP request. Returns parsed JSON or error string.
     On 429 (rate limited), sleeps Retry-After seconds and retries once.
@@ -122,13 +130,14 @@ let request t ~meth ~path ?body () =
       if String.length body_str = 0 then Ok `Null
       else Ok (Yojson.Safe.from_string body_str)
     end else begin
-      (* Full body goes to the central log (authoritative record). The
-         Error string carries only the status + path so callers that
-         surface it to users (e.g. "Failed to create thread: <error>")
-         stay concise and callers that also log the Error don't duplicate
-         the body in logs. *)
+      (* Log the full body (up to truncate_for_log's cap) centrally for
+         operator debugging, and include a short body snippet in the
+         Error string so user-facing surfaces (bot replies, control-API
+         responses) retain actionable detail like "Missing Permissions"
+         without bloating duplicated logs. *)
       log_non_2xx code body_str;
-      Error (Printf.sprintf "discord REST %s %s: HTTP %d" meth_str path code)
+      Error (Printf.sprintf "discord REST %s %s: HTTP %d %s"
+        meth_str path code (body_snippet body_str))
     end
   in
   try
@@ -149,11 +158,13 @@ let request t ~meth ~path ?body () =
     end else
       handle_response (resp, resp_body)
   with exn ->
-    (* Full exception detail goes to the central log; Error string stays
-       concise (same rationale as the non-2xx case above). *)
-    let exn_str = truncate_for_log (Printexc.to_string exn) in
-    Logs.warn (fun m -> m "REST %s %s: exception %s" meth_str path exn_str);
-    Error (Printf.sprintf "discord REST %s %s: exception" meth_str path)
+    (* Full detail in the central log; short snippet in the Error so
+       callers that surface it to users/API retain a useful hint. *)
+    let exn_raw = Printexc.to_string exn in
+    Logs.warn (fun m -> m "REST %s %s: exception %s" meth_str path
+      (truncate_for_log exn_raw));
+    Error (Printf.sprintf "discord REST %s %s: exception %s"
+      meth_str path (body_snippet exn_raw))
 
 (** Plan the chunks for a [create_message] call. Pure function, separated
     from I/O so it can be unit-tested. Content fitting in a single Discord
