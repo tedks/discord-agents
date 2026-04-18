@@ -244,6 +244,43 @@ let test_split_all_chunks_under_limit () =
   Alcotest.(check bool) "total content preserved"
     true (total >= 5000)
 
+(* Regression: !projects output with many entries must be safely chunkable.
+   The original bug was that create_message sent a single ~5700-char message
+   when 63 projects were discovered, and Discord silently rejected it. *)
+let test_split_projects_list_shape () =
+  let header = "**Projects** (use `!start <name>` or `!start <number>`):\n" in
+  let line i =
+    Printf.sprintf "`%d.` **tutorials/some-project-name-%d** — `/home/tedks/Projects/tutorials/some-project-name-%d`"
+      i i i
+  in
+  let lines = List.init 63 (fun i -> line (i + 1)) in
+  let input = header ^ String.concat "\n" lines in
+  Alcotest.(check bool) "input exceeds Discord's 2000-char limit (regression shape)"
+    true (String.length input > 2000);
+  let chunks = Discord_agents.Agent_process.split_message input in
+  Alcotest.(check bool) "split into multiple chunks"
+    true (List.length chunks >= 2);
+  List.iter (fun chunk ->
+    Alcotest.(check bool)
+      (Printf.sprintf "chunk %d chars <= 2000" (String.length chunk))
+      true (String.length chunk <= 2000)
+  ) chunks;
+  (* Every project line should appear in exactly one chunk (no data loss). *)
+  let combined = String.concat "" chunks in
+  List.iter (fun expected_line ->
+    let contains s sub =
+      let slen = String.length s and sublen = String.length sub in
+      let rec loop i =
+        if i + sublen > slen then false
+        else if String.sub s i sublen = sub then true
+        else loop (i + 1)
+      in loop 0
+    in
+    Alcotest.(check bool)
+      (Printf.sprintf "line preserved: %s" (String.sub expected_line 0 (min 30 (String.length expected_line))))
+      true (contains combined expected_line)
+  ) lines
+
 let split_message_tests = [
   Alcotest.test_case "short message" `Quick test_split_short;
   Alcotest.test_case "split at paragraph" `Quick test_split_long_at_paragraph;
@@ -251,6 +288,8 @@ let split_message_tests = [
     test_split_preserves_code_blocks;
   Alcotest.test_case "all chunks under limit" `Quick
     test_split_all_chunks_under_limit;
+  Alcotest.test_case "projects-list regression" `Quick
+    test_split_projects_list_shape;
 ]
 
 (* ── scan_fences ────────────────────────────────────────────────── *)

@@ -88,9 +88,15 @@ let request t ~meth ~path ?body () =
         Ok `Null
       else
         Ok (Yojson.Safe.from_string body_str)
-    end else
+    end else begin
+      (* Log non-2xx responses centrally so errors are visible even when
+         the caller discards the Result (the common [ignore (...)] pattern).
+         429s are handled and logged separately below. *)
+      let meth_str = Http.Method.to_string meth in
+      Logs.warn (fun m -> m "REST %s %s: %d %s" meth_str path code body_str);
       Error (Printf.sprintf "discord REST %s %s: %d %s"
-        (Http.Method.to_string meth) path code body_str)
+        meth_str path code body_str)
+    end
   in
   try
     let (resp, resp_body) = do_call () in
@@ -110,8 +116,11 @@ let request t ~meth ~path ?body () =
     end else
       handle_response (resp, resp_body)
   with exn ->
+    let meth_str = Http.Method.to_string meth in
+    Logs.warn (fun m -> m "REST %s %s: exception %s"
+      meth_str path (Printexc.to_string exn));
     Error (Printf.sprintf "discord REST %s %s: exception %s"
-      (Http.Method.to_string meth) path (Printexc.to_string exn))
+      meth_str path (Printexc.to_string exn))
 
 (** Send a message to a channel. Content over Discord's 2000-char limit
     is transparently split into multiple messages via [Agent_process.split_message],
