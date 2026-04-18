@@ -113,20 +113,43 @@ let request t ~meth ~path ?body () =
     Error (Printf.sprintf "discord REST %s %s: exception %s"
       (Http.Method.to_string meth) path (Printexc.to_string exn))
 
-(** Send a message to a channel. *)
+(** Send a message to a channel. Content over Discord's 2000-char limit
+    is transparently split into multiple messages via [Agent_process.split_message],
+    which preserves code-fence continuity. Only the first chunk carries
+    [reply_to]; follow-up chunks post as regular messages. The returned
+    message is the first chunk (ids of follow-ups are not exposed). *)
 let create_message t ~(channel_id : Discord_types.channel_id) ~content
     ?(reply_to : Discord_types.message_id option) () =
-  let body = `Assoc ([
-    ("content", `String content);
-  ] @ match reply_to with
-    | Some msg_id -> [("message_reference", `Assoc [("message_id", `String msg_id)])]
-    | None -> [])
+  let post_one ?reply_to chunk =
+    let body = `Assoc ([
+      ("content", `String chunk);
+    ] @ match reply_to with
+      | Some msg_id -> [("message_reference", `Assoc [("message_id", `String msg_id)])]
+      | None -> [])
+    in
+    match request t ~meth:`POST
+      ~path:(Printf.sprintf "/channels/%s/messages" channel_id) ~body () with
+    | Ok json ->
+      (try Ok (message_of_yojson json)
+       with exn -> Error (Printf.sprintf "create_message: parse error: %s"
+         (Printexc.to_string exn)))
+    | Error e -> Error e
   in
-  match request t ~meth:`POST ~path:(Printf.sprintf "/channels/%s/messages" channel_id) ~body () with
-  | Ok json ->
-    (try Ok (message_of_yojson json)
-     with exn -> Error (Printf.sprintf "create_message: parse error: %s" (Printexc.to_string exn)))
-  | Error e -> Error e
+  match Agent_process.split_message content with
+  | [] -> post_one ?reply_to content  (* defensive — split_message shouldn't return [] *)
+  | [single] -> post_one ?reply_to single
+  | first :: rest ->
+    Logs.info (fun m -> m "create_message: content %d chars exceeds Discord limit; split into %d chunks"
+      (String.length content) (List.length rest + 1));
+    (match post_one ?reply_to first with
+     | Error e -> Error e
+     | Ok first_msg ->
+       List.iter (fun chunk ->
+         match post_one chunk with
+         | Ok _ -> ()
+         | Error e -> Logs.warn (fun m -> m "create_message: follow-up chunk failed: %s" e)
+       ) rest;
+       Ok first_msg)
 
 (** Edit an existing message. *)
 let edit_message t ~(channel_id : Discord_types.channel_id)
