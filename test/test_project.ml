@@ -25,15 +25,19 @@ let make_bare_repo path =
   mkdir_p (Filename.concat path "objects");
   mkdir_p (Filename.concat path "refs")
 
+(* Walk the tree without following symlinks so a test that creates a
+   self-referential symlink (for the symlink-loop case) doesn't cause
+   infinite recursion during cleanup. *)
 let rec rm_rf path =
-  if Sys.file_exists path then begin
-    if Sys.is_directory path then begin
-      Sys.readdir path
-      |> Array.iter (fun name -> rm_rf (Filename.concat path name));
-      Unix.rmdir path
-    end else
-      Sys.remove path
-  end
+  match Unix.lstat path with
+  | exception Unix.Unix_error (ENOENT, _, _) -> ()
+  | { st_kind = S_DIR; _ } ->
+    Sys.readdir path
+    |> Array.iter (fun name -> rm_rf (Filename.concat path name));
+    Unix.rmdir path
+  | _ ->
+    (* Regular file, symlink, or other — unlink directly. *)
+    Unix.unlink path
 
 let with_tmpdir f =
   let base = Filename.temp_file "discord_agents_test_" "" in
@@ -154,6 +158,71 @@ let test_deduplicate_preserves_cluster_names () =
     Alcotest.(check (list string)) "names preserved through deduplicate"
       ["books/rust"; "books/sqlthw"] (names_of ps))
 
+(* Initialize a real git repo with a fake origin remote so get_remote_url
+   has something to find. Required for tests that exercise the dedup
+   rename-by-remote path. *)
+let make_git_repo_with_remote path ~remote_url =
+  mkdir_p path;
+  let run cmd =
+    let exit_code = Sys.command (Printf.sprintf "%s 2>/dev/null" cmd) in
+    if exit_code <> 0 then
+      Alcotest.failf "setup command failed (%d): %s" exit_code cmd
+  in
+  run (Printf.sprintf "git -C %s init -q --initial-branch=main"
+    (Filename.quote path));
+  run (Printf.sprintf "git -C %s remote add origin %s"
+    (Filename.quote path) (Filename.quote remote_url))
+
+let test_cluster_preserves_parent_with_remote () =
+  (* Real bug from code review: when a clustered repo has a remote URL,
+     the old dedup path renamed it to just the remote-basename and dropped
+     the parent/ prefix. Preserving "books/rust-learn" instead of
+     collapsing to "rust-learn" keeps the grouping context users set up. *)
+  with_tmpdir (fun base ->
+    make_git_repo_with_remote (Filename.concat base "books/rust")
+      ~remote_url:"https://github.com/example/rust-learn.git";
+    make_git_repo_with_remote (Filename.concat base "tutorials/react")
+      ~remote_url:"git@github.com:example/react-from-scratch.git";
+    let ps = P.discover ~base_directories:[base] in
+    Alcotest.(check (list string)) "parent prefix kept, basename from remote"
+      ["books/rust-learn"; "tutorials/react-from-scratch"]
+      (names_of ps))
+
+let test_symlink_loop_no_hang () =
+  (* Symlink loop inside a cluster should not hang or crash. One-level
+     recursion plus is_directory checks make this safe; we only recurse
+     into direct children, not into symlink targets that loop back. *)
+  with_tmpdir (fun base ->
+    make_git_dir (Filename.concat base "cluster/real");
+    let loop_src = Filename.concat base "cluster/loop" in
+    Unix.symlink base loop_src;
+    let ps = P.discover_in_directory base in
+    (* 'cluster/real' should be found; the symlink shouldn't cause a hang.
+       The symlink points to a dir that already contains cluster/ (but we
+       only recurse one level, so this terminates). Either the symlink's
+       target resolves to a non-git dir and is skipped, or it resolves to
+       one that contains cluster/ (still one level below). We assert the
+       real repo is always present and nothing crashes. *)
+    Alcotest.(check bool) "real cluster repo discovered"
+      true (List.mem "cluster/real" (names_of ps)))
+
+let test_permission_error_skipped () =
+  (* An unreadable subdirectory should be silently skipped, not crash
+     discovery. Our is_directory/readdir calls are wrapped in
+     try...with Sys_error _ -> []. *)
+  with_tmpdir (fun base ->
+    make_git_dir (Filename.concat base "cluster/readable");
+    let blocked = Filename.concat base "cluster/blocked" in
+    mkdir_p blocked;
+    Unix.chmod blocked 0o000;
+    let restore () =
+      try Unix.chmod blocked 0o755 with Unix.Unix_error _ -> ()
+    in
+    Fun.protect ~finally:restore (fun () ->
+      let ps = P.discover_in_directory base in
+      Alcotest.(check bool) "readable cluster child discovered"
+        true (List.mem "cluster/readable" (names_of ps))))
+
 let discovery_tests = [
   Alcotest.test_case "flat repo" `Quick test_flat_repo;
   Alcotest.test_case "bare repo" `Quick test_bare_repo;
@@ -169,6 +238,12 @@ let discovery_tests = [
   Alcotest.test_case "file in cluster" `Quick test_file_in_cluster;
   Alcotest.test_case "names preserved through deduplicate" `Quick
     test_deduplicate_preserves_cluster_names;
+  Alcotest.test_case "cluster parent preserved when child has remote" `Quick
+    test_cluster_preserves_parent_with_remote;
+  Alcotest.test_case "symlink loop doesn't hang discovery" `Quick
+    test_symlink_loop_no_hang;
+  Alcotest.test_case "unreadable subdir skipped, not crashes" `Quick
+    test_permission_error_skipped;
 ]
 
 let () =

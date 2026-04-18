@@ -246,7 +246,11 @@ let test_split_all_chunks_under_limit () =
 
 (* Regression: !projects output with many entries must be safely chunkable.
    The original bug was that create_message sent a single ~5700-char message
-   when 63 projects were discovered, and Discord silently rejected it. *)
+   when 63 projects were discovered, and Discord silently rejected it.
+
+   This test reconstructs the original text by stripping the whitespace the
+   splitter uses as delimiters — catching any duplication, reordering, or
+   loss a substring check would miss. *)
 let test_split_projects_list_shape () =
   let header = "**Projects** (use `!start <name>` or `!start <number>`):\n" in
   let line i =
@@ -265,21 +269,70 @@ let test_split_projects_list_shape () =
       (Printf.sprintf "chunk %d chars <= 2000" (String.length chunk))
       true (String.length chunk <= 2000)
   ) chunks;
-  (* Every project line should appear in exactly one chunk (no data loss). *)
-  let combined = String.concat "" chunks in
-  List.iter (fun expected_line ->
-    let contains s sub =
-      let slen = String.length s and sublen = String.length sub in
-      let rec loop i =
-        if i + sublen > slen then false
-        else if String.sub s i sublen = sub then true
-        else loop (i + 1)
-      in loop 0
-    in
-    Alcotest.(check bool)
-      (Printf.sprintf "line preserved: %s" (String.sub expected_line 0 (min 30 (String.length expected_line))))
-      true (contains combined expected_line)
-  ) lines
+  (* Strip whitespace from the original and the concatenation. split_message
+     consumes the separator (space/newline) it splits at, so whitespace-
+     insensitive comparison is the tightest check available without
+     instrumenting the splitter. Order and content must both match. *)
+  let strip_ws s =
+    let buf = Buffer.create (String.length s) in
+    String.iter (fun c ->
+      if c <> ' ' && c <> '\n' && c <> '\t' then Buffer.add_char buf c
+    ) s;
+    Buffer.contents buf
+  in
+  let recombined = strip_ws (String.concat "" chunks) in
+  let expected = strip_ws input in
+  Alcotest.(check string) "chunks reassemble to original (order-preserving)"
+    expected recombined
+
+(* plan_message_chunks is a pure function separated from create_message's I/O
+   so we can unit-test the reply_to semantics without mocking Discord. *)
+let test_plan_short_content () =
+  let plan = Discord_agents.Discord_rest.plan_message_chunks
+    ~reply_to:"origin-msg-id" "hello" in
+  Alcotest.(check int) "single chunk for short content" 1 (List.length plan);
+  match plan with
+  | [(content, reply_to)] ->
+    Alcotest.(check string) "content preserved" "hello" content;
+    Alcotest.(check (option string)) "reply_to carried"
+      (Some "origin-msg-id") reply_to
+  | _ -> Alcotest.fail "expected exactly one chunk"
+
+let test_plan_long_content_reply_to_first_only () =
+  let long = String.make 5000 'x' in
+  let plan = Discord_agents.Discord_rest.plan_message_chunks
+    ~reply_to:"origin-msg-id" long in
+  Alcotest.(check bool) "multiple chunks" true (List.length plan >= 2);
+  match plan with
+  | (_, first_reply) :: rest ->
+    Alcotest.(check (option string)) "first chunk carries reply_to"
+      (Some "origin-msg-id") first_reply;
+    List.iter (fun (_, follow_reply) ->
+      Alcotest.(check (option string)) "follow-up chunk has no reply_to"
+        None follow_reply
+    ) rest
+  | _ -> Alcotest.fail "expected at least one chunk"
+
+let test_plan_no_reply_to () =
+  let plan = Discord_agents.Discord_rest.plan_message_chunks
+    (String.make 5000 'x') in
+  Alcotest.(check bool) "multiple chunks" true (List.length plan >= 2);
+  List.iter (fun (_, reply_to) ->
+    Alcotest.(check (option string)) "no chunk has reply_to" None reply_to
+  ) plan
+
+let test_plan_boundary_2000 () =
+  (* Exactly at Discord's 2000-char limit: should be a single chunk,
+     not split at default_split_max=1900. This is the bug Codex caught. *)
+  let content = String.make 2000 'a' in
+  let plan = Discord_agents.Discord_rest.plan_message_chunks
+    ~reply_to:"origin" content in
+  Alcotest.(check int) "exactly 2000 chars stays as one chunk" 1 (List.length plan);
+  let content_3900 = String.make 1950 'a' in
+  let plan_under = Discord_agents.Discord_rest.plan_message_chunks
+    ~reply_to:"origin" content_3900 in
+  Alcotest.(check int) "1950 chars stays as one chunk (no 1901-2000 orphan)"
+    1 (List.length plan_under)
 
 let split_message_tests = [
   Alcotest.test_case "short message" `Quick test_split_short;
@@ -290,6 +343,14 @@ let split_message_tests = [
     test_split_all_chunks_under_limit;
   Alcotest.test_case "projects-list regression" `Quick
     test_split_projects_list_shape;
+  Alcotest.test_case "plan: short content → single chunk with reply_to" `Quick
+    test_plan_short_content;
+  Alcotest.test_case "plan: long content → reply_to on first only" `Quick
+    test_plan_long_content_reply_to_first_only;
+  Alcotest.test_case "plan: no reply_to propagates None" `Quick
+    test_plan_no_reply_to;
+  Alcotest.test_case "plan: 1901-2000 char range not split" `Quick
+    test_plan_boundary_2000;
 ]
 
 (* ── scan_fences ────────────────────────────────────────────────── *)

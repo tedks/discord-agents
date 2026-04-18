@@ -154,12 +154,18 @@ let deduplicate projects =
           by_url := UrlMap.add key p !by_url
         (* else keep existing *)
   ) projects;
-  (* Rename URL-matched projects to their remote repo name *)
+  (* Rename URL-matched projects to their remote repo name. For cluster
+     repos (name contains "/" from nested discovery), keep the parent
+     prefix so "books/rust" with remote "foo/rust-learn" becomes
+     "books/rust-learn", preserving the grouping context. *)
   let url_projects = UrlMap.bindings !by_url |> List.map (fun (_, p) ->
     match p.remote_url with
     | Some url ->
       let name = match repo_name_of_url url with
-        | Some n -> n
+        | Some n ->
+          (match String.index_opt p.name '/' with
+           | Some i -> String.sub p.name 0 i ^ "/" ^ n
+           | None -> n)
         | None -> p.name
       in
       { p with name }

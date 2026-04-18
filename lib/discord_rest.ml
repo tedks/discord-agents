@@ -69,33 +69,44 @@ let read_body (body : Cohttp_eio.Body.t) =
   in
   loop ()
 
+(** Truncate a body string for log output. Discord error responses are
+    normally short JSON objects, but we bound length to keep logs sane. *)
+let truncate_for_log ?(max_len = 500) s =
+  if String.length s <= max_len then s
+  else String.sub s 0 max_len ^ "... (truncated)"
+
 (** Low-level HTTP request. Returns parsed JSON or error string.
-    On 429 (rate limited), sleeps Retry-After seconds and retries once. *)
+    On 429 (rate limited), sleeps Retry-After seconds and retries once.
+    Non-2xx responses are logged centrally so callers that [ignore] the
+    Result still surface failures. 404s log at debug level (expected for
+    typing/reactions on deleted channels); other errors log at warn. *)
 let request t ~meth ~path ?body () =
   let uri = Uri.of_string (api_base ^ path) in
   let headers = make_headers t in
   let body_str = Option.map (fun j -> Yojson.Safe.to_string j) body in
+  let meth_str = Http.Method.to_string meth in
   let do_call () =
     let cohttp_body = Option.map Cohttp_eio.Body.of_string body_str in
     Cohttp_eio.Client.call t.client ~sw:t.sw ~headers ?body:cohttp_body meth uri
+  in
+  let log_non_2xx code body =
+    let body = truncate_for_log body in
+    if code = 404 then
+      Logs.debug (fun m -> m "REST %s %s: %d %s" meth_str path code body)
+    else
+      Logs.warn (fun m -> m "REST %s %s: %d %s" meth_str path code body)
   in
   let handle_response (resp, resp_body) =
     let status = Http.Response.status resp in
     let code = Http.Status.to_int status in
     let body_str = read_body resp_body in
     if code >= 200 && code < 300 then begin
-      if String.length body_str = 0 then
-        Ok `Null
-      else
-        Ok (Yojson.Safe.from_string body_str)
+      if String.length body_str = 0 then Ok `Null
+      else Ok (Yojson.Safe.from_string body_str)
     end else begin
-      (* Log non-2xx responses centrally so errors are visible even when
-         the caller discards the Result (the common [ignore (...)] pattern).
-         429s are handled and logged separately below. *)
-      let meth_str = Http.Method.to_string meth in
-      Logs.warn (fun m -> m "REST %s %s: %d %s" meth_str path code body_str);
+      log_non_2xx code body_str;
       Error (Printf.sprintf "discord REST %s %s: %d %s"
-        meth_str path code body_str)
+        meth_str path code (truncate_for_log body_str))
     end
   in
   try
@@ -116,23 +127,40 @@ let request t ~meth ~path ?body () =
     end else
       handle_response (resp, resp_body)
   with exn ->
-    let meth_str = Http.Method.to_string meth in
     Logs.warn (fun m -> m "REST %s %s: exception %s"
       meth_str path (Printexc.to_string exn));
     Error (Printf.sprintf "discord REST %s %s: exception %s"
       meth_str path (Printexc.to_string exn))
 
+(** Plan the chunks for a [create_message] call. Pure function, separated
+    from I/O so it can be unit-tested. Content fitting in a single Discord
+    message (\u2264 [discord_max_len]) returns a singleton carrying [reply_to].
+    Only the first chunk carries [reply_to] when split; follow-ups post as
+    standalone messages. *)
+let plan_message_chunks ?reply_to content =
+  if String.length content <= Agent_process.discord_max_len then
+    [(content, reply_to)]
+  else
+    match Agent_process.split_message content with
+    | [] -> [(content, reply_to)]  (* split_message never returns [] on non-empty input *)
+    | first :: rest ->
+      (first, reply_to) :: List.map (fun c -> (c, None)) rest
+
 (** Send a message to a channel. Content over Discord's 2000-char limit
     is transparently split into multiple messages via [Agent_process.split_message],
     which preserves code-fence continuity. Only the first chunk carries
     [reply_to]; follow-up chunks post as regular messages. The returned
-    message is the first chunk (ids of follow-ups are not exposed). *)
+    message is the first chunk (ids of follow-ups are not exposed).
+
+    If a follow-up chunk fails, we stop and return Error so the caller
+    knows delivery was incomplete, rather than silently returning Ok
+    with missing content in the middle. *)
 let create_message t ~(channel_id : Discord_types.channel_id) ~content
     ?(reply_to : Discord_types.message_id option) () =
-  let post_one ?reply_to chunk =
+  let post_one (chunk, chunk_reply_to) =
     let body = `Assoc ([
       ("content", `String chunk);
-    ] @ match reply_to with
+    ] @ match chunk_reply_to with
       | Some msg_id -> [("message_reference", `Assoc [("message_id", `String msg_id)])]
       | None -> [])
     in
@@ -144,21 +172,25 @@ let create_message t ~(channel_id : Discord_types.channel_id) ~content
          (Printexc.to_string exn)))
     | Error e -> Error e
   in
-  match Agent_process.split_message content with
-  | [] -> post_one ?reply_to content  (* defensive — split_message shouldn't return [] *)
-  | [single] -> post_one ?reply_to single
+  match plan_message_chunks ?reply_to content with
+  | [] -> Error "create_message: empty plan (should not happen)"
+  | [single] -> post_one single
   | first :: rest ->
     Logs.info (fun m -> m "create_message: content %d chars exceeds Discord limit; split into %d chunks"
       (String.length content) (List.length rest + 1));
-    (match post_one ?reply_to first with
+    (match post_one first with
      | Error e -> Error e
      | Ok first_msg ->
-       List.iter (fun chunk ->
-         match post_one chunk with
-         | Ok _ -> ()
-         | Error e -> Logs.warn (fun m -> m "create_message: follow-up chunk failed: %s" e)
-       ) rest;
-       Ok first_msg)
+       let rec send_rest = function
+         | [] -> Ok first_msg
+         | chunk :: more ->
+           match post_one chunk with
+           | Ok _ -> send_rest more
+           | Error e ->
+             Error (Printf.sprintf
+               "create_message: follow-up chunk failed, delivery incomplete: %s" e)
+       in
+       send_rest rest)
 
 (** Edit an existing message. *)
 let edit_message t ~(channel_id : Discord_types.channel_id)
