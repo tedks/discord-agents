@@ -69,13 +69,14 @@ let read_body (body : Cohttp_eio.Body.t) =
   in
   loop ()
 
-(** Truncate a byte string at (or before) [max_len] so the result is valid
-    UTF-8 whenever the input was. For valid UTF-8 input, walks back past
-    any continuation bytes at the cut point to land on a codepoint
-    boundary. For invalid input (stray continuation bytes, e.g. from a
-    malformed Printexc output), walks back until a leading byte or the
-    start of the string is reached — possibly cutting to empty, but
-    never emitting an invalid sequence. *)
+(** Truncate a byte string near [max_len] for log output. Preserves
+    UTF-8 validity without verifying it: if the input is valid UTF-8,
+    the prefix is also valid (we walk back past continuation bytes at
+    the cut point to land on a codepoint boundary). If the input is
+    already invalid (stray continuation bytes, lone leading bytes),
+    that invalidity may remain in the prefix — we don't scan or sanitize
+    bytes that were already there. Destination is a log; the caller
+    wants bounded length, not full validation. *)
 let truncate_for_log ?(max_len = 500) s =
   let len = String.length s in
   if len <= max_len then s
@@ -94,9 +95,12 @@ let truncate_for_log ?(max_len = 500) s =
     String.sub s 0 cut ^ "... (truncated)"
   end
 
-(** Return at most [max_len] bytes from the head of a body, UTF-8 safe.
-    Used for embedding a short excerpt of a Discord error body in
-    user-facing Error strings without risking invalid UTF-8. *)
+(** Return a short head-of-body excerpt for user-facing Error strings.
+    Returns [s] unchanged if it's within [max_len] bytes; otherwise
+    returns a prefix near [max_len] bytes plus the "... (truncated)"
+    suffix added by [truncate_for_log]. Final length can exceed [max_len]
+    by the suffix length. Inherits [truncate_for_log]'s UTF-8 behavior
+    (valid input stays valid; already-invalid input passes through). *)
 let body_snippet ?(max_len = 150) s =
   if String.length s <= max_len then s
   else truncate_for_log ~max_len s

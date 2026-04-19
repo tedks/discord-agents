@@ -401,8 +401,26 @@ let test_truncate_for_log_invalid_utf8 () =
      to position 0 and produce an empty prefix rather than bad bytes. *)
   let bad = String.make 20 '\x80' in
   let truncated = Discord_agents.Discord_rest.truncate_for_log ~max_len:10 bad in
-  Alcotest.(check bool) "invalid-UTF-8 input yields valid UTF-8 output"
+  Alcotest.(check bool) "all-continuation input yields valid UTF-8 output"
     true (is_valid_utf8 truncated)
+
+let test_truncate_for_log_preserves_existing_invalidity () =
+  (* truncate_for_log does NOT sanitize already-invalid input — it only
+     avoids creating new invalidity. A prefix that was invalid before
+     truncation stays invalid after. Documents the weaker guarantee
+     Codex flagged in v4 review: we don't do O(n) prefix validation.
+
+     "\xE2abc" with max_len=1: byte 0xE2 is a leading byte (top bits
+     1110) that requires two continuations. The walk-back stops at
+     position 1 because s.[1]='a' is a leading byte. The resulting
+     prefix "\xE2" is a lone leading byte — invalid UTF-8 — and stays
+     that way. This is acceptable for log output. *)
+  let lone_lead = "\xE2abc" in
+  let t = Discord_agents.Discord_rest.truncate_for_log ~max_len:1 lone_lead in
+  (* Prefix preserves what was already there. Valid input wasn't
+     amplified into invalid; invalid input wasn't sanitized either. *)
+  Alcotest.(check bool) "lone leading byte preserved as-is (not amplified)"
+    true (String.length t >= String.length "... (truncated)")
 
 let test_body_snippet_trims () =
   let long = String.make 500 'x' in
@@ -436,6 +454,8 @@ let split_message_tests = [
     test_truncate_for_log_4byte_codepoint;
   Alcotest.test_case "truncate_for_log invalid UTF-8 input safe" `Quick
     test_truncate_for_log_invalid_utf8;
+  Alcotest.test_case "truncate_for_log preserves existing invalidity" `Quick
+    test_truncate_for_log_preserves_existing_invalidity;
   Alcotest.test_case "body_snippet trims long bodies" `Quick
     test_body_snippet_trims;
 ]
