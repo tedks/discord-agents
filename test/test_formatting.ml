@@ -417,10 +417,23 @@ let test_truncate_for_log_preserves_existing_invalidity () =
      that way. This is acceptable for log output. *)
   let lone_lead = "\xE2abc" in
   let t = Discord_agents.Discord_rest.truncate_for_log ~max_len:1 lone_lead in
-  (* Prefix preserves what was already there. Valid input wasn't
-     amplified into invalid; invalid input wasn't sanitized either. *)
-  Alcotest.(check bool) "lone leading byte preserved as-is (not amplified)"
-    true (String.length t >= String.length "... (truncated)")
+  let suffix = "... (truncated)" in
+  let suffix_len = String.length suffix in
+  (* Must have truncated (output length >= suffix, input was shorter only if
+     we didn't truncate). *)
+  Alcotest.(check bool) "truncation occurred"
+    true (String.length t > suffix_len);
+  (* The preserved prefix is the first byte — "\xE2" — not empty and not
+     sanitized. Check bytes explicitly rather than just length: if a future
+     refactor silently stripped invalid bytes the test would catch it. *)
+  let prefix = String.sub t 0 (String.length t - suffix_len) in
+  Alcotest.(check string) "invalid leading byte preserved as-is"
+    "\xE2" prefix;
+  (* And the output is itself invalid UTF-8 — we intentionally don't
+     sanitize. If someone later adds a "clean on truncate" behavior this
+     test forces them to update the contract consciously. *)
+  Alcotest.(check bool) "output retains invalidity (not amplified, not cleaned)"
+    false (is_valid_utf8 t)
 
 let test_body_snippet_trims () =
   let long = String.make 500 'x' in
