@@ -69,22 +69,46 @@ let repo_name_of_url url =
     in
     if last = "" then None else Some last
 
+(** Max git repos to pull in from a single non-git parent directory. Protects
+    against vendored trees (node_modules/, third_party/) accidentally exploding
+    the project list. *)
+let max_nested_repos = 10
+
+let project_of_dir ~name path =
+  let is_bare = is_bare_repo path in
+  let is_git = is_git_dir path in
+  if is_bare || is_git then
+    let remote_url = get_remote_url path is_bare in
+    Some { name; path; is_bare; remote_url }
+  else
+    None
+
 let discover_in_directory base_dir =
   if not (Sys.file_exists base_dir && (try Sys.is_directory base_dir with Sys_error _ -> false)) then
     []
   else
     let entries = Sys.readdir base_dir |> Array.to_list in
-    List.filter_map (fun name ->
+    List.concat_map (fun name ->
       let path = Filename.concat base_dir name in
-      if not (try Sys.is_directory path with Sys_error _ -> false) then None
+      if not (try Sys.is_directory path with Sys_error _ -> false) then []
       else
-        let is_bare = is_bare_repo path in
-        let is_git = is_git_dir path in
-        if is_bare || is_git then
-          let remote_url = get_remote_url path is_bare in
-          Some { name; path; is_bare; remote_url }
-        else
-          None
+        match project_of_dir ~name path with
+        | Some p -> [p]
+        | None ->
+          (* Non-git directory: scan one level deeper for clustered repos
+             (e.g. ~/Projects/books/{lsqlthw,rust,projectsthw}). *)
+          let sub_entries =
+            try Sys.readdir path |> Array.to_list
+            with Sys_error _ -> []
+          in
+          let nested = List.filter_map (fun sub_name ->
+            let sub_path = Filename.concat path sub_name in
+            if not (try Sys.is_directory sub_path with Sys_error _ -> false) then None
+            else
+              project_of_dir ~name:(name ^ "/" ^ sub_name) sub_path
+          ) sub_entries in
+          if List.length nested > max_nested_repos then []
+          else nested
     ) entries
 
 (** Deduplicate projects by remote URL.
@@ -130,12 +154,23 @@ let deduplicate projects =
           by_url := UrlMap.add key p !by_url
         (* else keep existing *)
   ) projects;
-  (* Rename URL-matched projects to their remote repo name *)
+  (* Rename URL-matched projects to their remote repo name. For cluster
+     repos (name contains "/" from nested discovery), keep the parent
+     prefix so "books/rust" with remote "foo/rust-learn" becomes
+     "books/rust-learn", preserving the grouping context.
+
+     We take only the first slash because discovery currently recurses
+     exactly one level (so at most one slash exists in the name). If
+     discovery is ever extended to deeper recursion, revisit this to
+     preserve the full parent path. *)
   let url_projects = UrlMap.bindings !by_url |> List.map (fun (_, p) ->
     match p.remote_url with
     | Some url ->
       let name = match repo_name_of_url url with
-        | Some n -> n
+        | Some n ->
+          (match String.index_opt p.name '/' with
+           | Some i -> String.sub p.name 0 i ^ "/" ^ n
+           | None -> n)
         | None -> p.name
       in
       { p with name }

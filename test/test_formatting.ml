@@ -244,6 +244,206 @@ let test_split_all_chunks_under_limit () =
   Alcotest.(check bool) "total content preserved"
     true (total >= 5000)
 
+(* Regression: !projects output with many entries must be safely chunkable.
+   The original bug was that create_message sent a single ~5700-char message
+   when 63 projects were discovered, and Discord silently rejected it.
+
+   This test reconstructs the original text by stripping the whitespace the
+   splitter uses as delimiters — catching any duplication, reordering, or
+   loss a substring check would miss. *)
+let test_split_projects_list_shape () =
+  let header = "**Projects** (use `!start <name>` or `!start <number>`):\n" in
+  let line i =
+    Printf.sprintf "`%d.` **tutorials/some-project-name-%d** — `/home/tedks/Projects/tutorials/some-project-name-%d`"
+      i i i
+  in
+  let lines = List.init 63 (fun i -> line (i + 1)) in
+  let input = header ^ String.concat "\n" lines in
+  Alcotest.(check bool) "input exceeds Discord's 2000-char limit (regression shape)"
+    true (String.length input > 2000);
+  let chunks = Discord_agents.Agent_process.split_message input in
+  Alcotest.(check bool) "split into multiple chunks"
+    true (List.length chunks >= 2);
+  List.iter (fun chunk ->
+    Alcotest.(check bool)
+      (Printf.sprintf "chunk %d chars <= 2000" (String.length chunk))
+      true (String.length chunk <= 2000)
+  ) chunks;
+  (* Strip whitespace from the original and the concatenation. split_message
+     consumes the separator (space/newline) it splits at, so whitespace-
+     insensitive comparison is the tightest check available without
+     instrumenting the splitter. Order and content must both match. *)
+  let strip_ws s =
+    let buf = Buffer.create (String.length s) in
+    String.iter (fun c ->
+      if c <> ' ' && c <> '\n' && c <> '\t' then Buffer.add_char buf c
+    ) s;
+    Buffer.contents buf
+  in
+  let recombined = strip_ws (String.concat "" chunks) in
+  let expected = strip_ws input in
+  Alcotest.(check string) "chunks reassemble to original (order-preserving)"
+    expected recombined
+
+(* plan_message_chunks is a pure function separated from create_message's I/O
+   so we can unit-test the reply_to semantics without mocking Discord. *)
+let test_plan_short_content () =
+  let plan = Discord_agents.Discord_rest.plan_message_chunks
+    ~reply_to:"origin-msg-id" "hello" in
+  Alcotest.(check int) "single chunk for short content" 1 (List.length plan);
+  match plan with
+  | [(content, reply_to)] ->
+    Alcotest.(check string) "content preserved" "hello" content;
+    Alcotest.(check (option string)) "reply_to carried"
+      (Some "origin-msg-id") reply_to
+  | _ -> Alcotest.fail "expected exactly one chunk"
+
+let test_plan_long_content_reply_to_first_only () =
+  let long = String.make 5000 'x' in
+  let plan = Discord_agents.Discord_rest.plan_message_chunks
+    ~reply_to:"origin-msg-id" long in
+  Alcotest.(check bool) "multiple chunks" true (List.length plan >= 2);
+  match plan with
+  | (_, first_reply) :: rest ->
+    Alcotest.(check (option string)) "first chunk carries reply_to"
+      (Some "origin-msg-id") first_reply;
+    List.iter (fun (_, follow_reply) ->
+      Alcotest.(check (option string)) "follow-up chunk has no reply_to"
+        None follow_reply
+    ) rest
+  | _ -> Alcotest.fail "expected at least one chunk"
+
+let test_plan_no_reply_to () =
+  let plan = Discord_agents.Discord_rest.plan_message_chunks
+    (String.make 5000 'x') in
+  Alcotest.(check bool) "multiple chunks" true (List.length plan >= 2);
+  List.iter (fun (_, reply_to) ->
+    Alcotest.(check (option string)) "no chunk has reply_to" None reply_to
+  ) plan
+
+let test_plan_boundary_2000 () =
+  (* Exactly at Discord's 2000-char limit: should be a single chunk,
+     not split at default_split_max=1900. This is the bug Codex caught. *)
+  let content = String.make 2000 'a' in
+  let plan = Discord_agents.Discord_rest.plan_message_chunks
+    ~reply_to:"origin" content in
+  Alcotest.(check int) "exactly 2000 chars stays as one chunk" 1 (List.length plan);
+  let content_3900 = String.make 1950 'a' in
+  let plan_under = Discord_agents.Discord_rest.plan_message_chunks
+    ~reply_to:"origin" content_3900 in
+  Alcotest.(check int) "1950 chars stays as one chunk (no 1901-2000 orphan)"
+    1 (List.length plan_under)
+
+(* A standalone UTF-8 validity check so tests don't need an external lib.
+   Walks the bytes, verifying every leading byte is followed by the
+   right number of continuation bytes. Returns true only for valid UTF-8. *)
+let is_valid_utf8 s =
+  let n = String.length s in
+  let rec loop i =
+    if i >= n then true
+    else
+      let b = Char.code s.[i] in
+      let continuations =
+        if b < 0x80 then 0
+        else if b < 0xC0 then -1  (* stray continuation byte *)
+        else if b < 0xE0 then 1
+        else if b < 0xF0 then 2
+        else if b < 0xF8 then 3
+        else -1
+      in
+      if continuations < 0 || i + continuations >= n then false
+      else
+        let rec check_cont k =
+          if k > continuations then true
+          else if Char.code s.[i + k] land 0xC0 <> 0x80 then false
+          else check_cont (k + 1)
+        in
+        if check_cont 1 then loop (i + continuations + 1) else false
+  in
+  loop 0
+
+let test_truncate_for_log_utf8_boundary () =
+  (* "世界" is 6 bytes (two 3-byte codepoints). Place it so that a byte-
+     based cut at max_len=4 would land inside the first codepoint. The
+     function must walk back to a leading byte, not emit broken UTF-8. *)
+  let input = "hi " ^ "世界" ^ " tail" in
+  let truncated = Discord_agents.Discord_rest.truncate_for_log ~max_len:4 input in
+  Alcotest.(check bool) "truncated output is valid UTF-8"
+    true (is_valid_utf8 truncated);
+  (* And an ASCII-only case still truncates to exactly max_len bytes. *)
+  let ascii = String.make 100 'a' in
+  let trunc_ascii = Discord_agents.Discord_rest.truncate_for_log ~max_len:10 ascii in
+  Alcotest.(check int) "ASCII truncation cuts at max_len"
+    10 (String.length trunc_ascii - String.length "... (truncated)");
+  (* Under max_len: unchanged. *)
+  let short = "short" in
+  Alcotest.(check string) "under max_len unchanged"
+    short (Discord_agents.Discord_rest.truncate_for_log ~max_len:100 short)
+
+let test_truncate_for_log_4byte_codepoint () =
+  (* "🙂" is F0 9F 99 82 — a 4-byte codepoint. Cut inside it: the walk-
+     back must handle >3 bytes of continuation without losing track. *)
+  let input = "a" ^ "🙂" ^ "b" in
+  (* max_len=2 lands inside the emoji (byte 0x9F). *)
+  let truncated = Discord_agents.Discord_rest.truncate_for_log ~max_len:2 input in
+  Alcotest.(check bool) "4-byte codepoint truncation stays valid UTF-8"
+    true (is_valid_utf8 truncated);
+  (* max_len=4 lands on the emoji's last continuation byte. *)
+  let t4 = Discord_agents.Discord_rest.truncate_for_log ~max_len:4 input in
+  Alcotest.(check bool) "4-byte codepoint truncation at last byte stays valid"
+    true (is_valid_utf8 t4)
+
+let test_truncate_for_log_invalid_utf8 () =
+  (* Pathological invalid UTF-8: a string of stray continuation bytes.
+     Regression for a bug Codex found in v3 review — the old 4-step
+     walk-back bound left [cut] still pointing at a continuation byte,
+     emitting invalid UTF-8. The unbounded walk-back should fall back
+     to position 0 and produce an empty prefix rather than bad bytes. *)
+  let bad = String.make 20 '\x80' in
+  let truncated = Discord_agents.Discord_rest.truncate_for_log ~max_len:10 bad in
+  Alcotest.(check bool) "all-continuation input yields valid UTF-8 output"
+    true (is_valid_utf8 truncated)
+
+let test_truncate_for_log_preserves_existing_invalidity () =
+  (* truncate_for_log does NOT sanitize already-invalid input — it only
+     avoids creating new invalidity. A prefix that was invalid before
+     truncation stays invalid after. Documents the weaker guarantee
+     Codex flagged in v4 review: we don't do O(n) prefix validation.
+
+     "\xE2abc" with max_len=1: byte 0xE2 is a leading byte (top bits
+     1110) that requires two continuations. The walk-back stops at
+     position 1 because s.[1]='a' is a leading byte. The resulting
+     prefix "\xE2" is a lone leading byte — invalid UTF-8 — and stays
+     that way. This is acceptable for log output. *)
+  let lone_lead = "\xE2abc" in
+  let t = Discord_agents.Discord_rest.truncate_for_log ~max_len:1 lone_lead in
+  let suffix = "... (truncated)" in
+  let suffix_len = String.length suffix in
+  (* Must have truncated (output length >= suffix, input was shorter only if
+     we didn't truncate). *)
+  Alcotest.(check bool) "truncation occurred"
+    true (String.length t > suffix_len);
+  (* The preserved prefix is the first byte — "\xE2" — not empty and not
+     sanitized. Check bytes explicitly rather than just length: if a future
+     refactor silently stripped invalid bytes the test would catch it. *)
+  let prefix = String.sub t 0 (String.length t - suffix_len) in
+  Alcotest.(check string) "invalid leading byte preserved as-is"
+    "\xE2" prefix;
+  (* And the output is itself invalid UTF-8 — we intentionally don't
+     sanitize. If someone later adds a "clean on truncate" behavior this
+     test forces them to update the contract consciously. *)
+  Alcotest.(check bool) "output retains invalidity (not amplified, not cleaned)"
+    false (is_valid_utf8 t)
+
+let test_body_snippet_trims () =
+  let long = String.make 500 'x' in
+  let snippet = Discord_agents.Discord_rest.body_snippet ~max_len:100 long in
+  Alcotest.(check bool) "snippet bounded by max_len + suffix"
+    true (String.length snippet <= 100 + 20);
+  let short = "only short text" in
+  Alcotest.(check string) "short body unchanged"
+    short (Discord_agents.Discord_rest.body_snippet short)
+
 let split_message_tests = [
   Alcotest.test_case "short message" `Quick test_split_short;
   Alcotest.test_case "split at paragraph" `Quick test_split_long_at_paragraph;
@@ -251,6 +451,26 @@ let split_message_tests = [
     test_split_preserves_code_blocks;
   Alcotest.test_case "all chunks under limit" `Quick
     test_split_all_chunks_under_limit;
+  Alcotest.test_case "projects-list regression" `Quick
+    test_split_projects_list_shape;
+  Alcotest.test_case "plan: short content → single chunk with reply_to" `Quick
+    test_plan_short_content;
+  Alcotest.test_case "plan: long content → reply_to on first only" `Quick
+    test_plan_long_content_reply_to_first_only;
+  Alcotest.test_case "plan: no reply_to propagates None" `Quick
+    test_plan_no_reply_to;
+  Alcotest.test_case "plan: 1901-2000 char range not split" `Quick
+    test_plan_boundary_2000;
+  Alcotest.test_case "truncate_for_log UTF-8 safe" `Quick
+    test_truncate_for_log_utf8_boundary;
+  Alcotest.test_case "truncate_for_log handles 4-byte codepoint" `Quick
+    test_truncate_for_log_4byte_codepoint;
+  Alcotest.test_case "truncate_for_log invalid UTF-8 input safe" `Quick
+    test_truncate_for_log_invalid_utf8;
+  Alcotest.test_case "truncate_for_log preserves existing invalidity" `Quick
+    test_truncate_for_log_preserves_existing_invalidity;
+  Alcotest.test_case "body_snippet trims long bodies" `Quick
+    test_body_snippet_trims;
 ]
 
 (* ── scan_fences ────────────────────────────────────────────────── *)
