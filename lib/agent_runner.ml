@@ -126,7 +126,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
     ~prompt ?(attachments=[]) ~author_name ~channel_name ~channel_type
     ?(wrap_width=Agent_process.desktop_width)
     ?(output_lines=Agent_process.default_output_lines)
-    ?on_scroll_content ?on_pid () =
+    ?on_scroll_content ?on_pid ?on_session_id () =
   (* Download attachments and append paths to the prompt *)
   let downloaded = download_attachments ~rest
     ~working_dir:session.Session_store.working_dir attachments in
@@ -290,7 +290,14 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
         flush_to_discord ();
         last_edit := now
       end
-    | Agent_process.Result { text = _; session_id = _ } ->
+    | Agent_process.Result { text = _; session_id } ->
+      (* Codex assigns session ids server-side (via thread.started);
+         forward any new id so the caller can persist it for resume.
+         Claude's final result also carries session_id but it matches
+         the pre-assigned value, so the callback is a no-op there. *)
+      (match session_id, on_session_id with
+       | Some sid, Some cb -> cb sid
+       | _ -> ());
       flush_tool_status ();
       flush_to_discord ()
     | Agent_process.Tool_use info ->

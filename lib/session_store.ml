@@ -15,7 +15,11 @@ type session = {
   project_name : string;
   working_dir : string;
   agent_kind : Config.agent_kind;
-  session_id : string;  (* Claude session UUID, not a Discord snowflake *)
+  (* Mutable because Codex assigns its session id server-side: the
+     pre-generated UUID is overwritten once the first thread.started
+     event arrives. Claude accepts a caller-supplied id, so its value
+     never changes after creation. *)
+  mutable session_id : string;
   thread_id : Discord_types.channel_id;  (* threads are channels in Discord *)
   system_prompt : string option;
   mutable message_count : int;
@@ -129,6 +133,15 @@ let count t = SessionMap.cardinal t.sessions
 let increment_message_count t session =
   session.message_count <- session.message_count + 1;
   save t
+
+(** Update a session's id and persist.
+    Used when an agent assigns its id server-side (Codex's thread.started)
+    so the pre-generated UUID is replaced before the next resume. *)
+let set_session_id t session ~session_id =
+  if session.session_id <> session_id then begin
+    session.session_id <- session_id;
+    save t
+  end
 
 (** Reload sessions from disk if the file changed.
     Rate-limited to once per 5 seconds. Merges new sessions

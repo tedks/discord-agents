@@ -758,6 +758,157 @@ let escape_nested_fences_tests = [
     test_escape_nested_backticks_inside_code;
 ]
 
+(* ── parse_codex_json_line ────────────────────────────────────────── *)
+
+let parse_codex = Discord_agents.Agent_process.parse_codex_json_line
+
+(* Helpers to pattern-match on stream_event without depending on a pp. *)
+let expect_session_id events =
+  match events with
+  | [Discord_agents.Agent_process.Result { session_id = Some sid; _ }] ->
+    Some sid
+  | _ -> None
+
+let expect_text events =
+  match events with
+  | [Discord_agents.Agent_process.Text_delta s] -> Some s
+  | _ -> None
+
+let expect_tool events =
+  match events with
+  | [Discord_agents.Agent_process.Tool_use info] -> Some info
+  | _ -> None
+
+let expect_tool_result events =
+  match events with
+  | [Discord_agents.Agent_process.Tool_result { content }] -> Some content
+  | _ -> None
+
+let test_codex_thread_started () =
+  let line = {|{"type":"thread.started","thread_id":"abc-123"}|} in
+  Alcotest.(check (option string)) "captures thread_id as session_id"
+    (Some "abc-123") (expect_session_id (parse_codex line))
+
+let test_codex_turn_started_dropped () =
+  let line = {|{"type":"turn.started"}|} in
+  Alcotest.(check int) "turn.started emits nothing"
+    0 (List.length (parse_codex line))
+
+let test_codex_turn_completed_flushes () =
+  let line = {|{"type":"turn.completed","usage":{"input_tokens":1}}|} in
+  match parse_codex line with
+  | [Discord_agents.Agent_process.Result { session_id = None; _ }] -> ()
+  | _ -> Alcotest.fail "expected single Result with no session_id"
+
+let test_codex_agent_message () =
+  let line = {|{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"hello world"}}|} in
+  Alcotest.(check (option string)) "agent_message becomes Text_delta"
+    (Some "hello world") (expect_text (parse_codex line))
+
+let test_codex_agent_message_empty_dropped () =
+  let line = {|{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":""}}|} in
+  Alcotest.(check int) "empty agent_message emits nothing"
+    0 (List.length (parse_codex line))
+
+let test_codex_command_started () =
+  let line = {|{"type":"item.started","item":{"id":"i1","type":"command_execution","command":"ls -1","status":"in_progress"}}|} in
+  match expect_tool (parse_codex line) with
+  | Some info ->
+    Alcotest.(check string) "tool name" "Bash" info.tool_name;
+    Alcotest.(check string) "summary" "ls -1" info.tool_summary;
+    Alcotest.(check bool) "detail is bash code block"
+      true (let d = info.tool_detail in
+            String.length d >= 7 && String.sub d 0 7 = "```bash")
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let test_codex_command_completed () =
+  let line = {|{"type":"item.completed","item":{"id":"i1","type":"command_execution","command":"echo hi","aggregated_output":"hi\n","exit_code":0,"status":"completed"}}|} in
+  Alcotest.(check (option string)) "completed emits Tool_result with output"
+    (Some "hi\n") (expect_tool_result (parse_codex line))
+
+let test_codex_command_completed_nonzero_exit () =
+  let line = {|{"type":"item.completed","item":{"id":"i1","type":"command_execution","command":"false","aggregated_output":"","exit_code":1,"status":"completed"}}|} in
+  Alcotest.(check (option string)) "nonzero exit prefixed with [exit N]"
+    (Some "[exit 1]\n") (expect_tool_result (parse_codex line))
+
+let test_codex_command_completed_empty_dropped () =
+  let line = {|{"type":"item.completed","item":{"id":"i1","type":"command_execution","command":"true","aggregated_output":"","exit_code":0,"status":"completed"}}|} in
+  Alcotest.(check int) "exit 0 with no output emits nothing"
+    0 (List.length (parse_codex line))
+
+let test_codex_file_change_add () =
+  let line = {|{"type":"item.completed","item":{"id":"i2","type":"file_change","changes":[{"path":"/tmp/hello.txt","kind":"add"}],"status":"completed"}}|} in
+  match expect_tool (parse_codex line) with
+  | Some info ->
+    Alcotest.(check string) "add maps to Write" "Write" info.tool_name;
+    Alcotest.(check bool) "summary mentions path"
+      true (try ignore (Str.search_forward
+              (Str.regexp_string "/tmp/hello.txt") info.tool_summary 0); true
+            with Not_found -> false)
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let test_codex_file_change_update () =
+  let line = {|{"type":"item.completed","item":{"id":"i2","type":"file_change","changes":[{"path":"src/foo.ml","kind":"update"}]}}|} in
+  match expect_tool (parse_codex line) with
+  | Some info ->
+    Alcotest.(check string) "update maps to Edit" "Edit" info.tool_name
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let test_codex_file_change_multi () =
+  let line = {|{"type":"item.completed","item":{"id":"i2","type":"file_change","changes":[{"path":"a.ml","kind":"add"},{"path":"b.ml","kind":"update"}]}}|} in
+  match expect_tool (parse_codex line) with
+  | Some info ->
+    Alcotest.(check string) "multi-file maps to Edit" "Edit" info.tool_name;
+    Alcotest.(check string) "summary reports count" "2 files" info.tool_summary
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let test_codex_reasoning_dropped () =
+  let line = {|{"type":"item.completed","item":{"id":"i3","type":"reasoning","text":"thinking..."}}|} in
+  Alcotest.(check int) "reasoning emits nothing"
+    0 (List.length (parse_codex line))
+
+let test_codex_malformed_becomes_other () =
+  let line = "not json at all" in
+  match parse_codex line with
+  | [Discord_agents.Agent_process.Other raw] ->
+    Alcotest.(check string) "preserves raw line" line raw
+  | _ -> Alcotest.fail "expected single Other event"
+
+let test_codex_unknown_item_type () =
+  let line = {|{"type":"item.completed","item":{"type":"novel_item_type"}}|} in
+  match parse_codex line with
+  | [Discord_agents.Agent_process.Other _] -> ()
+  | _ -> Alcotest.fail "expected Other for unknown item type"
+
+let test_codex_command_injection_summary () =
+  (* Backticks in the command should not escape the inline code span
+     when shown in a Discord status line. *)
+  let line = {|{"type":"item.started","item":{"type":"command_execution","command":"echo `whoami`","status":"in_progress"}}|} in
+  match expect_tool (parse_codex line) with
+  | Some info ->
+    Alcotest.(check bool) "summary has no backticks"
+      true (not (String.contains info.tool_summary '`'))
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let codex_json_tests = [
+  Alcotest.test_case "thread.started captures id" `Quick test_codex_thread_started;
+  Alcotest.test_case "turn.started dropped" `Quick test_codex_turn_started_dropped;
+  Alcotest.test_case "turn.completed flushes" `Quick test_codex_turn_completed_flushes;
+  Alcotest.test_case "agent_message text" `Quick test_codex_agent_message;
+  Alcotest.test_case "empty agent_message dropped" `Quick test_codex_agent_message_empty_dropped;
+  Alcotest.test_case "command start is Tool_use Bash" `Quick test_codex_command_started;
+  Alcotest.test_case "command complete is Tool_result" `Quick test_codex_command_completed;
+  Alcotest.test_case "nonzero exit prefixed" `Quick test_codex_command_completed_nonzero_exit;
+  Alcotest.test_case "empty success dropped" `Quick test_codex_command_completed_empty_dropped;
+  Alcotest.test_case "file_change add" `Quick test_codex_file_change_add;
+  Alcotest.test_case "file_change update" `Quick test_codex_file_change_update;
+  Alcotest.test_case "file_change multi" `Quick test_codex_file_change_multi;
+  Alcotest.test_case "reasoning dropped" `Quick test_codex_reasoning_dropped;
+  Alcotest.test_case "malformed becomes Other" `Quick test_codex_malformed_becomes_other;
+  Alcotest.test_case "unknown item type" `Quick test_codex_unknown_item_type;
+  Alcotest.test_case "backticks sanitized in summary" `Quick test_codex_command_injection_summary;
+]
+
 (* ── runner ──────────────────────────────────────────────────────── *)
 
 let () =
@@ -772,4 +923,5 @@ let () =
     "command_parsing", command_tests;
     "tool_detail", tool_detail_tests;
     "escape_nested_fences", escape_nested_fences_tests;
+    "codex_json", codex_json_tests;
   ]

@@ -846,13 +846,16 @@ let handle_thread_message t msg ?channel_info () =
                 state.blocks <- blocks;
                 state.current_block <- 1;
                 Hashtbl.replace t.scroll_states channel_id state in
+              let on_session_id sid =
+                Session_store.set_session_id t.sessions session
+                  ~session_id:sid in
               let result = Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
                       ~session ~channel_id ~prompt
                       ~attachments:msg.attachments
                       ~author_name ~channel_name ~channel_type
                       ~wrap_width:t.wrap_width
                       ~output_lines:t.output_lines
-                      ~on_scroll_content ~on_pid () in
+                      ~on_scroll_content ~on_pid ~on_session_id () in
               ignore (Discord_rest.delete_own_reaction t.rest ~channel_id
                 ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
               (match result with

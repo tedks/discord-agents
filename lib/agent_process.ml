@@ -837,6 +837,99 @@ let parse_stream_json_line line =
     | _ -> [Other line]
   with _ -> [Other line]
 
+(** Parse a codex exec --json event line.
+    Codex emits one JSON object per line with these shapes:
+    - {"type":"thread.started","thread_id":"<uuid>"} — session id is
+      assigned server-side; capture for resume.
+    - {"type":"turn.started"} — ignored.
+    - {"type":"turn.completed","usage":{...}} — triggers a final flush.
+    - {"type":"item.started","item":{"type":"command_execution",...}} —
+      tool invocation beginning.
+    - {"type":"item.completed","item":{"type":"agent_message","text":...}}
+      — fully-formed assistant text (not streamed).
+    - {"type":"item.completed","item":{"type":"command_execution",
+      "aggregated_output":"...","exit_code":N,...}} — tool finished.
+    - {"type":"item.completed","item":{"type":"file_change","changes":[...]}}
+      — files modified by Codex.
+
+    Unlike Claude's stream-json, agent_message arrives as one complete
+    text per item, not as incremental deltas. The agent_runner's text
+    buffering and chunking handles both shapes. *)
+let parse_codex_json_line line =
+  try
+    let json = Yojson.Safe.from_string line in
+    let open Yojson.Safe.Util in
+    let typ = json |> member "type" |> to_string_option in
+    match typ with
+    | Some "thread.started" ->
+      (match json |> member "thread_id" |> to_string_option with
+       | Some tid -> [Result { text = ""; session_id = Some tid }]
+       | None -> [Other line])
+    | Some "turn.completed" ->
+      [Result { text = ""; session_id = None }]
+    | Some "turn.started" -> []
+    | Some ("item.started" | "item.completed" as t) ->
+      let completed = (t = "item.completed") in
+      let item = json |> member "item" in
+      (match item |> member "type" |> to_string_option with
+       | Some "agent_message" when completed ->
+         (match item |> member "text" |> to_string_option with
+          | Some text when text <> "" -> [Text_delta text]
+          | _ -> [])
+       | Some "command_execution" ->
+         let cmd = item |> member "command" |> to_string_option
+           |> Option.value ~default:"" in
+         if not completed then
+           let summary =
+             let s = sanitize_for_inline_code cmd in
+             if String.length s > 120 then String.sub s 0 120 ^ "..." else s
+           in
+           let detail =
+             if cmd = "" then ""
+             else Printf.sprintf "```bash\n%s\n```" (escape_code_fences cmd)
+           in
+           [Tool_use { tool_name = "Bash";
+                       tool_summary = summary; tool_detail = detail }]
+         else
+           let output = item |> member "aggregated_output" |> to_string_option
+             |> Option.value ~default:"" in
+           let exit_code = item |> member "exit_code" |> to_int_option in
+           let header = match exit_code with
+             | Some 0 | None -> ""
+             | Some n -> Printf.sprintf "[exit %d]\n" n in
+           let content = header ^ output in
+           if content = "" then [] else [Tool_result { content }]
+       | Some "file_change" when completed ->
+         let changes = match item |> member "changes" with
+           | `List xs -> xs | _ -> [] in
+         let entries = List.filter_map (fun c ->
+           let path = c |> member "path" |> to_string_option
+             |> Option.value ~default:"" in
+           let kind = c |> member "kind" |> to_string_option
+             |> Option.value ~default:"" in
+           if path = "" then None else Some (path, kind)
+         ) changes in
+         (match entries with
+          | [] -> []
+          | [(path, kind)] ->
+            let tool_name = if kind = "add" then "Write" else "Edit" in
+            let summary = Printf.sprintf "%s (%s)"
+              (sanitize_for_inline_code path) kind in
+            [Tool_use { tool_name; tool_summary = summary; tool_detail = "" }]
+          | many ->
+            let buf = Buffer.create 256 in
+            List.iter (fun (p, k) ->
+              Buffer.add_string buf (Printf.sprintf "%s %s\n" k p)
+            ) many;
+            let detail = Printf.sprintf "```\n%s```" (Buffer.contents buf) in
+            let summary = Printf.sprintf "%d files" (List.length many) in
+            [Tool_use { tool_name = "Edit";
+                        tool_summary = summary; tool_detail = detail }])
+       | Some "reasoning" -> []
+       | _ -> [Other line])
+    | _ -> [Other line]
+  with _ -> [Other line]
+
 (** Build the command args for an agent invocation. *)
 let claude_args ~session_id ~message_count ~prompt =
   let session_flag =
@@ -844,6 +937,16 @@ let claude_args ~session_id ~message_count ~prompt =
     else ["--resume"; session_id]
   in
   ["claude"; "-p"; "--verbose"; "--output-format"; "stream-json"] @ session_flag @ [prompt]
+
+(** Codex allocates its own session id in the thread.started event, so
+    the UUID the bot pre-generated is ignored on the first run.
+    [parse_codex_json_line] emits that id via Result.session_id; the
+    agent_runner persists it so the next invocation can resume. *)
+let codex_args ~session_id ~message_count ~prompt =
+  let base = ["codex"; "exec"; "--json"; "--full-auto";
+              "--skip-git-repo-check"] in
+  if message_count = 0 then base @ [prompt]
+  else base @ ["resume"; session_id; prompt]
 
 (** Spawn an agent and stream its output via a callback.
     The callback is called with each parsed event as it arrives.
@@ -897,7 +1000,7 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
         | None -> base
       in
       base
-    | Config.Codex -> ["codex"; "exec"; prompt]
+    | Config.Codex -> codex_args ~session_id ~message_count ~prompt
     | Config.Gemini -> ["gemini"; "-p"; prompt; "-o"; "stream-json"]
   in
   let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in
@@ -927,12 +1030,11 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
         while true do
           let line = Eio.Buf_read.line reader in
           if String.length line > 0 then begin
-            match kind with
-            | Config.Claude | Config.Gemini ->
-              let events = parse_stream_json_line line in
-              List.iter on_event events
-            | Config.Codex ->
-              on_event (Text_delta line)
+            let events = match kind with
+              | Config.Claude | Config.Gemini -> parse_stream_json_line line
+              | Config.Codex -> parse_codex_json_line line
+            in
+            List.iter on_event events
           end
         done
       with End_of_file -> ());
