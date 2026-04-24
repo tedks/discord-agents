@@ -435,13 +435,57 @@ let handle_command t msg cmd =
                "**%s** session started for **%s**%s\nWorking in: `%s`\nSend a message to interact."
                kind_str p.name branch_str working_dir) ())
        end)
-  | Command.Resume_session { session_id } ->
+  | Command.List_gemini_sessions ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
-      let found = Eio_unix.run_in_systhread (fun () ->
-        Claude_sessions.find_by_prefix session_id) in
+      let sessions = Gemini_sessions.discover ~hours:24 () in
+      let lines = List.map (fun (s : Gemini_sessions.info) ->
+        let age_min = int_of_float ((Unix.gettimeofday () -. s.mtime) /. 60.0) in
+        let age_str = if age_min < 60 then Printf.sprintf "%dm ago" age_min
+          else Printf.sprintf "%dh ago" (age_min / 60) in
+        let sid_short = String.sub s.session_id 0
+          (min 8 (String.length s.session_id)) in
+        let wd_str = if s.working_dir = "" then "(unknown project)"
+          else s.working_dir in
+        Printf.sprintf "- `%s` %s\n  %s — *%s*"
+          sid_short age_str wd_str
+          (if s.summary = "" then "(no summary)" else s.summary)
+      ) (List.filteri (fun i _ -> i < 10) sessions) in
+      reply (if lines = [] then "No recent Gemini sessions found."
+        else "**Recent Gemini sessions** (last 24h):\n" ^ String.concat "\n" lines
+             ^ "\n\nUse `!resume gemini <session_id_prefix>` to attach."))
+  | Command.Resume_session { session_id; kind } ->
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      (* Locate the session in the requested store (or try both if
+         kind = None; prefer Claude for legacy callers). *)
+      let try_claude () =
+        match Eio_unix.run_in_systhread (fun () ->
+          Claude_sessions.find_by_prefix session_id) with
+        | Some (sid, wd) -> Some (Config.Claude, sid, wd)
+        | None -> None
+      in
+      let try_gemini () =
+        match Gemini_sessions.find_by_prefix session_id with
+        | Some (sid, wd) -> Some (Config.Gemini, sid, wd)
+        | None -> None
+      in
+      let found = match kind with
+        | Some Config.Claude -> try_claude ()
+        | Some Config.Gemini -> try_gemini ()
+        | Some Config.Codex -> None  (* Codex session resume not implemented *)
+        | None ->
+          (match try_claude () with
+           | Some _ as r -> r
+           | None -> try_gemini ())
+      in
       match found with
-      | None -> reply (Printf.sprintf "No Claude session matching `%s`." session_id)
-      | Some (full_sid, raw_working_dir) ->
+      | None ->
+        let kind_label = match kind with
+          | Some k -> Config.string_of_agent_kind k ^ " "
+          | None -> "" in
+        reply (Printf.sprintf "No %ssession matching `%s`." kind_label session_id)
+      | Some (found_kind, full_sid, raw_working_dir) ->
+        let kind_label = Config.string_of_agent_kind found_kind in
+        let kind_title = String.capitalize_ascii kind_label in
         let sid_short = String.sub full_sid 0 (min 8 (String.length full_sid)) in
         (* Match working directory to a known project for channel routing *)
         let matched_project = List.find_opt (fun (p : Project.t) ->
@@ -468,15 +512,18 @@ let handle_command t msg cmd =
         in
         let project_name = match matched_project with
           | Some p -> p.name
-          | None -> Filename.basename raw_working_dir
+          | None ->
+            if raw_working_dir = "" then "gemini-session"
+            else Filename.basename raw_working_dir
         in
         (match Discord_rest.create_thread_no_message t.rest
-                ~channel_id:thread_parent ~name:(Printf.sprintf "resume / %s" sid_short) () with
+                ~channel_id:thread_parent
+                ~name:(Printf.sprintf "resume %s / %s" kind_label sid_short) () with
         | Error e -> reply (Printf.sprintf "Failed to create thread: %s" e)
         | Ok thread_ch ->
           let session : Session_store.session = {
             project_name; working_dir;
-            agent_kind = Config.Claude; session_id = full_sid;
+            agent_kind = found_kind; session_id = full_sid;
             thread_id = thread_ch.Discord_types.id;
             system_prompt = None; message_count = 1; processing = false;
             pending_queue = Queue.create (); initial_prompt = None;
@@ -484,8 +531,8 @@ let handle_command t msg cmd =
           Session_store.add t.sessions ~thread_id:thread_ch.id session;
           ignore (Discord_rest.create_message t.rest ~channel_id:thread_ch.id
             ~content:(Printf.sprintf
-              "**Resumed** Claude session `%s`\nWorking in: `%s`\nSend a message to continue."
-              sid_short working_dir) ())))
+              "**Resumed** %s session `%s`\nWorking in: `%s`\nSend a message to continue."
+              kind_title sid_short working_dir) ())))
   | Command.Stop_session { thread_id } ->
     (match Session_store.find_opt t.sessions ~thread_id with
      | None -> reply "Session not found."
@@ -640,8 +687,9 @@ let handle_command t msg cmd =
       "`!projects` — list discovered projects";
       "`!sessions` — list active bot sessions";
       "`!claude-sessions` — list recent Claude sessions";
-      "`!start <project> [agent]` — start a session (defaults to claude)";
-      "`!resume <session_id>` — resume a Claude session";
+      "`!gemini-sessions` — list recent Gemini sessions";
+      "`!start <project> [agent]` — start a session (claude|codex|gemini; defaults to claude)";
+      "`!resume [agent] <session_id>` — resume a session (agent defaults to claude)";
       "`!stop <thread_id>` — stop a session";
       "`!rename [thread_id] <name>` — rename a thread";
       "`!status` — bot status and running processes";
@@ -909,7 +957,8 @@ let handle_message t (msg : Discord_types.message) =
       let cmd = Command.parse msg.content in
       match cmd with
       | Command.Status | Command.List_projects | Command.List_sessions
-      | Command.List_claude_sessions | Command.Help ->
+      | Command.List_claude_sessions | Command.List_gemini_sessions
+      | Command.Help ->
         handle_command t msg cmd
       | _ ->
         ignore (Discord_rest.create_message t.rest

@@ -405,8 +405,13 @@ let cmd_testable =
       | Discord_agents.Command.List_projects -> "List_projects"
       | List_sessions -> "List_sessions"
       | List_claude_sessions -> "List_claude_sessions"
+      | List_gemini_sessions -> "List_gemini_sessions"
       | Start_agent { project; _ } -> "Start_agent(" ^ project ^ ")"
-      | Resume_session { session_id } -> "Resume_session(" ^ session_id ^ ")"
+      | Resume_session { session_id; kind = None } ->
+        "Resume_session(" ^ session_id ^ ")"
+      | Resume_session { session_id; kind = Some k } ->
+        Printf.sprintf "Resume_session(%s,%s)"
+          (Discord_agents.Config.string_of_agent_kind k) session_id
       | Stop_session { thread_id } -> "Stop_session(" ^ thread_id ^ ")"
       | Cleanup_channels -> "Cleanup_channels"
       | Restart -> "Restart"
@@ -518,7 +523,47 @@ let test_parse_scroll_zero () =
     Alcotest.(check pass) "zero scroll is Unknown" () ()
   | _ -> Alcotest.fail "expected Unknown for zero scroll"
 
+let test_parse_resume_no_kind () =
+  Alcotest.(check cmd_testable) "resume without kind arg"
+    (Discord_agents.Command.Resume_session { session_id = "abc12345"; kind = None })
+    (Discord_agents.Command.parse "!resume abc12345")
+
+let test_parse_resume_with_gemini_kind () =
+  Alcotest.(check cmd_testable) "resume with gemini kind"
+    (Discord_agents.Command.Resume_session {
+       session_id = "xyz"; kind = Some Discord_agents.Config.Gemini })
+    (Discord_agents.Command.parse "!resume gemini xyz")
+
+let test_parse_resume_with_claude_kind () =
+  Alcotest.(check cmd_testable) "resume with claude kind"
+    (Discord_agents.Command.Resume_session {
+       session_id = "xyz"; kind = Some Discord_agents.Config.Claude })
+    (Discord_agents.Command.parse "!resume claude xyz")
+
+let test_parse_resume_invalid_kind () =
+  match Discord_agents.Command.parse "!resume nonesuch xyz" with
+  | Discord_agents.Command.Unknown _ ->
+    Alcotest.(check pass) "invalid kind is Unknown" () ()
+  | _ -> Alcotest.fail "expected Unknown for invalid agent kind"
+
+let test_parse_gemini_sessions () =
+  Alcotest.(check cmd_testable) "gemini-sessions"
+    Discord_agents.Command.List_gemini_sessions
+    (Discord_agents.Command.parse "!gemini-sessions")
+
+let test_parse_start_gemini () =
+  Alcotest.(check cmd_testable) "start project gemini"
+    (Discord_agents.Command.Start_agent {
+       project = "myproj"; kind = Discord_agents.Config.Gemini })
+    (Discord_agents.Command.parse "!start myproj gemini")
+
 let command_tests = [
+  Alcotest.test_case "resume without kind" `Quick test_parse_resume_no_kind;
+  Alcotest.test_case "resume with gemini kind" `Quick test_parse_resume_with_gemini_kind;
+  Alcotest.test_case "resume with claude kind" `Quick test_parse_resume_with_claude_kind;
+  Alcotest.test_case "resume invalid kind" `Quick test_parse_resume_invalid_kind;
+  Alcotest.test_case "gemini-sessions" `Quick test_parse_gemini_sessions;
+  Alcotest.test_case "start with gemini kind" `Quick test_parse_start_gemini;
   Alcotest.test_case "desktop" `Quick test_parse_desktop;
   Alcotest.test_case "mobile" `Quick test_parse_mobile;
   Alcotest.test_case "wrapping no arg" `Quick test_parse_wrapping_no_arg;
@@ -909,6 +954,134 @@ let codex_json_tests = [
   Alcotest.test_case "backticks sanitized in summary" `Quick test_codex_command_injection_summary;
 ]
 
+(* ── parse_gemini_stream_json_line ────────────────────────────────── *)
+
+let parse_gemini = Discord_agents.Agent_process.parse_gemini_stream_json_line
+
+let test_gemini_init_captures_session_id () =
+  let line = {|{"type":"init","timestamp":"t","session_id":"s-42","model":"m"}|} in
+  Alcotest.(check (option string)) "init session_id"
+    (Some "s-42") (expect_session_id (parse_gemini line))
+
+let test_gemini_init_without_session_dropped () =
+  let line = {|{"type":"init","model":"m"}|} in
+  Alcotest.(check int) "init with no session_id emits nothing"
+    0 (List.length (parse_gemini line))
+
+let test_gemini_user_message_skipped () =
+  let line = {|{"type":"message","role":"user","content":"hello"}|} in
+  Alcotest.(check int) "user echo is not forwarded"
+    0 (List.length (parse_gemini line))
+
+let test_gemini_assistant_delta () =
+  let line = {|{"type":"message","role":"assistant","content":"Hello","delta":true}|} in
+  Alcotest.(check (option string)) "assistant content becomes Text_delta"
+    (Some "Hello") (expect_text (parse_gemini line))
+
+let test_gemini_assistant_empty_dropped () =
+  let line = {|{"type":"message","role":"assistant","content":"","delta":true}|} in
+  Alcotest.(check int) "empty assistant content emits nothing"
+    0 (List.length (parse_gemini line))
+
+let test_gemini_shell_tool_use () =
+  let line = {|{"type":"tool_use","tool_name":"run_shell_command","tool_id":"t1","parameters":{"command":"ls /tmp","description":"list"}}|} in
+  match expect_tool (parse_gemini line) with
+  | Some info ->
+    Alcotest.(check string) "maps to Bash" "Bash" info.tool_name;
+    Alcotest.(check string) "summary is the command" "ls /tmp" info.tool_summary;
+    Alcotest.(check bool) "detail is bash code block"
+      true (String.length info.tool_detail >= 7
+            && String.sub info.tool_detail 0 7 = "```bash")
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let test_gemini_read_file_tool_use () =
+  let line = {|{"type":"tool_use","tool_name":"read_file","tool_id":"t2","parameters":{"file_path":"/etc/hostname"}}|} in
+  match expect_tool (parse_gemini line) with
+  | Some info ->
+    Alcotest.(check string) "maps to Read" "Read" info.tool_name;
+    Alcotest.(check bool) "summary mentions path"
+      true (try ignore (Str.search_forward
+              (Str.regexp_string "/etc/hostname") info.tool_summary 0); true
+            with Not_found -> false)
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let test_gemini_write_file_tool_use () =
+  let line = {|{"type":"tool_use","tool_name":"write_file","tool_id":"t3","parameters":{"file_path":"/tmp/a.ml","content":"let () = ()"}}|} in
+  match expect_tool (parse_gemini line) with
+  | Some info ->
+    Alcotest.(check string) "maps to Write" "Write" info.tool_name;
+    Alcotest.(check bool) "detail is ocaml code block"
+      true (String.length info.tool_detail >= 8
+            && String.sub info.tool_detail 0 8 = "```ocaml")
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let test_gemini_unknown_tool_passthrough () =
+  let line = {|{"type":"tool_use","tool_name":"novel_tool","tool_id":"t4","parameters":{"x":"y"}}|} in
+  match expect_tool (parse_gemini line) with
+  | Some info ->
+    Alcotest.(check string) "unknown tool name preserved"
+      "novel_tool" info.tool_name
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let test_gemini_tool_result_success () =
+  let line = {|{"type":"tool_result","tool_id":"t1","status":"success","output":"hello world"}|} in
+  Alcotest.(check (option string)) "success carries output"
+    (Some "hello world") (expect_tool_result (parse_gemini line))
+
+let test_gemini_tool_result_error () =
+  let line = {|{"type":"tool_result","tool_id":"t1","status":"error","output":"bad path","error":{"type":"invalid","message":"nope"}}|} in
+  match expect_tool_result (parse_gemini line) with
+  | Some content ->
+    Alcotest.(check bool) "content marked as error"
+      true (String.length content >= 7 && String.sub content 0 7 = "[error]");
+    Alcotest.(check bool) "includes error message"
+      true (try ignore (Str.search_forward
+              (Str.regexp_string "nope") content 0); true
+            with Not_found -> false)
+  | None -> Alcotest.fail "expected single Tool_result"
+
+let test_gemini_tool_result_empty_dropped () =
+  let line = {|{"type":"tool_result","tool_id":"t1","status":"success","output":""}|} in
+  Alcotest.(check int) "empty output with no error emits nothing"
+    0 (List.length (parse_gemini line))
+
+let test_gemini_result_flushes () =
+  let line = {|{"type":"result","status":"success","stats":{"total_tokens":1}}|} in
+  match parse_gemini line with
+  | [Discord_agents.Agent_process.Result { session_id = None; text = "" }] -> ()
+  | _ -> Alcotest.fail "expected Result with empty text and no session_id"
+
+let test_gemini_malformed_becomes_other () =
+  let line = "YOLO mode is enabled." in
+  match parse_gemini line with
+  | [Discord_agents.Agent_process.Other raw] ->
+    Alcotest.(check string) "preserves raw line" line raw
+  | _ -> Alcotest.fail "expected Other event"
+
+let test_gemini_unknown_type_becomes_other () =
+  let line = {|{"type":"novel_event","foo":"bar"}|} in
+  match parse_gemini line with
+  | [Discord_agents.Agent_process.Other _] -> ()
+  | _ -> Alcotest.fail "expected Other for unknown type"
+
+let gemini_json_tests = [
+  Alcotest.test_case "init captures session_id" `Quick test_gemini_init_captures_session_id;
+  Alcotest.test_case "init missing session_id dropped" `Quick test_gemini_init_without_session_dropped;
+  Alcotest.test_case "user echo skipped" `Quick test_gemini_user_message_skipped;
+  Alcotest.test_case "assistant delta is Text_delta" `Quick test_gemini_assistant_delta;
+  Alcotest.test_case "empty assistant dropped" `Quick test_gemini_assistant_empty_dropped;
+  Alcotest.test_case "run_shell_command maps to Bash" `Quick test_gemini_shell_tool_use;
+  Alcotest.test_case "read_file maps to Read" `Quick test_gemini_read_file_tool_use;
+  Alcotest.test_case "write_file maps to Write" `Quick test_gemini_write_file_tool_use;
+  Alcotest.test_case "unknown tool name passthrough" `Quick test_gemini_unknown_tool_passthrough;
+  Alcotest.test_case "tool_result success" `Quick test_gemini_tool_result_success;
+  Alcotest.test_case "tool_result error prefixed" `Quick test_gemini_tool_result_error;
+  Alcotest.test_case "empty tool_result dropped" `Quick test_gemini_tool_result_empty_dropped;
+  Alcotest.test_case "result flushes with no session_id" `Quick test_gemini_result_flushes;
+  Alcotest.test_case "malformed becomes Other" `Quick test_gemini_malformed_becomes_other;
+  Alcotest.test_case "unknown type becomes Other" `Quick test_gemini_unknown_type_becomes_other;
+]
+
 (* ── runner ──────────────────────────────────────────────────────── *)
 
 let () =
@@ -924,4 +1097,5 @@ let () =
     "tool_detail", tool_detail_tests;
     "escape_nested_fences", escape_nested_fences_tests;
     "codex_json", codex_json_tests;
+    "gemini_json", gemini_json_tests;
   ]
