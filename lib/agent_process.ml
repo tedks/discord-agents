@@ -930,6 +930,94 @@ let parse_codex_json_line line =
     | _ -> [Other line]
   with _ -> [Other line]
 
+(** Parse a `gemini -p ... -o stream-json` event line.
+    Gemini emits one flat JSON object per line:
+    - {"type":"init","session_id":"<uuid>","model":"..."} — session id is
+      assigned server-side in this event; capture for resume.
+    - {"type":"message","role":"user","content":"..."} — echo of the
+      prompt we sent; skip.
+    - {"type":"message","role":"assistant","content":"...","delta":true}
+      — incremental assistant text.
+    - {"type":"tool_use","tool_name":"...","tool_id":"...",
+       "parameters":{...}} — tool invocation.
+    - {"type":"tool_result","tool_id":"...","status":"success|error",
+       "output":"...","error":{...}} — tool completed.
+    - {"type":"result","status":"success","stats":{...}} — turn
+      complete; triggers a flush (no text or session_id here).
+
+    Gemini's tool names differ from Claude's (run_shell_command, read_file,
+    write_file, ...). Since Gemini passes parameters under the same field
+    names Claude uses (command, file_path, content, pattern), we translate
+    the tool name so [summarize_tool_input] and [detail_of_tool_input]
+    produce matching output to Claude's. *)
+let gemini_tool_name_of name =
+  match name with
+  | "run_shell_command" -> "Bash"
+  | "read_file" -> "Read"
+  | "write_file" -> "Write"
+  | "replace" | "edit" -> "Edit"
+  | "search_file_content" -> "Grep"
+  | "glob" -> "Glob"
+  | "web_fetch" -> "WebFetch"
+  | "google_web_search" | "web_search" -> "WebSearch"
+  | other -> other
+
+let parse_gemini_stream_json_line line =
+  try
+    let json = Yojson.Safe.from_string line in
+    let open Yojson.Safe.Util in
+    let typ = json |> member "type" |> to_string_option in
+    match typ with
+    | Some "init" ->
+      (match json |> member "session_id" |> to_string_option with
+       | Some sid -> [Result { text = ""; session_id = Some sid }]
+       | None -> [])
+    | Some "message" ->
+      (match json |> member "role" |> to_string_option with
+       | Some "assistant" ->
+         (match json |> member "content" |> to_string_option with
+          | Some text when text <> "" -> [Text_delta text]
+          | _ -> [])
+       | _ -> [])  (* user echo or unknown role: skip *)
+    | Some "tool_use" ->
+      let raw_name = json |> member "tool_name" |> to_string_option
+        |> Option.value ~default:"unknown" in
+      let name = gemini_tool_name_of raw_name in
+      let params = json |> member "parameters" in
+      let summary = summarize_tool_input name params in
+      let detail = detail_of_tool_input name params in
+      [Tool_use { tool_name = name; tool_summary = summary;
+                  tool_detail = detail }]
+    | Some "tool_result" ->
+      let status = json |> member "status" |> to_string_option
+        |> Option.value ~default:"" in
+      let output = json |> member "output" |> to_string_option
+        |> Option.value ~default:"" in
+      let err_msg =
+        match json |> member "error" with
+        | `Null -> ""
+        | obj ->
+          (match obj |> member "message" |> to_string_option with
+           | Some m -> m
+           | None -> "")
+        | exception _ -> ""
+      in
+      let content = match status, output, err_msg with
+        | _, "", "" -> ""
+        | "error", "", m -> Printf.sprintf "[error] %s" m
+        | "error", o, "" -> Printf.sprintf "[error] %s" o
+        | "error", o, m -> Printf.sprintf "[error] %s\n%s" m o
+        | _, o, _ -> o
+      in
+      if content = "" then [] else [Tool_result { content }]
+    | Some "result" ->
+      (* Turn complete. No session_id here (already captured at init),
+         and no aggregated text (assistant deltas already delivered it).
+         Emit an empty Result to trigger a flush, matching Codex. *)
+      [Result { text = ""; session_id = None }]
+    | _ -> [Other line]
+  with _ -> [Other line]
+
 (** Build the command args for an agent invocation. *)
 let claude_args ~session_id ~message_count ~prompt =
   let session_flag =
@@ -948,6 +1036,16 @@ let codex_args ~session_id ~message_count ~prompt =
   if message_count = 0 then base @ [prompt]
   else base @ ["resume"; session_id; prompt]
 
+(** Gemini allocates its session id server-side in the init event, like
+    Codex. [parse_gemini_stream_json_line] emits it via Result.session_id
+    on the first run and [--resume <uuid>] is used on subsequent turns.
+    --yolo auto-approves tool calls, matching Claude's bypassPermissions
+    mode; Discord can't answer interactive approval prompts. *)
+let gemini_args ~session_id ~message_count ~prompt =
+  let base = ["gemini"; "-p"; prompt; "-o"; "stream-json"; "--yolo"] in
+  if message_count = 0 then base
+  else base @ ["--resume"; session_id]
+
 (** Spawn an agent and stream its output via a callback.
     The callback is called with each parsed event as it arrives.
     [?on_pid] is called with the child PID immediately after spawn,
@@ -958,37 +1056,76 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
   let mgr = Eio.Stdenv.process_mgr env in
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
-  (* Generate MCP config with absolute path to the Python script.
-     The static mcp.json has a relative path that breaks when Claude
-     runs in a different working directory. *)
+  (* Locate scripts/mcp-server.py (absolute path). The static mcp.json has
+     a relative path that breaks when the agent runs from a worktree. *)
+  let mcp_script_path =
+    try
+      let exe = Sys.executable_name in
+      let exe = if Filename.is_relative exe then Filename.concat (Sys.getcwd ()) exe else exe in
+      let rec find_root path =
+        let candidate = Filename.concat path "scripts/mcp-server.py" in
+        if Sys.file_exists candidate then candidate
+        else
+          let parent = Filename.dirname path in
+          if parent = path then "scripts/mcp-server.py"
+          else find_root parent
+      in
+      find_root (Filename.dirname exe)
+    with _ -> "scripts/mcp-server.py"
+  in
+  let mcp_json = Printf.sprintf
+    {|{"mcpServers":{"discord-agents":{"command":"python3","args":["%s"]}}}|}
+    mcp_script_path
+  in
+  let write_file ~path contents =
+    try
+      let oc = open_out path in
+      output_string oc contents;
+      close_out oc
+    with _ -> ()
+  in
+  (* Claude: write --mcp-config at a known location and pass the path. *)
   let mcp_config =
-    let script_path =
-      try
-        let exe = Sys.executable_name in
-        let exe = if Filename.is_relative exe then Filename.concat (Sys.getcwd ()) exe else exe in
-        let rec find_root path =
-          let candidate = Filename.concat path "scripts/mcp-server.py" in
-          if Sys.file_exists candidate then candidate
-          else
-            let parent = Filename.dirname path in
-            if parent = path then "scripts/mcp-server.py"
-            else find_root parent
-        in
-        find_root (Filename.dirname exe)
-      with _ -> "scripts/mcp-server.py"
-    in
-    (* Write a temp MCP config with the absolute script path *)
     let config_dir = Filename.concat (Sys.getenv "HOME") ".config/discord-agents" in
     let config_path = Filename.concat config_dir "mcp-generated.json" in
-    let json = Printf.sprintf
-      {|{"mcpServers":{"discord-agents":{"command":"python3","args":["%s"]}}}|}
-      script_path in
-    (try
-      let oc = open_out config_path in
-      output_string oc json;
-      close_out oc
-    with _ -> ());
+    write_file ~path:config_path mcp_json;
     config_path
+  in
+  (* Gemini has no --mcp-config flag; it loads mcpServers from the project's
+     .gemini/settings.json. Write it into the worktree and add .gemini/ to
+     the worktree's git excludes so it doesn't show as untracked. *)
+  let write_gemini_settings () =
+    let gemini_dir = Filename.concat working_dir ".gemini" in
+    (try if not (Sys.file_exists gemini_dir) then Unix.mkdir gemini_dir 0o755
+     with _ -> ());
+    write_file ~path:(Filename.concat gemini_dir "settings.json") mcp_json;
+    let exclude_path = Filename.concat working_dir ".git/info/exclude" in
+    try
+      if Sys.file_exists exclude_path then begin
+        let existing =
+          let ic = open_in exclude_path in
+          let n = in_channel_length ic in
+          let s = Bytes.create n in
+          really_input ic s 0 n;
+          close_in ic;
+          Bytes.to_string s
+        in
+        let has_needle =
+          let needle = ".gemini/" in
+          let nlen = String.length needle in
+          let rec has i =
+            if i + nlen > String.length existing then false
+            else if String.sub existing i nlen = needle then true
+            else has (i + 1)
+          in has 0
+        in
+        if not has_needle then begin
+          let oc = open_out_gen [Open_append] 0o644 exclude_path in
+          output_string oc "\n.gemini/\n";
+          close_out oc
+        end
+      end
+    with _ -> ()
   in
   let args = match kind with
     | Config.Claude ->
@@ -1001,7 +1138,9 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
       in
       base
     | Config.Codex -> codex_args ~session_id ~message_count ~prompt
-    | Config.Gemini -> ["gemini"; "-p"; prompt; "-o"; "stream-json"]
+    | Config.Gemini ->
+      write_gemini_settings ();
+      gemini_args ~session_id ~message_count ~prompt
   in
   let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in
   let stderr_r, stderr_w = Eio.Process.pipe ~sw mgr in
@@ -1031,8 +1170,9 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
           let line = Eio.Buf_read.line reader in
           if String.length line > 0 then begin
             let events = match kind with
-              | Config.Claude | Config.Gemini -> parse_stream_json_line line
+              | Config.Claude -> parse_stream_json_line line
               | Config.Codex -> parse_codex_json_line line
+              | Config.Gemini -> parse_gemini_stream_json_line line
             in
             List.iter on_event events
           end
