@@ -19,6 +19,23 @@ nix develop --command dune exec discord-agents
 nix develop --command dune exec discord-agents -- --test [CHANNEL_ID]
 ```
 
+### Switching between branches at runtime
+
+The bot acquires an exclusive lock on `~/.config/discord-agents/discord-agents.pid` (`bin/main.ml:24`). When a second instance starts, it reads the PID, sends SIGTERM (then SIGKILL after 2s if still alive), takes the lock, and runs. So switching branches doesn't require a manual stop — just launch the bot from the target worktree.
+
+```bash
+# Switch to a feature branch and run from it
+scripts/run-branch.sh feat/codex-support
+
+# Switch back
+scripts/run-branch.sh master
+
+# Path also works
+scripts/run-branch.sh /home/me/Projects/claude-discord/feat/foo
+```
+
+`scripts/run-branch.sh` builds first so a compile error doesn't kill the running bot, then `exec`s the bot in the foreground. The handover is intentionally abrupt — any in-flight Claude/Codex/Gemini child processes attached to the previous bot get orphaned, and any active session threads (including the one you're typing in if you triggered the switch from inside the bot) lose their parent. Use `!restart` instead when you want a graceful drain on the same code.
+
 ## Testing
 
 ```bash
