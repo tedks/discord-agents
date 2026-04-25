@@ -54,6 +54,7 @@ lib/agent_process.ml     — Subprocess management, per-agent JSON parsing (Clau
 lib/session_store.ml     — Session state, persistence to disk, message queue
 lib/command.ml           — Pure command parsing (no I/O)
 lib/claude_sessions.ml   — Claude Code session discovery on disk (~/.claude/projects/)
+lib/codex_sessions.ml    — Codex CLI session discovery on disk (~/.codex/sessions/)
 lib/gemini_sessions.ml   — Gemini CLI session discovery on disk (~/.gemini/tmp/)
 lib/channel_manager.ml   — Channel creation, ordering, cleanup
 lib/config.ml            — Configuration (JSON file + DISCORD_BOT_TOKEN env)
@@ -71,10 +72,11 @@ Commands require a `!` prefix:
 
 - `start <project> [agent]` — start a session (agent ∈ {claude, codex, gemini}; defaults to claude)
 - `start` — show numbered project list
-- `resume [agent] <session_id>` — resume an existing session (agent defaults to claude; tries gemini if not found)
+- `resume [agent] <session_id>` — resume an existing session (agent defaults to none; tries Claude → Codex → Gemini)
 - `projects` — list discovered projects with numbers
 - `sessions` — list active bot sessions
 - `claude-sessions` — list recent Claude Code sessions on this machine
+- `codex-sessions` — list recent Codex CLI sessions on this machine
 - `gemini-sessions` — list recent Gemini CLI sessions on this machine
 - `stop <thread_id>` — stop a session
 - `rename [thread_id] <name>` — rename a thread

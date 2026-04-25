@@ -139,8 +139,9 @@ You have MCP tools available:
 - list_projects: List all discovered projects
 - list_sessions: List active bot sessions
 - list_claude_sessions: Find recent Claude Code sessions to resume
+- list_codex_sessions: Find recent Codex CLI sessions to resume
 - list_gemini_sessions: Find recent Gemini CLI sessions to resume
-- resume_session: Resume an existing Claude or Gemini session (pass kind=gemini for Gemini)
+- resume_session: Resume an existing session (pass kind=codex or kind=gemini to disambiguate; default tries Claude → Codex → Gemini)
 - restart_bot: Rebuild and restart the bot
 - rename_thread: Rename a Discord thread
 - cleanup_channels: Delete stale Discord channels
@@ -175,8 +176,9 @@ You have MCP tools available:
 - list_projects: List all discovered projects
 - list_sessions: List active bot sessions
 - list_claude_sessions: Find recent Claude Code sessions to resume
+- list_codex_sessions: Find recent Codex CLI sessions to resume
 - list_gemini_sessions: Find recent Gemini CLI sessions to resume
-- resume_session: Resume an existing Claude or Gemini session (pass kind=gemini for Gemini)
+- resume_session: Resume an existing session (pass kind=codex or kind=gemini to disambiguate; default tries Claude → Codex → Gemini)
 - rename_thread: Rename a Discord thread
 - restart_bot: Rebuild and restart the bot
 - cleanup_channels: Delete stale Discord channels
@@ -369,14 +371,10 @@ let format_session_listing
       label (String.concat "\n" lines) resume_hint
 
 (** Build the user-facing "session not found" error for the Resume
-    handlers (Discord command, MCP tool). Special-cases the Codex
-    branch — Codex's session store isn't enumerable, so the prior
-    "No codex session matching ..." text was misleading. *)
+    handlers (Discord command, MCP tool). All three agents now have
+    discoverable session stores, so the message is uniform. *)
 let resume_not_found_message ~kind ~sid_prefix =
   match kind with
-  | Some Config.Codex ->
-    "Codex sessions cannot be enumerated; use !start with codex \
-     (or start_session with agent=codex) to create a new Codex session."
   | Some k ->
     Printf.sprintf "No %s session matching %S."
       (Config.string_of_agent_kind k) sid_prefix
@@ -515,6 +513,16 @@ let handle_command t msg cmd =
                "**%s** session started for **%s**%s\nWorking in: `%s`\nSend a message to interact."
                kind_str p.name branch_str working_dir) ())
        end)
+  | Command.List_codex_sessions ->
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      let entries =
+        Codex_sessions.discover ~hours:24 ()
+        |> List.filteri (fun i _ -> i < 10)
+        |> List.map (fun (s : Codex_sessions.info) ->
+          (s.session_id, s.working_dir, s.summary, s.mtime))
+      in
+      reply (format_session_listing ~label:"Codex"
+        ~resume_hint:"!resume codex <session_id_prefix>" entries))
   | Command.List_gemini_sessions ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       let entries =
@@ -536,19 +544,29 @@ let handle_command t msg cmd =
         | Some (sid, wd) -> Some (Config.Claude, sid, wd)
         | None -> None
       in
+      let try_codex () =
+        match Codex_sessions.find_by_prefix session_id with
+        | Some (sid, wd) -> Some (Config.Codex, sid, wd)
+        | None -> None
+      in
       let try_gemini () =
         match Gemini_sessions.find_by_prefix session_id with
         | Some (sid, wd) -> Some (Config.Gemini, sid, wd)
         | None -> None
       in
+      (* Explicit kind hits exactly one store; an unspecified kind
+         tries Claude → Codex → Gemini in order. *)
       let found = match kind with
         | Some Config.Claude -> try_claude ()
+        | Some Config.Codex -> try_codex ()
         | Some Config.Gemini -> try_gemini ()
-        | Some Config.Codex -> None  (* not enumerable *)
         | None ->
           (match try_claude () with
            | Some _ as r -> r
-           | None -> try_gemini ())
+           | None ->
+             match try_codex () with
+             | Some _ as r -> r
+             | None -> try_gemini ())
       in
       match found with
       | None ->
@@ -737,9 +755,10 @@ let handle_command t msg cmd =
       "`!projects` — list discovered projects";
       "`!sessions` — list active bot sessions";
       "`!claude-sessions` — list recent Claude sessions";
+      "`!codex-sessions` — list recent Codex sessions";
       "`!gemini-sessions` — list recent Gemini sessions";
       "`!start <project> [agent]` — start a session (claude|codex|gemini; defaults to claude)";
-      "`!resume [agent] <session_id>` — resume a session (agent defaults to claude; tries gemini if not found)";
+      "`!resume [agent] <session_id>` — resume a session (agent defaults to none; tries Claude → Codex → Gemini)";
       "`!stop <thread_id>` — stop a session";
       "`!rename [thread_id] <name>` — rename a thread";
       "`!status` — bot status and running processes";
@@ -1006,7 +1025,8 @@ let handle_message t (msg : Discord_types.message) =
       let cmd = Command.parse msg.content in
       match cmd with
       | Command.Status | Command.List_projects | Command.List_sessions
-      | Command.List_claude_sessions | Command.List_gemini_sessions
+      | Command.List_claude_sessions | Command.List_codex_sessions
+      | Command.List_gemini_sessions
       | Command.Help ->
         handle_command t msg cmd
       | _ ->

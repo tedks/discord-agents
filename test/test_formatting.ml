@@ -444,6 +444,7 @@ let cmd_testable =
       | Discord_agents.Command.List_projects -> "List_projects"
       | List_sessions -> "List_sessions"
       | List_claude_sessions -> "List_claude_sessions"
+      | List_codex_sessions -> "List_codex_sessions"
       | List_gemini_sessions -> "List_gemini_sessions"
       | Start_agent { project; _ } -> "Start_agent(" ^ project ^ ")"
       | Resume_session { session_id; kind = None } ->
@@ -586,6 +587,17 @@ let test_parse_resume_invalid_kind () =
     Alcotest.(check pass) "invalid kind is Unknown" () ()
   | _ -> Alcotest.fail "expected Unknown for invalid agent kind"
 
+let test_parse_codex_sessions () =
+  Alcotest.(check cmd_testable) "codex-sessions"
+    Discord_agents.Command.List_codex_sessions
+    (Discord_agents.Command.parse "!codex-sessions")
+
+let test_parse_resume_with_codex_kind () =
+  Alcotest.(check cmd_testable) "resume with codex kind"
+    (Discord_agents.Command.Resume_session
+       { session_id = "abc"; kind = Some Discord_agents.Config.Codex })
+    (Discord_agents.Command.parse "!resume codex abc")
+
 let test_parse_gemini_sessions () =
   Alcotest.(check cmd_testable) "gemini-sessions"
     Discord_agents.Command.List_gemini_sessions
@@ -617,7 +629,9 @@ let command_tests = [
   Alcotest.test_case "resume with gemini kind" `Quick test_parse_resume_with_gemini_kind;
   Alcotest.test_case "resume with claude kind" `Quick test_parse_resume_with_claude_kind;
   Alcotest.test_case "resume invalid kind" `Quick test_parse_resume_invalid_kind;
+  Alcotest.test_case "codex-sessions" `Quick test_parse_codex_sessions;
   Alcotest.test_case "gemini-sessions" `Quick test_parse_gemini_sessions;
+  Alcotest.test_case "resume with codex kind" `Quick test_parse_resume_with_codex_kind;
   Alcotest.test_case "start with gemini kind" `Quick test_parse_start_gemini;
 ]
 
@@ -1272,28 +1286,24 @@ let session_store_tests = [
 
 (* ── Bot.resume_not_found_message + Bot.merge_gemini_settings ───── *)
 
-let test_resume_not_found_codex_explains () =
+(* All three agent stores are enumerable now, so resume_not_found
+   has no special cases — every kind gets the same format. *)
+let test_resume_not_found_names_kind_and_sid kind expected_word =
   let msg = Discord_agents.Bot.resume_not_found_message
-    ~kind:(Some Discord_agents.Config.Codex) ~sid_prefix:"abc" in
-  Alcotest.(check bool) "codex error is not the misleading default"
-    false (try ignore (Str.search_forward
-      (Str.regexp_string "No codex session matching") msg 0); true
-    with Not_found -> false);
-  Alcotest.(check bool) "codex error explains why"
-    true (try ignore (Str.search_forward
-      (Str.regexp_string "cannot be enumerated") msg 0); true
-    with Not_found -> false)
+    ~kind:(Some kind) ~sid_prefix:"xyz" in
+  let contains s =
+    try ignore (Str.search_forward (Str.regexp_string s) msg 0); true
+    with Not_found -> false
+  in
+  Alcotest.(check bool)
+    (Printf.sprintf "error names %s and the sid" expected_word)
+    true (contains expected_word && contains "xyz")
+
+let test_resume_not_found_codex_uniform () =
+  test_resume_not_found_names_kind_and_sid Discord_agents.Config.Codex "codex"
 
 let test_resume_not_found_gemini_includes_sid () =
-  let msg = Discord_agents.Bot.resume_not_found_message
-    ~kind:(Some Discord_agents.Config.Gemini) ~sid_prefix:"xyz" in
-  Alcotest.(check bool) "gemini error names the kind and sid"
-    true ((try ignore (Str.search_forward
-              (Str.regexp_string "gemini") msg 0); true
-           with Not_found -> false)
-          && (try ignore (Str.search_forward
-                (Str.regexp_string "xyz") msg 0); true
-              with Not_found -> false))
+  test_resume_not_found_names_kind_and_sid Discord_agents.Config.Gemini "gemini"
 
 let test_merge_gemini_settings_preserves_other_servers () =
   let existing = Some {|{
@@ -1341,8 +1351,8 @@ let test_merge_gemini_settings_invalid_input_falls_back () =
             (json |> member "mcpServers" |> to_assoc))
 
 let resume_helpers_tests = [
-  Alcotest.test_case "Codex resume error explains absence" `Quick
-    test_resume_not_found_codex_explains;
+  Alcotest.test_case "Codex resume error names kind+sid (uniform)" `Quick
+    test_resume_not_found_codex_uniform;
   Alcotest.test_case "Gemini resume error names kind+sid" `Quick
     test_resume_not_found_gemini_includes_sid;
   Alcotest.test_case "merge_gemini_settings preserves other servers" `Quick

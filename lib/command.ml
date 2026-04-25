@@ -7,11 +7,11 @@ type t =
   | List_projects
   | List_sessions
   | List_claude_sessions
+  | List_codex_sessions
   | List_gemini_sessions
   | Start_agent of { project : string; kind : Config.agent_kind }
   (* [kind] disambiguates which session store to search. None = the
-     handler tries Claude first, then Gemini (Codex's session store
-     is internal to the Codex CLI; we don't enumerate it). *)
+     handler tries Claude → Codex → Gemini in that order. *)
   | Resume_session of { session_id : string; kind : Config.agent_kind option }
   | Stop_session of { thread_id : string }
   | Cleanup_channels
@@ -43,6 +43,7 @@ let parse content =
   | ["projects"] | ["list"] -> List_projects
   | ["sessions"] -> List_sessions
   | ["claude-sessions"] -> List_claude_sessions
+  | ["codex-sessions"] -> List_codex_sessions
   | ["gemini-sessions"] -> List_gemini_sessions
   | "start" :: project :: kind_str :: _ ->
     let kind = match Config.agent_kind_of_string (String.lowercase_ascii kind_str) with

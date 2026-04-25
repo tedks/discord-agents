@@ -97,6 +97,22 @@ let handle_list_claude_sessions _bot params =
   ) sessions in
   ok_response [("sessions", `List items)]
 
+let handle_list_codex_sessions _bot params =
+  let sessions = Codex_sessions.discover ~hours:(hours_param params) () in
+  let items = List.map (fun (s : Codex_sessions.info) ->
+    let sid_short = String.sub s.session_id 0
+      (min 8 (String.length s.session_id)) in
+    let age_min = int_of_float ((Unix.gettimeofday () -. s.mtime) /. 60.0) in
+    `Assoc [
+      ("session_id", `String s.session_id);
+      ("session_id_short", `String sid_short);
+      ("working_dir", `String s.working_dir);
+      ("summary", `String s.summary);
+      ("age_minutes", `Int age_min);
+    ]
+  ) sessions in
+  ok_response [("sessions", `List items)]
+
 let handle_list_gemini_sessions _bot params =
   let sessions = Gemini_sessions.discover ~hours:(hours_param params) () in
   let items = List.map (fun (s : Gemini_sessions.info) ->
@@ -209,17 +225,25 @@ let handle_resume_session (bot : Bot.t) params =
       Claude_sessions.find_by_prefix sid_prefix) with
     | Some (sid, wd) -> Some (Config.Claude, sid, wd) | None -> None
   in
+  let try_codex () =
+    match Codex_sessions.find_by_prefix sid_prefix with
+    | Some (sid, wd) -> Some (Config.Codex, sid, wd) | None -> None
+  in
   let try_gemini () =
     match Gemini_sessions.find_by_prefix sid_prefix with
     | Some (sid, wd) -> Some (Config.Gemini, sid, wd) | None -> None
   in
   let found = match kind with
     | Some Config.Claude -> try_claude ()
+    | Some Config.Codex -> try_codex ()
     | Some Config.Gemini -> try_gemini ()
-    | Some Config.Codex -> None  (* Codex's session store is internal *)
     | None ->
       (match try_claude () with
-       | Some _ as r -> r | None -> try_gemini ())
+       | Some _ as r -> r
+       | None ->
+         match try_codex () with
+         | Some _ as r -> r
+         | None -> try_gemini ())
   in
   match found with
   | None ->
@@ -307,6 +331,7 @@ let dispatch (bot : Bot.t) method_ params =
     | "list_projects" -> handle_list_projects bot
     | "list_sessions" -> handle_list_sessions bot
     | "list_claude_sessions" -> handle_list_claude_sessions bot params
+    | "list_codex_sessions" -> handle_list_codex_sessions bot params
     | "list_gemini_sessions" -> handle_list_gemini_sessions bot params
     | "start_session" -> handle_start_session bot params
     | "resume_session" -> handle_resume_session bot params
