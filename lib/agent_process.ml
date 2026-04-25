@@ -1139,51 +1139,20 @@ let claude_args ~session_id ~message_count ~prompt =
   in
   ["claude"; "-p"; "--verbose"; "--output-format"; "stream-json"] @ session_flag @ [prompt]
 
-(** Codex allocates its session id server-side in the thread.started
-    event, so the UUID the bot pre-generated is invalid for resume on
-    the first run. [parse_codex_json_line] emits the real id via
-    Result.session_id; the agent_runner forwards it through
-    [on_session_id], and bot.ml persists it together with
-    session_id_confirmed=true.
+(* ── MCP server config (shared by all three agents) ──────────────
 
-    Subsequent runs resume only if [session_id_confirmed] — gating on
-    message_count would resume with the placeholder UUID after a
-    first-turn failure that happened before thread.started, or skip
-    resume after a first-turn failure that happened after it. The
-    "--" separator prevents prompts that happen to begin with "-"
-    from being mistaken for a Codex flag. *)
-let codex_args ~session_id ~session_id_confirmed ~prompt =
-  let base = ["codex"; "exec"; "--json"; "--full-auto";
-              "--skip-git-repo-check"] in
-  if not session_id_confirmed then base @ ["--"; prompt]
-  else base @ ["resume"; session_id; "--"; prompt]
-
-(** Like Codex, Gemini allocates its session id server-side in the
-    [init] event and we capture it from the parser's first emitted
-    Result. Subsequent runs resume only when [session_id_confirmed],
-    matching the same coherence contract Codex uses.
-
-    [--yolo] auto-approves tool calls; without it Gemini blocks on an
-    interactive approval prompt that the non-interactive subprocess
-    can't answer (mirrors Codex's [--full-auto]). *)
-let gemini_args ~session_id ~session_id_confirmed ~prompt =
-  let base = ["gemini"; "-p"; prompt; "-o"; "stream-json"; "--yolo"] in
-  if not session_id_confirmed then base
-  else base @ ["--resume"; session_id]
-
-(* ── MCP server config (shared by Claude and Gemini) ─────────────
-
-   Both agents expose the bot's MCP tools (start_session, list_*,
-   etc.) by pointing at scripts/mcp-server.py. They differ only in
-   how that pointer is delivered:
+   All three agents expose the bot's MCP tools (start_session,
+   list_*, etc.) by pointing at scripts/mcp-server.py. They each
+   accept the pointer through a different mechanism:
 
    - Claude takes a [--mcp-config <path>] flag; we write the JSON to
      [~/.config/discord-agents/mcp-generated.json] and pass the path.
+   - Codex takes [-c key=value] TOML overrides per invocation; we
+     inject [mcp_servers.discord_agents.command/args] without
+     touching the user's [~/.codex/config.toml].
    - Gemini has no flag; it loads [mcpServers] from
      [<cwd>/.gemini/settings.json]. We write the file into the
-     worktree and add [.gemini/] to [.git/info/exclude].
-
-   Codex doesn't use MCP at all. *)
+     worktree and add [.gemini/] to [.git/info/exclude]. *)
 
 let mcp_script_path = lazy (
   (* Allow an explicit override for installs where the script doesn't
@@ -1312,6 +1281,85 @@ let setup_gemini_mcp ~working_dir =
         output_string oc "\n.gemini/\n")
     with _ -> ()
 
+(** Escape a string for embedding inside a TOML double-quoted string.
+    Backslash and double-quote are the only required escapes for our
+    use case (filesystem paths injected via [codex -c key="value"]). *)
+let escape_toml_string s =
+  let buf = Buffer.create (String.length s + 8) in
+  String.iter (fun c ->
+    match c with
+    | '\\' -> Buffer.add_string buf "\\\\"
+    | '"'  -> Buffer.add_string buf "\\\""
+    | _    -> Buffer.add_char buf c) s;
+  Buffer.contents buf
+
+(** TOML overrides that register the discord-agents MCP server for a
+    Codex invocation, without touching the user's ~/.codex/config.toml.
+    Two key=value pairs because Codex parses each [-c] independently. *)
+let codex_mcp_overrides () =
+  let path = escape_toml_string (Lazy.force mcp_script_path) in
+  [ "-c"; {|mcp_servers.discord_agents.command="python3"|};
+    "-c"; Printf.sprintf
+      {|mcp_servers.discord_agents.args=["%s"]|} path ]
+
+(** Codex allocates its session id server-side in the thread.started
+    event, so the UUID the bot pre-generated is invalid for resume on
+    the first run. [parse_codex_json_line] emits the real id via
+    Result.session_id; the agent_runner forwards it through
+    [on_session_id], and bot.ml persists it together with
+    session_id_confirmed=true.
+
+    Subsequent runs resume only if [session_id_confirmed] — gating on
+    message_count would resume with the placeholder UUID after a
+    first-turn failure that happened before thread.started, or skip
+    resume after a first-turn failure that happened after it. The
+    "--" separator prevents prompts that happen to begin with "-"
+    from being mistaken for a Codex flag. *)
+let codex_args ~session_id ~session_id_confirmed ~prompt =
+  let base = ["codex"; "exec"; "--json"; "--full-auto";
+              "--skip-git-repo-check"]
+             @ codex_mcp_overrides () in
+  if not session_id_confirmed then base @ ["--"; prompt]
+  else base @ ["resume"; session_id; "--"; prompt]
+
+(** Like Codex, Gemini allocates its session id server-side in the
+    [init] event and we capture it from the parser's first emitted
+    Result. Subsequent runs resume only when [session_id_confirmed],
+    matching the same coherence contract Codex uses.
+
+    [--yolo] auto-approves tool calls; without it Gemini blocks on an
+    interactive approval prompt that the non-interactive subprocess
+    can't answer (mirrors Codex's [--full-auto]).
+
+    Gemini's MCP server config is written into [.gemini/settings.json]
+    by [setup_gemini_mcp], which run_streaming calls before invoking
+    [gemini_args]. *)
+let gemini_args ~session_id ~session_id_confirmed ~prompt =
+  let base = ["gemini"; "-p"; prompt; "-o"; "stream-json"; "--yolo"] in
+  if not session_id_confirmed then base
+  else base @ ["--resume"; session_id]
+
+(** Compose the per-turn prompt sent to a non-Claude agent, prepending
+    the session's system prompt on the first turn so MCP-aware agents
+    know what tools they have. Claude takes [--append-system-prompt]
+    via run_streaming and skips this. The conversation history carries
+    the system prompt forward on subsequent turns, so we only inject
+    it when [message_count = 0].
+
+    Pure function so it's testable without a subprocess. *)
+let compose_session_prompt ~agent_kind ~system_prompt ~message_count
+    ~user_prompt =
+  let needs_inline =
+    message_count = 0
+    && (match agent_kind with
+        | Config.Codex | Config.Gemini -> true
+        | Config.Claude -> false)
+  in
+  match system_prompt with
+  | Some sp when needs_inline ->
+    Printf.sprintf "<bot-context>\n%s\n</bot-context>\n\n%s" sp user_prompt
+  | _ -> user_prompt
+
 (** Spawn an agent and stream its output via a callback.
     The callback is called with each parsed event as it arrives.
     [?on_pid] is called with the child PID immediately after spawn,
@@ -1322,6 +1370,11 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
   let mgr = Eio.Stdenv.process_mgr env in
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
+  (* Codex/Gemini get the system prompt prepended to the first user
+     turn (compose_session_prompt); Claude gets it via the dedicated
+     [--append-system-prompt] flag instead. *)
+  let prompt = compose_session_prompt
+    ~agent_kind:kind ~system_prompt ~message_count ~user_prompt:prompt in
   let args = match kind with
     | Config.Claude ->
       let base = claude_args ~session_id ~message_count ~prompt in

@@ -1369,35 +1369,165 @@ let resume_helpers_tests = [
 
 let codex_args = Discord_agents.Agent_process.codex_args
 
+(* The args list now contains MCP TOML overrides, so exact-list
+   matching would be brittle. Tests assert on structural shape: the
+   right subcommand, the right flags present, the MCP server
+   registered, and the prompt at the end after a -- separator. *)
+
+let contains_pair list k v =
+  let rec scan = function
+    | a :: b :: _ when a = k && b = v -> true
+    | _ :: rest -> scan rest
+    | [] -> false
+  in scan list
+
+let last_two list =
+  match List.rev list with
+  | last :: penultimate :: _ -> Some (penultimate, last)
+  | _ -> None
+
 let test_codex_args_fresh () =
   let args = codex_args ~session_id:"placeholder-uuid"
     ~session_id_confirmed:false ~prompt:"hello" in
-  Alcotest.(check (list string)) "fresh exec, no resume, -- before prompt"
-    ["codex"; "exec"; "--json"; "--full-auto"; "--skip-git-repo-check";
-     "--"; "hello"]
-    args
+  Alcotest.(check bool) "starts with `codex exec`" true
+    (List.length args >= 2 && List.nth args 0 = "codex"
+     && List.nth args 1 = "exec");
+  Alcotest.(check bool) "includes --json" true (List.mem "--json" args);
+  Alcotest.(check bool) "includes --full-auto" true
+    (List.mem "--full-auto" args);
+  Alcotest.(check bool) "includes --skip-git-repo-check" true
+    (List.mem "--skip-git-repo-check" args);
+  Alcotest.(check bool) "no resume on fresh" false (List.mem "resume" args);
+  Alcotest.(check (option (pair string string)))
+    "ends with -- then prompt" (Some ("--", "hello")) (last_two args)
 
 let test_codex_args_resume () =
-  let args = codex_args ~session_id:"019dc073-0e5f-74d3-8fcf-0bb027feab47"
+  let sid = "019dc073-0e5f-74d3-8fcf-0bb027feab47" in
+  let args = codex_args ~session_id:sid
     ~session_id_confirmed:true ~prompt:"continue" in
-  Alcotest.(check (list string)) "resume with id, -- before prompt"
-    ["codex"; "exec"; "--json"; "--full-auto"; "--skip-git-repo-check";
-     "resume"; "019dc073-0e5f-74d3-8fcf-0bb027feab47"; "--"; "continue"]
-    args
+  Alcotest.(check bool) "includes resume <sid>" true
+    (contains_pair args "resume" sid);
+  Alcotest.(check (option (pair string string)))
+    "ends with -- then prompt" (Some ("--", "continue")) (last_two args)
 
 let test_codex_args_dash_prompt_safe () =
   (* A prompt starting with - must not be consumed as a Codex flag. *)
   let args = codex_args ~session_id:"x" ~session_id_confirmed:false
     ~prompt:"--help me" in
-  let last = List.nth args (List.length args - 1) in
-  let second_last = List.nth args (List.length args - 2) in
-  Alcotest.(check string) "prompt is the last arg" "--help me" last;
-  Alcotest.(check string) "preceded by --" "--" second_last
+  Alcotest.(check (option (pair string string)))
+    "prompt sits after --" (Some ("--", "--help me")) (last_two args)
+
+let test_codex_args_includes_mcp_overrides () =
+  (* Codex sessions should expose the bot's MCP tools the same way
+     Claude (--mcp-config) and Gemini (.gemini/settings.json) do.
+     Two -c overrides register the discord-agents server. *)
+  let args = codex_args ~session_id:"x" ~session_id_confirmed:false
+    ~prompt:"hi" in
+  Alcotest.(check bool) "registers discord_agents.command"
+    true (contains_pair args "-c"
+            {|mcp_servers.discord_agents.command="python3"|});
+  Alcotest.(check bool) "registers discord_agents.args" true
+    (List.exists (fun s ->
+      try ignore (Str.search_forward
+        (Str.regexp_string "mcp_servers.discord_agents.args=[") s 0); true
+      with Not_found -> false) args)
+
+let test_codex_args_resume_keeps_mcp () =
+  (* Resuming a Codex session should still expose MCP tools. *)
+  let args = codex_args ~session_id:"x" ~session_id_confirmed:true
+    ~prompt:"hi" in
+  Alcotest.(check bool) "MCP override present on resume too"
+    true (contains_pair args "-c"
+            {|mcp_servers.discord_agents.command="python3"|})
 
 let codex_args_tests = [
-  Alcotest.test_case "fresh exec args" `Quick test_codex_args_fresh;
-  Alcotest.test_case "resume args" `Quick test_codex_args_resume;
-  Alcotest.test_case "dash-prefixed prompt" `Quick test_codex_args_dash_prompt_safe;
+  Alcotest.test_case "fresh exec shape" `Quick test_codex_args_fresh;
+  Alcotest.test_case "resume shape" `Quick test_codex_args_resume;
+  Alcotest.test_case "dash-prefixed prompt sits after --" `Quick
+    test_codex_args_dash_prompt_safe;
+  Alcotest.test_case "fresh includes MCP overrides" `Quick
+    test_codex_args_includes_mcp_overrides;
+  Alcotest.test_case "resume keeps MCP overrides" `Quick
+    test_codex_args_resume_keeps_mcp;
+]
+
+(* ── escape_toml_string + compose_session_prompt ──────────────────── *)
+
+let test_escape_toml_string_passthrough () =
+  let s = "/home/me/bot/scripts/mcp-server.py" in
+  Alcotest.(check string) "ordinary path passes through unchanged"
+    s (Discord_agents.Agent_process.escape_toml_string s)
+
+let test_escape_toml_string_quotes () =
+  let s = {|path with "quotes"|} in
+  Alcotest.(check string) "double-quote escaped to \\\""
+    {|path with \"quotes\"|}
+    (Discord_agents.Agent_process.escape_toml_string s)
+
+let test_escape_toml_string_backslash () =
+  let s = {|c:\Users\bot|} in
+  Alcotest.(check string) "backslash escaped to \\\\"
+    {|c:\\Users\\bot|}
+    (Discord_agents.Agent_process.escape_toml_string s)
+
+let compose = Discord_agents.Agent_process.compose_session_prompt
+
+let test_compose_claude_no_prepend () =
+  (* Claude has --append-system-prompt, so the user prompt is
+     unchanged regardless of whether system_prompt is set. *)
+  let out = compose ~agent_kind:Discord_agents.Config.Claude
+    ~system_prompt:(Some "INSTR") ~message_count:0 ~user_prompt:"hi" in
+  Alcotest.(check string) "claude prompt unchanged" "hi" out
+
+let test_compose_codex_first_turn_prepends () =
+  let out = compose ~agent_kind:Discord_agents.Config.Codex
+    ~system_prompt:(Some "INSTR") ~message_count:0 ~user_prompt:"hi" in
+  Alcotest.(check bool) "first-turn Codex receives <bot-context>"
+    true (try ignore (Str.search_forward
+      (Str.regexp_string "<bot-context>") out 0); true
+    with Not_found -> false);
+  Alcotest.(check bool) "system prompt embedded" true
+    (try ignore (Str.search_forward (Str.regexp_string "INSTR") out 0); true
+    with Not_found -> false);
+  Alcotest.(check bool) "user prompt still present" true
+    (try ignore (Str.search_forward (Str.regexp_string "hi") out 0); true
+    with Not_found -> false)
+
+let test_compose_codex_subsequent_turn_no_prepend () =
+  let out = compose ~agent_kind:Discord_agents.Config.Codex
+    ~system_prompt:(Some "INSTR") ~message_count:1 ~user_prompt:"hi" in
+  Alcotest.(check string) "subsequent turn unchanged" "hi" out
+
+let test_compose_gemini_first_turn_prepends () =
+  let out = compose ~agent_kind:Discord_agents.Config.Gemini
+    ~system_prompt:(Some "INSTR") ~message_count:0 ~user_prompt:"hi" in
+  Alcotest.(check bool) "first-turn Gemini also gets <bot-context>"
+    true (try ignore (Str.search_forward
+      (Str.regexp_string "<bot-context>") out 0); true
+    with Not_found -> false)
+
+let test_compose_no_system_prompt_passthrough () =
+  let out = compose ~agent_kind:Discord_agents.Config.Codex
+    ~system_prompt:None ~message_count:0 ~user_prompt:"hi" in
+  Alcotest.(check string) "no system prompt = unchanged" "hi" out
+
+let prompt_helpers_tests = [
+  Alcotest.test_case "escape_toml_string passthrough" `Quick
+    test_escape_toml_string_passthrough;
+  Alcotest.test_case "escape_toml_string quotes" `Quick
+    test_escape_toml_string_quotes;
+  Alcotest.test_case "escape_toml_string backslash" `Quick
+    test_escape_toml_string_backslash;
+  Alcotest.test_case "compose: Claude unchanged (uses --append flag)" `Quick
+    test_compose_claude_no_prepend;
+  Alcotest.test_case "compose: Codex first turn prepends bot-context" `Quick
+    test_compose_codex_first_turn_prepends;
+  Alcotest.test_case "compose: Codex subsequent turn unchanged" `Quick
+    test_compose_codex_subsequent_turn_no_prepend;
+  Alcotest.test_case "compose: Gemini first turn prepends bot-context" `Quick
+    test_compose_gemini_first_turn_prepends;
+  Alcotest.test_case "compose: no system prompt = passthrough" `Quick
+    test_compose_no_system_prompt_passthrough;
 ]
 
 (* ── parse_gemini_stream_json_line ────────────────────────────────── *)
@@ -1591,6 +1721,7 @@ let () =
     "codex_json", codex_json_tests;
     "codex_safety", codex_safety_tests;
     "codex_args", codex_args_tests;
+    "prompt_helpers", prompt_helpers_tests;
     "gemini_json", gemini_json_tests;
     "gemini_args", gemini_args_tests;
     "caller_pinned", caller_pinned_tests;

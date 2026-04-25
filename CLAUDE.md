@@ -146,10 +146,22 @@ Gemini tool names (`run_shell_command`, `read_file`, `write_file`, `replace`, `s
 
 ## MCP configuration
 
-The bot exposes MCP tools (start_session, list_sessions, etc.) via `scripts/mcp-server.py`. How each agent picks it up:
+The bot exposes MCP tools (start_session, list_sessions, etc.) via `scripts/mcp-server.py`. All three agents now pick it up — each through a different mechanism:
+
 - **Claude** — `--mcp-config <path>` flag; we write the config to `~/.config/discord-agents/mcp-generated.json`.
-- **Codex** — does not use MCP.
-- **Gemini** — has no `--mcp-config` flag; loads `mcpServers` from `<cwd>/.gemini/settings.json`. The bot writes that file into the worktree at session start and appends `.gemini/` to the worktree's `.git/info/exclude` so it doesn't show as untracked.
+- **Codex** — TOML overrides via `-c key=value` per invocation: `mcp_servers.discord_agents.command="python3"` and `mcp_servers.discord_agents.args=["..."]`. Doesn't touch the user's `~/.codex/config.toml`.
+- **Gemini** — has no `--mcp-config` flag; loads `mcpServers` from `<cwd>/.gemini/settings.json`. The bot merges its entry into any existing settings file (preserving the user's other MCP servers and unrelated keys) at session start and appends `.gemini/` to the worktree's `.git/info/exclude`.
+
+For non-default install layouts where the script doesn't live next to the executable, set `DISCORD_AGENTS_MCP_SCRIPT=/path/to/mcp-server.py` to override the heuristic search.
+
+## System prompts
+
+Per-session system prompts (set via `Session_store.session.system_prompt`) tell the agent what role it's playing and which MCP tools it has. Forwarded to each agent through its native mechanism:
+
+- **Claude** — `--append-system-prompt <text>` flag (persistent across all turns).
+- **Codex / Gemini** — neither CLI exposes a system-instruction flag, so the bot prepends the prompt as a `<bot-context>...</bot-context>` block to the user's first-turn message. The conversation history carries it forward on subsequent turns. See `Agent_process.compose_session_prompt`.
+
+Today only the control/project channel sessions (created by `ensure_channel_session`) set a system prompt, and those are hardcoded to Claude. The Codex/Gemini paths are wired and tested so a future feature could back a control/project channel with a different agent without further plumbing.
 
 ## Bare repo / worktree setup
 
