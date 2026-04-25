@@ -1186,20 +1186,27 @@ let gemini_args ~session_id ~session_id_confirmed ~prompt =
    Codex doesn't use MCP at all. *)
 
 let mcp_script_path = lazy (
-  try
-    let exe = Sys.executable_name in
-    let exe = if Filename.is_relative exe
-      then Filename.concat (Sys.getcwd ()) exe else exe in
-    let rec find_root path =
-      let candidate = Filename.concat path "scripts/mcp-server.py" in
-      if Sys.file_exists candidate then candidate
-      else
-        let parent = Filename.dirname path in
-        if parent = path then "scripts/mcp-server.py"
-        else find_root parent
-    in
-    find_root (Filename.dirname exe)
-  with _ -> "scripts/mcp-server.py"
+  (* Allow an explicit override for installs where the script doesn't
+     live next to the executable (e.g. a standalone binary, or a
+     packaged install). Falls through to the heuristic search if
+     unset. *)
+  match Sys.getenv_opt "DISCORD_AGENTS_MCP_SCRIPT" with
+  | Some path when path <> "" -> path
+  | _ ->
+    try
+      let exe = Sys.executable_name in
+      let exe = if Filename.is_relative exe
+        then Filename.concat (Sys.getcwd ()) exe else exe in
+      let rec find_root path =
+        let candidate = Filename.concat path "scripts/mcp-server.py" in
+        if Sys.file_exists candidate then candidate
+        else
+          let parent = Filename.dirname path in
+          if parent = path then "scripts/mcp-server.py"
+          else find_root parent
+      in
+      find_root (Filename.dirname exe)
+    with _ -> "scripts/mcp-server.py"
 )
 
 let mcp_json = lazy (
@@ -1244,18 +1251,56 @@ let claude_mcp_config_path () =
   write_file_safely ~path:config_path (Lazy.force mcp_json);
   config_path
 
-(** Gemini: drop [.gemini/settings.json] into the worktree and ensure
-    [.gemini/] is in [.git/info/exclude] so the worktree stays clean.
-    Idempotent — the exclude append is a no-op if [.gemini/] is
-    already listed. *)
+(** Inject our [discord-agents] entry into a Gemini settings JSON
+    string (preserving any other [mcpServers] and unrelated
+    top-level keys the user might have set). If the input doesn't
+    parse as JSON, fall back to writing our config alone. *)
+let merge_gemini_settings existing =
+  let our_entry = `Assoc [
+    ("command", `String "python3");
+    ("args", `List [`String (Lazy.force mcp_script_path)]);
+  ] in
+  let render_fresh () =
+    Yojson.Safe.pretty_to_string
+      (`Assoc [("mcpServers", `Assoc [("discord-agents", our_entry)])])
+  in
+  match existing with
+  | None -> render_fresh ()
+  | Some text ->
+    try
+      let json = Yojson.Safe.from_string text in
+      let updated = match json with
+        | `Assoc fields ->
+          let prior_servers = match List.assoc_opt "mcpServers" fields with
+            | Some (`Assoc servers) -> servers
+            | _ -> [] in
+          let new_servers =
+            ("discord-agents", our_entry)
+            :: List.filter (fun (k, _) -> k <> "discord-agents") prior_servers
+          in
+          let new_fields =
+            ("mcpServers", `Assoc new_servers)
+            :: List.filter (fun (k, _) -> k <> "mcpServers") fields
+          in
+          `Assoc new_fields
+        | _ -> json
+      in
+      Yojson.Safe.pretty_to_string updated
+    with _ -> render_fresh ()
+
+(** Gemini: drop our entry into [.gemini/settings.json] (merging into
+    any pre-existing user config) and ensure [.gemini/] is in
+    [.git/info/exclude]. Both writes are idempotent — re-running
+    against a worktree we've already configured leaves the file and
+    the exclude line unchanged in shape. *)
 let setup_gemini_mcp ~working_dir =
   let gemini_dir = Filename.concat working_dir ".gemini" in
   (try
      if not (Sys.file_exists gemini_dir) then Unix.mkdir gemini_dir 0o755
    with _ -> ());
-  write_file_safely
-    ~path:(Filename.concat gemini_dir "settings.json")
-    (Lazy.force mcp_json);
+  let settings_path = Filename.concat gemini_dir "settings.json" in
+  let merged = merge_gemini_settings (read_file_opt settings_path) in
+  write_file_safely ~path:settings_path merged;
   let exclude_path = Filename.concat working_dir ".git/info/exclude" in
   match read_file_opt exclude_path with
   | None -> ()

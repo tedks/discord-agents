@@ -139,7 +139,8 @@ You have MCP tools available:
 - list_projects: List all discovered projects
 - list_sessions: List active bot sessions
 - list_claude_sessions: Find recent Claude Code sessions to resume
-- resume_session: Resume an existing Claude session
+- list_gemini_sessions: Find recent Gemini CLI sessions to resume
+- resume_session: Resume an existing Claude or Gemini session (pass kind=gemini for Gemini)
 - restart_bot: Rebuild and restart the bot
 - rename_thread: Rename a Discord thread
 - cleanup_channels: Delete stale Discord channels
@@ -174,7 +175,8 @@ You have MCP tools available:
 - list_projects: List all discovered projects
 - list_sessions: List active bot sessions
 - list_claude_sessions: Find recent Claude Code sessions to resume
-- resume_session: Resume an existing Claude session
+- list_gemini_sessions: Find recent Gemini CLI sessions to resume
+- resume_session: Resume an existing Claude or Gemini session (pass kind=gemini for Gemini)
 - rename_thread: Rename a Discord thread
 - restart_bot: Rebuild and restart the bot
 - cleanup_channels: Delete stale Discord channels
@@ -366,6 +368,65 @@ let format_session_listing
       "**Recent %s sessions** (last 24h):\n%s\n\nUse `%s` to attach."
       label (String.concat "\n" lines) resume_hint
 
+(** Build the user-facing "session not found" error for the Resume
+    handlers (Discord command, MCP tool). Special-cases the Codex
+    branch — Codex's session store isn't enumerable, so the prior
+    "No codex session matching ..." text was misleading. *)
+let resume_not_found_message ~kind ~sid_prefix =
+  match kind with
+  | Some Config.Codex ->
+    "Codex sessions cannot be enumerated; use !start with codex \
+     (or start_session with agent=codex) to create a new Codex session."
+  | Some k ->
+    Printf.sprintf "No %s session matching %S."
+      (Config.string_of_agent_kind k) sid_prefix
+  | None ->
+    Printf.sprintf "No session matching %S." sid_prefix
+
+(** Routing data needed to attach a resumed session to a Discord
+    thread. Computed once per Resume invocation, used by both the
+    Discord command handler and the MCP control_api handler. *)
+type resume_target = {
+  thread_parent : Discord_types.channel_id;
+  working_dir : string;
+  project_name : string;
+}
+
+(** Given the working_dir reported by disk discovery, pick the right
+    Discord parent channel and resolve any path nuances (bare-repo
+    pointer → master worktree, missing project → kind-named
+    placeholder). [fallback_channel] is used when no project channel
+    matches — typically the channel where the resume was invoked
+    (Discord) or the bot's control channel (MCP). *)
+let resolve_resume_target t ~raw_working_dir ~kind_label ~fallback_channel =
+  let matched_project = List.find_opt (fun (p : Project.t) ->
+    raw_working_dir = p.path
+    || (String.length raw_working_dir > String.length p.path + 1
+        && String.sub raw_working_dir 0 (String.length p.path + 1)
+           = p.path ^ "/")
+  ) (projects t) in
+  let thread_parent = match matched_project with
+    | Some p ->
+      (match Channel_manager.find_or_create ~rest:t.rest
+               ~guild_id:t.config.guild_id ~project:p (channels t) with
+       | Some ch_id -> ch_id
+       | None -> fallback_channel)
+    | None -> fallback_channel
+  in
+  let working_dir = match matched_project with
+    | Some p when p.is_bare && raw_working_dir = p.path ->
+      (match working_dir_of_project p with
+       | Ok wd -> wd | Error _ -> raw_working_dir)
+    | _ -> raw_working_dir
+  in
+  let project_name = match matched_project with
+    | Some p -> p.name
+    | None ->
+      if raw_working_dir = "" then kind_label ^ "-session"
+      else Filename.basename raw_working_dir
+  in
+  { thread_parent; working_dir; project_name }
+
 (** Handle a parsed command. *)
 let handle_command t msg cmd =
   let channel_id = msg.Discord_types.channel_id in
@@ -491,51 +552,30 @@ let handle_command t msg cmd =
       in
       match found with
       | None ->
-        let kind_label = match kind with
-          | Some k -> Config.string_of_agent_kind k ^ " "
-          | None -> "" in
-        reply (Printf.sprintf "No %ssession matching `%s`." kind_label session_id)
+        reply (resume_not_found_message ~kind ~sid_prefix:session_id)
       | Some (found_kind, full_sid, raw_working_dir) ->
         let kind_label = Config.string_of_agent_kind found_kind in
         let kind_title = String.capitalize_ascii kind_label in
         let sid_short = String.sub full_sid 0 (min 8 (String.length full_sid)) in
-        (* Match working directory to a known project for channel routing *)
-        let matched_project = List.find_opt (fun (p : Project.t) ->
-          raw_working_dir = p.path
-          || (String.length raw_working_dir > String.length p.path + 1
-              && String.sub raw_working_dir 0 (String.length p.path + 1)
-                 = p.path ^ "/")
-        ) (projects t) in
-        let thread_parent = match matched_project with
-          | Some p ->
-            (match Channel_manager.find_or_create ~rest:t.rest
-                     ~guild_id:t.config.guild_id ~project:p (channels t) with
-             | Some ch_id -> ch_id
-             | None -> channel_id)
-          | None -> channel_id
-        in
-        (* If working_dir is a bare repo root, use the main worktree instead *)
-        let working_dir = match matched_project with
-          | Some p when p.is_bare && raw_working_dir = p.path ->
-            (match working_dir_of_project p with
-             | Ok wd -> wd
-             | Error _ -> raw_working_dir)
-          | _ -> raw_working_dir
-        in
-        let project_name = match matched_project with
-          | Some p -> p.name
-          | None ->
-            if raw_working_dir = "" then kind_label ^ "-session"
-            else Filename.basename raw_working_dir
+        let { thread_parent; working_dir; project_name } =
+          resolve_resume_target t
+            ~raw_working_dir ~kind_label ~fallback_channel:channel_id
         in
         (match Discord_rest.create_thread_no_message t.rest
                 ~channel_id:thread_parent
                 ~name:(Printf.sprintf "resume %s / %s" kind_label sid_short) () with
         | Error e -> reply (Printf.sprintf "Failed to create thread: %s" e)
         | Ok thread_ch ->
+          (* session_id_confirmed:true is critical here: we resolved
+             [full_sid] from disk discovery, so it's a real id the
+             agent will recognize. Without this override the
+             make_session default for Gemini (caller_pinned=false)
+             would mark the session unconfirmed and the next turn's
+             gemini_args would omit --resume, starting a fresh chat. *)
           let session = Session_store.make_session
             ~project_name ~working_dir ~agent_kind:found_kind
-            ~session_id:full_sid ~message_count:1
+            ~session_id:full_sid ~session_id_confirmed:true
+            ~message_count:1
             ~thread_id:thread_ch.Discord_types.id
             ~system_prompt:None ~initial_prompt:None () in
           Session_store.add t.sessions ~thread_id:thread_ch.id session;

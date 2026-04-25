@@ -35,16 +35,25 @@ fi
 target="$1"
 
 # If not absolute, look up via `git worktree list`. Match either by
-# branch name (refs/heads/<name>) or by path basename.
+# branch name (refs/heads/<name>) or by path basename. Skip bare-repo
+# entries — porcelain emits "bare" for them and we can't `dune exec`
+# from a bare path. The match decision is deferred to end-of-block
+# (blank line) so we know whether the entry was bare before printing.
 if [[ "$target" != /* ]]; then
   resolved=$(git worktree list --porcelain | awk -v name="$target" '
-    /^worktree / { path = $2 }
+    function flush() {
+      if (path != "" && !bare && basename_match) { print path; found = 1; exit }
+      path = ""; bare = 0; basename_match = 0
+    }
+    /^worktree / { flush(); path = $2; basename_match = (path ~ ("/" name "$")) }
+    /^bare/      { bare = 1 }
     /^branch / {
       branch = $2
       sub(/^refs\/heads\//, "", branch)
-      if (branch == name) { print path; exit }
+      if (branch == name && !bare) { print path; found = 1; exit }
     }
-    /^worktree / && $2 ~ ("/" name "$") { print $2; exit }
+    /^$/ { flush() }
+    END  { if (!found) flush() }
   ')
   if [[ -z "${resolved:-}" ]]; then
     echo "No worktree matching '$target'" >&2

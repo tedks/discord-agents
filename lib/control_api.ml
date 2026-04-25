@@ -223,56 +223,34 @@ let handle_resume_session (bot : Bot.t) params =
   in
   match found with
   | None ->
-    let label = match kind with
-      | Some k -> Config.string_of_agent_kind k ^ " "
-      | None -> "" in
-    error_response (Printf.sprintf "No %ssession matching '%s'." label sid_prefix)
+    error_response (Bot.resume_not_found_message ~kind ~sid_prefix)
   | Some (resolved_kind, full_sid, raw_working_dir) ->
     let kind_label = Config.string_of_agent_kind resolved_kind in
     let kind_title = String.capitalize_ascii kind_label in
     let sid_short = String.sub full_sid 0 (min 8 (String.length full_sid)) in
-    let matched_project = List.find_opt (fun (p : Project.t) ->
-      raw_working_dir = p.path
-      || (String.length raw_working_dir > String.length p.path + 1
-          && String.sub raw_working_dir 0 (String.length p.path + 1)
-             = p.path ^ "/")
-    ) (Bot.projects bot) in
-    let thread_parent = match matched_project with
-      | Some p ->
-        (match Channel_manager.find_or_create ~rest:bot.rest
-                 ~guild_id:bot.config.guild_id ~project:p (Bot.channels bot) with
-         | Some ch_id -> ch_id
-         | None ->
-           (match bot.config.control_channel_id with
-            | Some ctl -> ctl | None -> ""))
-      | None ->
-        (match bot.config.control_channel_id with
-         | Some ctl -> ctl | None -> "")
+    let fallback_channel = match bot.config.control_channel_id with
+      | Some ctl -> ctl | None -> ""
+    in
+    let { Bot.thread_parent; working_dir; project_name } =
+      Bot.resolve_resume_target bot
+        ~raw_working_dir ~kind_label ~fallback_channel
     in
     if thread_parent = "" then
       error_response "No channel found for thread creation."
     else
-      let working_dir = match matched_project with
-        | Some p when p.is_bare && raw_working_dir = p.path ->
-          (match Bot.working_dir_of_project p with
-           | Ok wd -> wd | Error _ -> raw_working_dir)
-        | _ -> raw_working_dir
-      in
-      let project_name = match matched_project with
-        | Some p -> p.name
-        | None ->
-          if raw_working_dir = "" then kind_label ^ "-session"
-          else Filename.basename raw_working_dir
-      in
       let thread_name =
         Printf.sprintf "resume %s / %s" kind_label sid_short in
       (match Discord_rest.create_thread_no_message bot.rest
               ~channel_id:thread_parent ~name:thread_name () with
       | Error e -> error_response (Printf.sprintf "Failed to create thread: %s" e)
       | Ok thread_ch ->
+        (* session_id_confirmed:true is critical: see Bot.handle_command
+           Resume_session for the rationale — without it, Gemini resumes
+           start fresh chats instead of resuming. *)
         let session = Session_store.make_session
           ~project_name ~working_dir ~agent_kind:resolved_kind
-          ~session_id:full_sid ~message_count:1
+          ~session_id:full_sid ~session_id_confirmed:true
+          ~message_count:1
           ~thread_id:thread_ch.Discord_types.id
           ~system_prompt:None ~initial_prompt:None () in
         Session_store.add bot.sessions ~thread_id:thread_ch.id session;

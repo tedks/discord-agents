@@ -96,7 +96,9 @@ let invoke_or_skip ~label ~cmd ~parse =
   parse_lines parse output
 
 (** Generate a UUID-v4 for Claude session ids. Reads /proc on Linux
-    or shells out to uuidgen. *)
+    or shells out to uuidgen. We don't reuse [Resource.generate_uuid]
+    because it depends on Mirage_crypto_rng being initialized — which
+    bin/main.ml sets up but this test binary doesn't. *)
 let fresh_uuid () =
   let (_, out) = run_capture
     "uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid" in

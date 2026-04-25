@@ -20,21 +20,19 @@ let read_file path =
     really_input ic s 0 n;
     Bytes.to_string s)
 
-(** SHA-256 of a string via the [sha256sum] shell utility.
-    Returns hex digest or "" on failure. We shell out to avoid taking
-    a cryptographic-hash dependency for one-shot session discovery. *)
+(** SHA-256 of a string via the [sha256sum] shell utility, fed over
+    stdin so we don't have to manage a temp file. Returns hex digest
+    or "" on failure. We shell out to avoid taking a cryptographic-
+    hash dependency for one-shot session discovery. *)
 let sha256_hex s =
   try
-    let tmp = Filename.temp_file "gemini_sess" "" in
-    Fun.protect ~finally:(fun () -> try Sys.remove tmp with _ -> ())
+    let (ic, oc) = Unix.open_process "sha256sum 2>/dev/null" in
+    Fun.protect
+      ~finally:(fun () -> ignore (Unix.close_process (ic, oc)))
       (fun () ->
-        let oc = open_out tmp in
         output_string oc s;
         close_out oc;
-        let ic = Unix.open_process_in
-          (Printf.sprintf "sha256sum %s 2>/dev/null" (Filename.quote tmp)) in
         let line = try input_line ic with End_of_file -> "" in
-        ignore (Unix.close_process_in ic);
         match String.index_opt line ' ' with
         | Some i -> String.sub line 0 i
         | None -> String.trim line)

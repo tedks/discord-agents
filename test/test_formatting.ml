@@ -1214,6 +1214,47 @@ let test_legacy_gemini_session_defaults_unconfirmed () =
       false s.session_id_confirmed
   | _ -> Alcotest.fail "expected exactly one session"
 
+(* Regression: the Resume_session handlers in bot.ml and control_api.ml
+   construct a session record with [session_id_confirmed:true] because
+   they've just resolved [session_id] from disk discovery and know
+   it's resumable. Without that override, make_session would default
+   Gemini sessions to unconfirmed (caller_pinned_session_id Gemini =
+   false), and the next turn would emit gemini_args without --resume
+   and start a fresh chat. This test pins the override. *)
+let test_make_session_resume_override_gemini_confirms () =
+  let s = Discord_agents.Session_store.make_session
+    ~project_name:"foo" ~working_dir:"/tmp/foo"
+    ~agent_kind:Discord_agents.Config.Gemini
+    ~session_id:"recovered-from-disk"
+    ~session_id_confirmed:true ~message_count:1
+    ~thread_id:"123" ~system_prompt:None ~initial_prompt:None ()
+  in
+  Alcotest.(check bool)
+    "resume override flips Gemini's session_id_confirmed to true"
+    true s.session_id_confirmed
+
+let test_make_session_default_gemini_unconfirmed () =
+  let s = Discord_agents.Session_store.make_session
+    ~project_name:"foo" ~working_dir:"/tmp/foo"
+    ~agent_kind:Discord_agents.Config.Gemini
+    ~session_id:"placeholder"
+    ~thread_id:"123" ~system_prompt:None ~initial_prompt:None ()
+  in
+  Alcotest.(check bool)
+    "fresh Gemini default is unconfirmed (id is placeholder until init)"
+    false s.session_id_confirmed
+
+let test_make_session_default_claude_confirmed () =
+  let s = Discord_agents.Session_store.make_session
+    ~project_name:"foo" ~working_dir:"/tmp/foo"
+    ~agent_kind:Discord_agents.Config.Claude
+    ~session_id:"caller-pinned"
+    ~thread_id:"123" ~system_prompt:None ~initial_prompt:None ()
+  in
+  Alcotest.(check bool)
+    "Claude default is confirmed (--session-id pins it)"
+    true s.session_id_confirmed
+
 let session_store_tests = [
   Alcotest.test_case "legacy Codex session unconfirmed" `Quick
     test_legacy_codex_session_defaults_unconfirmed;
@@ -1221,6 +1262,97 @@ let session_store_tests = [
     test_legacy_claude_session_defaults_confirmed;
   Alcotest.test_case "legacy Gemini session unconfirmed" `Quick
     test_legacy_gemini_session_defaults_unconfirmed;
+  Alcotest.test_case "Resume override flips Gemini to confirmed" `Quick
+    test_make_session_resume_override_gemini_confirms;
+  Alcotest.test_case "fresh Gemini default unconfirmed" `Quick
+    test_make_session_default_gemini_unconfirmed;
+  Alcotest.test_case "fresh Claude default confirmed" `Quick
+    test_make_session_default_claude_confirmed;
+]
+
+(* ── Bot.resume_not_found_message + Bot.merge_gemini_settings ───── *)
+
+let test_resume_not_found_codex_explains () =
+  let msg = Discord_agents.Bot.resume_not_found_message
+    ~kind:(Some Discord_agents.Config.Codex) ~sid_prefix:"abc" in
+  Alcotest.(check bool) "codex error is not the misleading default"
+    false (try ignore (Str.search_forward
+      (Str.regexp_string "No codex session matching") msg 0); true
+    with Not_found -> false);
+  Alcotest.(check bool) "codex error explains why"
+    true (try ignore (Str.search_forward
+      (Str.regexp_string "cannot be enumerated") msg 0); true
+    with Not_found -> false)
+
+let test_resume_not_found_gemini_includes_sid () =
+  let msg = Discord_agents.Bot.resume_not_found_message
+    ~kind:(Some Discord_agents.Config.Gemini) ~sid_prefix:"xyz" in
+  Alcotest.(check bool) "gemini error names the kind and sid"
+    true ((try ignore (Str.search_forward
+              (Str.regexp_string "gemini") msg 0); true
+           with Not_found -> false)
+          && (try ignore (Str.search_forward
+                (Str.regexp_string "xyz") msg 0); true
+              with Not_found -> false))
+
+let test_merge_gemini_settings_preserves_other_servers () =
+  let existing = Some {|{
+    "mcpServers": { "user-tool": { "command": "foo", "args": [] } },
+    "theme": "dark"
+  }|} in
+  let merged = Discord_agents.Agent_process.merge_gemini_settings existing in
+  let json = Yojson.Safe.from_string merged in
+  let open Yojson.Safe.Util in
+  let servers = json |> member "mcpServers" |> to_assoc in
+  Alcotest.(check bool) "user-tool preserved"
+    true (List.mem_assoc "user-tool" servers);
+  Alcotest.(check bool) "discord-agents added"
+    true (List.mem_assoc "discord-agents" servers);
+  Alcotest.(check bool) "unrelated top-level keys preserved (theme)"
+    true (List.mem_assoc "theme" (json |> to_assoc))
+
+let test_merge_gemini_settings_overwrites_our_entry () =
+  let existing = Some {|{
+    "mcpServers": { "discord-agents": { "command": "stale", "args": [] } }
+  }|} in
+  let merged = Discord_agents.Agent_process.merge_gemini_settings existing in
+  let json = Yojson.Safe.from_string merged in
+  let open Yojson.Safe.Util in
+  let our_cmd = json |> member "mcpServers" |> member "discord-agents"
+                |> member "command" |> to_string in
+  Alcotest.(check string) "stale entry replaced with current python3"
+    "python3" our_cmd
+
+let test_merge_gemini_settings_creates_when_absent () =
+  let merged = Discord_agents.Agent_process.merge_gemini_settings None in
+  let json = Yojson.Safe.from_string merged in
+  let open Yojson.Safe.Util in
+  Alcotest.(check bool) "creates mcpServers with our entry"
+    true (List.mem_assoc "discord-agents"
+            (json |> member "mcpServers" |> to_assoc))
+
+let test_merge_gemini_settings_invalid_input_falls_back () =
+  let merged = Discord_agents.Agent_process.merge_gemini_settings
+    (Some "not valid json {") in
+  let json = Yojson.Safe.from_string merged in
+  let open Yojson.Safe.Util in
+  Alcotest.(check bool) "invalid input falls back to fresh config"
+    true (List.mem_assoc "discord-agents"
+            (json |> member "mcpServers" |> to_assoc))
+
+let resume_helpers_tests = [
+  Alcotest.test_case "Codex resume error explains absence" `Quick
+    test_resume_not_found_codex_explains;
+  Alcotest.test_case "Gemini resume error names kind+sid" `Quick
+    test_resume_not_found_gemini_includes_sid;
+  Alcotest.test_case "merge_gemini_settings preserves other servers" `Quick
+    test_merge_gemini_settings_preserves_other_servers;
+  Alcotest.test_case "merge_gemini_settings overwrites our stale entry" `Quick
+    test_merge_gemini_settings_overwrites_our_entry;
+  Alcotest.test_case "merge_gemini_settings creates when absent" `Quick
+    test_merge_gemini_settings_creates_when_absent;
+  Alcotest.test_case "merge_gemini_settings invalid input falls back" `Quick
+    test_merge_gemini_settings_invalid_input_falls_back;
 ]
 
 (* ── codex_args ────────────────────────────────────────────────────── *)
@@ -1453,4 +1585,5 @@ let () =
     "gemini_args", gemini_args_tests;
     "caller_pinned", caller_pinned_tests;
     "session_store", session_store_tests;
+    "resume_helpers", resume_helpers_tests;
   ]

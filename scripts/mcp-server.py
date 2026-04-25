@@ -60,7 +60,7 @@ def control_request(method, params=None, timeout=60):
 TOOLS = [
     {
         "name": "start_session",
-        "description": "Start a new Claude agent session for a project. Creates a Discord thread and git worktree. Returns the thread info.",
+        "description": "Start a new agent session for a project (claude, codex, or gemini). Creates a Discord thread and git worktree. Returns the thread info.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -271,7 +271,9 @@ def handle_tool_call(name, arguments):
             return result["error"]
         tid = result.get("thread_id", "")
         sid = result.get("session_id", "")[:8]
-        return f"Resumed session `{sid}` in <#{tid}>."
+        kind = result.get("agent_kind", "")
+        kind_label = f"{kind.capitalize()} " if kind else ""
+        return f"Resumed {kind_label}session `{sid}` in <#{tid}>."
 
     elif name == "restart_bot":
         result = control_request("restart")
