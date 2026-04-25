@@ -802,8 +802,17 @@ let test_codex_turn_completed_flushes () =
 
 let test_codex_agent_message () =
   let line = {|{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"hello world"}}|} in
-  Alcotest.(check (option string)) "agent_message becomes Text_delta"
-    (Some "hello world") (expect_text (parse_codex line))
+  (* The trailing blank line keeps consecutive Codex agent_messages
+     from running together when several land in a single turn. *)
+  Alcotest.(check (option string)) "agent_message becomes Text_delta with separator"
+    (Some "hello world\n\n") (expect_text (parse_codex line))
+
+let test_codex_agent_message_started_dropped () =
+  (* Codex emits agent_message only as item.completed in practice; an
+     item.started should produce no event, not an Other-line log. *)
+  let line = {|{"type":"item.started","item":{"id":"i0","type":"agent_message","text":""}}|} in
+  Alcotest.(check int) "item.started agent_message emits nothing"
+    0 (List.length (parse_codex line))
 
 let test_codex_agent_message_empty_dropped () =
   let line = {|{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":""}}|} in
@@ -895,6 +904,7 @@ let codex_json_tests = [
   Alcotest.test_case "turn.started dropped" `Quick test_codex_turn_started_dropped;
   Alcotest.test_case "turn.completed flushes" `Quick test_codex_turn_completed_flushes;
   Alcotest.test_case "agent_message text" `Quick test_codex_agent_message;
+  Alcotest.test_case "agent_message item.started dropped" `Quick test_codex_agent_message_started_dropped;
   Alcotest.test_case "empty agent_message dropped" `Quick test_codex_agent_message_empty_dropped;
   Alcotest.test_case "command start is Tool_use Bash" `Quick test_codex_command_started;
   Alcotest.test_case "command complete is Tool_result" `Quick test_codex_command_completed;
@@ -936,6 +946,23 @@ let test_codex_error_missing_message () =
   match expect_error (parse_codex line) with
   | Some _ -> ()
   | None -> Alcotest.fail "expected fallback error message"
+
+let test_codex_turn_failed_scalar_error () =
+  (* Codex sometimes inlines the error message as a string instead of
+     wrapping it in an object. The previous parser raised Type_error
+     here and the outer try silently swallowed the frame. *)
+  let line = {|{"type":"turn.failed","error":"rate limited"}|} in
+  Alcotest.(check (option string)) "scalar error string surfaces verbatim"
+    (Some "rate limited") (expect_error (parse_codex line))
+
+let test_codex_file_change_all_add_is_write () =
+  (* Multi-file change where every entry is an add should display as
+     Write (📝), not Edit (✏️) — matches single-file behavior. *)
+  let line = {|{"type":"item.completed","item":{"type":"file_change","changes":[{"path":"a.ml","kind":"add"},{"path":"b.ml","kind":"add"}]}}|} in
+  match expect_tool (parse_codex line) with
+  | Some info ->
+    Alcotest.(check string) "all-add multi-file uses Write" "Write" info.tool_name
+  | None -> Alcotest.fail "expected single Tool_use"
 
 let test_codex_command_detail_oversized_capped () =
   (* Build a 10000-char command. The detail block must be capped well
@@ -1034,6 +1061,49 @@ let codex_safety_tests = [
   Alcotest.test_case "file_change paths with backticks escaped" `Quick test_codex_file_change_path_with_backticks;
   Alcotest.test_case "missing file_change kind has default" `Quick test_codex_file_change_kind_default;
   Alcotest.test_case "command summary UTF-8 safe truncation" `Quick test_codex_command_summary_utf8_safe;
+  Alcotest.test_case "turn.failed with scalar error string" `Quick test_codex_turn_failed_scalar_error;
+  Alcotest.test_case "all-add multi-file uses Write tool" `Quick test_codex_file_change_all_add_is_write;
+]
+
+(* ── Session_store: legacy load defaults ─────────────────────────── *)
+
+let test_legacy_codex_session_defaults_unconfirmed () =
+  (* A session record persisted before [session_id_confirmed] existed
+     must default to [false] for Codex sessions, so the next run
+     starts fresh rather than attempting [codex exec resume <stale-uuid>]
+     with the bot-generated placeholder. *)
+  let json = Yojson.Safe.from_string {|[
+    {"project_name":"foo","working_dir":"/tmp/foo",
+     "agent_kind":"codex","session_id":"placeholder-uuid",
+     "thread_id":"123","message_count":2}
+  ]|} in
+  let map = Discord_agents.Session_store.sessions_of_json json in
+  let sessions = Discord_agents.Session_store.SessionMap.bindings map in
+  match sessions with
+  | [(_, s)] ->
+    Alcotest.(check bool) "legacy Codex session defaults to unconfirmed"
+      false s.session_id_confirmed
+  | _ -> Alcotest.fail "expected exactly one session"
+
+let test_legacy_claude_session_defaults_confirmed () =
+  let json = Yojson.Safe.from_string {|[
+    {"project_name":"foo","working_dir":"/tmp/foo",
+     "agent_kind":"claude","session_id":"some-uuid",
+     "thread_id":"123","message_count":2}
+  ]|} in
+  let map = Discord_agents.Session_store.sessions_of_json json in
+  let sessions = Discord_agents.Session_store.SessionMap.bindings map in
+  match sessions with
+  | [(_, s)] ->
+    Alcotest.(check bool) "legacy Claude session defaults to confirmed"
+      true s.session_id_confirmed
+  | _ -> Alcotest.fail "expected exactly one session"
+
+let session_store_tests = [
+  Alcotest.test_case "legacy Codex session unconfirmed" `Quick
+    test_legacy_codex_session_defaults_unconfirmed;
+  Alcotest.test_case "legacy Claude session confirmed" `Quick
+    test_legacy_claude_session_defaults_confirmed;
 ]
 
 (* ── codex_args ────────────────────────────────────────────────────── *)
@@ -1088,4 +1158,5 @@ let () =
     "codex_json", codex_json_tests;
     "codex_safety", codex_safety_tests;
     "codex_args", codex_args_tests;
+    "session_store", session_store_tests;
   ]

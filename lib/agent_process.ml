@@ -893,14 +893,19 @@ let get_string ~default key json =
 let get_int_opt key json =
   Yojson.Safe.Util.(json |> member key |> to_int_option)
 
-(** Codex error frames put the message either at top-level (the
-    [error] frame) or nested under [error.message] (the [turn.failed]
-    frame). Resolve both shapes to the same string. *)
+(** Codex error frames carry the message in one of three shapes:
+    - top-level [{message}] (the [error] frame)
+    - nested object [{error: {message}}] (the [turn.failed] frame)
+    - nested string [{error: "..."}] (occasionally seen; the message
+      is inlined as a string)
+    Resolving each explicitly avoids a [Type_error] from the Yojson
+    accessors when [error] turns out to be a scalar. *)
 let codex_error_message json =
   let default = "unspecified codex error" in
-  let nested = Yojson.Safe.Util.member "error" json in
-  let source = if nested = `Null then json else nested in
-  get_string ~default "message" source
+  match Yojson.Safe.Util.member "error" json with
+  | `Assoc _ as nested -> get_string ~default "message" nested
+  | `String s -> s
+  | _ -> get_string ~default "message" json
 
 (** A single file-change entry. [kind] is normalized to the verb used
     by Codex ("add", "update", "delete") — empty values become
@@ -917,12 +922,26 @@ let parse_file_change_entries item =
     if path = "" then None else Some { path; kind }
   ) raw
 
+(* Per-item helpers. Each takes the raw [completed] flag so the
+   item.started / item.completed split is owned where the semantics
+   are actually understood, not in the dispatcher.
+
+   Codex emits [agent_message] / [file_change] / [error] only as
+   item.completed in the wild; the explicit no-op on item.started
+   future-proofs against a Codex change without polluting Other-line
+   debug logs. [command_execution] is the only shape with a real
+   start-and-end lifecycle. *)
+
 (** Fully-formed assistant text. Codex emits this once per item with
-    the complete message — there are no incremental deltas. *)
-let parse_codex_agent_message item =
-  match get_string_opt "text" item with
-  | Some text when text <> "" -> [Text_delta text]
-  | _ -> []
+    the complete message — there are no incremental deltas. The
+    trailing blank line keeps successive messages from running
+    together when several land in one turn with no tool use between
+    them ([msg1msg2] would otherwise corrupt markdown formatting). *)
+let parse_codex_agent_message ~completed item =
+  if not completed then []
+  else match get_string_opt "text" item with
+    | Some text when text <> "" -> [Text_delta (text ^ "\n\n")]
+    | _ -> []
 
 (** Bash command lifecycle. The started event opens the tool block;
     the completed event closes it with the captured output. *)
@@ -945,16 +964,26 @@ let parse_codex_command_execution ~completed item =
 
 (** Files modified by Codex in a single item. Single-file changes get
     a compact inline summary; multi-file changes use a code-block
-    detail listing each path on its own line. *)
-let parse_codex_file_change item =
-  match parse_file_change_entries item with
+    detail listing each path on its own line. The tool name reflects
+    whether every entry is an [add] (Write) or there's at least one
+    in-place edit (Edit). Empty-path entries are dropped silently —
+    Codex doesn't emit them in practice and they would render as a
+    contentless tool_use. *)
+let parse_codex_file_change ~completed item =
+  if not completed then [] else
+  let entries = parse_file_change_entries item in
+  let tool_name_for entries =
+    if List.for_all (fun e -> e.kind = "add") entries then "Write"
+    else "Edit"
+  in
+  match entries with
   | [] -> []
   | [{ path; kind }] ->
-    let tool_name = if kind = "add" then "Write" else "Edit" in
     let summary = truncate_inline ~max_chars:120
       (Printf.sprintf "%s (%s)"
          (sanitize_for_inline_code path) kind) in
-    [Tool_use { tool_name; tool_summary = summary; tool_detail = "" }]
+    [Tool_use { tool_name = tool_name_for entries;
+                tool_summary = summary; tool_detail = "" }]
   | many ->
     let buf = Buffer.create 256 in
     List.iter (fun { path; kind } ->
@@ -962,21 +991,22 @@ let parse_codex_file_change item =
     ) many;
     let detail = code_block_capped ~lang:"" (Buffer.contents buf) in
     let summary = Printf.sprintf "%d files" (List.length many) in
-    [Tool_use { tool_name = "Edit";
+    [Tool_use { tool_name = tool_name_for many;
                 tool_summary = summary; tool_detail = detail }]
 
-(** Item-level dispatch. [line] is the raw JSON line; we keep it so
-    unrecognized shapes can be passed through as [Other] for logging. *)
+(** Non-fatal error item. Forwarded as an [Error] event so
+    [Agent_runner] can surface the message to Discord. *)
+let parse_codex_error ~completed item =
+  if completed then [Error (codex_error_message item)] else []
+
+(** Item-level dispatch. Every known item type has explicit handling;
+    only genuinely unrecognized shapes fall through to [Other]. *)
 let parse_codex_item ~completed ~line item =
   match get_string_opt "type" item with
-  | Some "agent_message" when completed ->
-    parse_codex_agent_message item
-  | Some "command_execution" ->
-    parse_codex_command_execution ~completed item
-  | Some "file_change" when completed ->
-    parse_codex_file_change item
-  | Some "error" when completed ->
-    [Error (codex_error_message item)]
+  | Some "agent_message" -> parse_codex_agent_message ~completed item
+  | Some "command_execution" -> parse_codex_command_execution ~completed item
+  | Some "file_change" -> parse_codex_file_change ~completed item
+  | Some "error" -> parse_codex_error ~completed item
   | Some "reasoning" -> []
   | _ -> [Other line]
 

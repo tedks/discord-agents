@@ -382,9 +382,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       collect_error e
     | Agent_process.Other line ->
       Logs.debug (fun m -> m "agent_runner: other event: %s"
-        (if String.length line > 200
-         then String.sub line 0 200 ^ "..."
-         else line))
+        (Agent_process.truncate_inline ~max_chars:200 line))
   in
   let result =
     Fun.protect ~finally:(fun () -> typing_active := false)
@@ -396,8 +394,15 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
           ~message_count:session.message_count
           ?system_prompt:session.system_prompt
           ~prompt:context_prompt ~on_event ?on_pid ()) in
+  (* All result-path messages route through here so they get split at
+     Discord's 2000-char limit. Codex's turn.failed payloads can be
+     very large JSON blobs; without splitting, Discord rejects the
+     message and the user sees nothing. *)
   let send text =
-    ignore (Discord_rest.create_message rest ~channel_id ~content:text ()) in
+    List.iter (fun chunk ->
+      ignore (Discord_rest.create_message rest ~channel_id ~content:chunk ())
+    ) (Agent_process.split_message text)
+  in
   match result with
   | Ok () ->
     flush_to_discord ();
