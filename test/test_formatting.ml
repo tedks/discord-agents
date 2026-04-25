@@ -843,11 +843,11 @@ let escape_nested_fences_tests = [
     test_escape_nested_backticks_inside_code;
 ]
 
-(* ── parse_codex_json_line ────────────────────────────────────────── *)
+(* ── stream_event predicates (shared by every parser test group) ──── *)
 
-let parse_codex = Discord_agents.Agent_process.parse_codex_json_line
-
-(* Helpers to pattern-match on stream_event without depending on a pp. *)
+(* Helpers to pattern-match on stream_event lists without depending on
+   a pp. Each returns Some payload when the events list is exactly
+   the expected single-event shape, None otherwise. *)
 let expect_session_id events =
   match events with
   | [Discord_agents.Agent_process.Result { session_id = Some sid; _ }] ->
@@ -868,6 +868,10 @@ let expect_tool_result events =
   match events with
   | [Discord_agents.Agent_process.Tool_result { content }] -> Some content
   | _ -> None
+
+(* ── parse_codex_json_line ────────────────────────────────────────── *)
+
+let parse_codex = Discord_agents.Agent_process.parse_codex_json_line
 
 let test_codex_thread_started () =
   let line = {|{"type":"thread.started","thread_id":"abc-123"}|} in

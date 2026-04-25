@@ -775,29 +775,39 @@ let detail_of_tool_input name input =
      | _ -> "")
   | _ -> ""
 
-(** Parse a stream-json line into a list of events.
-    Returns a list because a single assistant message can contain
-    both text and tool_use content blocks. *)
+(** Yojson accessor helpers shared by all three parsers. Collapse the
+    noisy [j |> member k |> to_string_option |> Option.value ~default]
+    chain that recurs everywhere. *)
+
+let get_string_opt key json =
+  Yojson.Safe.Util.(json |> member key |> to_string_option)
+
+let get_string ~default key json =
+  Option.value (get_string_opt key json) ~default
+
+let get_int_opt key json =
+  Yojson.Safe.Util.(json |> member key |> to_int_option)
+
+(** Parse a stream-json line (Claude / Gemini share-the-shape, though
+    Gemini has its own parser).  Returns a list because a single
+    assistant message can contain both text and tool_use content blocks. *)
 let parse_stream_json_line line =
   try
     let json = Yojson.Safe.from_string line in
     let open Yojson.Safe.Util in
-    let typ = json |> member "type" |> to_string_option in
-    match typ with
+    match get_string_opt "type" json with
     | Some "assistant" ->
-      let msg = json |> member "message" in
-      let content = msg |> member "content" in
+      let content = json |> member "message" |> member "content" in
       let events = match content with
         | `List items ->
           List.filter_map (fun item ->
-            match item |> member "type" |> to_string_option with
+            match get_string_opt "type" item with
             | Some "text" ->
-              (match item |> member "text" |> to_string_option with
+              (match get_string_opt "text" item with
                | Some t -> Some (Text_delta t)
                | None -> None)
             | Some "tool_use" ->
-              let name = item |> member "name" |> to_string_option
-                |> Option.value ~default:"unknown" in
+              let name = get_string ~default:"unknown" "name" item in
               let input = item |> member "input" in
               let summary = summarize_tool_input name input in
               let detail = detail_of_tool_input name input in
@@ -810,8 +820,8 @@ let parse_stream_json_line line =
                 | `List parts ->
                   (* Content may be a list of {type: "text", text: "..."} *)
                   let texts = List.filter_map (fun p ->
-                    match p |> member "type" |> to_string_option with
-                    | Some "text" -> p |> member "text" |> to_string_option
+                    match get_string_opt "type" p with
+                    | Some "text" -> get_string_opt "text" p
                     | _ -> None
                   ) parts in
                   String.concat "\n" texts
@@ -825,9 +835,8 @@ let parse_stream_json_line line =
       in
       (match events with [] -> [Other line] | _ -> events)
     | Some "result" ->
-      let result_text = json |> member "result" |> to_string_option
-        |> Option.value ~default:"" in
-      let session_id = json |> member "session_id" |> to_string_option in
+      let result_text = get_string ~default:"" "result" json in
+      let session_id = get_string_opt "session_id" json in
       [Result { text = result_text; session_id }]
     | Some "user" ->
       (* User messages carry tool_result content blocks with tool output.
@@ -836,10 +845,8 @@ let parse_stream_json_line line =
         match json |> member "tool_use_result" with
         | `Null -> None
         | obj ->
-          let stdout = obj |> member "stdout" |> to_string_option
-            |> Option.value ~default:"" in
-          let stderr = obj |> member "stderr" |> to_string_option
-            |> Option.value ~default:"" in
+          let stdout = get_string ~default:"" "stdout" obj in
+          let stderr = get_string ~default:"" "stderr" obj in
           let combined = match stdout, stderr with
             | "", "" -> ""
             | s, "" -> s
@@ -853,12 +860,11 @@ let parse_stream_json_line line =
        | Some content -> [Tool_result { content }]
        | None ->
          (* Fall back to content blocks *)
-         let msg = json |> member "message" in
-         let content = msg |> member "content" in
+         let content = json |> member "message" |> member "content" in
          let results = match content with
            | `List items ->
              List.filter_map (fun item ->
-               match item |> member "type" |> to_string_option with
+               match get_string_opt "type" item with
                | Some "tool_result" ->
                  let c = match item |> member "content" with
                    | `String s -> s
@@ -903,17 +909,6 @@ let parse_stream_json_line line =
    forwarded as [Error] events so [Agent_runner] can surface Codex's
    stdout-only error frames; without this they vanish into [Other]
    and the user sees an empty "agent exited with code N" message. *)
-
-(** Yojson accessor helpers — collapse the noisy
-    [j |> member k |> to_string_option |> Option.value ~default] chain. *)
-let get_string_opt key json =
-  Yojson.Safe.Util.(json |> member key |> to_string_option)
-
-let get_string ~default key json =
-  Option.value (get_string_opt key json) ~default
-
-let get_int_opt key json =
-  Yojson.Safe.Util.(json |> member key |> to_int_option)
 
 (** Codex error frames carry the message in one of three shapes:
     - top-level [{message}] (the [error] frame)
@@ -1176,6 +1171,102 @@ let gemini_args ~session_id ~session_id_confirmed ~prompt =
   if not session_id_confirmed then base
   else base @ ["--resume"; session_id]
 
+(* ── MCP server config (shared by Claude and Gemini) ─────────────
+
+   Both agents expose the bot's MCP tools (start_session, list_*,
+   etc.) by pointing at scripts/mcp-server.py. They differ only in
+   how that pointer is delivered:
+
+   - Claude takes a [--mcp-config <path>] flag; we write the JSON to
+     [~/.config/discord-agents/mcp-generated.json] and pass the path.
+   - Gemini has no flag; it loads [mcpServers] from
+     [<cwd>/.gemini/settings.json]. We write the file into the
+     worktree and add [.gemini/] to [.git/info/exclude].
+
+   Codex doesn't use MCP at all. *)
+
+let mcp_script_path = lazy (
+  try
+    let exe = Sys.executable_name in
+    let exe = if Filename.is_relative exe
+      then Filename.concat (Sys.getcwd ()) exe else exe in
+    let rec find_root path =
+      let candidate = Filename.concat path "scripts/mcp-server.py" in
+      if Sys.file_exists candidate then candidate
+      else
+        let parent = Filename.dirname path in
+        if parent = path then "scripts/mcp-server.py"
+        else find_root parent
+    in
+    find_root (Filename.dirname exe)
+  with _ -> "scripts/mcp-server.py"
+)
+
+let mcp_json = lazy (
+  Printf.sprintf
+    {|{"mcpServers":{"discord-agents":{"command":"python3","args":["%s"]}}}|}
+    (Lazy.force mcp_script_path)
+)
+
+let write_file_safely ~path contents =
+  try
+    let oc = open_out path in
+    output_string oc contents;
+    close_out oc
+  with _ -> ()
+
+let read_file_opt path =
+  try
+    let ic = open_in path in
+    Fun.protect ~finally:(fun () -> close_in ic) (fun () ->
+      let n = in_channel_length ic in
+      let s = Bytes.create n in
+      really_input ic s 0 n;
+      Some (Bytes.to_string s))
+  with _ -> None
+
+let contains_substring text needle =
+  let nlen = String.length needle in
+  let tlen = String.length text in
+  if nlen = 0 then true
+  else
+    let rec scan i =
+      if i + nlen > tlen then false
+      else if String.sub text i nlen = needle then true
+      else scan (i + 1)
+    in scan 0
+
+(** Claude: write the MCP config to a well-known location and return
+    the path for [--mcp-config]. *)
+let claude_mcp_config_path () =
+  let config_dir = Filename.concat (Sys.getenv "HOME") ".config/discord-agents" in
+  let config_path = Filename.concat config_dir "mcp-generated.json" in
+  write_file_safely ~path:config_path (Lazy.force mcp_json);
+  config_path
+
+(** Gemini: drop [.gemini/settings.json] into the worktree and ensure
+    [.gemini/] is in [.git/info/exclude] so the worktree stays clean.
+    Idempotent — the exclude append is a no-op if [.gemini/] is
+    already listed. *)
+let setup_gemini_mcp ~working_dir =
+  let gemini_dir = Filename.concat working_dir ".gemini" in
+  (try
+     if not (Sys.file_exists gemini_dir) then Unix.mkdir gemini_dir 0o755
+   with _ -> ());
+  write_file_safely
+    ~path:(Filename.concat gemini_dir "settings.json")
+    (Lazy.force mcp_json);
+  let exclude_path = Filename.concat working_dir ".git/info/exclude" in
+  match read_file_opt exclude_path with
+  | None -> ()
+  | Some existing when contains_substring existing ".gemini/" -> ()
+  | Some _ ->
+    try
+      let oc = open_out_gen [Open_append] 0o644 exclude_path in
+      Fun.protect ~finally:(fun () -> close_out oc) (fun () ->
+        output_string oc "\n.gemini/\n")
+    with _ -> ()
+
 (** Spawn an agent and stream its output via a callback.
     The callback is called with each parsed event as it arrives.
     [?on_pid] is called with the child PID immediately after spawn,
@@ -1186,92 +1277,17 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
   let mgr = Eio.Stdenv.process_mgr env in
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
-  (* Locate scripts/mcp-server.py relative to the running executable so
-     the static mcp.json's relative path doesn't break when an agent
-     runs in a different working directory. *)
-  let mcp_script_path =
-    try
-      let exe = Sys.executable_name in
-      let exe = if Filename.is_relative exe
-        then Filename.concat (Sys.getcwd ()) exe else exe in
-      let rec find_root path =
-        let candidate = Filename.concat path "scripts/mcp-server.py" in
-        if Sys.file_exists candidate then candidate
-        else
-          let parent = Filename.dirname path in
-          if parent = path then "scripts/mcp-server.py"
-          else find_root parent
-      in
-      find_root (Filename.dirname exe)
-    with _ -> "scripts/mcp-server.py"
-  in
-  let mcp_json = Printf.sprintf
-    {|{"mcpServers":{"discord-agents":{"command":"python3","args":["%s"]}}}|}
-    mcp_script_path
-  in
-  let write_file_safely ~path contents =
-    try
-      let oc = open_out path in
-      output_string oc contents;
-      close_out oc
-    with _ -> ()
-  in
-  (* Claude: write the MCP config at a known location and pass the path
-     via [--mcp-config <path>]. *)
-  let claude_mcp_config () =
-    let config_dir = Filename.concat (Sys.getenv "HOME") ".config/discord-agents" in
-    let config_path = Filename.concat config_dir "mcp-generated.json" in
-    write_file_safely ~path:config_path mcp_json;
-    config_path
-  in
-  (* Gemini has no [--mcp-config] flag; it loads [mcpServers] from the
-     project's [.gemini/settings.json]. Write that file into the
-     worktree and append [.gemini/] to the worktree's [.git/info/exclude]
-     so it doesn't appear as untracked. *)
-  let setup_gemini_mcp () =
-    let gemini_dir = Filename.concat working_dir ".gemini" in
-    (try
-       if not (Sys.file_exists gemini_dir) then Unix.mkdir gemini_dir 0o755
-     with _ -> ());
-    write_file_safely
-      ~path:(Filename.concat gemini_dir "settings.json") mcp_json;
-    let exclude_path = Filename.concat working_dir ".git/info/exclude" in
-    try
-      if Sys.file_exists exclude_path then begin
-        let existing =
-          let ic = open_in exclude_path in
-          Fun.protect ~finally:(fun () -> close_in ic) (fun () ->
-            let n = in_channel_length ic in
-            let s = Bytes.create n in
-            really_input ic s 0 n;
-            Bytes.to_string s)
-        in
-        let needle = ".gemini/" in
-        let nlen = String.length needle in
-        let rec already_excluded i =
-          if i + nlen > String.length existing then false
-          else if String.sub existing i nlen = needle then true
-          else already_excluded (i + 1)
-        in
-        if not (already_excluded 0) then begin
-          let oc = open_out_gen [Open_append] 0o644 exclude_path in
-          output_string oc "\n.gemini/\n";
-          close_out oc
-        end
-      end
-    with _ -> ()
-  in
   let args = match kind with
     | Config.Claude ->
       let base = claude_args ~session_id ~message_count ~prompt in
-      let base = base @ ["--mcp-config"; claude_mcp_config ()] in
+      let base = base @ ["--mcp-config"; claude_mcp_config_path ()] in
       (match system_prompt with
        | Some sp -> base @ ["--append-system-prompt"; sp]
        | None -> base)
     | Config.Codex ->
       codex_args ~session_id ~session_id_confirmed ~prompt
     | Config.Gemini ->
-      setup_gemini_mcp ();
+      setup_gemini_mcp ~working_dir;
       gemini_args ~session_id ~session_id_confirmed ~prompt
   in
   let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in

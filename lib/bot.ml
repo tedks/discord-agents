@@ -339,6 +339,33 @@ let refresh_projects t =
       Some (old_count, new_count))
   end
 
+(** Render a "recent sessions" Discord listing in a uniform shape so
+    [!claude-sessions] and [!gemini-sessions] don't drift in formatting.
+    Caller maps their per-agent info record to a tuple of the four
+    fields actually used and supplies the human label + resume hint. *)
+let format_session_listing
+    ~label ~resume_hint
+    (entries : (string * string * string * float) list) =
+  if entries = [] then
+    Printf.sprintf "No recent %s sessions found." label
+  else
+    let now = Unix.gettimeofday () in
+    let lines = List.map (fun (sid, wd, summary, mtime) ->
+      let age_min = int_of_float ((now -. mtime) /. 60.0) in
+      let age_str =
+        if age_min < 60 then Printf.sprintf "%dm ago" age_min
+        else Printf.sprintf "%dh ago" (age_min / 60)
+      in
+      let sid_short = String.sub sid 0 (min 8 (String.length sid)) in
+      let wd_str = if wd = "" then "(unknown project)" else wd in
+      let summary_str = if summary = "" then "(no summary)" else summary in
+      Printf.sprintf "- `%s` %s\n  %s — *%s*"
+        sid_short age_str wd_str summary_str
+    ) entries in
+    Printf.sprintf
+      "**Recent %s sessions** (last 24h):\n%s\n\nUse `%s` to attach."
+      label (String.concat "\n" lines) resume_hint
+
 (** Handle a parsed command. *)
 let handle_command t msg cmd =
   let channel_id = msg.Discord_types.channel_id in
@@ -365,20 +392,14 @@ let handle_command t msg cmd =
       else "**Sessions:**\n" ^ String.concat "\n" lines)
   | Command.List_claude_sessions ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
-      let sessions = Claude_sessions.discover ~hours:24 () in
-      let lines = List.map (fun (s : Claude_sessions.info) ->
-        let age_min = int_of_float ((Unix.gettimeofday () -. s.mtime) /. 60.0) in
-        let age_str = if age_min < 60 then Printf.sprintf "%dm ago" age_min
-          else Printf.sprintf "%dh ago" (age_min / 60) in
-        let sid_short = String.sub s.session_id 0
-          (min 8 (String.length s.session_id)) in
-        Printf.sprintf "- `%s` %s\n  %s — *%s*"
-          sid_short age_str s.working_dir
-          (if s.summary = "" then "(no summary)" else s.summary)
-      ) (List.filteri (fun i _ -> i < 10) sessions) in
-      reply (if lines = [] then "No recent Claude sessions found."
-        else "**Recent Claude sessions** (last 24h):\n" ^ String.concat "\n" lines
-             ^ "\n\nUse `!resume <session_id_prefix>` to attach."))
+      let entries =
+        Claude_sessions.discover ~hours:24 ()
+        |> List.filteri (fun i _ -> i < 10)
+        |> List.map (fun (s : Claude_sessions.info) ->
+          (s.session_id, s.working_dir, s.summary, s.mtime))
+      in
+      reply (format_session_listing ~label:"Claude"
+        ~resume_hint:"!resume <session_id_prefix>" entries))
   | Command.Start_agent { project; kind } ->
     let proj = Command.find_project_fuzzy (projects t) project in
     (match proj with
@@ -435,22 +456,14 @@ let handle_command t msg cmd =
        end)
   | Command.List_gemini_sessions ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
-      let sessions = Gemini_sessions.discover ~hours:24 () in
-      let lines = List.map (fun (s : Gemini_sessions.info) ->
-        let age_min = int_of_float ((Unix.gettimeofday () -. s.mtime) /. 60.0) in
-        let age_str = if age_min < 60 then Printf.sprintf "%dm ago" age_min
-          else Printf.sprintf "%dh ago" (age_min / 60) in
-        let sid_short = String.sub s.session_id 0
-          (min 8 (String.length s.session_id)) in
-        let wd_str = if s.working_dir = "" then "(unknown project)"
-          else s.working_dir in
-        Printf.sprintf "- `%s` %s\n  %s — *%s*"
-          sid_short age_str wd_str
-          (if s.summary = "" then "(no summary)" else s.summary)
-      ) (List.filteri (fun i _ -> i < 10) sessions) in
-      reply (if lines = [] then "No recent Gemini sessions found."
-        else "**Recent Gemini sessions** (last 24h):\n" ^ String.concat "\n" lines
-             ^ "\n\nUse `!resume gemini <session_id_prefix>` to attach."))
+      let entries =
+        Gemini_sessions.discover ~hours:24 ()
+        |> List.filteri (fun i _ -> i < 10)
+        |> List.map (fun (s : Gemini_sessions.info) ->
+          (s.session_id, s.working_dir, s.summary, s.mtime))
+      in
+      reply (format_session_listing ~label:"Gemini"
+        ~resume_hint:"!resume gemini <session_id_prefix>" entries))
   | Command.Resume_session { session_id; kind } ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       (* Locate the session in the requested store, or try Claude
