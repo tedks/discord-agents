@@ -1186,50 +1186,93 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
   let mgr = Eio.Stdenv.process_mgr env in
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
-  (* Generate MCP config with absolute path to the Python script.
-     The static mcp.json has a relative path that breaks when Claude
+  (* Locate scripts/mcp-server.py relative to the running executable so
+     the static mcp.json's relative path doesn't break when an agent
      runs in a different working directory. *)
-  let mcp_config =
-    let script_path =
-      try
-        let exe = Sys.executable_name in
-        let exe = if Filename.is_relative exe then Filename.concat (Sys.getcwd ()) exe else exe in
-        let rec find_root path =
-          let candidate = Filename.concat path "scripts/mcp-server.py" in
-          if Sys.file_exists candidate then candidate
-          else
-            let parent = Filename.dirname path in
-            if parent = path then "scripts/mcp-server.py"
-            else find_root parent
-        in
-        find_root (Filename.dirname exe)
-      with _ -> "scripts/mcp-server.py"
-    in
-    (* Write a temp MCP config with the absolute script path *)
+  let mcp_script_path =
+    try
+      let exe = Sys.executable_name in
+      let exe = if Filename.is_relative exe
+        then Filename.concat (Sys.getcwd ()) exe else exe in
+      let rec find_root path =
+        let candidate = Filename.concat path "scripts/mcp-server.py" in
+        if Sys.file_exists candidate then candidate
+        else
+          let parent = Filename.dirname path in
+          if parent = path then "scripts/mcp-server.py"
+          else find_root parent
+      in
+      find_root (Filename.dirname exe)
+    with _ -> "scripts/mcp-server.py"
+  in
+  let mcp_json = Printf.sprintf
+    {|{"mcpServers":{"discord-agents":{"command":"python3","args":["%s"]}}}|}
+    mcp_script_path
+  in
+  let write_file_safely ~path contents =
+    try
+      let oc = open_out path in
+      output_string oc contents;
+      close_out oc
+    with _ -> ()
+  in
+  (* Claude: write the MCP config at a known location and pass the path
+     via [--mcp-config <path>]. *)
+  let claude_mcp_config () =
     let config_dir = Filename.concat (Sys.getenv "HOME") ".config/discord-agents" in
     let config_path = Filename.concat config_dir "mcp-generated.json" in
-    let json = Printf.sprintf
-      {|{"mcpServers":{"discord-agents":{"command":"python3","args":["%s"]}}}|}
-      script_path in
-    (try
-      let oc = open_out config_path in
-      output_string oc json;
-      close_out oc
-    with _ -> ());
+    write_file_safely ~path:config_path mcp_json;
     config_path
+  in
+  (* Gemini has no [--mcp-config] flag; it loads [mcpServers] from the
+     project's [.gemini/settings.json]. Write that file into the
+     worktree and append [.gemini/] to the worktree's [.git/info/exclude]
+     so it doesn't appear as untracked. *)
+  let setup_gemini_mcp () =
+    let gemini_dir = Filename.concat working_dir ".gemini" in
+    (try
+       if not (Sys.file_exists gemini_dir) then Unix.mkdir gemini_dir 0o755
+     with _ -> ());
+    write_file_safely
+      ~path:(Filename.concat gemini_dir "settings.json") mcp_json;
+    let exclude_path = Filename.concat working_dir ".git/info/exclude" in
+    try
+      if Sys.file_exists exclude_path then begin
+        let existing =
+          let ic = open_in exclude_path in
+          Fun.protect ~finally:(fun () -> close_in ic) (fun () ->
+            let n = in_channel_length ic in
+            let s = Bytes.create n in
+            really_input ic s 0 n;
+            Bytes.to_string s)
+        in
+        let needle = ".gemini/" in
+        let nlen = String.length needle in
+        let rec already_excluded i =
+          if i + nlen > String.length existing then false
+          else if String.sub existing i nlen = needle then true
+          else already_excluded (i + 1)
+        in
+        if not (already_excluded 0) then begin
+          let oc = open_out_gen [Open_append] 0o644 exclude_path in
+          output_string oc "\n.gemini/\n";
+          close_out oc
+        end
+      end
+    with _ -> ()
   in
   let args = match kind with
     | Config.Claude ->
       let base = claude_args ~session_id ~message_count ~prompt in
-      (* All Claude sessions get MCP tools for thread/session management *)
-      let base = base @ ["--mcp-config"; mcp_config] in
-      let base = match system_prompt with
-        | Some sp -> base @ ["--append-system-prompt"; sp]
-        | None -> base
-      in
-      base
-    | Config.Codex -> codex_args ~session_id ~session_id_confirmed ~prompt
-    | Config.Gemini -> gemini_args ~session_id ~session_id_confirmed ~prompt
+      let base = base @ ["--mcp-config"; claude_mcp_config ()] in
+      (match system_prompt with
+       | Some sp -> base @ ["--append-system-prompt"; sp]
+       | None -> base)
+    | Config.Codex ->
+      codex_args ~session_id ~session_id_confirmed ~prompt
+    | Config.Gemini ->
+      setup_gemini_mcp ();
+      gemini_args ~session_id ~session_id_confirmed ~prompt
   in
   let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in
   let stderr_r, stderr_w = Eio.Process.pipe ~sw mgr in

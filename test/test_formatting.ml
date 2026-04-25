@@ -444,8 +444,13 @@ let cmd_testable =
       | Discord_agents.Command.List_projects -> "List_projects"
       | List_sessions -> "List_sessions"
       | List_claude_sessions -> "List_claude_sessions"
+      | List_gemini_sessions -> "List_gemini_sessions"
       | Start_agent { project; _ } -> "Start_agent(" ^ project ^ ")"
-      | Resume_session { session_id } -> "Resume_session(" ^ session_id ^ ")"
+      | Resume_session { session_id; kind = None } ->
+        "Resume_session(" ^ session_id ^ ")"
+      | Resume_session { session_id; kind = Some k } ->
+        Printf.sprintf "Resume_session(%s,%s)"
+          (Discord_agents.Config.string_of_agent_kind k) session_id
       | Stop_session { thread_id } -> "Stop_session(" ^ thread_id ^ ")"
       | Cleanup_channels -> "Cleanup_channels"
       | Restart -> "Restart"
@@ -557,6 +562,41 @@ let test_parse_scroll_zero () =
     Alcotest.(check pass) "zero scroll is Unknown" () ()
   | _ -> Alcotest.fail "expected Unknown for zero scroll"
 
+let test_parse_resume_no_kind () =
+  Alcotest.(check cmd_testable) "resume without kind"
+    (Discord_agents.Command.Resume_session
+       { session_id = "abc12345"; kind = None })
+    (Discord_agents.Command.parse "!resume abc12345")
+
+let test_parse_resume_with_gemini_kind () =
+  Alcotest.(check cmd_testable) "resume with gemini kind"
+    (Discord_agents.Command.Resume_session
+       { session_id = "xyz"; kind = Some Discord_agents.Config.Gemini })
+    (Discord_agents.Command.parse "!resume gemini xyz")
+
+let test_parse_resume_with_claude_kind () =
+  Alcotest.(check cmd_testable) "resume with claude kind"
+    (Discord_agents.Command.Resume_session
+       { session_id = "xyz"; kind = Some Discord_agents.Config.Claude })
+    (Discord_agents.Command.parse "!resume claude xyz")
+
+let test_parse_resume_invalid_kind () =
+  match Discord_agents.Command.parse "!resume nonesuch xyz" with
+  | Discord_agents.Command.Unknown _ ->
+    Alcotest.(check pass) "invalid kind is Unknown" () ()
+  | _ -> Alcotest.fail "expected Unknown for invalid agent kind"
+
+let test_parse_gemini_sessions () =
+  Alcotest.(check cmd_testable) "gemini-sessions"
+    Discord_agents.Command.List_gemini_sessions
+    (Discord_agents.Command.parse "!gemini-sessions")
+
+let test_parse_start_gemini () =
+  Alcotest.(check cmd_testable) "start project gemini"
+    (Discord_agents.Command.Start_agent
+       { project = "myproj"; kind = Discord_agents.Config.Gemini })
+    (Discord_agents.Command.parse "!start myproj gemini")
+
 let command_tests = [
   Alcotest.test_case "desktop" `Quick test_parse_desktop;
   Alcotest.test_case "mobile" `Quick test_parse_mobile;
@@ -573,6 +613,12 @@ let command_tests = [
   Alcotest.test_case "scroll forward" `Quick test_parse_scroll_forward;
   Alcotest.test_case "scroll backward" `Quick test_parse_scroll_backward;
   Alcotest.test_case "scroll zero" `Quick test_parse_scroll_zero;
+  Alcotest.test_case "resume without kind" `Quick test_parse_resume_no_kind;
+  Alcotest.test_case "resume with gemini kind" `Quick test_parse_resume_with_gemini_kind;
+  Alcotest.test_case "resume with claude kind" `Quick test_parse_resume_with_claude_kind;
+  Alcotest.test_case "resume invalid kind" `Quick test_parse_resume_invalid_kind;
+  Alcotest.test_case "gemini-sessions" `Quick test_parse_gemini_sessions;
+  Alcotest.test_case "start with gemini kind" `Quick test_parse_start_gemini;
 ]
 
 (* ── tool detail formatting ────────────────────────────────────── *)

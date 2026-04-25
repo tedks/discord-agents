@@ -33,9 +33,11 @@ Always run tests after changes to formatting, command parsing, or agent_process.
 bin/main.ml              — Entry point, Eio_main.run, signal handling, pidfile
 lib/bot.ml               — Top-level orchestrator, command routing, channel management
 lib/agent_runner.ml      — Agent lifecycle, streaming output to Discord, typing indicator
-lib/agent_process.ml     — Subprocess management, stream-json parsing, formatting, escaping
+lib/agent_process.ml     — Subprocess management, per-agent JSON parsing (Claude/Codex/Gemini), formatting, escaping
 lib/session_store.ml     — Session state, persistence to disk, message queue
 lib/command.ml           — Pure command parsing (no I/O)
+lib/claude_sessions.ml   — Claude Code session discovery on disk (~/.claude/projects/)
+lib/gemini_sessions.ml   — Gemini CLI session discovery on disk (~/.gemini/tmp/)
 lib/channel_manager.ml   — Channel creation, ordering, cleanup
 lib/config.ml            — Configuration (JSON file + DISCORD_BOT_TOKEN env)
 lib/project.ml           — Project discovery, dedup by remote, worktree management
@@ -50,12 +52,13 @@ test/test_formatting.ml  — Tests for formatting, wrapping, escaping, command p
 
 Commands require a `!` prefix:
 
-- `start <project>` — start a session (fuzzy matches project name)
+- `start <project> [agent]` — start a session (agent ∈ {claude, codex, gemini}; defaults to claude)
 - `start` — show numbered project list
-- `resume <session_id>` — resume an existing Claude Code session
+- `resume [agent] <session_id>` — resume an existing session (agent defaults to claude; tries gemini if not found)
 - `projects` — list discovered projects with numbers
 - `sessions` — list active bot sessions
 - `claude-sessions` — list recent Claude Code sessions on this machine
+- `gemini-sessions` — list recent Gemini CLI sessions on this machine
 - `stop <thread_id>` — stop a session
 - `rename [thread_id] <name>` — rename a thread
 - `desktop` — set wrapping to desktop width (120 chars)
@@ -89,13 +92,45 @@ Non-command messages in control/project channels are routed to a Claude session 
 - **GitHub shorthand**: `owner/repo#N` does NOT render as a clickable link. Always use full URLs (`https://github.com/...`).
 - **Tables**: Discord doesn't render markdown tables. `reformat_tables` wraps them in padded code blocks.
 
-## stream-json format
+## Agent JSON event schemas
 
-Claude Code CLI with `--output-format stream-json` emits:
+Each agent has its own event schema; per-agent parsers in `lib/agent_process.ml` translate them all into a shared `stream_event` type (`Text_delta` / `Tool_use` / `Tool_result` / `Result` / `Error` / `Other`).
+
+**Claude Code** (`--output-format stream-json`, parsed by `parse_stream_json_line`):
 - `{"type": "assistant", "message": {"content": [...]}}` — text and tool_use blocks
 - `{"type": "result", "result": "...", "session_id": "..."}` — final result
 
-Tool results (output from tool execution) are NOT emitted as separate events. They are internal to Claude Code CLI. We display tool inputs (diffs, commands) from tool_use blocks but cannot show tool output.
+Tool results are NOT emitted as separate events; they're internal to Claude Code. We display tool inputs (diffs, commands) from tool_use blocks but cannot show tool output.
+
+**Codex** (`exec --json`, parsed by `parse_codex_json_line`):
+- `{"type":"thread.started","thread_id":"<uuid>"}` — server-allocated session id
+- `{"type":"item.completed","item":{"type":"agent_message","text":"..."}}` — assistant text
+- `{"type":"item.started/completed","item":{"type":"command_execution",...}}` — bash tool lifecycle
+- `{"type":"item.completed","item":{"type":"file_change","changes":[...]}}` — files modified
+- `{"type":"turn.failed","error":{"message":"..."}}` / `{"type":"error","message":"..."}` — surfaced as Error events
+- `{"type":"turn.completed","usage":{...}}` — flush
+
+**Gemini** (`-o stream-json --yolo`, parsed by `parse_gemini_stream_json_line`):
+- `{"type":"init","session_id":"<uuid>","model":"..."}` — server-allocated session id
+- `{"type":"message","role":"assistant","content":"...","delta":true}` — incremental text
+- `{"type":"tool_use","tool_name":"run_shell_command","parameters":{...}}` — tool call
+- `{"type":"tool_result","status":"success|error","output":"..."}` — Gemini *does* emit these
+- `{"type":"result","status":"...","stats":{...}}` — flush
+
+Gemini tool names (`run_shell_command`, `read_file`, `write_file`, `replace`, `search_file_content`, `glob`, `web_fetch`, `google_web_search`) are translated to Claude-equivalents (`Bash`, `Read`, `Write`, `Edit`, `Grep`, `Glob`, `WebFetch`, `WebSearch`) by `gemini_tool_name_of` so the runner's emoji/verb table stays agent-agnostic.
+
+## Session id origin
+
+`Config.caller_pinned_session_id` records, per agent, who allocates the session id:
+- **Claude** — the bot pins it via `--session-id <uuid>`; the id is authoritative from creation.
+- **Codex / Gemini** — the agent allocates server-side and emits it on first run (Codex's `thread.started`, Gemini's `init`); we capture it via `on_session_id` in `agent_runner` and persist via `Session_store.set_session_id`. The `session_id_confirmed` flag gates resume so a first-turn failure that occurred before/after the id was emitted is handled correctly.
+
+## MCP configuration
+
+The bot exposes MCP tools (start_session, list_sessions, etc.) via `scripts/mcp-server.py`. How each agent picks it up:
+- **Claude** — `--mcp-config <path>` flag; we write the config to `~/.config/discord-agents/mcp-generated.json`.
+- **Codex** — does not use MCP.
+- **Gemini** — has no `--mcp-config` flag; loads `mcpServers` from `<cwd>/.gemini/settings.json`. The bot writes that file into the worktree at session start and appends `.gemini/` to the worktree's `.git/info/exclude` so it doesn't show as untracked.
 
 ## Bare repo / worktree setup
 
