@@ -397,11 +397,13 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
   (* All result-path messages route through here so they get split at
      Discord's 2000-char limit. Codex's turn.failed payloads can be
      very large JSON blobs; without splitting, Discord rejects the
-     message and the user sees nothing. *)
+     message and the user sees nothing. Empty input is a no-op so
+     no caller can accidentally post a blank message. *)
   let send text =
-    List.iter (fun chunk ->
-      ignore (Discord_rest.create_message rest ~channel_id ~content:chunk ())
-    ) (Agent_process.split_message text)
+    if text <> "" then
+      List.iter (fun chunk ->
+        ignore (Discord_rest.create_message rest ~channel_id ~content:chunk ())
+      ) (Agent_process.split_message text)
   in
   match result with
   | Ok () ->
@@ -416,6 +418,10 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
     Ok ()
   | Error e ->
     Logs.warn (fun m -> m "agent_runner: error: %s" e);
+    (* Flush buffered assistant text before the error message so the
+       last partial reply isn't dropped on the floor — the Ok branch
+       does this and the symmetry was missing. *)
+    flush_to_discord ();
     let combined = match collected_errors () with
       | None -> e
       | Some errs -> errs ^ "\n" ^ e in

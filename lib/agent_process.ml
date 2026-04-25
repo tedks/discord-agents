@@ -311,6 +311,20 @@ let utf8_step s i =
   else if c < 0xF0 then 3    (* 3-byte sequence *)
   else 4                     (* 4-byte sequence *)
 
+(** Walk back to the nearest UTF-8 codepoint boundary at or before [pos].
+    A continuation byte (0x80–0xBF) means we're mid-codepoint; lead
+    bytes and ASCII bytes start a codepoint and are valid split points.
+    Used by [split_message] to keep its fallback (no separator within
+    budget) from chopping a multibyte character. *)
+let utf8_boundary_at_or_before s pos =
+  let n = String.length s in
+  let p = ref (min pos n) in
+  while !p > 0 && !p < n
+    && (let c = Char.code s.[!p] in c >= 0x80 && c < 0xC0) do
+    decr p
+  done;
+  !p
+
 (** Walk forward from byte [start] in [s], advancing one unit at a time
     (a triple-backtick counts as 6 budget bytes / 3 source bytes; any
     other UTF-8 codepoint costs its raw byte length).  Returns the byte
@@ -362,6 +376,15 @@ let take_fitting_prefix ?(start=0) ~max_chars s =
         && s.[start] = '`' && s.[start+1] = '`' && s.[start+2] = '`' in
       let raw_step = if is_triple then 3 else utf8_step s start in
       min raw_step (n - start)
+
+(** UTF-8 safe truncation for inline summary strings: caps at [max_chars]
+    bytes (post-fence-escape) and appends "...".  Returns [s] unchanged
+    if it already fits.  Always lands on a UTF-8 codepoint boundary. *)
+let truncate_inline ~max_chars s =
+  if escaped_length s <= max_chars then s
+  else
+    let taken = take_fitting_prefix ~max_chars s in
+    String.sub s 0 taken ^ "..."
 
 (** Split a single line into chunks each fitting within [max_chars]
     post-escape.  Short lines pass through unchanged. *)
@@ -465,7 +488,14 @@ let split_message ?(max_len=default_split_max) text =
         | None ->
           match try_find " " with
           | Some p -> p + 1
-          | None -> limit
+          | None ->
+            (* No whitespace within budget — split on a UTF-8
+               codepoint boundary so we never produce malformed
+               bytes for long unbroken non-ASCII content (Codex
+               JSON error blobs without spaces are the typical
+               case).  Boundary-walking is bounded by [pos] so a
+               full continuation-byte run still makes progress. *)
+            max (pos + 1) (utf8_boundary_at_or_before text limit)
     in
     (* code_state: None = not in code block, Some lang = in code block.
        lang may be "" for bare ``` fences. *)
@@ -518,10 +548,7 @@ let summarize_tool_input name input =
     | Some i -> String.sub s (i + 1) (String.length s - i - 1)
     | None -> s
   in
-  let truncate n s =
-    if String.length s <= n then s
-    else String.sub s 0 n ^ "..."
-  in
+  let truncate n s = truncate_inline ~max_chars:n s in
   let clean n s = truncate n (sanitize_for_inline_code s) in
   let safe_basename p = sanitize_for_inline_code (basename p) in
   match name with
@@ -606,11 +633,6 @@ let lang_of_path path =
     | "nix" -> "nix"
     | "ex" | "exs" -> "elixir"
     | _ -> ""
-
-(** Truncate a string, adding "..." if truncated. *)
-let truncate_detail n s =
-  if String.length s <= n then s
-  else String.sub s 0 n ^ "\n..."
 
 (** Escape triple backticks in text destined for a Discord code block.
     Discord has no escape mechanism inside code blocks, so we replace
@@ -698,15 +720,6 @@ let code_block_capped ~lang content =
   in
   Printf.sprintf "```%s\n%s\n```" lang (escape_code_fences capped)
 
-(** UTF-8 safe truncation for inline summary strings: caps at [max_chars]
-    bytes (post-fence-escape) and appends "...".  Returns [s] unchanged
-    if it already fits.  Always lands on a UTF-8 codepoint boundary. *)
-let truncate_inline ~max_chars s =
-  if escaped_length s <= max_chars then s
-  else
-    let taken = take_fitting_prefix ~max_chars s in
-    String.sub s 0 taken ^ "..."
-
 (** Generate a syntax-highlighted code block showing tool content details.
     Returns "" if the tool doesn't have interesting content to show. *)
 let detail_of_tool_input name input =
@@ -749,7 +762,8 @@ let detail_of_tool_input name input =
   | "Grep" ->
     (match get "pattern" with
      | Some pat when String.length pat > 0 ->
-       code_block_capped ~lang:"" ("/" ^ truncate_detail 200 pat ^ "/")
+       code_block_capped ~lang:""
+         ("/" ^ truncate_inline ~max_chars:200 pat ^ "/")
      | _ -> "")
   | _ -> ""
 
@@ -933,14 +947,21 @@ let parse_file_change_entries item =
    start-and-end lifecycle. *)
 
 (** Fully-formed assistant text. Codex emits this once per item with
-    the complete message — there are no incremental deltas. The
-    trailing blank line keeps successive messages from running
-    together when several land in one turn with no tool use between
-    them ([msg1msg2] would otherwise corrupt markdown formatting). *)
+    the complete message — there are no incremental deltas. We
+    normalize the tail to exactly "\n\n" so successive messages in one
+    turn render as separate paragraphs ([msg1msg2] would otherwise
+    corrupt markdown), without producing "\n\n\n+" when the message
+    already ended in newlines. *)
 let parse_codex_agent_message ~completed item =
+  let normalize_paragraph_end s =
+    let rec back i =
+      if i = 0 || s.[i-1] <> '\n' then i else back (i - 1)
+    in
+    String.sub s 0 (back (String.length s)) ^ "\n\n"
+  in
   if not completed then []
   else match get_string_opt "text" item with
-    | Some text when text <> "" -> [Text_delta (text ^ "\n\n")]
+    | Some text when text <> "" -> [Text_delta (normalize_paragraph_end text)]
     | _ -> []
 
 (** Bash command lifecycle. The started event opens the tool block;

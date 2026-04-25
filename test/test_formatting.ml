@@ -244,6 +244,43 @@ let test_split_all_chunks_under_limit () =
   Alcotest.(check bool) "total content preserved"
     true (total >= 5000)
 
+let test_split_no_separator_utf8_safe () =
+  (* Long unbroken non-ASCII (e.g. a Codex error JSON without spaces).
+     Each codepoint is 4 bytes; the no-separator fallback used to slice
+     mid-codepoint. Validate every chunk is well-formed UTF-8 by walking
+     the bytes — a continuation byte (0x80–0xBF) at chunk start signals
+     a mid-codepoint split. *)
+  let emoji = "\xF0\x9F\x98\x80" in  (* 😀 U+1F600 *)
+  let input = String.concat "" (List.init 1000 (fun _ -> emoji)) in
+  let chunks = Discord_agents.Agent_process.split_message input in
+  let well_formed s =
+    let n = String.length s in
+    let rec walk i =
+      if i >= n then true
+      else
+        let c = Char.code s.[i] in
+        let need =
+          if c < 0x80 then 0
+          else if c < 0xC0 then -1   (* mid-codepoint at boundary — bad *)
+          else if c < 0xE0 then 1
+          else if c < 0xF0 then 2
+          else 3
+        in
+        if need < 0 || i + need >= n then false
+        else
+          let ok = ref true in
+          for k = 1 to need do
+            let cc = Char.code s.[i + k] in
+            if cc < 0x80 || cc >= 0xC0 then ok := false
+          done;
+          !ok && walk (i + 1 + need)
+    in
+    walk 0
+  in
+  List.iter (fun chunk ->
+    Alcotest.(check bool) "chunk is well-formed UTF-8" true (well_formed chunk)
+  ) chunks
+
 let split_message_tests = [
   Alcotest.test_case "short message" `Quick test_split_short;
   Alcotest.test_case "split at paragraph" `Quick test_split_long_at_paragraph;
@@ -251,6 +288,8 @@ let split_message_tests = [
     test_split_preserves_code_blocks;
   Alcotest.test_case "all chunks under limit" `Quick
     test_split_all_chunks_under_limit;
+  Alcotest.test_case "no-separator fallback is UTF-8 safe" `Quick
+    test_split_no_separator_utf8_safe;
 ]
 
 (* ── scan_fences ────────────────────────────────────────────────── *)
@@ -814,6 +853,14 @@ let test_codex_agent_message_started_dropped () =
   Alcotest.(check int) "item.started agent_message emits nothing"
     0 (List.length (parse_codex line))
 
+let test_codex_agent_message_already_terminated () =
+  (* If Codex's text already ends in newlines, the separator helper
+     normalizes the tail to exactly "\n\n" rather than appending and
+     producing "\n\n\n+". *)
+  let line = {|{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"hello\n\n\n"}}|} in
+  Alcotest.(check (option string)) "trailing newlines collapsed to two"
+    (Some "hello\n\n") (expect_text (parse_codex line))
+
 let test_codex_agent_message_empty_dropped () =
   let line = {|{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":""}}|} in
   Alcotest.(check int) "empty agent_message emits nothing"
@@ -905,6 +952,7 @@ let codex_json_tests = [
   Alcotest.test_case "turn.completed flushes" `Quick test_codex_turn_completed_flushes;
   Alcotest.test_case "agent_message text" `Quick test_codex_agent_message;
   Alcotest.test_case "agent_message item.started dropped" `Quick test_codex_agent_message_started_dropped;
+  Alcotest.test_case "agent_message trailing newlines normalized" `Quick test_codex_agent_message_already_terminated;
   Alcotest.test_case "empty agent_message dropped" `Quick test_codex_agent_message_empty_dropped;
   Alcotest.test_case "command start is Tool_use Bash" `Quick test_codex_command_started;
   Alcotest.test_case "command complete is Tool_result" `Quick test_codex_command_completed;
