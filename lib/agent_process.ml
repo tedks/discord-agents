@@ -712,7 +712,6 @@ let truncate_inline ~max_chars s =
 let detail_of_tool_input name input =
   let open Yojson.Safe.Util in
   let get key = input |> member key |> to_string_option in
-  let code_block lang content = code_block_capped ~lang content in
   match name with
   | "Edit" ->
     let old_s = match get "old_string" with Some s -> s | None -> "" in
@@ -735,21 +734,22 @@ let detail_of_tool_input name input =
         else if new_s <> "" then new_s
         else old_s
       in
-      code_block "diff" content
+      code_block_capped ~lang:"diff" content
   | "Bash" ->
     (match get "command" with
-     | Some cmd when String.length cmd > 0 -> code_block "bash" cmd
+     | Some cmd when String.length cmd > 0 ->
+       code_block_capped ~lang:"bash" cmd
      | _ -> "")
   | "Write" ->
     let path = match get "file_path" with Some p -> p | None -> "" in
     let lang = lang_of_path path in
     (match get "content" with
-     | Some c when String.length c > 0 -> code_block lang c
+     | Some c when String.length c > 0 -> code_block_capped ~lang c
      | _ -> "")
   | "Grep" ->
     (match get "pattern" with
      | Some pat when String.length pat > 0 ->
-       code_block "" ("/" ^ truncate_detail 200 pat ^ "/")
+       code_block_capped ~lang:"" ("/" ^ truncate_detail 200 pat ^ "/")
      | _ -> "")
   | _ -> ""
 
@@ -851,115 +851,152 @@ let parse_stream_json_line line =
     | _ -> [Other line]
   with _ -> [Other line]
 
-(** Parse a codex exec --json event line.
-    Codex emits one JSON object per line with these shapes:
-    - {"type":"thread.started","thread_id":"<uuid>"} — session id is
-      assigned server-side; capture for resume.
-    - {"type":"turn.started"} — ignored.
-    - {"type":"turn.completed","usage":{...}} — triggers a final flush.
-    - {"type":"turn.failed","error":{"message":"..."}} — fatal error; the
-      message is otherwise unrecoverable from the subprocess's empty
-      stderr, so we lift it into an [Error] event.
-    - {"type":"error","message":"..."} — top-level error frame, same
-      treatment.
-    - {"type":"item.started","item":{"type":"command_execution",...}} —
-      tool invocation beginning.
-    - {"type":"item.completed","item":{"type":"agent_message","text":...}}
-      — fully-formed assistant text (not streamed).
-    - {"type":"item.completed","item":{"type":"command_execution",
-      "aggregated_output":"...","exit_code":N,...}} — tool finished.
-    - {"type":"item.completed","item":{"type":"file_change","changes":[...]}}
-      — files modified by Codex.
-    - {"type":"item.completed","item":{"type":"error","message":"..."}}
-      — non-fatal error item, forwarded for visibility.
+(* ── Codex JSON parser ─────────────────────────────────────────────
 
-    Unlike Claude's stream-json, agent_message arrives as one complete
-    text per item, not as incremental deltas. The agent_runner's text
-    buffering and chunking handles both shapes. *)
+   Codex emits one JSON object per line on stdout when invoked with
+   [--json]. The dispatcher [parse_codex_json_line] matches on the
+   top-level [type] field and delegates to a small helper per shape:
+
+   | top-level type    | helper / treatment
+   |-------------------|---------------------------------------------
+   | thread.started    | capture session id via Result event
+   | turn.started      | ignored
+   | turn.completed    | flush via empty Result event
+   | turn.failed       | lift error message into Error event
+   | error             | lift error message into Error event
+   | item.started      | parse_codex_item ~completed:false
+   | item.completed    | parse_codex_item ~completed:true
+
+   Item-level shapes recognized inside item.* envelopes:
+
+   | item.type         | helper / treatment
+   |-------------------|---------------------------------------------
+   | agent_message     | Text_delta (one whole message, not a delta)
+   | command_execution | Tool_use on start, Tool_result on completion
+   | file_change       | Tool_use describing the path(s) modified
+   | error             | Error event (non-fatal)
+   | reasoning         | dropped
+
+   Anything unrecognized falls through to Other(raw line). Errors are
+   forwarded as [Error] events so [Agent_runner] can surface Codex's
+   stdout-only error frames; without this they vanish into [Other]
+   and the user sees an empty "agent exited with code N" message. *)
+
+(** Yojson accessor helpers — collapse the noisy
+    [j |> member k |> to_string_option |> Option.value ~default] chain. *)
+let get_string_opt key json =
+  Yojson.Safe.Util.(json |> member key |> to_string_option)
+
+let get_string ~default key json =
+  Option.value (get_string_opt key json) ~default
+
+let get_int_opt key json =
+  Yojson.Safe.Util.(json |> member key |> to_int_option)
+
+(** Codex error frames put the message either at top-level (the
+    [error] frame) or nested under [error.message] (the [turn.failed]
+    frame). Resolve both shapes to the same string. *)
+let codex_error_message json =
+  let default = "unspecified codex error" in
+  let nested = Yojson.Safe.Util.member "error" json in
+  let source = if nested = `Null then json else nested in
+  get_string ~default "message" source
+
+(** A single file-change entry. [kind] is normalized to the verb used
+    by Codex ("add", "update", "delete") — empty values become
+    "modified" so the rendered summary never says "path ()". *)
+type file_change_entry = { path : string; kind : string }
+
+let parse_file_change_entries item =
+  let raw = match Yojson.Safe.Util.member "changes" item with
+    | `List xs -> xs | _ -> [] in
+  List.filter_map (fun c ->
+    let path = get_string ~default:"" "path" c in
+    let kind = match get_string ~default:"" "kind" c with
+      | "" -> "modified" | k -> k in
+    if path = "" then None else Some { path; kind }
+  ) raw
+
+(** Fully-formed assistant text. Codex emits this once per item with
+    the complete message — there are no incremental deltas. *)
+let parse_codex_agent_message item =
+  match get_string_opt "text" item with
+  | Some text when text <> "" -> [Text_delta text]
+  | _ -> []
+
+(** Bash command lifecycle. The started event opens the tool block;
+    the completed event closes it with the captured output. *)
+let parse_codex_command_execution ~completed item =
+  let cmd = get_string ~default:"" "command" item in
+  if not completed then
+    let summary = truncate_inline ~max_chars:120
+      (sanitize_for_inline_code cmd) in
+    let detail = if cmd = "" then ""
+      else code_block_capped ~lang:"bash" cmd in
+    [Tool_use { tool_name = "Bash";
+                tool_summary = summary; tool_detail = detail }]
+  else
+    let output = get_string ~default:"" "aggregated_output" item in
+    let header = match get_int_opt "exit_code" item with
+      | Some 0 | None -> ""
+      | Some n -> Printf.sprintf "[exit %d]\n" n in
+    let content = header ^ output in
+    if content = "" then [] else [Tool_result { content }]
+
+(** Files modified by Codex in a single item. Single-file changes get
+    a compact inline summary; multi-file changes use a code-block
+    detail listing each path on its own line. *)
+let parse_codex_file_change item =
+  match parse_file_change_entries item with
+  | [] -> []
+  | [{ path; kind }] ->
+    let tool_name = if kind = "add" then "Write" else "Edit" in
+    let summary = truncate_inline ~max_chars:120
+      (Printf.sprintf "%s (%s)"
+         (sanitize_for_inline_code path) kind) in
+    [Tool_use { tool_name; tool_summary = summary; tool_detail = "" }]
+  | many ->
+    let buf = Buffer.create 256 in
+    List.iter (fun { path; kind } ->
+      Buffer.add_string buf (Printf.sprintf "%s %s\n" kind path)
+    ) many;
+    let detail = code_block_capped ~lang:"" (Buffer.contents buf) in
+    let summary = Printf.sprintf "%d files" (List.length many) in
+    [Tool_use { tool_name = "Edit";
+                tool_summary = summary; tool_detail = detail }]
+
+(** Item-level dispatch. [line] is the raw JSON line; we keep it so
+    unrecognized shapes can be passed through as [Other] for logging. *)
+let parse_codex_item ~completed ~line item =
+  match get_string_opt "type" item with
+  | Some "agent_message" when completed ->
+    parse_codex_agent_message item
+  | Some "command_execution" ->
+    parse_codex_command_execution ~completed item
+  | Some "file_change" when completed ->
+    parse_codex_file_change item
+  | Some "error" when completed ->
+    [Error (codex_error_message item)]
+  | Some "reasoning" -> []
+  | _ -> [Other line]
+
 let parse_codex_json_line line =
-  let open Yojson.Safe.Util in
-  let extract_error obj =
-    (* turn.failed wraps the message in a nested "error" object;
-       top-level error frames put it directly on "message". *)
-    match obj |> member "error" with
-    | `Null ->
-      obj |> member "message" |> to_string_option
-      |> Option.value ~default:"unspecified codex error"
-    | err ->
-      err |> member "message" |> to_string_option
-      |> Option.value ~default:"unspecified codex error"
-  in
-  let parse_item ~completed item =
-    match item |> member "type" |> to_string_option with
-    | Some "agent_message" when completed ->
-      (match item |> member "text" |> to_string_option with
-       | Some text when text <> "" -> [Text_delta text]
-       | _ -> [])
-    | Some "command_execution" ->
-      let cmd = item |> member "command" |> to_string_option
-        |> Option.value ~default:"" in
-      if not completed then
-        let summary = truncate_inline ~max_chars:120
-          (sanitize_for_inline_code cmd) in
-        let detail = if cmd = "" then ""
-          else code_block_capped ~lang:"bash" cmd in
-        [Tool_use { tool_name = "Bash";
-                    tool_summary = summary; tool_detail = detail }]
-      else
-        let output = item |> member "aggregated_output" |> to_string_option
-          |> Option.value ~default:"" in
-        let exit_code = item |> member "exit_code" |> to_int_option in
-        let header = match exit_code with
-          | Some 0 | None -> ""
-          | Some n -> Printf.sprintf "[exit %d]\n" n in
-        let content = header ^ output in
-        if content = "" then [] else [Tool_result { content }]
-    | Some "file_change" when completed ->
-      let changes = match item |> member "changes" with
-        | `List xs -> xs | _ -> [] in
-      let entries = List.filter_map (fun c ->
-        let path = c |> member "path" |> to_string_option
-          |> Option.value ~default:"" in
-        let kind = c |> member "kind" |> to_string_option
-          |> Option.value ~default:"" in
-        let kind = if kind = "" then "modified" else kind in
-        if path = "" then None else Some (path, kind)
-      ) changes in
-      (match entries with
-       | [] -> []
-       | [(path, kind)] ->
-         let tool_name = if kind = "add" then "Write" else "Edit" in
-         let summary = truncate_inline ~max_chars:120
-           (Printf.sprintf "%s (%s)"
-              (sanitize_for_inline_code path) kind) in
-         [Tool_use { tool_name; tool_summary = summary; tool_detail = "" }]
-       | many ->
-         let buf = Buffer.create 256 in
-         List.iter (fun (p, k) ->
-           Buffer.add_string buf (Printf.sprintf "%s %s\n" k p)
-         ) many;
-         let detail = code_block_capped ~lang:"" (Buffer.contents buf) in
-         let summary = Printf.sprintf "%d files" (List.length many) in
-         [Tool_use { tool_name = "Edit";
-                     tool_summary = summary; tool_detail = detail }])
-    | Some "error" when completed ->
-      [Error (extract_error item)]
-    | Some "reasoning" -> []
-    | _ -> [Other line]
-  in
   try
     let json = Yojson.Safe.from_string line in
-    match json |> member "type" |> to_string_option with
+    match get_string_opt "type" json with
     | Some "thread.started" ->
-      (match json |> member "thread_id" |> to_string_option with
+      (match get_string_opt "thread_id" json with
        | Some tid -> [Result { text = ""; session_id = Some tid }]
        | None -> [Other line])
     | Some "turn.completed" -> [Result { text = ""; session_id = None }]
     | Some "turn.started" -> []
-    | Some "turn.failed" -> [Error (extract_error json)]
-    | Some "error" -> [Error (extract_error json)]
-    | Some "item.started" -> parse_item ~completed:false (json |> member "item")
-    | Some "item.completed" -> parse_item ~completed:true (json |> member "item")
+    | Some ("turn.failed" | "error") -> [Error (codex_error_message json)]
+    | Some "item.started" ->
+      parse_codex_item ~completed:false ~line
+        (Yojson.Safe.Util.member "item" json)
+    | Some "item.completed" ->
+      parse_codex_item ~completed:true ~line
+        (Yojson.Safe.Util.member "item" json)
     | _ -> [Other line]
   with _ -> [Other line]
 

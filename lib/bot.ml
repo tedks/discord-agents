@@ -420,14 +420,11 @@ let handle_command t msg cmd =
                  ~name:(Printf.sprintf "%s / %s" kind_str p.name) () with
          | Error e -> reply (Printf.sprintf "Failed to create thread: %s" e)
          | Ok thread_ch ->
-           let session : Session_store.session = {
-             project_name = p.name; working_dir; agent_kind = kind;
-             session_id = Resource.generate_uuid ();
-             session_id_confirmed = (kind <> Config.Codex);
-             thread_id = thread_ch.Discord_types.id;
-             system_prompt = None; message_count = 0; processing = false;
-             pending_queue = Queue.create (); initial_prompt = None;
-           } in
+           let session = Session_store.make_session
+             ~project_name:p.name ~working_dir ~agent_kind:kind
+             ~session_id:(Resource.generate_uuid ())
+             ~thread_id:thread_ch.Discord_types.id
+             ~system_prompt:None ~initial_prompt:None () in
            Session_store.add t.sessions ~thread_id:thread_ch.id session;
            let branch_str = match branch_info with
              | Some b -> Printf.sprintf "\nBranch: `%s`" b | None -> "" in
@@ -475,14 +472,11 @@ let handle_command t msg cmd =
                 ~channel_id:thread_parent ~name:(Printf.sprintf "resume / %s" sid_short) () with
         | Error e -> reply (Printf.sprintf "Failed to create thread: %s" e)
         | Ok thread_ch ->
-          let session : Session_store.session = {
-            project_name; working_dir;
-            agent_kind = Config.Claude; session_id = full_sid;
-            session_id_confirmed = true;
-            thread_id = thread_ch.Discord_types.id;
-            system_prompt = None; message_count = 1; processing = false;
-            pending_queue = Queue.create (); initial_prompt = None;
-          } in
+          let session = Session_store.make_session
+            ~project_name ~working_dir ~agent_kind:Config.Claude
+            ~session_id:full_sid ~message_count:1
+            ~thread_id:thread_ch.Discord_types.id
+            ~system_prompt:None ~initial_prompt:None () in
           Session_store.add t.sessions ~thread_id:thread_ch.id session;
           ignore (Discord_rest.create_message t.rest ~channel_id:thread_ch.id
             ~content:(Printf.sprintf
@@ -892,14 +886,11 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
   match Session_store.find_opt t.sessions ~thread_id:channel_id with
   | Some _ -> ()
   | None ->
-    let session : Session_store.session = {
-      project_name; working_dir; agent_kind = Config.Claude;
-      session_id = Resource.generate_uuid ();
-      session_id_confirmed = true;
-      thread_id = channel_id;
-      system_prompt; message_count = 0; processing = false;
-      pending_queue = Queue.create (); initial_prompt = None;
-    } in
+    let session = Session_store.make_session
+      ~project_name ~working_dir ~agent_kind:Config.Claude
+      ~session_id:(Resource.generate_uuid ())
+      ~thread_id:channel_id
+      ~system_prompt ~initial_prompt:None () in
     Session_store.add t.sessions ~thread_id:channel_id session;
     Logs.info (fun m -> m "bot: auto-created session for %s" project_name)
 

@@ -124,6 +124,23 @@ let load_from_disk () =
 let create () =
   { sessions = load_from_disk (); last_reload = Unix.gettimeofday () }
 
+(** Construct a session record with sensible defaults. Centralizes the
+    rule that [session_id_confirmed] starts true for Claude/Gemini
+    (caller-supplied ids) and false for Codex (id assigned by the
+    agent on first run). Callers can override via the optional arg. *)
+let make_session ~project_name ~working_dir ~agent_kind ~session_id
+    ~thread_id ~system_prompt ~initial_prompt
+    ?(message_count = 0)
+    ?session_id_confirmed () =
+  let session_id_confirmed = match session_id_confirmed with
+    | Some b -> b
+    | None -> agent_kind <> Config.Codex
+  in
+  { project_name; working_dir; agent_kind; session_id;
+    session_id_confirmed; thread_id; system_prompt;
+    message_count; processing = false;
+    pending_queue = Queue.create (); initial_prompt }
+
 (** Add a session and persist to disk. *)
 let add t ~(thread_id : Discord_types.channel_id) session =
   t.sessions <- SessionMap.add thread_id session t.sessions;
@@ -150,16 +167,16 @@ let increment_message_count t session =
   save t
 
 (** Update a session's id and mark it confirmed for resume.
-    Used when an agent assigns its id server-side (Codex's thread.started)
-    so the pre-generated UUID is replaced before the next resume.
-    Persisting [session_id_confirmed] here is the load-bearing bit: it
-    is what tells the next invocation to issue [codex exec resume]
-    rather than start a fresh session. *)
+    Used when an agent assigns its id server-side (Codex's
+    thread.started) so the pre-generated UUID is replaced before the
+    next resume. Persisting [session_id_confirmed] here is the
+    load-bearing bit: it tells the next invocation to issue
+    [codex exec resume] rather than start a fresh session. *)
 let set_session_id t session ~session_id =
-  let id_changed = session.session_id <> session_id in
-  let confirmation_changed = not session.session_id_confirmed in
-  if id_changed || confirmation_changed then begin
-    if id_changed then session.session_id <- session_id;
+  let already = session.session_id = session_id
+                && session.session_id_confirmed in
+  if not already then begin
+    session.session_id <- session_id;
     session.session_id_confirmed <- true;
     save t
   end

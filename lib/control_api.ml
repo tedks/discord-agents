@@ -152,14 +152,10 @@ let handle_start_session (bot : Bot.t) params =
         | Error e -> error_response (Printf.sprintf "Failed to create thread: %s" e)
         | Ok thread_ch ->
           let session_id = Resource.generate_uuid () in
-          let session : Session_store.session = {
-            project_name = p.name; working_dir; agent_kind = kind;
-            session_id;
-            session_id_confirmed = (kind <> Config.Codex);
-            thread_id = thread_ch.Discord_types.id;
-            system_prompt = None; message_count = 0; processing = false;
-            pending_queue = Queue.create (); initial_prompt;
-          } in
+          let session = Session_store.make_session
+            ~project_name:p.name ~working_dir ~agent_kind:kind
+            ~session_id ~thread_id:thread_ch.Discord_types.id
+            ~system_prompt:None ~initial_prompt () in
           Session_store.add bot.sessions ~thread_id:thread_ch.id session;
           let branch_str = match branch_info with
             | Some b -> Printf.sprintf "\nBranch: `%s`" b | None -> "" in
@@ -223,14 +219,11 @@ let handle_resume_session (bot : Bot.t) params =
               ~channel_id:thread_parent ~name:thread_name () with
       | Error e -> error_response (Printf.sprintf "Failed to create thread: %s" e)
       | Ok thread_ch ->
-        let session : Session_store.session = {
-          project_name; working_dir;
-          agent_kind = Config.Claude; session_id = full_sid;
-          session_id_confirmed = true;
-          thread_id = thread_ch.Discord_types.id;
-          system_prompt = None; message_count = 1; processing = false;
-          pending_queue = Queue.create (); initial_prompt = None;
-        } in
+        let session = Session_store.make_session
+          ~project_name ~working_dir ~agent_kind:Config.Claude
+          ~session_id:full_sid ~message_count:1
+          ~thread_id:thread_ch.Discord_types.id
+          ~system_prompt:None ~initial_prompt:None () in
         Session_store.add bot.sessions ~thread_id:thread_ch.id session;
         ignore (Discord_rest.create_message bot.rest ~channel_id:thread_ch.id
           ~content:(Printf.sprintf

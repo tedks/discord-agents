@@ -155,7 +155,15 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
      frames on stdout — its stderr is empty in those cases — so we
      accumulate them here. Appended to the displayed error message on
      nonzero exit; reported as a follow-up if the run still exited 0. *)
-  let error_msgs = ref [] in
+  let error_buf = Buffer.create 256 in
+  let collect_error e =
+    if Buffer.length error_buf > 0 then Buffer.add_char error_buf '\n';
+    Buffer.add_string error_buf e
+  in
+  let collected_errors () =
+    if Buffer.length error_buf = 0 then None
+    else Some (Buffer.contents error_buf)
+  in
   (* Background fiber: continuously send typing indicators while processing.
      Discord typing indicators expire after ~10s, so we refresh every 8s.
      Polls every 1s so the fiber stops within 1s of processing completing,
@@ -371,7 +379,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       end
     | Agent_process.Error e ->
       Logs.warn (fun m -> m "agent_runner: error event: %s" e);
-      error_msgs := e :: !error_msgs
+      collect_error e
     | Agent_process.Other line ->
       Logs.debug (fun m -> m "agent_runner: other event: %s"
         (if String.length line > 200
@@ -388,26 +396,23 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
           ~message_count:session.message_count
           ?system_prompt:session.system_prompt
           ~prompt:context_prompt ~on_event ?on_pid ()) in
-  let collected_errors () = List.rev !error_msgs in
+  let send text =
+    ignore (Discord_rest.create_message rest ~channel_id ~content:text ()) in
   match result with
   | Ok () ->
     flush_to_discord ();
-    let errs = collected_errors () in
-    if errs <> [] then
-      (* Codex sometimes reports errors mid-turn that don't fail the
-         process; surface them so the user sees what went wrong. *)
-      ignore (Discord_rest.create_message rest ~channel_id
-        ~content:(Printf.sprintf "Agent reported: %s"
-          (String.concat "\n" errs)) ())
-    else if Buffer.length result_buf = 0 then
-      ignore (Discord_rest.create_message rest ~channel_id
-        ~content:"(no response)" ());
+    (match collected_errors () with
+     | Some errs ->
+       (* Codex sometimes reports errors mid-turn that don't fail the
+          process; surface them so the user sees what went wrong. *)
+       send (Printf.sprintf "Agent reported: %s" errs)
+     | None when Buffer.length result_buf = 0 -> send "(no response)"
+     | None -> ());
     Ok ()
   | Error e ->
     Logs.warn (fun m -> m "agent_runner: error: %s" e);
     let combined = match collected_errors () with
-      | [] -> e
-      | errs -> String.concat "\n" errs ^ "\n" ^ e in
-    ignore (Discord_rest.create_message rest ~channel_id
-      ~content:(Printf.sprintf "Agent error: %s" combined) ());
+      | None -> e
+      | Some errs -> errs ^ "\n" ^ e in
+    send (Printf.sprintf "Agent error: %s" combined);
     Error e
