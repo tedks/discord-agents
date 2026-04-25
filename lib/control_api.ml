@@ -72,13 +72,16 @@ let handle_list_sessions (bot : Bot.t) =
   ) entries in
   ok_response [("sessions", `List sessions)]
 
+(** Extract [hours] from the optional params object, defaulting to 24. *)
+let hours_param params =
+  match params with
+  | Some (`Assoc l) ->
+    (match List.assoc_opt "hours" l with
+     | Some (`Int h) -> h | _ -> 24)
+  | _ -> 24
+
 let handle_list_claude_sessions _bot params =
-  let hours = match params with
-    | Some (`Assoc l) ->
-      (match List.assoc_opt "hours" l with
-       | Some (`Int h) -> h | _ -> 24)
-    | _ -> 24 in
-  let sessions = Claude_sessions.discover ~hours () in
+  let sessions = Claude_sessions.discover ~hours:(hours_param params) () in
   let items = List.map (fun (s : Claude_sessions.info) ->
     let sid_short = String.sub s.session_id 0
       (min 8 (String.length s.session_id)) in
@@ -87,6 +90,22 @@ let handle_list_claude_sessions _bot params =
       ("session_id", `String s.session_id);
       ("session_id_short", `String sid_short);
       ("project_dir", `String s.project_dir);
+      ("working_dir", `String s.working_dir);
+      ("summary", `String s.summary);
+      ("age_minutes", `Int age_min);
+    ]
+  ) sessions in
+  ok_response [("sessions", `List items)]
+
+let handle_list_gemini_sessions _bot params =
+  let sessions = Gemini_sessions.discover ~hours:(hours_param params) () in
+  let items = List.map (fun (s : Gemini_sessions.info) ->
+    let sid_short = String.sub s.session_id 0
+      (min 8 (String.length s.session_id)) in
+    let age_min = int_of_float ((Unix.gettimeofday () -. s.mtime) /. 60.0) in
+    `Assoc [
+      ("session_id", `String s.session_id);
+      ("session_id_short", `String sid_short);
       ("working_dir", `String s.working_dir);
       ("summary", `String s.summary);
       ("age_minutes", `Int age_min);
@@ -177,11 +196,40 @@ let handle_resume_session (bot : Bot.t) params =
   let params = match params with Some p -> p | None ->
     failwith "missing params" in
   let sid_prefix = params |> member "session_id" |> to_string in
-  let found = Eio_unix.run_in_systhread (fun () ->
-    Claude_sessions.find_by_prefix sid_prefix) in
+  let kind = match params |> member "kind" |> to_string_option with
+    | None -> None
+    | Some s ->
+      (match Config.agent_kind_of_string (String.lowercase_ascii s) with
+       | Ok k -> Some k | Error _ -> None)
+  in
+  (* Mirror Bot.handle_command's Resume_session dispatch: explicit
+     kind looks up its own store; None tries Claude then Gemini. *)
+  let try_claude () =
+    match Eio_unix.run_in_systhread (fun () ->
+      Claude_sessions.find_by_prefix sid_prefix) with
+    | Some (sid, wd) -> Some (Config.Claude, sid, wd) | None -> None
+  in
+  let try_gemini () =
+    match Gemini_sessions.find_by_prefix sid_prefix with
+    | Some (sid, wd) -> Some (Config.Gemini, sid, wd) | None -> None
+  in
+  let found = match kind with
+    | Some Config.Claude -> try_claude ()
+    | Some Config.Gemini -> try_gemini ()
+    | Some Config.Codex -> None  (* Codex's session store is internal *)
+    | None ->
+      (match try_claude () with
+       | Some _ as r -> r | None -> try_gemini ())
+  in
   match found with
-  | None -> error_response (Printf.sprintf "No Claude session matching '%s'." sid_prefix)
-  | Some (full_sid, raw_working_dir) ->
+  | None ->
+    let label = match kind with
+      | Some k -> Config.string_of_agent_kind k ^ " "
+      | None -> "" in
+    error_response (Printf.sprintf "No %ssession matching '%s'." label sid_prefix)
+  | Some (resolved_kind, full_sid, raw_working_dir) ->
+    let kind_label = Config.string_of_agent_kind resolved_kind in
+    let kind_title = String.capitalize_ascii kind_label in
     let sid_short = String.sub full_sid 0 (min 8 (String.length full_sid)) in
     let matched_project = List.find_opt (fun (p : Project.t) ->
       raw_working_dir = p.path
@@ -212,28 +260,32 @@ let handle_resume_session (bot : Bot.t) params =
       in
       let project_name = match matched_project with
         | Some p -> p.name
-        | None -> Filename.basename raw_working_dir
+        | None ->
+          if raw_working_dir = "" then kind_label ^ "-session"
+          else Filename.basename raw_working_dir
       in
-      let thread_name = Printf.sprintf "resume / %s" sid_short in
+      let thread_name =
+        Printf.sprintf "resume %s / %s" kind_label sid_short in
       (match Discord_rest.create_thread_no_message bot.rest
               ~channel_id:thread_parent ~name:thread_name () with
       | Error e -> error_response (Printf.sprintf "Failed to create thread: %s" e)
       | Ok thread_ch ->
         let session = Session_store.make_session
-          ~project_name ~working_dir ~agent_kind:Config.Claude
+          ~project_name ~working_dir ~agent_kind:resolved_kind
           ~session_id:full_sid ~message_count:1
           ~thread_id:thread_ch.Discord_types.id
           ~system_prompt:None ~initial_prompt:None () in
         Session_store.add bot.sessions ~thread_id:thread_ch.id session;
         ignore (Discord_rest.create_message bot.rest ~channel_id:thread_ch.id
           ~content:(Printf.sprintf
-            "**Resumed** Claude session `%s`\nWorking in: `%s`\nSend a message to continue."
-            sid_short working_dir) ());
+            "**Resumed** %s session `%s`\nWorking in: `%s`\nSend a message to continue."
+            kind_title sid_short working_dir) ());
         ok_response [
           ("thread_id", `String thread_ch.id);
           ("working_dir", `String working_dir);
           ("session_id", `String full_sid);
           ("project_name", `String project_name);
+          ("agent_kind", `String kind_label);
         ])
 
 let handle_restart (bot : Bot.t) =
@@ -277,6 +329,7 @@ let dispatch (bot : Bot.t) method_ params =
     | "list_projects" -> handle_list_projects bot
     | "list_sessions" -> handle_list_sessions bot
     | "list_claude_sessions" -> handle_list_claude_sessions bot params
+    | "list_gemini_sessions" -> handle_list_gemini_sessions bot params
     | "start_session" -> handle_start_session bot params
     | "resume_session" -> handle_resume_session bot params
     | "restart" -> handle_restart bot

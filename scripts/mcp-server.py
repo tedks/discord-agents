@@ -119,14 +119,33 @@ TOOLS = [
         }
     },
     {
+        "name": "list_gemini_sessions",
+        "description": "List recent Gemini CLI sessions on this machine (last 24h). Useful for finding sessions to resume.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "hours": {
+                    "type": "integer",
+                    "description": "How many hours back to search",
+                    "default": 24
+                }
+            }
+        }
+    },
+    {
         "name": "resume_session",
-        "description": "Resume an existing Claude Code session in a new Discord thread. Use list_claude_sessions first to find the session ID.",
+        "description": "Resume an existing Claude or Gemini session in a new Discord thread. Use list_claude_sessions / list_gemini_sessions to find a session ID. With kind unspecified, the bot tries Claude first, then Gemini.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "session_id": {
                     "type": "string",
-                    "description": "Claude session ID or prefix (at least 8 characters)"
+                    "description": "Session ID or prefix (at least 8 characters)"
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["claude", "gemini"],
+                    "description": "Which session store to search. Omit to try Claude then Gemini."
                 }
             },
             "required": ["session_id"]
@@ -216,6 +235,22 @@ def handle_tool_call(name, arguments):
             summary = s.get("summary", "(no summary)")
             lines.append(f"- `{s['session_id_short']}` {age_str} — {summary}")
         return "\n".join(lines) + "\n\nUse resume_session with a session ID prefix to attach."
+
+    elif name == "list_gemini_sessions":
+        result = control_request("list_gemini_sessions", arguments)
+        if "error" in result:
+            return result["error"]
+        sessions = result.get("sessions", [])
+        if not sessions:
+            return "No recent Gemini sessions found."
+        lines = []
+        for s in sessions:
+            age = s.get("age_minutes", 0)
+            age_str = f"{age}m ago" if age < 60 else f"{age // 60}h ago"
+            summary = s.get("summary", "(no summary)")
+            wd = s.get("working_dir", "") or "(unknown project)"
+            lines.append(f"- `{s['session_id_short']}` {age_str} — {wd} — {summary}")
+        return "\n".join(lines) + "\n\nUse resume_session with kind=gemini to attach."
 
     elif name == "start_session":
         result = control_request("start_session", arguments, timeout=120)
