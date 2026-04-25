@@ -1,3 +1,7 @@
 (test
  (name test_formatting)
  (libraries discord_agents alcotest str))
+
+(test
+ (name test_agent_contracts)
+ (libraries discord_agents alcotest str unix))
