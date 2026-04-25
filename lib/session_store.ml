@@ -20,6 +20,12 @@ type session = {
      event arrives. Claude accepts a caller-supplied id, so its value
      never changes after creation. *)
   mutable session_id : string;
+  (* True once the agent has acknowledged [session_id] as resumable.
+     Always true for Claude/Gemini (caller-supplied ids). For Codex,
+     starts false and flips true when thread.started arrives. Used by
+     the Codex resume gate so a first-turn failure that occurred
+     before/after the id assignment is handled correctly. *)
+  mutable session_id_confirmed : bool;
   thread_id : Discord_types.channel_id;  (* threads are channels in Discord *)
   system_prompt : string option;
   mutable message_count : int;
@@ -48,6 +54,7 @@ let sessions_to_json sessions =
       ("working_dir", `String s.working_dir);
       ("agent_kind", `String (Config.string_of_agent_kind s.agent_kind));
       ("session_id", `String s.session_id);
+      ("session_id_confirmed", `Bool s.session_id_confirmed);
       ("thread_id", `String s.thread_id);
       ("message_count", `Int s.message_count);
     ] @ (match s.system_prompt with
@@ -64,13 +71,21 @@ let sessions_of_json json =
     let open Yojson.Safe.Util in
     let entries = to_list json |> List.map (fun j ->
       let thread_id = j |> member "thread_id" |> to_string in
+      let agent_kind = (match Config.agent_kind_of_string
+        (j |> member "agent_kind" |> to_string) with
+        | Ok k -> k | Error _ -> Config.Claude) in
+      (* For sessions written before session_id_confirmed existed,
+         default Codex to false (be safe — start fresh) and others to
+         true (their ids were always caller-supplied). *)
+      let session_id_confirmed = match j |> member "session_id_confirmed" with
+        | `Bool b -> b
+        | _ -> agent_kind <> Config.Codex in
       let session = {
         project_name = j |> member "project_name" |> to_string;
         working_dir = j |> member "working_dir" |> to_string;
-        agent_kind = (match Config.agent_kind_of_string
-          (j |> member "agent_kind" |> to_string) with
-          | Ok k -> k | Error _ -> Config.Claude);
+        agent_kind;
         session_id = j |> member "session_id" |> to_string;
+        session_id_confirmed;
         thread_id;
         system_prompt = j |> member "system_prompt" |> to_string_option;
         message_count = j |> member "message_count" |> to_int;
@@ -134,12 +149,18 @@ let increment_message_count t session =
   session.message_count <- session.message_count + 1;
   save t
 
-(** Update a session's id and persist.
+(** Update a session's id and mark it confirmed for resume.
     Used when an agent assigns its id server-side (Codex's thread.started)
-    so the pre-generated UUID is replaced before the next resume. *)
+    so the pre-generated UUID is replaced before the next resume.
+    Persisting [session_id_confirmed] here is the load-bearing bit: it
+    is what tells the next invocation to issue [codex exec resume]
+    rather than start a fresh session. *)
 let set_session_id t session ~session_id =
-  if session.session_id <> session_id then begin
-    session.session_id <- session_id;
+  let id_changed = session.session_id <> session_id in
+  let confirmation_changed = not session.session_id_confirmed in
+  if id_changed || confirmation_changed then begin
+    if id_changed then session.session_id <- session_id;
+    session.session_id_confirmed <- true;
     save t
   end
 

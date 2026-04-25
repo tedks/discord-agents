@@ -423,6 +423,7 @@ let handle_command t msg cmd =
            let session : Session_store.session = {
              project_name = p.name; working_dir; agent_kind = kind;
              session_id = Resource.generate_uuid ();
+             session_id_confirmed = (kind <> Config.Codex);
              thread_id = thread_ch.Discord_types.id;
              system_prompt = None; message_count = 0; processing = false;
              pending_queue = Queue.create (); initial_prompt = None;
@@ -477,6 +478,7 @@ let handle_command t msg cmd =
           let session : Session_store.session = {
             project_name; working_dir;
             agent_kind = Config.Claude; session_id = full_sid;
+            session_id_confirmed = true;
             thread_id = thread_ch.Discord_types.id;
             system_prompt = None; message_count = 1; processing = false;
             pending_queue = Queue.create (); initial_prompt = None;
@@ -892,7 +894,9 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
   | None ->
     let session : Session_store.session = {
       project_name; working_dir; agent_kind = Config.Claude;
-      session_id = Resource.generate_uuid (); thread_id = channel_id;
+      session_id = Resource.generate_uuid ();
+      session_id_confirmed = true;
+      thread_id = channel_id;
       system_prompt; message_count = 0; processing = false;
       pending_queue = Queue.create (); initial_prompt = None;
     } in

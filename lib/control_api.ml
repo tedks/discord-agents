@@ -154,7 +154,9 @@ let handle_start_session (bot : Bot.t) params =
           let session_id = Resource.generate_uuid () in
           let session : Session_store.session = {
             project_name = p.name; working_dir; agent_kind = kind;
-            session_id; thread_id = thread_ch.Discord_types.id;
+            session_id;
+            session_id_confirmed = (kind <> Config.Codex);
+            thread_id = thread_ch.Discord_types.id;
             system_prompt = None; message_count = 0; processing = false;
             pending_queue = Queue.create (); initial_prompt;
           } in
@@ -224,6 +226,7 @@ let handle_resume_session (bot : Bot.t) params =
         let session : Session_store.session = {
           project_name; working_dir;
           agent_kind = Config.Claude; session_id = full_sid;
+          session_id_confirmed = true;
           thread_id = thread_ch.Discord_types.id;
           system_prompt = None; message_count = 1; processing = false;
           pending_queue = Queue.create (); initial_prompt = None;

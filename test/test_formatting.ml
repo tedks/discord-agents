@@ -909,6 +909,168 @@ let codex_json_tests = [
   Alcotest.test_case "backticks sanitized in summary" `Quick test_codex_command_injection_summary;
 ]
 
+(* ── parse_codex_json_line: error frames + safety caps ────────────── *)
+
+let expect_error events =
+  match events with
+  | [Discord_agents.Agent_process.Error msg] -> Some msg
+  | _ -> None
+
+let test_codex_top_level_error () =
+  let line = {|{"type":"error","message":"model unavailable"}|} in
+  Alcotest.(check (option string)) "top-level error surfaces"
+    (Some "model unavailable") (expect_error (parse_codex line))
+
+let test_codex_turn_failed () =
+  let line = {|{"type":"turn.failed","error":{"message":"rate limited"}}|} in
+  Alcotest.(check (option string)) "turn.failed surfaces nested message"
+    (Some "rate limited") (expect_error (parse_codex line))
+
+let test_codex_item_error () =
+  let line = {|{"type":"item.completed","item":{"id":"i0","type":"error","message":"bad model metadata"}}|} in
+  Alcotest.(check (option string)) "item-level error surfaces"
+    (Some "bad model metadata") (expect_error (parse_codex line))
+
+let test_codex_error_missing_message () =
+  let line = {|{"type":"error"}|} in
+  match expect_error (parse_codex line) with
+  | Some _ -> ()
+  | None -> Alcotest.fail "expected fallback error message"
+
+let test_codex_command_detail_oversized_capped () =
+  (* Build a 10000-char command. The detail block must be capped well
+     under Discord's 2000-char message limit. *)
+  let huge = String.make 10_000 'a' in
+  let line = Printf.sprintf
+    {|{"type":"item.started","item":{"type":"command_execution","command":"%s","status":"in_progress"}}|}
+    huge in
+  match expect_tool (parse_codex line) with
+  | Some info ->
+    Alcotest.(check bool) "detail under 2000 chars"
+      true (String.length info.tool_detail < 2000);
+    Alcotest.(check bool) "summary under 200 chars"
+      true (String.length info.tool_summary < 200)
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let test_codex_file_change_path_with_backticks () =
+  (* A filename containing ``` must not break out of the detail code
+     block. After escape_code_fences, no raw ``` should remain. *)
+  let line = {|{"type":"item.completed","item":{"type":"file_change","changes":[{"path":"a.ml","kind":"add"},{"path":"weird```name.ml","kind":"update"}]}}|} in
+  match expect_tool (parse_codex line) with
+  | Some info ->
+    let detail = info.tool_detail in
+    (* Outer fences only — count of triple-backtick runs should be 2. *)
+    let count_triples s =
+      let n = String.length s in
+      let count = ref 0 in
+      let i = ref 0 in
+      while !i + 2 < n do
+        if s.[!i] = '`' && s.[!i+1] = '`' && s.[!i+2] = '`' then begin
+          incr count;
+          i := !i + 3
+        end else incr i
+      done;
+      !count
+    in
+    Alcotest.(check int) "exactly 2 fence markers (open + close)"
+      2 (count_triples detail)
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let test_codex_file_change_kind_default () =
+  (* Missing kind should not produce an empty parens like "path ()". *)
+  let line = {|{"type":"item.completed","item":{"type":"file_change","changes":[{"path":"foo.ml"}]}}|} in
+  match expect_tool (parse_codex line) with
+  | Some info ->
+    Alcotest.(check bool) "summary not empty parens"
+      false (try ignore (Str.search_forward
+        (Str.regexp_string "()") info.tool_summary 0); true
+      with Not_found -> false)
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let test_codex_command_summary_utf8_safe () =
+  (* 50 copies of a 4-byte emoji = 200 bytes. The 120-byte truncation
+     must land on a codepoint boundary, not in the middle of the
+     4-byte sequence. We check by walking the bytes: a UTF-8 lead
+     byte must be followed by exactly the right number of continuation
+     bytes; any premature end means truncation chopped a codepoint. *)
+  let emoji = "\xF0\x9F\x98\x80" in  (* 😀 U+1F600 *)
+  let cmd = String.concat "" (List.init 50 (fun _ -> emoji)) in
+  let line = Printf.sprintf
+    {|{"type":"item.started","item":{"type":"command_execution","command":"%s","status":"in_progress"}}|}
+    cmd in
+  match expect_tool (parse_codex line) with
+  | Some info ->
+    let s = info.tool_summary in
+    let rec valid i =
+      if i >= String.length s then true
+      else
+        let c = Char.code s.[i] in
+        let need =
+          if c < 0x80 then 0
+          else if c < 0xC0 then -1   (* stray continuation *)
+          else if c < 0xE0 then 1
+          else if c < 0xF0 then 2
+          else 3
+        in
+        if need < 0 then false
+        else if i + need >= String.length s then false
+        else
+          let ok = ref true in
+          for k = 1 to need do
+            let cc = Char.code s.[i + k] in
+            if cc < 0x80 || cc >= 0xC0 then ok := false
+          done;
+          !ok && valid (i + 1 + need)
+    in
+    Alcotest.(check bool) "summary is valid UTF-8" true (valid 0)
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let codex_safety_tests = [
+  Alcotest.test_case "top-level error surfaces" `Quick test_codex_top_level_error;
+  Alcotest.test_case "turn.failed surfaces" `Quick test_codex_turn_failed;
+  Alcotest.test_case "item.completed error surfaces" `Quick test_codex_item_error;
+  Alcotest.test_case "error missing message has fallback" `Quick test_codex_error_missing_message;
+  Alcotest.test_case "oversized command detail is capped" `Quick test_codex_command_detail_oversized_capped;
+  Alcotest.test_case "file_change paths with backticks escaped" `Quick test_codex_file_change_path_with_backticks;
+  Alcotest.test_case "missing file_change kind has default" `Quick test_codex_file_change_kind_default;
+  Alcotest.test_case "command summary UTF-8 safe truncation" `Quick test_codex_command_summary_utf8_safe;
+]
+
+(* ── codex_args ────────────────────────────────────────────────────── *)
+
+let codex_args = Discord_agents.Agent_process.codex_args
+
+let test_codex_args_fresh () =
+  let args = codex_args ~session_id:"placeholder-uuid"
+    ~session_id_confirmed:false ~prompt:"hello" in
+  Alcotest.(check (list string)) "fresh exec, no resume, -- before prompt"
+    ["codex"; "exec"; "--json"; "--full-auto"; "--skip-git-repo-check";
+     "--"; "hello"]
+    args
+
+let test_codex_args_resume () =
+  let args = codex_args ~session_id:"019dc073-0e5f-74d3-8fcf-0bb027feab47"
+    ~session_id_confirmed:true ~prompt:"continue" in
+  Alcotest.(check (list string)) "resume with id, -- before prompt"
+    ["codex"; "exec"; "--json"; "--full-auto"; "--skip-git-repo-check";
+     "resume"; "019dc073-0e5f-74d3-8fcf-0bb027feab47"; "--"; "continue"]
+    args
+
+let test_codex_args_dash_prompt_safe () =
+  (* A prompt starting with - must not be consumed as a Codex flag. *)
+  let args = codex_args ~session_id:"x" ~session_id_confirmed:false
+    ~prompt:"--help me" in
+  let last = List.nth args (List.length args - 1) in
+  let second_last = List.nth args (List.length args - 2) in
+  Alcotest.(check string) "prompt is the last arg" "--help me" last;
+  Alcotest.(check string) "preceded by --" "--" second_last
+
+let codex_args_tests = [
+  Alcotest.test_case "fresh exec args" `Quick test_codex_args_fresh;
+  Alcotest.test_case "resume args" `Quick test_codex_args_resume;
+  Alcotest.test_case "dash-prefixed prompt" `Quick test_codex_args_dash_prompt_safe;
+]
+
 (* ── runner ──────────────────────────────────────────────────────── *)
 
 let () =
@@ -924,4 +1086,6 @@ let () =
     "tool_detail", tool_detail_tests;
     "escape_nested_fences", escape_nested_fences_tests;
     "codex_json", codex_json_tests;
+    "codex_safety", codex_safety_tests;
+    "codex_args", codex_args_tests;
   ]

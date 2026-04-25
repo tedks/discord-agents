@@ -151,6 +151,11 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
   let in_tool_mode = ref false in
   let typing_active = ref true in
   let last_edit = ref (Unix.gettimeofday ()) in
+  (* Codex emits fatal errors (turn.failed, top-level error) as JSON
+     frames on stdout — its stderr is empty in those cases — so we
+     accumulate them here. Appended to the displayed error message on
+     nonzero exit; reported as a follow-up if the run still exited 0. *)
+  let error_msgs = ref [] in
   (* Background fiber: continuously send typing indicators while processing.
      Discord typing indicators expire after ~10s, so we refresh every 8s.
      Polls every 1s so the fiber stops within 1s of processing completing,
@@ -365,7 +370,8 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
         flush_tool_status ()
       end
     | Agent_process.Error e ->
-      Logs.warn (fun m -> m "agent_runner: error event: %s" e)
+      Logs.warn (fun m -> m "agent_runner: error event: %s" e);
+      error_msgs := e :: !error_msgs
     | Agent_process.Other line ->
       Logs.debug (fun m -> m "agent_runner: other event: %s"
         (if String.length line > 200
@@ -378,18 +384,30 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
           ~working_dir:session.working_dir
           ~kind:session.agent_kind
           ~session_id:session.session_id
+          ~session_id_confirmed:session.session_id_confirmed
           ~message_count:session.message_count
           ?system_prompt:session.system_prompt
           ~prompt:context_prompt ~on_event ?on_pid ()) in
+  let collected_errors () = List.rev !error_msgs in
   match result with
   | Ok () ->
     flush_to_discord ();
-    if Buffer.length result_buf = 0 then
+    let errs = collected_errors () in
+    if errs <> [] then
+      (* Codex sometimes reports errors mid-turn that don't fail the
+         process; surface them so the user sees what went wrong. *)
+      ignore (Discord_rest.create_message rest ~channel_id
+        ~content:(Printf.sprintf "Agent reported: %s"
+          (String.concat "\n" errs)) ())
+    else if Buffer.length result_buf = 0 then
       ignore (Discord_rest.create_message rest ~channel_id
         ~content:"(no response)" ());
     Ok ()
   | Error e ->
     Logs.warn (fun m -> m "agent_runner: error: %s" e);
+    let combined = match collected_errors () with
+      | [] -> e
+      | errs -> String.concat "\n" errs ^ "\n" ^ e in
     ignore (Discord_rest.create_message rest ~channel_id
-      ~content:(Printf.sprintf "Agent error: %s" e) ());
+      ~content:(Printf.sprintf "Agent error: %s" combined) ());
     Error e

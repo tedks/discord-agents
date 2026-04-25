@@ -1,8 +1,9 @@
 (** Agent subprocess management using Eio.
 
     Spawns Claude/Codex/Gemini as subprocesses with proper I/O handling.
-    Claude and Gemini use stream-json output for real-time streaming.
-    Codex uses plain text output. *)
+    Claude and Gemini use stream-json output for real-time streaming;
+    Codex uses its own JSONL event stream (codex exec --json) parsed by
+    [parse_codex_json_line]. *)
 
 type tool_info = {
   tool_name: string;        (** Tool name (e.g. "Read", "Edit", "Bash") *)
@@ -683,22 +684,35 @@ let escape_nested_fences text =
   ) lines;
   Buffer.contents buf
 
+(** Wrap [content] in a Discord code block with [lang] syntax hinting,
+    capping the post-escape byte length at [max_detail_len] (UTF-8 safe,
+    fence-aware) and rewriting any inner ``` so they cannot close the
+    outer fence. Used by both Claude's tool-detail rendering and Codex's
+    command/file-change detail rendering. *)
+let code_block_capped ~lang content =
+  let capped =
+    if escaped_length content <= max_detail_len then content
+    else
+      let taken = take_fitting_prefix ~max_chars:max_detail_len content in
+      String.sub content 0 taken ^ "\n... (truncated)"
+  in
+  Printf.sprintf "```%s\n%s\n```" lang (escape_code_fences capped)
+
+(** UTF-8 safe truncation for inline summary strings: caps at [max_chars]
+    bytes (post-fence-escape) and appends "...".  Returns [s] unchanged
+    if it already fits.  Always lands on a UTF-8 codepoint boundary. *)
+let truncate_inline ~max_chars s =
+  if escaped_length s <= max_chars then s
+  else
+    let taken = take_fitting_prefix ~max_chars s in
+    String.sub s 0 taken ^ "..."
+
 (** Generate a syntax-highlighted code block showing tool content details.
     Returns "" if the tool doesn't have interesting content to show. *)
 let detail_of_tool_input name input =
   let open Yojson.Safe.Util in
   let get key = input |> member key |> to_string_option in
-  (* Build a code block with fences escaped and capped at max_detail_len.
-     Cap is evaluated against escaped length (fence-aware, UTF-8 safe). *)
-  let code_block lang content =
-    let capped =
-      if escaped_length content <= max_detail_len then content
-      else
-        let taken = take_fitting_prefix ~max_chars:max_detail_len content in
-        String.sub content 0 taken ^ "\n... (truncated)"
-    in
-    Printf.sprintf "```%s\n%s\n```" lang (escape_code_fences capped)
-  in
+  let code_block lang content = code_block_capped ~lang content in
   match name with
   | "Edit" ->
     let old_s = match get "old_string" with Some s -> s | None -> "" in
@@ -843,6 +857,11 @@ let parse_stream_json_line line =
       assigned server-side; capture for resume.
     - {"type":"turn.started"} — ignored.
     - {"type":"turn.completed","usage":{...}} — triggers a final flush.
+    - {"type":"turn.failed","error":{"message":"..."}} — fatal error; the
+      message is otherwise unrecoverable from the subprocess's empty
+      stderr, so we lift it into an [Error] event.
+    - {"type":"error","message":"..."} — top-level error frame, same
+      treatment.
     - {"type":"item.started","item":{"type":"command_execution",...}} —
       tool invocation beginning.
     - {"type":"item.completed","item":{"type":"agent_message","text":...}}
@@ -851,82 +870,96 @@ let parse_stream_json_line line =
       "aggregated_output":"...","exit_code":N,...}} — tool finished.
     - {"type":"item.completed","item":{"type":"file_change","changes":[...]}}
       — files modified by Codex.
+    - {"type":"item.completed","item":{"type":"error","message":"..."}}
+      — non-fatal error item, forwarded for visibility.
 
     Unlike Claude's stream-json, agent_message arrives as one complete
     text per item, not as incremental deltas. The agent_runner's text
     buffering and chunking handles both shapes. *)
 let parse_codex_json_line line =
+  let open Yojson.Safe.Util in
+  let extract_error obj =
+    (* turn.failed wraps the message in a nested "error" object;
+       top-level error frames put it directly on "message". *)
+    match obj |> member "error" with
+    | `Null ->
+      obj |> member "message" |> to_string_option
+      |> Option.value ~default:"unspecified codex error"
+    | err ->
+      err |> member "message" |> to_string_option
+      |> Option.value ~default:"unspecified codex error"
+  in
+  let parse_item ~completed item =
+    match item |> member "type" |> to_string_option with
+    | Some "agent_message" when completed ->
+      (match item |> member "text" |> to_string_option with
+       | Some text when text <> "" -> [Text_delta text]
+       | _ -> [])
+    | Some "command_execution" ->
+      let cmd = item |> member "command" |> to_string_option
+        |> Option.value ~default:"" in
+      if not completed then
+        let summary = truncate_inline ~max_chars:120
+          (sanitize_for_inline_code cmd) in
+        let detail = if cmd = "" then ""
+          else code_block_capped ~lang:"bash" cmd in
+        [Tool_use { tool_name = "Bash";
+                    tool_summary = summary; tool_detail = detail }]
+      else
+        let output = item |> member "aggregated_output" |> to_string_option
+          |> Option.value ~default:"" in
+        let exit_code = item |> member "exit_code" |> to_int_option in
+        let header = match exit_code with
+          | Some 0 | None -> ""
+          | Some n -> Printf.sprintf "[exit %d]\n" n in
+        let content = header ^ output in
+        if content = "" then [] else [Tool_result { content }]
+    | Some "file_change" when completed ->
+      let changes = match item |> member "changes" with
+        | `List xs -> xs | _ -> [] in
+      let entries = List.filter_map (fun c ->
+        let path = c |> member "path" |> to_string_option
+          |> Option.value ~default:"" in
+        let kind = c |> member "kind" |> to_string_option
+          |> Option.value ~default:"" in
+        let kind = if kind = "" then "modified" else kind in
+        if path = "" then None else Some (path, kind)
+      ) changes in
+      (match entries with
+       | [] -> []
+       | [(path, kind)] ->
+         let tool_name = if kind = "add" then "Write" else "Edit" in
+         let summary = truncate_inline ~max_chars:120
+           (Printf.sprintf "%s (%s)"
+              (sanitize_for_inline_code path) kind) in
+         [Tool_use { tool_name; tool_summary = summary; tool_detail = "" }]
+       | many ->
+         let buf = Buffer.create 256 in
+         List.iter (fun (p, k) ->
+           Buffer.add_string buf (Printf.sprintf "%s %s\n" k p)
+         ) many;
+         let detail = code_block_capped ~lang:"" (Buffer.contents buf) in
+         let summary = Printf.sprintf "%d files" (List.length many) in
+         [Tool_use { tool_name = "Edit";
+                     tool_summary = summary; tool_detail = detail }])
+    | Some "error" when completed ->
+      [Error (extract_error item)]
+    | Some "reasoning" -> []
+    | _ -> [Other line]
+  in
   try
     let json = Yojson.Safe.from_string line in
-    let open Yojson.Safe.Util in
-    let typ = json |> member "type" |> to_string_option in
-    match typ with
+    match json |> member "type" |> to_string_option with
     | Some "thread.started" ->
       (match json |> member "thread_id" |> to_string_option with
        | Some tid -> [Result { text = ""; session_id = Some tid }]
        | None -> [Other line])
-    | Some "turn.completed" ->
-      [Result { text = ""; session_id = None }]
+    | Some "turn.completed" -> [Result { text = ""; session_id = None }]
     | Some "turn.started" -> []
-    | Some ("item.started" | "item.completed" as t) ->
-      let completed = (t = "item.completed") in
-      let item = json |> member "item" in
-      (match item |> member "type" |> to_string_option with
-       | Some "agent_message" when completed ->
-         (match item |> member "text" |> to_string_option with
-          | Some text when text <> "" -> [Text_delta text]
-          | _ -> [])
-       | Some "command_execution" ->
-         let cmd = item |> member "command" |> to_string_option
-           |> Option.value ~default:"" in
-         if not completed then
-           let summary =
-             let s = sanitize_for_inline_code cmd in
-             if String.length s > 120 then String.sub s 0 120 ^ "..." else s
-           in
-           let detail =
-             if cmd = "" then ""
-             else Printf.sprintf "```bash\n%s\n```" (escape_code_fences cmd)
-           in
-           [Tool_use { tool_name = "Bash";
-                       tool_summary = summary; tool_detail = detail }]
-         else
-           let output = item |> member "aggregated_output" |> to_string_option
-             |> Option.value ~default:"" in
-           let exit_code = item |> member "exit_code" |> to_int_option in
-           let header = match exit_code with
-             | Some 0 | None -> ""
-             | Some n -> Printf.sprintf "[exit %d]\n" n in
-           let content = header ^ output in
-           if content = "" then [] else [Tool_result { content }]
-       | Some "file_change" when completed ->
-         let changes = match item |> member "changes" with
-           | `List xs -> xs | _ -> [] in
-         let entries = List.filter_map (fun c ->
-           let path = c |> member "path" |> to_string_option
-             |> Option.value ~default:"" in
-           let kind = c |> member "kind" |> to_string_option
-             |> Option.value ~default:"" in
-           if path = "" then None else Some (path, kind)
-         ) changes in
-         (match entries with
-          | [] -> []
-          | [(path, kind)] ->
-            let tool_name = if kind = "add" then "Write" else "Edit" in
-            let summary = Printf.sprintf "%s (%s)"
-              (sanitize_for_inline_code path) kind in
-            [Tool_use { tool_name; tool_summary = summary; tool_detail = "" }]
-          | many ->
-            let buf = Buffer.create 256 in
-            List.iter (fun (p, k) ->
-              Buffer.add_string buf (Printf.sprintf "%s %s\n" k p)
-            ) many;
-            let detail = Printf.sprintf "```\n%s```" (Buffer.contents buf) in
-            let summary = Printf.sprintf "%d files" (List.length many) in
-            [Tool_use { tool_name = "Edit";
-                        tool_summary = summary; tool_detail = detail }])
-       | Some "reasoning" -> []
-       | _ -> [Other line])
+    | Some "turn.failed" -> [Error (extract_error json)]
+    | Some "error" -> [Error (extract_error json)]
+    | Some "item.started" -> parse_item ~completed:false (json |> member "item")
+    | Some "item.completed" -> parse_item ~completed:true (json |> member "item")
     | _ -> [Other line]
   with _ -> [Other line]
 
@@ -938,15 +971,24 @@ let claude_args ~session_id ~message_count ~prompt =
   in
   ["claude"; "-p"; "--verbose"; "--output-format"; "stream-json"] @ session_flag @ [prompt]
 
-(** Codex allocates its own session id in the thread.started event, so
-    the UUID the bot pre-generated is ignored on the first run.
-    [parse_codex_json_line] emits that id via Result.session_id; the
-    agent_runner persists it so the next invocation can resume. *)
-let codex_args ~session_id ~message_count ~prompt =
+(** Codex allocates its session id server-side in the thread.started
+    event, so the UUID the bot pre-generated is invalid for resume on
+    the first run. [parse_codex_json_line] emits the real id via
+    Result.session_id; the agent_runner forwards it through
+    [on_session_id], and bot.ml persists it together with
+    session_id_confirmed=true.
+
+    Subsequent runs resume only if [session_id_confirmed] — gating on
+    message_count would resume with the placeholder UUID after a
+    first-turn failure that happened before thread.started, or skip
+    resume after a first-turn failure that happened after it. The
+    "--" separator prevents prompts that happen to begin with "-"
+    from being mistaken for a Codex flag. *)
+let codex_args ~session_id ~session_id_confirmed ~prompt =
   let base = ["codex"; "exec"; "--json"; "--full-auto";
               "--skip-git-repo-check"] in
-  if message_count = 0 then base @ [prompt]
-  else base @ ["resume"; session_id; prompt]
+  if not session_id_confirmed then base @ ["--"; prompt]
+  else base @ ["resume"; session_id; "--"; prompt]
 
 (** Spawn an agent and stream its output via a callback.
     The callback is called with each parsed event as it arrives.
@@ -954,7 +996,7 @@ let codex_args ~session_id ~message_count ~prompt =
     so the caller can track active subprocesses for cleanup.
     Returns when the process exits. *)
 let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
-    ?system_prompt ~prompt ~on_event ?on_pid () =
+    ?(session_id_confirmed=true) ?system_prompt ~prompt ~on_event ?on_pid () =
   let mgr = Eio.Stdenv.process_mgr env in
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
@@ -1000,7 +1042,7 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
         | None -> base
       in
       base
-    | Config.Codex -> codex_args ~session_id ~message_count ~prompt
+    | Config.Codex -> codex_args ~session_id ~session_id_confirmed ~prompt
     | Config.Gemini -> ["gemini"; "-p"; prompt; "-o"; "stream-json"]
   in
   let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in
