@@ -110,13 +110,30 @@ let fresh_uuid () =
    Agent_process uses in production. The prompt always asks for a
    single-word reply so the response is small and cheap. *)
 
+(* Build the production Codex args via [codex_args] so any drift in
+   the args helper (added flags, MCP overrides, etc.) is exercised
+   live. Optionally inject [--ephemeral] so the fresh test doesn't
+   leave a session file behind in [~/.codex/sessions/]. The resume
+   test cannot use [--ephemeral] (it relies on persistence) and so
+   leaves one session per run; that's the cost of testing the
+   actual workflow. *)
+let codex_command ~ephemeral ~session_id ~session_id_confirmed prompt =
+  let args = Discord_agents.Agent_process.codex_args
+    ~session_id ~session_id_confirmed ~prompt in
+  let args = if ephemeral then
+      match args with
+      | "codex" :: "exec" :: rest -> "codex" :: "exec" :: "--ephemeral" :: rest
+      | other -> other
+    else args
+  in
+  String.concat " " (List.map Filename.quote args)
+
 let codex_fresh =
   Alcotest.test_case "fresh exec emits thread.started + agent_message"
     `Slow (fun () ->
-      let cmd =
-        "codex exec --json --full-auto --skip-git-repo-check --ephemeral \
-         -- 'reply with the single word ok'"
-      in
+      let cmd = codex_command ~ephemeral:true
+        ~session_id:"" ~session_id_confirmed:false
+        "reply with the single word ok" in
       let events = invoke_or_skip ~label:"codex fresh" ~cmd
         ~parse:Discord_agents.Agent_process.parse_codex_json_line in
       Alcotest.(check bool)
@@ -129,10 +146,9 @@ let codex_fresh =
 let codex_resume =
   Alcotest.test_case "resume preserves the captured session id"
     `Slow (fun () ->
-      let fresh_cmd =
-        "codex exec --json --full-auto --skip-git-repo-check \
-         -- 'reply with the single word ok'"
-      in
+      let fresh_cmd = codex_command ~ephemeral:false
+        ~session_id:"" ~session_id_confirmed:false
+        "reply with the single word ok" in
       let fresh_events = invoke_or_skip ~label:"codex fresh (for resume)"
         ~cmd:fresh_cmd
         ~parse:Discord_agents.Agent_process.parse_codex_json_line in
@@ -140,10 +156,9 @@ let codex_resume =
         | Some s -> s
         | None -> Alcotest.fail "codex fresh did not emit a session id"
       in
-      let resume_cmd = Printf.sprintf
-        "codex exec resume --json --full-auto --skip-git-repo-check %s \
-         -- 'reply with the single word ok'" sid
-      in
+      let resume_cmd = codex_command ~ephemeral:false
+        ~session_id:sid ~session_id_confirmed:true
+        "reply with the single word ok" in
       let resume_events = invoke_or_skip ~label:"codex resume"
         ~cmd:resume_cmd
         ~parse:Discord_agents.Agent_process.parse_codex_json_line in

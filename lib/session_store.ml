@@ -15,16 +15,18 @@ type session = {
   project_name : string;
   working_dir : string;
   agent_kind : Config.agent_kind;
-  (* Mutable because Codex assigns its session id server-side: the
-     pre-generated UUID is overwritten once the first thread.started
-     event arrives. Claude accepts a caller-supplied id, so its value
-     never changes after creation. *)
+  (* Mutable because Codex and Gemini assign their session ids
+     server-side: the pre-generated UUID is overwritten once the
+     first event arrives (Codex's [thread.started] / Gemini's
+     [init]). Claude accepts a caller-supplied id, so its value
+     never changes after creation. See [Config.caller_pinned_session_id]. *)
   mutable session_id : string;
   (* True once the agent has acknowledged [session_id] as resumable.
-     Always true for Claude/Gemini (caller-supplied ids). For Codex,
-     starts false and flips true when thread.started arrives. Used by
-     the Codex resume gate so a first-turn failure that occurred
-     before/after the id assignment is handled correctly. *)
+     Always true for Claude (caller-supplied ids). For Codex and
+     Gemini, starts false and flips true when the first server-side
+     event echoes the id back. Used by the resume gate so a
+     first-turn failure that occurred before/after the id assignment
+     is handled correctly. *)
   mutable session_id_confirmed : bool;
   thread_id : Discord_types.channel_id;  (* threads are channels in Discord *)
   system_prompt : string option;

@@ -83,8 +83,7 @@ let hours_param params =
 let handle_list_claude_sessions _bot params =
   let sessions = Claude_sessions.discover ~hours:(hours_param params) () in
   let items = List.map (fun (s : Claude_sessions.info) ->
-    let sid_short = String.sub s.session_id 0
-      (min 8 (String.length s.session_id)) in
+    let sid_short = Resource.short_id s.session_id in
     let age_min = int_of_float ((Unix.gettimeofday () -. s.mtime) /. 60.0) in
     `Assoc [
       ("session_id", `String s.session_id);
@@ -100,8 +99,7 @@ let handle_list_claude_sessions _bot params =
 let handle_list_codex_sessions _bot params =
   let sessions = Codex_sessions.discover ~hours:(hours_param params) () in
   let items = List.map (fun (s : Codex_sessions.info) ->
-    let sid_short = String.sub s.session_id 0
-      (min 8 (String.length s.session_id)) in
+    let sid_short = Resource.short_id s.session_id in
     let age_min = int_of_float ((Unix.gettimeofday () -. s.mtime) /. 60.0) in
     `Assoc [
       ("session_id", `String s.session_id);
@@ -116,8 +114,7 @@ let handle_list_codex_sessions _bot params =
 let handle_list_gemini_sessions _bot params =
   let sessions = Gemini_sessions.discover ~hours:(hours_param params) () in
   let items = List.map (fun (s : Gemini_sessions.info) ->
-    let sid_short = String.sub s.session_id 0
-      (min 8 (String.length s.session_id)) in
+    let sid_short = Resource.short_id s.session_id in
     let age_min = int_of_float ((Unix.gettimeofday () -. s.mtime) /. 60.0) in
     `Assoc [
       ("session_id", `String s.session_id);
@@ -221,8 +218,7 @@ let handle_resume_session (bot : Bot.t) params =
   (* Mirror Bot.handle_command's Resume_session dispatch: explicit
      kind looks up its own store; None tries Claude then Gemini. *)
   let try_claude () =
-    match Eio_unix.run_in_systhread (fun () ->
-      Claude_sessions.find_by_prefix sid_prefix) with
+    match Claude_sessions.find_by_prefix sid_prefix with
     | Some (sid, wd) -> Some (Config.Claude, sid, wd) | None -> None
   in
   let try_codex () =
@@ -248,10 +244,18 @@ let handle_resume_session (bot : Bot.t) params =
   match found with
   | None ->
     error_response (Bot.resume_not_found_message ~kind ~sid_prefix)
+  | Some (_, full_sid, "") ->
+    (* See Bot.handle_command Resume_session for the rationale —
+       Gemini sessions with unresolvable projectHash arrive here
+       with an empty working_dir; running gemini with an empty cwd
+       writes settings.json into the bot's directory. *)
+    error_response (Printf.sprintf
+      "Cannot resume session '%s': its working directory could not \
+       be resolved." (Resource.short_id full_sid))
   | Some (resolved_kind, full_sid, raw_working_dir) ->
     let kind_label = Config.string_of_agent_kind resolved_kind in
     let kind_title = String.capitalize_ascii kind_label in
-    let sid_short = String.sub full_sid 0 (min 8 (String.length full_sid)) in
+    let sid_short = Resource.short_id full_sid in
     let fallback_channel = match bot.config.control_channel_id with
       | Some ctl -> ctl | None -> ""
     in

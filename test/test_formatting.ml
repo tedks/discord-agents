@@ -1350,6 +1350,20 @@ let test_merge_gemini_settings_invalid_input_falls_back () =
     true (List.mem_assoc "discord-agents"
             (json |> member "mcpServers" |> to_assoc))
 
+let test_merge_gemini_settings_non_object_falls_back () =
+  (* Parseable JSON that isn't an object — list, scalar — would
+     round-trip unchanged under naive logic, dropping our MCP entry. *)
+  List.iter (fun text ->
+    let merged = Discord_agents.Agent_process.merge_gemini_settings
+      (Some text) in
+    let json = Yojson.Safe.from_string merged in
+    let open Yojson.Safe.Util in
+    Alcotest.(check bool)
+      (Printf.sprintf "non-object %S falls back to fresh config" text)
+      true (List.mem_assoc "discord-agents"
+              (json |> member "mcpServers" |> to_assoc))
+  ) ["[]"; {|"a string"|}; "42"; "null"; "true"]
+
 let resume_helpers_tests = [
   Alcotest.test_case "Codex resume error names kind+sid (uniform)" `Quick
     test_resume_not_found_codex_uniform;
@@ -1363,6 +1377,8 @@ let resume_helpers_tests = [
     test_merge_gemini_settings_creates_when_absent;
   Alcotest.test_case "merge_gemini_settings invalid input falls back" `Quick
     test_merge_gemini_settings_invalid_input_falls_back;
+  Alcotest.test_case "merge_gemini_settings non-object falls back" `Quick
+    test_merge_gemini_settings_non_object_falls_back;
 ]
 
 (* ── codex_args ────────────────────────────────────────────────────── *)
@@ -1470,6 +1486,21 @@ let test_escape_toml_string_backslash () =
     {|c:\\Users\\bot|}
     (Discord_agents.Agent_process.escape_toml_string s)
 
+let test_escape_toml_string_control_chars () =
+  (* Control bytes never appear in real filesystem paths, but the
+     spec requires them to be escaped — verify we don't pass them
+     through raw, which would produce invalid TOML. *)
+  let s = "a\x01b\nc\td" in
+  let escaped = Discord_agents.Agent_process.escape_toml_string s in
+  Alcotest.(check bool) "no raw control bytes survive"
+    true (String.for_all (fun c ->
+      let code = Char.code c in
+      code >= 0x20 && code <> 0x7F || c = '\\' || c = '"') escaped);
+  Alcotest.(check bool) "literal newline becomes \\n"
+    true (try ignore (Str.search_forward
+      (Str.regexp_string "\\n") escaped 0); true
+    with Not_found -> false)
+
 let compose = Discord_agents.Agent_process.compose_session_prompt
 
 let test_compose_claude_no_prepend () =
@@ -1518,6 +1549,8 @@ let prompt_helpers_tests = [
     test_escape_toml_string_quotes;
   Alcotest.test_case "escape_toml_string backslash" `Quick
     test_escape_toml_string_backslash;
+  Alcotest.test_case "escape_toml_string control chars" `Quick
+    test_escape_toml_string_control_chars;
   Alcotest.test_case "compose: Claude unchanged (uses --append flag)" `Quick
     test_compose_claude_no_prepend;
   Alcotest.test_case "compose: Codex first turn prepends bot-context" `Quick

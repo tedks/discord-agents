@@ -55,3 +55,7 @@ let generate_uuid () =
   Printf.sprintf "%s-%s-%s-%s-%s"
     (String.sub s 0 8) (String.sub s 8 4) (String.sub s 12 4)
     (String.sub s 16 4) (String.sub s 20 12)
+
+(** First 8 hex chars of a session id, the convention every Discord
+    listing and resume reply uses. Safe on shorter inputs. *)
+let short_id sid = String.sub sid 0 (min 8 (String.length sid))

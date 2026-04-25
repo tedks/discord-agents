@@ -1222,8 +1222,11 @@ let claude_mcp_config_path () =
 
 (** Inject our [discord-agents] entry into a Gemini settings JSON
     string (preserving any other [mcpServers] and unrelated
-    top-level keys the user might have set). If the input doesn't
-    parse as JSON, fall back to writing our config alone. *)
+    top-level keys the user might have set). Falls back to a fresh
+    config when the input is missing, malformed, or parseable but
+    not an object — in any of those cases the existing content
+    couldn't have meaningfully held our entry, so we'd lose nothing
+    by replacing it. *)
 let merge_gemini_settings existing =
   let our_entry = `Assoc [
     ("command", `String "python3");
@@ -1237,29 +1240,54 @@ let merge_gemini_settings existing =
   | None -> render_fresh ()
   | Some text ->
     try
-      let json = Yojson.Safe.from_string text in
-      let updated = match json with
-        | `Assoc fields ->
-          let prior_servers = match List.assoc_opt "mcpServers" fields with
-            | Some (`Assoc servers) -> servers
-            | _ -> [] in
-          let new_servers =
-            ("discord-agents", our_entry)
-            :: List.filter (fun (k, _) -> k <> "discord-agents") prior_servers
-          in
-          let new_fields =
-            ("mcpServers", `Assoc new_servers)
-            :: List.filter (fun (k, _) -> k <> "mcpServers") fields
-          in
-          `Assoc new_fields
-        | _ -> json
-      in
-      Yojson.Safe.pretty_to_string updated
+      match Yojson.Safe.from_string text with
+      | `Assoc fields ->
+        let prior_servers = match List.assoc_opt "mcpServers" fields with
+          | Some (`Assoc servers) -> servers
+          | _ -> [] in
+        let new_servers =
+          ("discord-agents", our_entry)
+          :: List.filter (fun (k, _) -> k <> "discord-agents") prior_servers
+        in
+        let new_fields =
+          ("mcpServers", `Assoc new_servers)
+          :: List.filter (fun (k, _) -> k <> "mcpServers") fields
+        in
+        Yojson.Safe.pretty_to_string (`Assoc new_fields)
+      | _ -> render_fresh ()  (* parseable but non-object: discard *)
     with _ -> render_fresh ()
 
+(** Resolve the path to the [info/exclude] file for [working_dir]'s
+    git repo. In a regular checkout this is [<wd>/.git/info/exclude];
+    in a git worktree, [.git] is a *file* pointing at
+    [<gitdir>/worktrees/<name>], whose own [info/exclude] is the
+    worktree-specific one. Shells out to [git rev-parse] so we don't
+    have to re-implement that lookup ourselves; returns None if
+    [working_dir] isn't a git repo at all. *)
+let resolve_git_info_exclude ~working_dir =
+  if working_dir = "" then None
+  else
+    try
+      let cmd = Printf.sprintf
+        "git -C %s rev-parse --git-dir 2>/dev/null"
+        (Filename.quote working_dir) in
+      let ic = Unix.open_process_in cmd in
+      let line = try input_line ic with End_of_file -> "" in
+      let _ = Unix.close_process_in ic in
+      let trimmed = String.trim line in
+      if trimmed = "" then None
+      else
+        let gitdir =
+          if Filename.is_relative trimmed
+          then Filename.concat working_dir trimmed
+          else trimmed
+        in
+        Some (Filename.concat gitdir "info/exclude")
+    with _ -> None
+
 (** Gemini: drop our entry into [.gemini/settings.json] (merging into
-    any pre-existing user config) and ensure [.gemini/] is in
-    [.git/info/exclude]. Both writes are idempotent — re-running
+    any pre-existing user config) and ensure [.gemini/] is in the
+    repo's [info/exclude]. Both writes are idempotent — re-running
     against a worktree we've already configured leaves the file and
     the exclude line unchanged in shape. *)
 let setup_gemini_mcp ~working_dir =
@@ -1270,27 +1298,41 @@ let setup_gemini_mcp ~working_dir =
   let settings_path = Filename.concat gemini_dir "settings.json" in
   let merged = merge_gemini_settings (read_file_opt settings_path) in
   write_file_safely ~path:settings_path merged;
-  let exclude_path = Filename.concat working_dir ".git/info/exclude" in
-  match read_file_opt exclude_path with
+  match resolve_git_info_exclude ~working_dir with
   | None -> ()
-  | Some existing when contains_substring existing ".gemini/" -> ()
-  | Some _ ->
-    try
-      let oc = open_out_gen [Open_append] 0o644 exclude_path in
-      Fun.protect ~finally:(fun () -> close_out oc) (fun () ->
-        output_string oc "\n.gemini/\n")
-    with _ -> ()
+  | Some exclude_path ->
+    match read_file_opt exclude_path with
+    | Some existing when contains_substring existing ".gemini/" -> ()
+    | _ ->
+      try
+        (* exclude_path is in [<gitdir>/info/]; create info/ if needed. *)
+        let info_dir = Filename.dirname exclude_path in
+        (try if not (Sys.file_exists info_dir) then Unix.mkdir info_dir 0o755
+         with _ -> ());
+        let oc = open_out_gen [Open_append; Open_creat] 0o644 exclude_path in
+        Fun.protect ~finally:(fun () -> close_out oc) (fun () ->
+          output_string oc "\n.gemini/\n")
+      with _ -> ()
 
 (** Escape a string for embedding inside a TOML double-quoted string.
-    Backslash and double-quote are the only required escapes for our
-    use case (filesystem paths injected via [codex -c key="value"]). *)
+    Beyond backslash and double-quote (the cases we actually hit with
+    filesystem paths), the TOML spec also requires control characters
+    [U+0000..U+001F] and [U+007F] to be escaped — these would never
+    appear in a real path but we round-trip them faithfully so this
+    helper is correct in isolation. *)
 let escape_toml_string s =
   let buf = Buffer.create (String.length s + 8) in
   String.iter (fun c ->
+    let code = Char.code c in
     match c with
     | '\\' -> Buffer.add_string buf "\\\\"
     | '"'  -> Buffer.add_string buf "\\\""
-    | _    -> Buffer.add_char buf c) s;
+    | '\n' -> Buffer.add_string buf "\\n"
+    | '\r' -> Buffer.add_string buf "\\r"
+    | '\t' -> Buffer.add_string buf "\\t"
+    | _ when code < 0x20 || code = 0x7F ->
+      Buffer.add_string buf (Printf.sprintf "\\u%04X" code)
+    | _ -> Buffer.add_char buf c) s;
   Buffer.contents buf
 
 (** TOML overrides that register the discord-agents MCP server for a

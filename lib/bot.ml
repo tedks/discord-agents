@@ -360,7 +360,7 @@ let format_session_listing
         if age_min < 60 then Printf.sprintf "%dm ago" age_min
         else Printf.sprintf "%dh ago" (age_min / 60)
       in
-      let sid_short = String.sub sid 0 (min 8 (String.length sid)) in
+      let sid_short = Resource.short_id sid in
       let wd_str = if wd = "" then "(unknown project)" else wd in
       let summary_str = if summary = "" then "(no summary)" else summary in
       Printf.sprintf "- `%s` %s\n  %s — *%s*"
@@ -535,12 +535,10 @@ let handle_command t msg cmd =
         ~resume_hint:"!resume gemini <session_id_prefix>" entries))
   | Command.Resume_session { session_id; kind } ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
-      (* Locate the session in the requested store, or try Claude
-         then Gemini if [kind] is unspecified. Codex's session store
-         is internal to the Codex CLI; we don't enumerate it. *)
+      (* Locate the session in the requested store, or try
+         Claude → Codex → Gemini in order if [kind] is unspecified. *)
       let try_claude () =
-        match Eio_unix.run_in_systhread (fun () ->
-          Claude_sessions.find_by_prefix session_id) with
+        match Claude_sessions.find_by_prefix session_id with
         | Some (sid, wd) -> Some (Config.Claude, sid, wd)
         | None -> None
       in
@@ -571,10 +569,23 @@ let handle_command t msg cmd =
       match found with
       | None ->
         reply (resume_not_found_message ~kind ~sid_prefix:session_id)
+      | Some (_, full_sid, "") ->
+        (* Gemini sessions whose projectHash isn't in
+           ~/.gemini/projects.json come back with working_dir = "".
+           Spawning a child with an empty cwd would write
+           [.gemini/settings.json] and [.git/info/exclude] in the
+           bot's own directory, polluting unrelated state. Reject
+           with a clear message; the session is still discoverable
+           via [!gemini-sessions], just not resumable. *)
+        reply (Printf.sprintf
+          "Cannot resume session `%s`: its working directory could \
+           not be resolved. Start a fresh session with \
+           `!start <project>` instead."
+          (Resource.short_id full_sid))
       | Some (found_kind, full_sid, raw_working_dir) ->
         let kind_label = Config.string_of_agent_kind found_kind in
         let kind_title = String.capitalize_ascii kind_label in
-        let sid_short = String.sub full_sid 0 (min 8 (String.length full_sid)) in
+        let sid_short = Resource.short_id full_sid in
         let { thread_parent; working_dir; project_name } =
           resolve_resume_target t
             ~raw_working_dir ~kind_label ~fallback_channel:channel_id
