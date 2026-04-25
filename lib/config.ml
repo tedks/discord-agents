@@ -19,6 +19,17 @@ let string_of_agent_kind = function
   | Codex -> "codex"
   | Gemini -> "gemini"
 
+(** Whether this agent accepts a caller-supplied session id at startup
+    (Claude's [--session-id]) or allocates its own server-side and
+    emits it on first run (Codex's [thread.started], Gemini's [init]).
+
+    [Session_store.session_id_confirmed] defaults from this:
+    caller-pinned ids are confirmed at creation; server-allocated ids
+    start unconfirmed until the parser sees the first event. *)
+let caller_pinned_session_id = function
+  | Claude -> true
+  | Codex | Gemini -> false
+
 let agent_kind_of_yojson = function
   | `String s ->
     (match agent_kind_of_string s with

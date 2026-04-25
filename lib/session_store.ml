@@ -75,11 +75,13 @@ let sessions_of_json json =
         (j |> member "agent_kind" |> to_string) with
         | Ok k -> k | Error _ -> Config.Claude) in
       (* For sessions written before session_id_confirmed existed,
-         default Codex to false (be safe — start fresh) and others to
-         true (their ids were always caller-supplied). *)
+         derive the default from the agent's id origin: caller-pinned
+         agents (Claude) are always confirmed; server-allocated ones
+         (Codex, Gemini) default to false so the next run starts
+         fresh rather than resuming a placeholder. *)
       let session_id_confirmed = match j |> member "session_id_confirmed" with
         | `Bool b -> b
-        | _ -> agent_kind <> Config.Codex in
+        | _ -> Config.caller_pinned_session_id agent_kind in
       let session = {
         project_name = j |> member "project_name" |> to_string;
         working_dir = j |> member "working_dir" |> to_string;
@@ -124,17 +126,18 @@ let load_from_disk () =
 let create () =
   { sessions = load_from_disk (); last_reload = Unix.gettimeofday () }
 
-(** Construct a session record with sensible defaults. Centralizes the
-    rule that [session_id_confirmed] starts true for Claude/Gemini
-    (caller-supplied ids) and false for Codex (id assigned by the
-    agent on first run). Callers can override via the optional arg. *)
+(** Construct a session record with sensible defaults. The
+    [session_id_confirmed] default is derived from the agent: Claude
+    pins its own id (confirmed at creation), while Codex and Gemini
+    allocate server-side and start unconfirmed until the parser sees
+    the first event. Callers can override via the optional arg. *)
 let make_session ~project_name ~working_dir ~agent_kind ~session_id
     ~thread_id ~system_prompt ~initial_prompt
     ?(message_count = 0)
     ?session_id_confirmed () =
   let session_id_confirmed = match session_id_confirmed with
     | Some b -> b
-    | None -> agent_kind <> Config.Codex
+    | None -> Config.caller_pinned_session_id agent_kind
   in
   { project_name; working_dir; agent_kind; session_id;
     session_id_confirmed; thread_id; system_prompt;

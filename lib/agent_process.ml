@@ -1,9 +1,17 @@
 (** Agent subprocess management using Eio.
 
-    Spawns Claude/Codex/Gemini as subprocesses with proper I/O handling.
-    Claude and Gemini use stream-json output for real-time streaming;
-    Codex uses its own JSONL event stream (codex exec --json) parsed by
-    [parse_codex_json_line]. *)
+    Spawns Claude/Codex/Gemini as subprocesses with proper I/O
+    handling. Each agent has its own JSONL event schema; we translate
+    them all into a common [stream_event] type that the runner
+    consumes:
+
+    - Claude   — [parse_stream_json_line] over [--output-format
+      stream-json].
+    - Codex    — [parse_codex_json_line] over [exec --json].
+    - Gemini   — [parse_gemini_stream_json_line] over [-o stream-json].
+
+    The shared event type is the abstraction; per-agent parsers are
+    the only place vendor-specific shapes appear. *)
 
 type tool_info = {
   tool_name: string;        (** Tool name (e.g. "Read", "Edit", "Bash") *)
@@ -1051,6 +1059,83 @@ let parse_codex_json_line line =
     | _ -> [Other line]
   with _ -> [Other line]
 
+(* ── Gemini JSON parser ────────────────────────────────────────────
+
+   Gemini's [-o stream-json] schema is flat — one event per line, each
+   with a top-level [type] field. The events we care about:
+
+   | type        | shape we read
+   |-------------|----------------------------------------------
+   | init        | {session_id} → captured for resume
+   | message     | {role: assistant, content, delta:true} → text
+   | message     | {role: user, ...} → ignored (echo of our prompt)
+   | tool_use    | {tool_name, parameters} → Tool_use after rename
+   | tool_result | {status, output, error?} → Tool_result
+   | result      | {status, stats} → flush
+
+   Gemini's tool names differ from Claude's; [gemini_tool_name_of]
+   maps the common ones so the runner's emoji/verb table stays agent-
+   agnostic. Unknown names pass through unchanged. *)
+
+let gemini_tool_name_of = function
+  | "run_shell_command" -> "Bash"
+  | "read_file" -> "Read"
+  | "write_file" -> "Write"
+  | "replace" | "edit" -> "Edit"
+  | "search_file_content" -> "Grep"
+  | "glob" -> "Glob"
+  | "web_fetch" -> "WebFetch"
+  | "google_web_search" | "web_search" -> "WebSearch"
+  | other -> other
+
+let parse_gemini_stream_json_line line =
+  try
+    let json = Yojson.Safe.from_string line in
+    match get_string_opt "type" json with
+    | Some "init" ->
+      (match get_string_opt "session_id" json with
+       | Some sid -> [Result { text = ""; session_id = Some sid }]
+       | None -> [])
+    | Some "message" ->
+      (match get_string_opt "role" json with
+       | Some "assistant" ->
+         (match get_string_opt "content" json with
+          | Some text when text <> "" -> [Text_delta text]
+          | _ -> [])
+       | _ -> [])  (* user echo or unknown role: ignored *)
+    | Some "tool_use" ->
+      let name = gemini_tool_name_of
+        (get_string ~default:"unknown" "tool_name" json) in
+      let params = Yojson.Safe.Util.member "parameters" json in
+      let summary = summarize_tool_input name params in
+      let detail = detail_of_tool_input name params in
+      [Tool_use { tool_name = name; tool_summary = summary;
+                  tool_detail = detail }]
+    | Some "tool_result" ->
+      let status = get_string ~default:"" "status" json in
+      let output = get_string ~default:"" "output" json in
+      let err_msg =
+        match Yojson.Safe.Util.member "error" json with
+        | `Assoc _ as obj -> get_string ~default:"" "message" obj
+        | `String s -> s
+        | _ -> ""
+      in
+      let content = match status, output, err_msg with
+        | _, "", "" -> ""
+        | "error", "", m -> Printf.sprintf "[error] %s" m
+        | "error", o, "" -> Printf.sprintf "[error] %s" o
+        | "error", o, m -> Printf.sprintf "[error] %s\n%s" m o
+        | _, o, _ -> o
+      in
+      if content = "" then [] else [Tool_result { content }]
+    | Some "result" ->
+      (* Turn complete. session_id was captured at init; assistant text
+         was already delivered as deltas. Empty Result triggers a flush
+         in agent_runner, matching Codex's turn.completed handling. *)
+      [Result { text = ""; session_id = None }]
+    | _ -> [Other line]
+  with _ -> [Other line]
+
 (** Build the command args for an agent invocation. *)
 let claude_args ~session_id ~message_count ~prompt =
   let session_flag =
@@ -1077,6 +1162,19 @@ let codex_args ~session_id ~session_id_confirmed ~prompt =
               "--skip-git-repo-check"] in
   if not session_id_confirmed then base @ ["--"; prompt]
   else base @ ["resume"; session_id; "--"; prompt]
+
+(** Like Codex, Gemini allocates its session id server-side in the
+    [init] event and we capture it from the parser's first emitted
+    Result. Subsequent runs resume only when [session_id_confirmed],
+    matching the same coherence contract Codex uses.
+
+    [--yolo] auto-approves tool calls; without it Gemini blocks on an
+    interactive approval prompt that the non-interactive subprocess
+    can't answer (mirrors Codex's [--full-auto]). *)
+let gemini_args ~session_id ~session_id_confirmed ~prompt =
+  let base = ["gemini"; "-p"; prompt; "-o"; "stream-json"; "--yolo"] in
+  if not session_id_confirmed then base
+  else base @ ["--resume"; session_id]
 
 (** Spawn an agent and stream its output via a callback.
     The callback is called with each parsed event as it arrives.
@@ -1131,7 +1229,7 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
       in
       base
     | Config.Codex -> codex_args ~session_id ~session_id_confirmed ~prompt
-    | Config.Gemini -> ["gemini"; "-p"; prompt; "-o"; "stream-json"]
+    | Config.Gemini -> gemini_args ~session_id ~session_id_confirmed ~prompt
   in
   let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in
   let stderr_r, stderr_w = Eio.Process.pipe ~sw mgr in
@@ -1161,8 +1259,9 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
           let line = Eio.Buf_read.line reader in
           if String.length line > 0 then begin
             let events = match kind with
-              | Config.Claude | Config.Gemini -> parse_stream_json_line line
+              | Config.Claude -> parse_stream_json_line line
               | Config.Codex -> parse_codex_json_line line
+              | Config.Gemini -> parse_gemini_stream_json_line line
             in
             List.iter on_event events
           end

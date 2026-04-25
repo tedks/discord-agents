@@ -1147,11 +1147,30 @@ let test_legacy_claude_session_defaults_confirmed () =
       true s.session_id_confirmed
   | _ -> Alcotest.fail "expected exactly one session"
 
+let test_legacy_gemini_session_defaults_unconfirmed () =
+  (* Same rationale as Codex — Gemini's session ids are server-allocated
+     so a missing field on a legacy record must default to false to
+     prevent a stale-uuid resume on first use after upgrade. *)
+  let json = Yojson.Safe.from_string {|[
+    {"project_name":"foo","working_dir":"/tmp/foo",
+     "agent_kind":"gemini","session_id":"placeholder-uuid",
+     "thread_id":"123","message_count":2}
+  ]|} in
+  let map = Discord_agents.Session_store.sessions_of_json json in
+  let sessions = Discord_agents.Session_store.SessionMap.bindings map in
+  match sessions with
+  | [(_, s)] ->
+    Alcotest.(check bool) "legacy Gemini session defaults to unconfirmed"
+      false s.session_id_confirmed
+  | _ -> Alcotest.fail "expected exactly one session"
+
 let session_store_tests = [
   Alcotest.test_case "legacy Codex session unconfirmed" `Quick
     test_legacy_codex_session_defaults_unconfirmed;
   Alcotest.test_case "legacy Claude session confirmed" `Quick
     test_legacy_claude_session_defaults_confirmed;
+  Alcotest.test_case "legacy Gemini session unconfirmed" `Quick
+    test_legacy_gemini_session_defaults_unconfirmed;
 ]
 
 (* ── codex_args ────────────────────────────────────────────────────── *)
@@ -1189,6 +1208,180 @@ let codex_args_tests = [
   Alcotest.test_case "dash-prefixed prompt" `Quick test_codex_args_dash_prompt_safe;
 ]
 
+(* ── parse_gemini_stream_json_line ────────────────────────────────── *)
+
+let parse_gemini = Discord_agents.Agent_process.parse_gemini_stream_json_line
+
+let test_gemini_init_captures_session_id () =
+  let line = {|{"type":"init","timestamp":"t","session_id":"s-42","model":"m"}|} in
+  Alcotest.(check (option string)) "init session_id"
+    (Some "s-42") (expect_session_id (parse_gemini line))
+
+let test_gemini_init_without_session_dropped () =
+  let line = {|{"type":"init","model":"m"}|} in
+  Alcotest.(check int) "init with no session_id emits nothing"
+    0 (List.length (parse_gemini line))
+
+let test_gemini_user_message_skipped () =
+  let line = {|{"type":"message","role":"user","content":"hello"}|} in
+  Alcotest.(check int) "user echo not forwarded"
+    0 (List.length (parse_gemini line))
+
+let test_gemini_assistant_delta () =
+  let line = {|{"type":"message","role":"assistant","content":"Hello","delta":true}|} in
+  Alcotest.(check (option string)) "assistant content becomes Text_delta"
+    (Some "Hello") (expect_text (parse_gemini line))
+
+let test_gemini_assistant_empty_dropped () =
+  let line = {|{"type":"message","role":"assistant","content":"","delta":true}|} in
+  Alcotest.(check int) "empty assistant content emits nothing"
+    0 (List.length (parse_gemini line))
+
+let test_gemini_shell_tool_use () =
+  let line = {|{"type":"tool_use","tool_name":"run_shell_command","tool_id":"t1","parameters":{"command":"ls /tmp"}}|} in
+  match expect_tool (parse_gemini line) with
+  | Some info ->
+    Alcotest.(check string) "maps to Bash" "Bash" info.tool_name;
+    Alcotest.(check string) "summary is the command" "ls /tmp" info.tool_summary;
+    Alcotest.(check bool) "detail is bash code block"
+      true (let d = info.tool_detail in
+            String.length d >= 7 && String.sub d 0 7 = "```bash")
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let test_gemini_read_file_tool_use () =
+  let line = {|{"type":"tool_use","tool_name":"read_file","parameters":{"file_path":"/etc/hostname"}}|} in
+  match expect_tool (parse_gemini line) with
+  | Some info ->
+    Alcotest.(check string) "maps to Read" "Read" info.tool_name;
+    Alcotest.(check bool) "summary mentions path"
+      true (try ignore (Str.search_forward
+              (Str.regexp_string "/etc/hostname") info.tool_summary 0); true
+            with Not_found -> false)
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let test_gemini_write_file_tool_use () =
+  let line = {|{"type":"tool_use","tool_name":"write_file","parameters":{"file_path":"/tmp/a.ml","content":"let () = ()"}}|} in
+  match expect_tool (parse_gemini line) with
+  | Some info ->
+    Alcotest.(check string) "maps to Write" "Write" info.tool_name;
+    Alcotest.(check bool) "detail uses ocaml lang from path"
+      true (let d = info.tool_detail in
+            String.length d >= 8 && String.sub d 0 8 = "```ocaml")
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let test_gemini_unknown_tool_passthrough () =
+  let line = {|{"type":"tool_use","tool_name":"novel_tool","parameters":{"x":"y"}}|} in
+  match expect_tool (parse_gemini line) with
+  | Some info ->
+    Alcotest.(check string) "unknown tool name preserved"
+      "novel_tool" info.tool_name
+  | None -> Alcotest.fail "expected single Tool_use"
+
+let test_gemini_tool_result_success () =
+  let line = {|{"type":"tool_result","tool_id":"t1","status":"success","output":"hello world"}|} in
+  Alcotest.(check (option string)) "success carries output"
+    (Some "hello world") (expect_tool_result (parse_gemini line))
+
+let test_gemini_tool_result_error () =
+  let line = {|{"type":"tool_result","tool_id":"t1","status":"error","output":"bad path","error":{"type":"invalid","message":"nope"}}|} in
+  match expect_tool_result (parse_gemini line) with
+  | Some content ->
+    Alcotest.(check bool) "content marked as error"
+      true (String.length content >= 7 && String.sub content 0 7 = "[error]");
+    Alcotest.(check bool) "includes error message"
+      true (try ignore (Str.search_forward
+              (Str.regexp_string "nope") content 0); true
+            with Not_found -> false)
+  | None -> Alcotest.fail "expected single Tool_result"
+
+let test_gemini_tool_result_empty_dropped () =
+  let line = {|{"type":"tool_result","tool_id":"t1","status":"success","output":""}|} in
+  Alcotest.(check int) "empty output emits nothing"
+    0 (List.length (parse_gemini line))
+
+let test_gemini_result_flushes () =
+  let line = {|{"type":"result","status":"success","stats":{"total_tokens":1}}|} in
+  match parse_gemini line with
+  | [Discord_agents.Agent_process.Result { session_id = None; text = "" }] -> ()
+  | _ -> Alcotest.fail "expected Result with empty text and no session_id"
+
+let test_gemini_malformed_becomes_other () =
+  let line = "YOLO mode is enabled." in
+  match parse_gemini line with
+  | [Discord_agents.Agent_process.Other raw] ->
+    Alcotest.(check string) "preserves raw line" line raw
+  | _ -> Alcotest.fail "expected Other event"
+
+let test_gemini_unknown_type_becomes_other () =
+  let line = {|{"type":"novel_event","foo":"bar"}|} in
+  match parse_gemini line with
+  | [Discord_agents.Agent_process.Other _] -> ()
+  | _ -> Alcotest.fail "expected Other for unknown type"
+
+let gemini_json_tests = [
+  Alcotest.test_case "init captures session_id" `Quick test_gemini_init_captures_session_id;
+  Alcotest.test_case "init missing session_id dropped" `Quick test_gemini_init_without_session_dropped;
+  Alcotest.test_case "user echo skipped" `Quick test_gemini_user_message_skipped;
+  Alcotest.test_case "assistant delta is Text_delta" `Quick test_gemini_assistant_delta;
+  Alcotest.test_case "empty assistant dropped" `Quick test_gemini_assistant_empty_dropped;
+  Alcotest.test_case "run_shell_command maps to Bash" `Quick test_gemini_shell_tool_use;
+  Alcotest.test_case "read_file maps to Read" `Quick test_gemini_read_file_tool_use;
+  Alcotest.test_case "write_file maps to Write" `Quick test_gemini_write_file_tool_use;
+  Alcotest.test_case "unknown tool name passthrough" `Quick test_gemini_unknown_tool_passthrough;
+  Alcotest.test_case "tool_result success carries output" `Quick test_gemini_tool_result_success;
+  Alcotest.test_case "tool_result error formatted" `Quick test_gemini_tool_result_error;
+  Alcotest.test_case "empty tool_result dropped" `Quick test_gemini_tool_result_empty_dropped;
+  Alcotest.test_case "result flushes" `Quick test_gemini_result_flushes;
+  Alcotest.test_case "malformed becomes Other" `Quick test_gemini_malformed_becomes_other;
+  Alcotest.test_case "unknown type becomes Other" `Quick test_gemini_unknown_type_becomes_other;
+]
+
+(* ── gemini_args ──────────────────────────────────────────────────── *)
+
+let gemini_args = Discord_agents.Agent_process.gemini_args
+
+let test_gemini_args_fresh () =
+  let args = gemini_args ~session_id:"placeholder"
+    ~session_id_confirmed:false ~prompt:"hello" in
+  Alcotest.(check (list string))
+    "fresh invocation: -p prompt, -o stream-json, --yolo, no resume"
+    ["gemini"; "-p"; "hello"; "-o"; "stream-json"; "--yolo"]
+    args
+
+let test_gemini_args_resume () =
+  let args = gemini_args ~session_id:"abc-123"
+    ~session_id_confirmed:true ~prompt:"continue" in
+  Alcotest.(check (list string))
+    "resume invocation appends --resume <id>"
+    ["gemini"; "-p"; "continue"; "-o"; "stream-json"; "--yolo";
+     "--resume"; "abc-123"]
+    args
+
+let gemini_args_tests = [
+  Alcotest.test_case "fresh invocation args" `Quick test_gemini_args_fresh;
+  Alcotest.test_case "resume invocation args" `Quick test_gemini_args_resume;
+]
+
+(* ── caller_pinned_session_id ─────────────────────────────────────── *)
+
+let test_caller_pinned_claude () =
+  Alcotest.(check bool) "Claude pins its own session id"
+    true (Discord_agents.Config.caller_pinned_session_id Discord_agents.Config.Claude)
+
+let test_caller_pinned_codex () =
+  Alcotest.(check bool) "Codex allocates server-side"
+    false (Discord_agents.Config.caller_pinned_session_id Discord_agents.Config.Codex)
+
+let test_caller_pinned_gemini () =
+  Alcotest.(check bool) "Gemini allocates server-side"
+    false (Discord_agents.Config.caller_pinned_session_id Discord_agents.Config.Gemini)
+
+let caller_pinned_tests = [
+  Alcotest.test_case "Claude is caller-pinned" `Quick test_caller_pinned_claude;
+  Alcotest.test_case "Codex is server-allocated" `Quick test_caller_pinned_codex;
+  Alcotest.test_case "Gemini is server-allocated" `Quick test_caller_pinned_gemini;
+]
+
 (* ── runner ──────────────────────────────────────────────────────── *)
 
 let () =
@@ -1206,5 +1399,8 @@ let () =
     "codex_json", codex_json_tests;
     "codex_safety", codex_safety_tests;
     "codex_args", codex_args_tests;
+    "gemini_json", gemini_json_tests;
+    "gemini_args", gemini_args_tests;
+    "caller_pinned", caller_pinned_tests;
     "session_store", session_store_tests;
   ]
