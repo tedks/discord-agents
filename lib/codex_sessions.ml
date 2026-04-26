@@ -75,9 +75,6 @@ let looks_like_system_context s =
   || starts_with "<INSTRUCTIONS>"
   || starts_with "<user_instructions>"
 
-let truncate n s =
-  if String.length s <= n then s else String.sub s 0 n
-
 (** Parse the session file's [session_meta] header (first line) and
     walk subsequent [response_item] lines for the first user message
     that looks like a real prompt rather than injected context.
@@ -124,7 +121,8 @@ let extract_meta fpath =
                     let trimmed = String.trim (String.concat " " texts) in
                     if trimmed <> ""
                        && not (looks_like_system_context trimmed)
-                    then summary := truncate 80 trimmed
+                    then summary :=
+                      Resource.normalize_summary ~max_bytes:80 trimmed
               with _ -> ())
             done
           with End_of_file -> ());

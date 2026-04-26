@@ -1350,6 +1350,95 @@ let test_merge_gemini_settings_invalid_input_falls_back () =
     true (List.mem_assoc "discord-agents"
             (json |> member "mcpServers" |> to_assoc))
 
+(* ── Resource.normalize_summary (at-source defense) ──────────────── *)
+
+let normalize_summary = Discord_agents.Resource.normalize_summary
+
+let test_normalize_summary_short_passthrough () =
+  Alcotest.(check string) "short ASCII unchanged"
+    "hello world"
+    (normalize_summary ~max_bytes:80 "hello world")
+
+let test_normalize_summary_collapses_newlines () =
+  Alcotest.(check string) "\\n \\r \\t become single spaces"
+    "line one line two line three"
+    (normalize_summary ~max_bytes:80 "line one\nline two\rline three")
+
+let test_normalize_summary_byte_truncates () =
+  let s = String.make 200 'a' in
+  let out = normalize_summary ~max_bytes:80 s in
+  Alcotest.(check int) "ASCII truncated to exactly max_bytes" 80
+    (String.length out)
+
+let test_normalize_summary_utf8_boundary () =
+  (* 100 four-byte emoji = 400 bytes. Truncating at 81 bytes
+     (which lands inside the 21st codepoint) should walk back to
+     the 80-byte mark which is a codepoint boundary. *)
+  let emoji = "\xF0\x9F\x98\x80" in  (* 😀 U+1F600 *)
+  let s = String.concat "" (List.init 100 (fun _ -> emoji)) in
+  let out = normalize_summary ~max_bytes:81 s in
+  Alcotest.(check bool) "result length is a multiple of 4 (codepoint boundary)"
+    true (String.length out mod 4 = 0);
+  Alcotest.(check bool) "result <= 81 bytes"
+    true (String.length out <= 81)
+
+let test_normalize_summary_well_formed_utf8 () =
+  (* Validate by walking: every byte must be ASCII or a UTF-8 lead
+     followed by the right number of continuation bytes — never a
+     stray continuation byte at the start of a sequence. *)
+  let emoji = "\xF0\x9F\x98\x80" in
+  let s = String.concat "" (List.init 50 (fun _ -> emoji)) in
+  let out = normalize_summary ~max_bytes:73 s in
+  let n = String.length out in
+  let rec walk i =
+    if i >= n then true
+    else
+      let c = Char.code out.[i] in
+      let need =
+        if c < 0x80 then 0
+        else if c < 0xC0 then -1   (* stray continuation *)
+        else if c < 0xE0 then 1
+        else if c < 0xF0 then 2
+        else 3
+      in
+      if need < 0 || i + need >= n then false
+      else
+        let ok = ref true in
+        for k = 1 to need do
+          let cc = Char.code out.[i + k] in
+          if cc < 0x80 || cc >= 0xC0 then ok := false
+        done;
+        !ok && walk (i + 1 + need)
+  in
+  Alcotest.(check bool) "output is well-formed UTF-8" true (walk 0)
+
+let test_normalize_summary_combined () =
+  (* Multi-paragraph user prompt with non-ASCII content — exactly the
+     shape that triggered the original bullet-leak bug. *)
+  let s = "Review the diff\n- and analyze 日本語\n- and report" in
+  let out = normalize_summary ~max_bytes:80 s in
+  Alcotest.(check bool) "no \\n survives"
+    false (String.contains out '\n');
+  Alcotest.(check bool) "no \\r survives"
+    false (String.contains out '\r');
+  Alcotest.(check bool) "no \\t survives"
+    false (String.contains out '\t')
+
+let normalize_summary_tests = [
+  Alcotest.test_case "short ASCII passthrough" `Quick
+    test_normalize_summary_short_passthrough;
+  Alcotest.test_case "collapses \\n \\r \\t to space" `Quick
+    test_normalize_summary_collapses_newlines;
+  Alcotest.test_case "ASCII truncates to max_bytes" `Quick
+    test_normalize_summary_byte_truncates;
+  Alcotest.test_case "UTF-8 truncate lands on codepoint boundary" `Quick
+    test_normalize_summary_utf8_boundary;
+  Alcotest.test_case "UTF-8 output is well-formed" `Quick
+    test_normalize_summary_well_formed_utf8;
+  Alcotest.test_case "newline + UTF-8 combined input" `Quick
+    test_normalize_summary_combined;
+]
+
 (* ── single_line + format_session_listing newline safety ─────────── *)
 
 let test_single_line_strips_newlines () =
@@ -1866,4 +1955,5 @@ let () =
     "caller_pinned", caller_pinned_tests;
     "session_store", session_store_tests;
     "resume_helpers", resume_helpers_tests;
+    "normalize_summary", normalize_summary_tests;
   ]

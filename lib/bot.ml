@@ -454,7 +454,7 @@ let handle_command t msg cmd =
     let entries = Session_store.bindings t.sessions in
     let lines = List.map (fun (_tid, (s : Session_store.session)) ->
       Printf.sprintf "- **%s** / %s — %d messages (thread: <#%s>)"
-        s.project_name
+        (Agent_process.single_line s.project_name)
         (Config.string_of_agent_kind s.agent_kind)
         s.message_count s.thread_id
     ) entries in
@@ -481,9 +481,15 @@ let handle_command t msg cmd =
            else if String.sub name i (String.length q) = q then true
            else has (i + 1) in has 0
        ) (projects t) in
+       (* Sanitize the user-supplied [project] before echoing it back:
+          Discord allows multi-line messages, so [project] can contain
+          a literal newline (Command.parse only splits on spaces). An
+          unsanitized echo would let the user inject markdown into
+          our error replies. *)
+       let project_safe = Agent_process.single_line project in
        (match suggestions with
-        | [] -> reply (Printf.sprintf "No project matching `%s`. Try `!projects`." project)
-        | _ -> reply (Printf.sprintf "No unique match for `%s`. Did you mean:\n%s" project
+        | [] -> reply (Printf.sprintf "No project matching `%s`. Try `!projects`." project_safe)
+        | _ -> reply (Printf.sprintf "No unique match for `%s`. Did you mean:\n%s" project_safe
             (String.concat "\n" (List.map (fun (p : Project.t) ->
               Printf.sprintf "- `!start %s`" p.name) suggestions))))
      | Some p ->

@@ -63,11 +63,11 @@ let extract_summary fpath =
                 match item |> member "type" |> to_string_option with
                 | Some "text" ->
                   let text = item |> member "text" |> to_string in
-                  summary := String.sub text 0 (min 80 (String.length text))
+                  summary := Resource.normalize_summary ~max_bytes:80 text
                 | _ -> ()
             ) items
           | `String s ->
-            summary := String.sub s 0 (min 80 (String.length s))
+            summary := Resource.normalize_summary ~max_bytes:80 s
           | _ -> ()
         end
       done with End_of_file | _ -> ());

@@ -80,10 +80,10 @@ let extract_meta fpath =
                  | Some _ -> true | None -> false) items with
                | Some first ->
                  (match first |> member "text" |> to_string_option with
-                  | Some t -> String.sub t 0 (min 80 (String.length t))
+                  | Some t -> Resource.normalize_summary ~max_bytes:80 t
                   | None -> "")
                | None -> "")
-            | `String s -> String.sub s 0 (min 80 (String.length s))
+            | `String s -> Resource.normalize_summary ~max_bytes:80 s
             | _ -> "")
          | _ -> "")
       | _ -> ""
