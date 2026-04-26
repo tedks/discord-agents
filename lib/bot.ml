@@ -361,8 +361,19 @@ let format_session_listing
         else Printf.sprintf "%dh ago" (age_min / 60)
       in
       let sid_short = Resource.short_id sid in
-      let wd_str = if wd = "" then "(unknown project)" else wd in
-      let summary_str = if summary = "" then "(no summary)" else summary in
+      (* Single-line both fields: a literal newline in [summary]
+         (Codex/Gemini prompts are often multi-paragraph) would land
+         the rest of the entry at column 0, where Discord parses it
+         as a sibling top-level bullet. Working dirs don't normally
+         contain newlines but defensive sanitization is free. *)
+      let wd_str =
+        if wd = "" then "(unknown project)"
+        else Agent_process.single_line wd
+      in
+      let summary_str =
+        if summary = "" then "(no summary)"
+        else Agent_process.single_line summary
+      in
       Printf.sprintf "- `%s` %s\n  %s — *%s*"
         sid_short age_str wd_str summary_str
     ) entries in

@@ -1350,6 +1350,75 @@ let test_merge_gemini_settings_invalid_input_falls_back () =
     true (List.mem_assoc "discord-agents"
             (json |> member "mcpServers" |> to_assoc))
 
+(* ── single_line + format_session_listing newline safety ─────────── *)
+
+let test_single_line_strips_newlines () =
+  let s = "line one\nline two\rline three\tindented" in
+  Alcotest.(check string) "all of \\n \\r \\t become spaces"
+    "line one line two line three indented"
+    (Discord_agents.Agent_process.single_line s)
+
+let test_single_line_passthrough () =
+  let s = "no whitespace problems here" in
+  Alcotest.(check string) "clean input unchanged" s
+    (Discord_agents.Agent_process.single_line s)
+
+let test_single_line_preserves_backticks () =
+  (* sanitize_for_inline_code substitutes ` with '. single_line
+     doesn't — so prompts referring to `function_name` stay readable
+     when shown in italics or plain text. *)
+  let s = "see `foo`\nbar" in
+  Alcotest.(check string) "backticks survive"
+    "see `foo` bar"
+    (Discord_agents.Agent_process.single_line s)
+
+let test_format_session_listing_strips_newlines_in_summary () =
+  (* Regression: a Codex/Gemini first-user-prompt with a literal
+     newline in it would put the rest of the entry at column 0,
+     which Discord parsed as a sibling top-level bullet. *)
+  let entries = [
+    ("019dc073abcdef", "/home/me/proj",
+     "Review the diff\n- and analyze\n- and report",
+     Unix.gettimeofday () -. 60.0)
+  ] in
+  let rendered = Discord_agents.Bot.format_session_listing
+    ~label:"Codex" ~resume_hint:"!resume codex <prefix>" entries in
+  (* Each entry should produce exactly two lines: bullet + indented
+     continuation. With a 3-line summary the OLD code emitted four
+     lines per entry (bullet + continuation + 2 leaked summary lines),
+     and Discord parsed each leaked line as a sibling top-level
+     bullet. Drop the header and resume-hint frame and count. *)
+  let entry_lines = String.split_on_char '\n' rendered
+                    |> List.filter (fun l -> String.length l > 0)
+                    |> List.filter (fun l ->
+                      not (String.length l >= 2 && String.sub l 0 2 = "**")
+                      && not (String.length l >= 3 && String.sub l 0 3 = "Use")) in
+  Alcotest.(check int) "exactly 2 lines per entry (bullet + continuation)"
+    2 (List.length entry_lines)
+
+let test_format_session_listing_strips_newlines_in_wd () =
+  (* Defensive: working dirs don't normally contain newlines, but if
+     someone tampered with session metadata we shouldn't break the
+     listing format. *)
+  let entries = [
+    ("019dc073abcdef", "/path/with\nnewline", "summary",
+     Unix.gettimeofday ())
+  ] in
+  let rendered = Discord_agents.Bot.format_session_listing
+    ~label:"Test" ~resume_hint:"x" entries in
+  (* The path content survives — "newline" is still in the output. *)
+  Alcotest.(check bool) "rest of path survives the sanitization"
+    true (try
+      ignore (Str.search_forward (Str.regexp_string "newline") rendered 0); true
+    with Not_found -> false);
+  (* But the literal \n is replaced with a space, so no rendered line
+     starts with "newline" (which would mean the \n leaked through and
+     Discord would render the rest as a sibling line). *)
+  let lines = String.split_on_char '\n' rendered in
+  Alcotest.(check bool) "no rendered line starts with the post-\\n content"
+    false (List.exists (fun l ->
+      String.length l >= 7 && String.sub l 0 7 = "newline") lines)
+
 let test_exclude_already_lists_gemini_positive () =
   let already = Discord_agents.Agent_process.exclude_already_lists_gemini in
   Alcotest.(check bool) "exact .gemini/ on its own line"
@@ -1406,6 +1475,16 @@ let resume_helpers_tests = [
     test_exclude_already_lists_gemini_positive;
   Alcotest.test_case "exclude check rejects comment/negated/subpath" `Quick
     test_exclude_already_lists_gemini_false_positives;
+  Alcotest.test_case "single_line strips \\n \\r \\t" `Quick
+    test_single_line_strips_newlines;
+  Alcotest.test_case "single_line passthrough" `Quick
+    test_single_line_passthrough;
+  Alcotest.test_case "single_line preserves backticks" `Quick
+    test_single_line_preserves_backticks;
+  Alcotest.test_case "format_session_listing strips newlines in summary" `Quick
+    test_format_session_listing_strips_newlines_in_summary;
+  Alcotest.test_case "format_session_listing strips newlines in working_dir" `Quick
+    test_format_session_listing_strips_newlines_in_wd;
 ]
 
 (* ── codex_args ────────────────────────────────────────────────────── *)
