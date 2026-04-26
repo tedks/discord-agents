@@ -60,12 +60,27 @@ let generate_uuid () =
     listing and resume reply uses. Safe on shorter inputs. *)
 let short_id sid = String.sub sid 0 (min 8 (String.length sid))
 
+(** Replace each \n / \r / \t in [s] with a single space. The
+    replacement is 1:1 (a run of three newlines becomes three
+    spaces, not one) — visually equivalent in Discord and simpler
+    to reason about than a collapsing version.
+
+    Used as defense-in-depth at every render boundary that emits
+    user-controlled strings into Discord markdown, so a literal
+    newline in (e.g.) a project name or session summary doesn't
+    let the rest of the entry land at column 0 — Discord parses
+    that as a sibling top-level bullet. *)
+let single_line s =
+  String.map (function
+    | '\n' | '\r' | '\t' -> ' '
+    | c -> c) s
+
 (** Normalize a session-summary string for any downstream renderer:
-    collapse \n / \r / \t to single spaces (multi-paragraph user
-    prompts would otherwise leak as sibling top-level bullets when
-    Discord renders them inside a markdown list), then truncate to
-    [max_bytes] on a UTF-8 codepoint boundary so we never emit a
-    half-encoded character.
+    [single_line] it (multi-paragraph user prompts would otherwise
+    leak as sibling top-level bullets when Discord renders them
+    inside a markdown list), then truncate to [max_bytes] on a
+    UTF-8 codepoint boundary so we never emit a half-encoded
+    character.
 
     Used at the source by every session discoverer
     (claude_sessions, codex_sessions, gemini_sessions) so the
@@ -73,9 +88,7 @@ let short_id sid = String.sub sid 0 (min 8 (String.length sid))
     consumes it (Bot.format_session_listing, MCP server,
     control_api JSON, etc). *)
 let normalize_summary ~max_bytes s =
-  let cleaned = String.map (function
-    | '\n' | '\r' | '\t' -> ' '
-    | c -> c) s in
+  let cleaned = single_line s in
   let n = String.length cleaned in
   if n <= max_bytes then cleaned
   else

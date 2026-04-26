@@ -368,11 +368,11 @@ let format_session_listing
          contain newlines but defensive sanitization is free. *)
       let wd_str =
         if wd = "" then "(unknown project)"
-        else Agent_process.single_line wd
+        else Resource.single_line wd
       in
       let summary_str =
         if summary = "" then "(no summary)"
-        else Agent_process.single_line summary
+        else Resource.single_line summary
       in
       Printf.sprintf "- `%s` %s\n  %s — *%s*"
         sid_short age_str wd_str summary_str
@@ -454,7 +454,7 @@ let handle_command t msg cmd =
     let entries = Session_store.bindings t.sessions in
     let lines = List.map (fun (_tid, (s : Session_store.session)) ->
       Printf.sprintf "- **%s** / %s — %d messages (thread: <#%s>)"
-        (Agent_process.single_line s.project_name)
+        (Resource.single_line s.project_name)
         (Config.string_of_agent_kind s.agent_kind)
         s.message_count s.thread_id
     ) entries in
@@ -486,7 +486,7 @@ let handle_command t msg cmd =
           a literal newline (Command.parse only splits on spaces). An
           unsanitized echo would let the user inject markdown into
           our error replies. *)
-       let project_safe = Agent_process.single_line project in
+       let project_safe = Resource.single_line project in
        (match suggestions with
         | [] -> reply (Printf.sprintf "No project matching `%s`. Try `!projects`." project_safe)
         | _ -> reply (Printf.sprintf "No unique match for `%s`. Did you mean:\n%s" project_safe

@@ -62,8 +62,12 @@ let handle_list_projects (bot : Bot.t) =
 let handle_list_sessions (bot : Bot.t) =
   let entries = Session_store.bindings bot.sessions in
   let sessions = List.map (fun (_tid, (s : Session_store.session)) ->
+    (* single_line on project_name: an MCP client formats this back
+       into Discord markdown bullets (scripts/mcp-server.py:234), so
+       a literal newline in a project name would split the bullet
+       just like it did for session summaries before 25d3546. *)
     `Assoc [
-      ("project_name", `String s.project_name);
+      ("project_name", `String (Resource.single_line s.project_name));
       ("agent_kind", `String (Config.string_of_agent_kind s.agent_kind));
       ("message_count", `Int s.message_count);
       ("thread_id", `String s.thread_id);
@@ -145,7 +149,14 @@ let handle_start_session (bot : Bot.t) params =
       if s = "" then None else Some s
     | None -> None in
   match Command.find_project_fuzzy (Bot.projects bot) project_str with
-  | None -> error_response (Printf.sprintf "No project matching '%s'." project_str)
+  | None ->
+    (* Sanitize the MCP-supplied project string before echoing it
+       back: the MCP client renders the error into Discord, where a
+       literal newline in the input would let the rest of the error
+       land at column 0 and parse as a sibling bullet. Same defense
+       Bot.handle_command applies for the Discord !start path. *)
+    error_response (Printf.sprintf "No project matching '%s'."
+      (Resource.single_line project_str))
   | Some p ->
     let kind_str = Config.string_of_agent_kind kind in
     let branch_name = Printf.sprintf "agent/%s-%s"

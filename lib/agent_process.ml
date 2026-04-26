@@ -540,17 +540,6 @@ let sanitize_for_inline_code s =
     | '\n' | '\r' -> ' '
     | c -> c)
 
-(** Collapse newlines/tabs to single spaces — for content that must
-    render on one line in Discord (session-listing summaries,
-    working-dir paths). Unlike [sanitize_for_inline_code] this
-    preserves backticks (so prompts containing inline code render
-    correctly when shown in italics or plain text). *)
-let single_line s =
-  String.init (String.length s) (fun i ->
-    match s.[i] with
-    | '\n' | '\r' | '\t' -> ' '
-    | c -> c)
-
 (** Extract a short summary from tool_use input JSON for display.
     The result is safe for embedding in Discord inline code spans. *)
 let summarize_tool_input name input =

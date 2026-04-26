@@ -1530,12 +1530,12 @@ let test_single_line_strips_newlines () =
   let s = "line one\nline two\rline three\tindented" in
   Alcotest.(check string) "all of \\n \\r \\t become spaces"
     "line one line two line three indented"
-    (Discord_agents.Agent_process.single_line s)
+    (Discord_agents.Resource.single_line s)
 
 let test_single_line_passthrough () =
   let s = "no whitespace problems here" in
   Alcotest.(check string) "clean input unchanged" s
-    (Discord_agents.Agent_process.single_line s)
+    (Discord_agents.Resource.single_line s)
 
 let test_single_line_preserves_backticks () =
   (* sanitize_for_inline_code substitutes ` with '. single_line
@@ -1544,7 +1544,7 @@ let test_single_line_preserves_backticks () =
   let s = "see `foo`\nbar" in
   Alcotest.(check string) "backticks survive"
     "see `foo` bar"
-    (Discord_agents.Agent_process.single_line s)
+    (Discord_agents.Resource.single_line s)
 
 let test_format_session_listing_strips_newlines_in_summary () =
   (* Regression: a Codex/Gemini first-user-prompt with a literal
