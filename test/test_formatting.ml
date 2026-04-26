@@ -1439,6 +1439,91 @@ let normalize_summary_tests = [
     test_normalize_summary_combined;
 ]
 
+(* ── Per-discoverer integration tests ────────────────────────────────
+
+   These prove the at-source sanitization actually fires: a synthetic
+   session file with a multi-paragraph user prompt goes through each
+   discoverer's [extract_*] function, and the returned summary must
+   have no \n / \r / \t. This guards against a future regression
+   where someone replaces [Resource.normalize_summary] with raw
+   [String.sub] in one of the discoverers — the unit tests of
+   [normalize_summary] alone wouldn't catch that. *)
+
+let with_temp_file content fn =
+  let path = Filename.temp_file "test_session" ".jsonl" in
+  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ())
+    (fun () ->
+      let oc = open_out path in
+      output_string oc content;
+      close_out oc;
+      fn path)
+
+let no_whitespace_breakers s =
+  not (String.contains s '\n')
+  && not (String.contains s '\r')
+  && not (String.contains s '\t')
+
+let test_codex_extract_meta_sanitizes_summary () =
+  (* Codex session_meta on line 1, then a multi-paragraph user prompt
+     on line 2. Mirrors the actual ~/.codex/sessions/ format. *)
+  let content =
+    {|{"type":"session_meta","payload":{"id":"019dc-test","cwd":"/tmp/proj","timestamp":"now"}}|}
+    ^ "\n" ^
+    {|{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Review the diff\n- and analyze\n- and report"}]}}|}
+  in
+  with_temp_file content (fun path ->
+    match Discord_agents.Codex_sessions.extract_meta path with
+    | Some (sid, cwd, summary) ->
+      Alcotest.(check string) "session id parsed" "019dc-test" sid;
+      Alcotest.(check string) "cwd parsed" "/tmp/proj" cwd;
+      Alcotest.(check bool) "summary contains the user's text"
+        true (try ignore (Str.search_forward
+          (Str.regexp_string "Review the diff") summary 0); true
+        with Not_found -> false);
+      Alcotest.(check bool) "summary has no \\n / \\r / \\t (would leak as bullets)"
+        true (no_whitespace_breakers summary)
+    | None -> Alcotest.fail "Codex_sessions.extract_meta returned None")
+
+let test_claude_extract_summary_sanitizes () =
+  let content =
+    {|{"type":"user","message":{"content":[{"type":"text","text":"line one\nline two\n- bullet"}]}}|}
+  in
+  with_temp_file content (fun path ->
+    let summary = Discord_agents.Claude_sessions.extract_summary path in
+    Alcotest.(check bool) "summary contains the user's text"
+      true (try ignore (Str.search_forward
+        (Str.regexp_string "line one") summary 0); true
+      with Not_found -> false);
+    Alcotest.(check bool) "summary has no \\n / \\r / \\t"
+      true (no_whitespace_breakers summary))
+
+let test_gemini_extract_meta_sanitizes_summary () =
+  (* Gemini session is a single JSON object (not JSONL). messages[0]
+     should be the user's first turn with content[].text. *)
+  let content =
+    {|{"sessionId":"test-sid","projectHash":"deadbeef","messages":[{"type":"user","content":[{"text":"first paragraph\nsecond paragraph"}]}]}|}
+  in
+  with_temp_file content (fun path ->
+    match Discord_agents.Gemini_sessions.extract_meta path with
+    | Some (sid, _phash, summary) ->
+      Alcotest.(check string) "session id parsed" "test-sid" sid;
+      Alcotest.(check bool) "summary contains the user's text"
+        true (try ignore (Str.search_forward
+          (Str.regexp_string "first paragraph") summary 0); true
+        with Not_found -> false);
+      Alcotest.(check bool) "summary has no \\n / \\r / \\t"
+        true (no_whitespace_breakers summary)
+    | None -> Alcotest.fail "Gemini_sessions.extract_meta returned None")
+
+let discoverer_sanitization_tests = [
+  Alcotest.test_case "Codex extract_meta sanitizes summary" `Quick
+    test_codex_extract_meta_sanitizes_summary;
+  Alcotest.test_case "Claude extract_summary sanitizes" `Quick
+    test_claude_extract_summary_sanitizes;
+  Alcotest.test_case "Gemini extract_meta sanitizes summary" `Quick
+    test_gemini_extract_meta_sanitizes_summary;
+]
+
 (* ── single_line + format_session_listing newline safety ─────────── *)
 
 let test_single_line_strips_newlines () =
@@ -1956,4 +2041,5 @@ let () =
     "session_store", session_store_tests;
     "resume_helpers", resume_helpers_tests;
     "normalize_summary", normalize_summary_tests;
+    "discoverer_sanitization", discoverer_sanitization_tests;
   ]
