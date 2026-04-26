@@ -1350,6 +1350,29 @@ let test_merge_gemini_settings_invalid_input_falls_back () =
     true (List.mem_assoc "discord-agents"
             (json |> member "mcpServers" |> to_assoc))
 
+let test_exclude_already_lists_gemini_positive () =
+  let already = Discord_agents.Agent_process.exclude_already_lists_gemini in
+  Alcotest.(check bool) "exact .gemini/ on its own line"
+    true (already "*.tmp\n.gemini/\nbuild/\n");
+  Alcotest.(check bool) ".gemini (no slash) also recognized"
+    true (already ".gemini\n");
+  Alcotest.(check bool) "leading/trailing whitespace tolerated"
+    true (already "  .gemini/  \n")
+
+let test_exclude_already_lists_gemini_false_positives () =
+  (* These lines LOOK like they exclude .gemini/ but don't. The old
+     substring check would have matched and skipped the append,
+     leaving the directory un-ignored. *)
+  let already = Discord_agents.Agent_process.exclude_already_lists_gemini in
+  Alcotest.(check bool) "comment doesn't count"
+    false (already "# .gemini/ used to be here\n");
+  Alcotest.(check bool) "negated pattern doesn't count"
+    false (already "!.gemini/\n");
+  Alcotest.(check bool) "subpath doesn't count"
+    false (already ".gemini/cache\n");
+  Alcotest.(check bool) "empty file"
+    false (already "")
+
 let test_merge_gemini_settings_non_object_falls_back () =
   (* Parseable JSON that isn't an object — list, scalar — would
      round-trip unchanged under naive logic, dropping our MCP entry. *)
@@ -1379,6 +1402,10 @@ let resume_helpers_tests = [
     test_merge_gemini_settings_invalid_input_falls_back;
   Alcotest.test_case "merge_gemini_settings non-object falls back" `Quick
     test_merge_gemini_settings_non_object_falls_back;
+  Alcotest.test_case "exclude check recognizes exact .gemini/ line" `Quick
+    test_exclude_already_lists_gemini_positive;
+  Alcotest.test_case "exclude check rejects comment/negated/subpath" `Quick
+    test_exclude_already_lists_gemini_false_positives;
 ]
 
 (* ── codex_args ────────────────────────────────────────────────────── *)

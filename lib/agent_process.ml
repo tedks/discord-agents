@@ -1257,33 +1257,42 @@ let merge_gemini_settings existing =
       | _ -> render_fresh ()  (* parseable but non-object: discard *)
     with _ -> render_fresh ()
 
-(** Resolve the path to the [info/exclude] file for [working_dir]'s
-    git repo. In a regular checkout this is [<wd>/.git/info/exclude];
-    in a git worktree, [.git] is a *file* pointing at
-    [<gitdir>/worktrees/<name>], whose own [info/exclude] is the
-    worktree-specific one. Shells out to [git rev-parse] so we don't
-    have to re-implement that lookup ourselves; returns None if
-    [working_dir] isn't a git repo at all. *)
+(** Resolve the [info/exclude] file Git actually reads for
+    [working_dir]. Uses [git rev-parse --git-path info/exclude],
+    which Does The Right Thing in both regular checkouts and linked
+    worktrees: the previous version used [--git-dir] and concatenated
+    [info/exclude], which in worktrees pointed at the per-worktree
+    gitdir's [info/exclude] — a file Git never reads, so the append
+    silently no-op'd from Git's perspective. Returns None if
+    [working_dir] isn't a git repo. *)
 let resolve_git_info_exclude ~working_dir =
   if working_dir = "" then None
   else
     try
       let cmd = Printf.sprintf
-        "git -C %s rev-parse --git-dir 2>/dev/null"
+        "git -C %s rev-parse --git-path info/exclude 2>/dev/null"
         (Filename.quote working_dir) in
       let ic = Unix.open_process_in cmd in
       let line = try input_line ic with End_of_file -> "" in
       let _ = Unix.close_process_in ic in
       let trimmed = String.trim line in
       if trimmed = "" then None
+      else if Filename.is_relative trimmed then
+        Some (Filename.concat working_dir trimmed)
       else
-        let gitdir =
-          if Filename.is_relative trimmed
-          then Filename.concat working_dir trimmed
-          else trimmed
-        in
-        Some (Filename.concat gitdir "info/exclude")
+        Some trimmed
     with _ -> None
+
+(** True if [text] already contains a line that is exactly the
+    pattern [.gemini/] (or [.gemini]) — ignoring leading/trailing
+    whitespace, but rejecting commented (`# .gemini/`) and negated
+    (`!.gemini/`) lines that look similar but don't actually
+    exclude the directory. *)
+let exclude_already_lists_gemini text =
+  String.split_on_char '\n' text
+  |> List.exists (fun line ->
+    let trimmed = String.trim line in
+    trimmed = ".gemini/" || trimmed = ".gemini")
 
 (** Gemini: drop our entry into [.gemini/settings.json] (merging into
     any pre-existing user config) and ensure [.gemini/] is in the
@@ -1291,6 +1300,11 @@ let resolve_git_info_exclude ~working_dir =
     against a worktree we've already configured leaves the file and
     the exclude line unchanged in shape. *)
 let setup_gemini_mcp ~working_dir =
+  if working_dir = "" then ()
+    (* Defense-in-depth: the resume handlers reject empty working_dir
+       before we get here, but a future caller shouldn't write
+       .gemini/ into the bot's own directory by accident. *)
+  else
   let gemini_dir = Filename.concat working_dir ".gemini" in
   (try
      if not (Sys.file_exists gemini_dir) then Unix.mkdir gemini_dir 0o755
@@ -1302,10 +1316,11 @@ let setup_gemini_mcp ~working_dir =
   | None -> ()
   | Some exclude_path ->
     match read_file_opt exclude_path with
-    | Some existing when contains_substring existing ".gemini/" -> ()
+    | Some existing when exclude_already_lists_gemini existing -> ()
     | _ ->
       try
-        (* exclude_path is in [<gitdir>/info/]; create info/ if needed. *)
+        (* exclude_path may live in a directory git hasn't materialized
+           (e.g. a fresh worktree's info/). Create it if missing. *)
         let info_dir = Filename.dirname exclude_path in
         (try if not (Sys.file_exists info_dir) then Unix.mkdir info_dir 0o755
          with _ -> ());
