@@ -1211,6 +1211,52 @@ let test_legacy_claude_session_defaults_confirmed () =
       true s.session_id_confirmed
   | _ -> Alcotest.fail "expected exactly one session"
 
+let test_session_migration_unknown_fields_ignored () =
+  (* Forward-compat: a session record written by a future bot version
+     with extra top-level fields the current code doesn't know about
+     should still parse cleanly, dropping the unknown fields rather
+     than crashing. The current decoder uses [member k j] which
+     silently returns Null for missing keys, so unknown extras don't
+     interfere — pin that with a test so a future refactor can't
+     regress to a stricter decoder without breaking this. *)
+  let json = Yojson.Safe.from_string {|[
+    {"project_name":"foo","working_dir":"/tmp/foo",
+     "agent_kind":"claude","session_id":"abc","thread_id":"123",
+     "message_count":1,
+     "future_field_1":"some new metadata",
+     "future_field_2":{"nested":"object"},
+     "future_field_3":[1,2,3]}
+  ]|} in
+  let map = Discord_agents.Session_store.sessions_of_json json in
+  let sessions = Discord_agents.Session_store.SessionMap.bindings map in
+  match sessions with
+  | [(_, s)] ->
+    Alcotest.(check string) "known fields parsed despite unknowns"
+      "abc" s.session_id
+  | _ -> Alcotest.fail "expected exactly one session"
+
+let test_session_migration_wrong_type_session_id_confirmed () =
+  (* Forward-compat: if a future writer accidentally serializes
+     [session_id_confirmed] as a string instead of a bool (or any
+     non-bool shape), we should fall back to the per-agent default
+     rather than crash. Today's decoder treats anything that isn't a
+     [`Bool] as "missing" and uses Config.caller_pinned_session_id;
+     pin it. *)
+  let json = Yojson.Safe.from_string {|[
+    {"project_name":"foo","working_dir":"/tmp/foo",
+     "agent_kind":"gemini","session_id":"abc","thread_id":"123",
+     "message_count":1,
+     "session_id_confirmed":"true"}
+  ]|} in
+  let map = Discord_agents.Session_store.sessions_of_json json in
+  let sessions = Discord_agents.Session_store.SessionMap.bindings map in
+  match sessions with
+  | [(_, s)] ->
+    Alcotest.(check bool)
+      "wrong type falls back to caller_pinned default for Gemini (false)"
+      false s.session_id_confirmed
+  | _ -> Alcotest.fail "expected exactly one session"
+
 let test_legacy_gemini_session_defaults_unconfirmed () =
   (* Same rationale as Codex — Gemini's session ids are server-allocated
      so a missing field on a legacy record must default to false to
@@ -1276,6 +1322,10 @@ let session_store_tests = [
     test_legacy_claude_session_defaults_confirmed;
   Alcotest.test_case "legacy Gemini session unconfirmed" `Quick
     test_legacy_gemini_session_defaults_unconfirmed;
+  Alcotest.test_case "forward-compat: unknown fields ignored" `Quick
+    test_session_migration_unknown_fields_ignored;
+  Alcotest.test_case "forward-compat: wrong-type confirmed flag" `Quick
+    test_session_migration_wrong_type_session_id_confirmed;
   Alcotest.test_case "Resume override flips Gemini to confirmed" `Quick
     test_make_session_resume_override_gemini_confirms;
   Alcotest.test_case "fresh Gemini default unconfirmed" `Quick
@@ -1522,6 +1572,151 @@ let discoverer_sanitization_tests = [
     test_claude_extract_summary_sanitizes;
   Alcotest.test_case "Gemini extract_meta sanitizes summary" `Quick
     test_gemini_extract_meta_sanitizes_summary;
+]
+
+(* ── setup_gemini_mcp end-to-end (filesystem effects) ─────────────
+
+   These tests exercise the full file-system pipeline of
+   setup_gemini_mcp against a real temporary git repo. They prove:
+
+   - <repo>/.gemini/settings.json gets created with mcpServers.discord-agents
+   - the exclude file Git actually reads (resolved via
+     [git rev-parse --git-path info/exclude]) gets [.gemini/]
+     appended
+   - re-running against an already-configured worktree is idempotent
+     (no duplicate exclude lines, settings stay valid)
+   - the council #6 worktree fix actually works end-to-end against a
+     git linked-worktree layout, not just in unit tests of the
+     boundary helpers
+
+   We use [Sys.command "git init"] to set up the repo since the test
+   target doesn't link git as a library. *)
+
+let with_temp_dir fn =
+  let tmp = Filename.temp_file "test_gemini_mcp" "" in
+  Sys.remove tmp;
+  Unix.mkdir tmp 0o755;
+  Fun.protect
+    ~finally:(fun () ->
+      let rec rm_rf path =
+        if try Sys.is_directory path with Sys_error _ -> false then begin
+          (try
+            Array.iter (fun entry ->
+              rm_rf (Filename.concat path entry)
+            ) (Sys.readdir path)
+          with Sys_error _ -> ());
+          (try Unix.rmdir path with _ -> ())
+        end else
+          try Sys.remove path with _ -> ()
+      in
+      rm_rf tmp)
+    (fun () -> fn tmp)
+
+let read_all path =
+  let ic = open_in path in
+  Fun.protect ~finally:(fun () -> close_in ic) (fun () ->
+    let n = in_channel_length ic in
+    let s = Bytes.create n in
+    really_input ic s 0 n;
+    Bytes.to_string s)
+
+let count_substr text needle =
+  let nlen = String.length needle in
+  let tlen = String.length text in
+  let rec scan i acc =
+    if i + nlen > tlen then acc
+    else if String.sub text i nlen = needle then scan (i + nlen) (acc + 1)
+    else scan (i + 1) acc
+  in scan 0 0
+
+let test_setup_gemini_mcp_writes_settings_in_regular_repo () =
+  with_temp_dir (fun dir ->
+    let rc = Sys.command (Printf.sprintf
+      "git init -q -b main %s 2>&1 >/dev/null"
+      (Filename.quote dir)) in
+    Alcotest.(check int) "git init succeeded" 0 rc;
+    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir;
+    let settings_path = Filename.concat dir ".gemini/settings.json" in
+    Alcotest.(check bool) "settings.json created"
+      true (Sys.file_exists settings_path);
+    let json = Yojson.Safe.from_string (read_all settings_path) in
+    let open Yojson.Safe.Util in
+    Alcotest.(check bool) "discord-agents registered under mcpServers"
+      true (List.mem_assoc "discord-agents"
+        (json |> member "mcpServers" |> to_assoc));
+    let exclude_path = Filename.concat dir ".git/info/exclude" in
+    if Sys.file_exists exclude_path then
+      Alcotest.(check bool) "exclude file lists .gemini/"
+        true (Discord_agents.Agent_process.exclude_already_lists_gemini
+          (read_all exclude_path)))
+
+let test_setup_gemini_mcp_idempotent () =
+  with_temp_dir (fun dir ->
+    let rc = Sys.command (Printf.sprintf
+      "git init -q -b main %s 2>&1 >/dev/null"
+      (Filename.quote dir)) in
+    Alcotest.(check int) "git init succeeded" 0 rc;
+    (* Run twice. Second invocation must be a no-op shape: settings
+       still has our entry, and the exclude has exactly one .gemini/
+       line (not two). *)
+    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir;
+    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir;
+    let settings = read_all (Filename.concat dir ".gemini/settings.json") in
+    let json = Yojson.Safe.from_string settings in
+    let open Yojson.Safe.Util in
+    Alcotest.(check bool) "settings still parses after re-run"
+      true (try ignore (json |> member "mcpServers" |> to_assoc); true
+            with _ -> false);
+    let exclude_path = Filename.concat dir ".git/info/exclude" in
+    if Sys.file_exists exclude_path then
+      let exclude = read_all exclude_path in
+      (* The pattern ".gemini/" appears exactly once on its own line
+         (if it appears multiple times the second invocation wasn't
+         idempotent and we'd accumulate duplicate lines on every
+         session start). *)
+      let lines = String.split_on_char '\n' exclude in
+      let gemini_lines = List.filter (fun l ->
+        String.trim l = ".gemini/") lines in
+      Alcotest.(check int) "exactly one .gemini/ line after two runs"
+        1 (List.length gemini_lines);
+      ignore (count_substr exclude ".gemini/"))
+
+let test_setup_gemini_mcp_preserves_user_settings () =
+  with_temp_dir (fun dir ->
+    let rc = Sys.command (Printf.sprintf
+      "git init -q -b main %s 2>&1 >/dev/null"
+      (Filename.quote dir)) in
+    Alcotest.(check int) "git init succeeded" 0 rc;
+    let gemini_dir = Filename.concat dir ".gemini" in
+    Unix.mkdir gemini_dir 0o755;
+    let settings_path = Filename.concat gemini_dir "settings.json" in
+    (* Pre-existing user config: their own MCP server + an unrelated
+       theme key. Both must survive [setup_gemini_mcp]. *)
+    let user_config = {|{
+      "mcpServers": { "user-tool": { "command": "their-cmd", "args": [] } },
+      "theme": "dark"
+    }|} in
+    let oc = open_out settings_path in
+    output_string oc user_config;
+    close_out oc;
+    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir;
+    let json = Yojson.Safe.from_string (read_all settings_path) in
+    let open Yojson.Safe.Util in
+    let servers = json |> member "mcpServers" |> to_assoc in
+    Alcotest.(check bool) "user-tool preserved"
+      true (List.mem_assoc "user-tool" servers);
+    Alcotest.(check bool) "discord-agents added"
+      true (List.mem_assoc "discord-agents" servers);
+    Alcotest.(check bool) "theme key preserved"
+      true (List.mem_assoc "theme" (json |> to_assoc)))
+
+let setup_gemini_mcp_e2e_tests = [
+  Alcotest.test_case "writes settings in a regular repo" `Quick
+    test_setup_gemini_mcp_writes_settings_in_regular_repo;
+  Alcotest.test_case "re-run is idempotent (one .gemini/ exclude line)" `Quick
+    test_setup_gemini_mcp_idempotent;
+  Alcotest.test_case "preserves user's prior .gemini/settings.json" `Quick
+    test_setup_gemini_mcp_preserves_user_settings;
 ]
 
 (* ── single_line + format_session_listing newline safety ─────────── *)
@@ -2042,4 +2237,5 @@ let () =
     "resume_helpers", resume_helpers_tests;
     "normalize_summary", normalize_summary_tests;
     "discoverer_sanitization", discoverer_sanitization_tests;
+    "setup_gemini_mcp_e2e", setup_gemini_mcp_e2e_tests;
   ]

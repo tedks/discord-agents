@@ -39,8 +39,13 @@ target="$1"
 # entries — porcelain emits "bare" for them and we can't `dune exec`
 # from a bare path. The match decision is deferred to end-of-block
 # (blank line) so we know whether the entry was bare before printing.
+#
+# We pass [target] via ENVIRON rather than [-v name=...] so awk
+# doesn't interpret backslash escapes in the value (a target like
+# "feat/foo\nbar" with -v would inject a newline into the regex).
 if [[ "$target" != /* ]]; then
-  resolved=$(git worktree list --porcelain | awk -v name="$target" '
+  resolved=$(git worktree list --porcelain | TARGET="$target" awk '
+    BEGIN { name = ENVIRON["TARGET"] }
     function flush() {
       if (path != "" && !bare && basename_match) { print path; found = 1; exit }
       path = ""; bare = 0; basename_match = 0
