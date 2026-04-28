@@ -60,7 +60,7 @@ def control_request(method, params=None, timeout=60):
 TOOLS = [
     {
         "name": "start_session",
-        "description": "Start a new Claude agent session for a project. Creates a Discord thread and git worktree. Returns the thread info.",
+        "description": "Start a new agent session for a project (claude, codex, or gemini). Creates a Discord thread and git worktree. Returns the thread info.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -119,14 +119,47 @@ TOOLS = [
         }
     },
     {
+        "name": "list_codex_sessions",
+        "description": "List recent Codex CLI sessions on this machine (last 24h). Useful for finding sessions to resume.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "hours": {
+                    "type": "integer",
+                    "description": "How many hours back to search",
+                    "default": 24
+                }
+            }
+        }
+    },
+    {
+        "name": "list_gemini_sessions",
+        "description": "List recent Gemini CLI sessions on this machine (last 24h). Useful for finding sessions to resume.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "hours": {
+                    "type": "integer",
+                    "description": "How many hours back to search",
+                    "default": 24
+                }
+            }
+        }
+    },
+    {
         "name": "resume_session",
-        "description": "Resume an existing Claude Code session in a new Discord thread. Use list_claude_sessions first to find the session ID.",
+        "description": "Resume an existing Claude, Codex, or Gemini session in a new Discord thread. Use list_claude_sessions / list_codex_sessions / list_gemini_sessions to find a session ID. With kind unspecified, the bot tries Claude → Codex → Gemini.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "session_id": {
                     "type": "string",
-                    "description": "Claude session ID or prefix (at least 8 characters)"
+                    "description": "Session ID or prefix (at least 8 characters)"
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["claude", "codex", "gemini"],
+                    "description": "Which session store to search. Omit to try Claude → Codex → Gemini."
                 }
             },
             "required": ["session_id"]
@@ -217,6 +250,38 @@ def handle_tool_call(name, arguments):
             lines.append(f"- `{s['session_id_short']}` {age_str} — {summary}")
         return "\n".join(lines) + "\n\nUse resume_session with a session ID prefix to attach."
 
+    elif name == "list_codex_sessions":
+        result = control_request("list_codex_sessions", arguments)
+        if "error" in result:
+            return result["error"]
+        sessions = result.get("sessions", [])
+        if not sessions:
+            return "No recent Codex sessions found."
+        lines = []
+        for s in sessions:
+            age = s.get("age_minutes", 0)
+            age_str = f"{age}m ago" if age < 60 else f"{age // 60}h ago"
+            summary = s.get("summary", "(no summary)")
+            wd = s.get("working_dir", "") or "(unknown project)"
+            lines.append(f"- `{s['session_id_short']}` {age_str} — {wd} — {summary}")
+        return "\n".join(lines) + "\n\nUse resume_session with kind=codex to attach."
+
+    elif name == "list_gemini_sessions":
+        result = control_request("list_gemini_sessions", arguments)
+        if "error" in result:
+            return result["error"]
+        sessions = result.get("sessions", [])
+        if not sessions:
+            return "No recent Gemini sessions found."
+        lines = []
+        for s in sessions:
+            age = s.get("age_minutes", 0)
+            age_str = f"{age}m ago" if age < 60 else f"{age // 60}h ago"
+            summary = s.get("summary", "(no summary)")
+            wd = s.get("working_dir", "") or "(unknown project)"
+            lines.append(f"- `{s['session_id_short']}` {age_str} — {wd} — {summary}")
+        return "\n".join(lines) + "\n\nUse resume_session with kind=gemini to attach."
+
     elif name == "start_session":
         result = control_request("start_session", arguments, timeout=120)
         if "error" in result and "no project matching" in result["error"].lower():
@@ -236,7 +301,9 @@ def handle_tool_call(name, arguments):
             return result["error"]
         tid = result.get("thread_id", "")
         sid = result.get("session_id", "")[:8]
-        return f"Resumed session `{sid}` in <#{tid}>."
+        kind = result.get("agent_kind", "")
+        kind_label = f"{kind.capitalize()} " if kind else ""
+        return f"Resumed {kind_label}session `{sid}` in <#{tid}>."
 
     elif name == "restart_bot":
         result = control_request("restart")

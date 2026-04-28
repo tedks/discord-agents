@@ -63,11 +63,11 @@ let extract_summary fpath =
                 match item |> member "type" |> to_string_option with
                 | Some "text" ->
                   let text = item |> member "text" |> to_string in
-                  summary := String.sub text 0 (min 80 (String.length text))
+                  summary := Resource.normalize_summary ~max_bytes:80 text
                 | _ -> ()
             ) items
           | `String s ->
-            summary := String.sub s 0 (min 80 (String.length s))
+            summary := Resource.normalize_summary ~max_bytes:80 s
           | _ -> ()
         end
       done with End_of_file | _ -> ());
@@ -110,8 +110,11 @@ let discover ?(hours=24) () =
     ) project_dirs;
     List.sort (fun a b -> compare b.mtime a.mtime) !results
 
-(** Find a session by ID prefix. *)
+(** Find a session by ID prefix. Wraps the filesystem walk in a
+    systhread so the Eio fiber doesn't block — matches the convention
+    Codex_sessions and Gemini_sessions use. *)
 let find_by_prefix session_id_prefix =
+  Eio_unix.run_in_systhread @@ fun () ->
   let home = Sys.getenv "HOME" in
   let projects_dir = Filename.concat home ".claude/projects" in
   if not (Sys.file_exists projects_dir) then None

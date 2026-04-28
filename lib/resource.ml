@@ -55,3 +55,50 @@ let generate_uuid () =
   Printf.sprintf "%s-%s-%s-%s-%s"
     (String.sub s 0 8) (String.sub s 8 4) (String.sub s 12 4)
     (String.sub s 16 4) (String.sub s 20 12)
+
+(** First 8 hex chars of a session id, the convention every Discord
+    listing and resume reply uses. Safe on shorter inputs. *)
+let short_id sid = String.sub sid 0 (min 8 (String.length sid))
+
+(** Replace each \n / \r / \t in [s] with a single space. The
+    replacement is 1:1 (a run of three newlines becomes three
+    spaces, not one) — visually equivalent in Discord and simpler
+    to reason about than a collapsing version.
+
+    Used as defense-in-depth at every render boundary that emits
+    user-controlled strings into Discord markdown, so a literal
+    newline in (e.g.) a project name or session summary doesn't
+    let the rest of the entry land at column 0 — Discord parses
+    that as a sibling top-level bullet. *)
+let single_line s =
+  String.map (function
+    | '\n' | '\r' | '\t' -> ' '
+    | c -> c) s
+
+(** Normalize a session-summary string for any downstream renderer:
+    [single_line] it (multi-paragraph user prompts would otherwise
+    leak as sibling top-level bullets when Discord renders them
+    inside a markdown list), then truncate to [max_bytes] on a
+    UTF-8 codepoint boundary so we never emit a half-encoded
+    character.
+
+    Used at the source by every session discoverer
+    (claude_sessions, codex_sessions, gemini_sessions) so the
+    [info.summary] field is safe regardless of which renderer
+    consumes it (Bot.format_session_listing, MCP server,
+    control_api JSON, etc). *)
+let normalize_summary ~max_bytes s =
+  let cleaned = single_line s in
+  let n = String.length cleaned in
+  if n <= max_bytes then cleaned
+  else
+    (* Walk back from max_bytes to a codepoint boundary. A
+       continuation byte (0x80–0xBF) is mid-codepoint; lead and
+       ASCII bytes are valid split points. Bounded by [max_bytes]
+       and by remaining length so we always make progress. *)
+    let p = ref max_bytes in
+    while !p > 0 && !p < n
+      && (let c = Char.code cleaned.[!p] in c >= 0x80 && c < 0xC0) do
+      decr p
+    done;
+    String.sub cleaned 0 !p

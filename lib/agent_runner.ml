@@ -126,7 +126,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
     ~prompt ?(attachments=[]) ~author_name ~channel_name ~channel_type
     ?(wrap_width=Agent_process.desktop_width)
     ?(output_lines=Agent_process.default_output_lines)
-    ?on_scroll_content ?on_pid () =
+    ?on_scroll_content ?on_pid ?on_session_id () =
   (* Download attachments and append paths to the prompt *)
   let downloaded = download_attachments ~rest
     ~working_dir:session.Session_store.working_dir attachments in
@@ -151,6 +151,19 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
   let in_tool_mode = ref false in
   let typing_active = ref true in
   let last_edit = ref (Unix.gettimeofday ()) in
+  (* Codex emits fatal errors (turn.failed, top-level error) as JSON
+     frames on stdout — its stderr is empty in those cases — so we
+     accumulate them here. Appended to the displayed error message on
+     nonzero exit; reported as a follow-up if the run still exited 0. *)
+  let error_buf = Buffer.create 256 in
+  let collect_error e =
+    if Buffer.length error_buf > 0 then Buffer.add_char error_buf '\n';
+    Buffer.add_string error_buf e
+  in
+  let collected_errors () =
+    if Buffer.length error_buf = 0 then None
+    else Some (Buffer.contents error_buf)
+  in
   (* Background fiber: continuously send typing indicators while processing.
      Discord typing indicators expire after ~10s, so we refresh every 8s.
      Polls every 1s so the fiber stops within 1s of processing completing,
@@ -290,7 +303,14 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
         flush_to_discord ();
         last_edit := now
       end
-    | Agent_process.Result { text = _; session_id = _ } ->
+    | Agent_process.Result { text = _; session_id } ->
+      (* Codex assigns session ids server-side (via thread.started);
+         forward any new id so the caller can persist it for resume.
+         Claude's final result also carries session_id but it matches
+         the pre-assigned value, so the callback is a no-op there. *)
+      (match session_id, on_session_id with
+       | Some sid, Some cb -> cb sid
+       | _ -> ());
       flush_tool_status ();
       flush_to_discord ()
     | Agent_process.Tool_use info ->
@@ -358,12 +378,11 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
         flush_tool_status ()
       end
     | Agent_process.Error e ->
-      Logs.warn (fun m -> m "agent_runner: error event: %s" e)
+      Logs.warn (fun m -> m "agent_runner: error event: %s" e);
+      collect_error e
     | Agent_process.Other line ->
       Logs.debug (fun m -> m "agent_runner: other event: %s"
-        (if String.length line > 200
-         then String.sub line 0 200 ^ "..."
-         else line))
+        (Agent_process.truncate_inline ~max_chars:200 line))
   in
   let result =
     Fun.protect ~finally:(fun () -> typing_active := false)
@@ -371,18 +390,40 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
           ~working_dir:session.working_dir
           ~kind:session.agent_kind
           ~session_id:session.session_id
+          ~session_id_confirmed:session.session_id_confirmed
           ~message_count:session.message_count
           ?system_prompt:session.system_prompt
           ~prompt:context_prompt ~on_event ?on_pid ()) in
+  (* All result-path messages route through here so they get split at
+     Discord's 2000-char limit. Codex's turn.failed payloads can be
+     very large JSON blobs; without splitting, Discord rejects the
+     message and the user sees nothing. Empty input is a no-op so
+     no caller can accidentally post a blank message. *)
+  let send text =
+    if text <> "" then
+      List.iter (fun chunk ->
+        ignore (Discord_rest.create_message rest ~channel_id ~content:chunk ())
+      ) (Agent_process.split_message text)
+  in
   match result with
   | Ok () ->
     flush_to_discord ();
-    if Buffer.length result_buf = 0 then
-      ignore (Discord_rest.create_message rest ~channel_id
-        ~content:"(no response)" ());
+    (match collected_errors () with
+     | Some errs ->
+       (* Codex sometimes reports errors mid-turn that don't fail the
+          process; surface them so the user sees what went wrong. *)
+       send (Printf.sprintf "Agent reported: %s" errs)
+     | None when Buffer.length result_buf = 0 -> send "(no response)"
+     | None -> ());
     Ok ()
   | Error e ->
     Logs.warn (fun m -> m "agent_runner: error: %s" e);
-    ignore (Discord_rest.create_message rest ~channel_id
-      ~content:(Printf.sprintf "Agent error: %s" e) ());
+    (* Flush buffered assistant text before the error message so the
+       last partial reply isn't dropped on the floor — the Ok branch
+       does this and the symmetry was missing. *)
+    flush_to_discord ();
+    let combined = match collected_errors () with
+      | None -> e
+      | Some errs -> errs ^ "\n" ^ e in
+    send (Printf.sprintf "Agent error: %s" combined);
     Error e

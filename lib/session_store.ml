@@ -15,7 +15,19 @@ type session = {
   project_name : string;
   working_dir : string;
   agent_kind : Config.agent_kind;
-  session_id : string;  (* Claude session UUID, not a Discord snowflake *)
+  (* Mutable because Codex and Gemini assign their session ids
+     server-side: the pre-generated UUID is overwritten once the
+     first event arrives (Codex's [thread.started] / Gemini's
+     [init]). Claude accepts a caller-supplied id, so its value
+     never changes after creation. See [Config.caller_pinned_session_id]. *)
+  mutable session_id : string;
+  (* True once the agent has acknowledged [session_id] as resumable.
+     Always true for Claude (caller-supplied ids). For Codex and
+     Gemini, starts false and flips true when the first server-side
+     event echoes the id back. Used by the resume gate so a
+     first-turn failure that occurred before/after the id assignment
+     is handled correctly. *)
+  mutable session_id_confirmed : bool;
   thread_id : Discord_types.channel_id;  (* threads are channels in Discord *)
   system_prompt : string option;
   mutable message_count : int;
@@ -44,6 +56,7 @@ let sessions_to_json sessions =
       ("working_dir", `String s.working_dir);
       ("agent_kind", `String (Config.string_of_agent_kind s.agent_kind));
       ("session_id", `String s.session_id);
+      ("session_id_confirmed", `Bool s.session_id_confirmed);
       ("thread_id", `String s.thread_id);
       ("message_count", `Int s.message_count);
     ] @ (match s.system_prompt with
@@ -60,13 +73,23 @@ let sessions_of_json json =
     let open Yojson.Safe.Util in
     let entries = to_list json |> List.map (fun j ->
       let thread_id = j |> member "thread_id" |> to_string in
+      let agent_kind = (match Config.agent_kind_of_string
+        (j |> member "agent_kind" |> to_string) with
+        | Ok k -> k | Error _ -> Config.Claude) in
+      (* For sessions written before session_id_confirmed existed,
+         derive the default from the agent's id origin: caller-pinned
+         agents (Claude) are always confirmed; server-allocated ones
+         (Codex, Gemini) default to false so the next run starts
+         fresh rather than resuming a placeholder. *)
+      let session_id_confirmed = match j |> member "session_id_confirmed" with
+        | `Bool b -> b
+        | _ -> Config.caller_pinned_session_id agent_kind in
       let session = {
         project_name = j |> member "project_name" |> to_string;
         working_dir = j |> member "working_dir" |> to_string;
-        agent_kind = (match Config.agent_kind_of_string
-          (j |> member "agent_kind" |> to_string) with
-          | Ok k -> k | Error _ -> Config.Claude);
+        agent_kind;
         session_id = j |> member "session_id" |> to_string;
+        session_id_confirmed;
         thread_id;
         system_prompt = j |> member "system_prompt" |> to_string_option;
         message_count = j |> member "message_count" |> to_int;
@@ -105,6 +128,24 @@ let load_from_disk () =
 let create () =
   { sessions = load_from_disk (); last_reload = Unix.gettimeofday () }
 
+(** Construct a session record with sensible defaults. The
+    [session_id_confirmed] default is derived from the agent: Claude
+    pins its own id (confirmed at creation), while Codex and Gemini
+    allocate server-side and start unconfirmed until the parser sees
+    the first event. Callers can override via the optional arg. *)
+let make_session ~project_name ~working_dir ~agent_kind ~session_id
+    ~thread_id ~system_prompt ~initial_prompt
+    ?(message_count = 0)
+    ?session_id_confirmed () =
+  let session_id_confirmed = match session_id_confirmed with
+    | Some b -> b
+    | None -> Config.caller_pinned_session_id agent_kind
+  in
+  { project_name; working_dir; agent_kind; session_id;
+    session_id_confirmed; thread_id; system_prompt;
+    message_count; processing = false;
+    pending_queue = Queue.create (); initial_prompt }
+
 (** Add a session and persist to disk. *)
 let add t ~(thread_id : Discord_types.channel_id) session =
   t.sessions <- SessionMap.add thread_id session t.sessions;
@@ -129,6 +170,21 @@ let count t = SessionMap.cardinal t.sessions
 let increment_message_count t session =
   session.message_count <- session.message_count + 1;
   save t
+
+(** Update a session's id and mark it confirmed for resume.
+    Used when an agent assigns its id server-side (Codex's
+    thread.started) so the pre-generated UUID is replaced before the
+    next resume. Persisting [session_id_confirmed] here is the
+    load-bearing bit: it tells the next invocation to issue
+    [codex exec resume] rather than start a fresh session. *)
+let set_session_id t session ~session_id =
+  let already = session.session_id = session_id
+                && session.session_id_confirmed in
+  if not already then begin
+    session.session_id <- session_id;
+    session.session_id_confirmed <- true;
+    save t
+  end
 
 (** Reload sessions from disk if the file changed.
     Rate-limited to once per 5 seconds. Merges new sessions

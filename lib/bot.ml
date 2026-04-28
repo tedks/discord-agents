@@ -139,7 +139,9 @@ You have MCP tools available:
 - list_projects: List all discovered projects
 - list_sessions: List active bot sessions
 - list_claude_sessions: Find recent Claude Code sessions to resume
-- resume_session: Resume an existing Claude session
+- list_codex_sessions: Find recent Codex CLI sessions to resume
+- list_gemini_sessions: Find recent Gemini CLI sessions to resume
+- resume_session: Resume an existing session (pass kind=codex or kind=gemini to disambiguate; default tries Claude → Codex → Gemini)
 - restart_bot: Rebuild and restart the bot
 - rename_thread: Rename a Discord thread
 - cleanup_channels: Delete stale Discord channels
@@ -174,7 +176,9 @@ You have MCP tools available:
 - list_projects: List all discovered projects
 - list_sessions: List active bot sessions
 - list_claude_sessions: Find recent Claude Code sessions to resume
-- resume_session: Resume an existing Claude session
+- list_codex_sessions: Find recent Codex CLI sessions to resume
+- list_gemini_sessions: Find recent Gemini CLI sessions to resume
+- resume_session: Resume an existing session (pass kind=codex or kind=gemini to disambiguate; default tries Claude → Codex → Gemini)
 - rename_thread: Rename a Discord thread
 - restart_bot: Rebuild and restart the bot
 - cleanup_channels: Delete stale Discord channels
@@ -339,6 +343,99 @@ let refresh_projects t =
       Some (old_count, new_count))
   end
 
+(** Render a "recent sessions" Discord listing in a uniform shape so
+    [!claude-sessions] and [!gemini-sessions] don't drift in formatting.
+    Caller maps their per-agent info record to a tuple of the four
+    fields actually used and supplies the human label + resume hint. *)
+let format_session_listing
+    ~label ~resume_hint
+    (entries : (string * string * string * float) list) =
+  if entries = [] then
+    Printf.sprintf "No recent %s sessions found." label
+  else
+    let now = Unix.gettimeofday () in
+    let lines = List.map (fun (sid, wd, summary, mtime) ->
+      let age_min = int_of_float ((now -. mtime) /. 60.0) in
+      let age_str =
+        if age_min < 60 then Printf.sprintf "%dm ago" age_min
+        else Printf.sprintf "%dh ago" (age_min / 60)
+      in
+      let sid_short = Resource.short_id sid in
+      (* Single-line both fields: a literal newline in [summary]
+         (Codex/Gemini prompts are often multi-paragraph) would land
+         the rest of the entry at column 0, where Discord parses it
+         as a sibling top-level bullet. Working dirs don't normally
+         contain newlines but defensive sanitization is free. *)
+      let wd_str =
+        if wd = "" then "(unknown project)"
+        else Resource.single_line wd
+      in
+      let summary_str =
+        if summary = "" then "(no summary)"
+        else Resource.single_line summary
+      in
+      Printf.sprintf "- `%s` %s\n  %s — *%s*"
+        sid_short age_str wd_str summary_str
+    ) entries in
+    Printf.sprintf
+      "**Recent %s sessions** (last 24h):\n%s\n\nUse `%s` to attach."
+      label (String.concat "\n" lines) resume_hint
+
+(** Build the user-facing "session not found" error for the Resume
+    handlers (Discord command, MCP tool). All three agents now have
+    discoverable session stores, so the message is uniform. *)
+let resume_not_found_message ~kind ~sid_prefix =
+  match kind with
+  | Some k ->
+    Printf.sprintf "No %s session matching %S."
+      (Config.string_of_agent_kind k) sid_prefix
+  | None ->
+    Printf.sprintf "No session matching %S." sid_prefix
+
+(** Routing data needed to attach a resumed session to a Discord
+    thread. Computed once per Resume invocation, used by both the
+    Discord command handler and the MCP control_api handler. *)
+type resume_target = {
+  thread_parent : Discord_types.channel_id;
+  working_dir : string;
+  project_name : string;
+}
+
+(** Given the working_dir reported by disk discovery, pick the right
+    Discord parent channel and resolve any path nuances (bare-repo
+    pointer → master worktree, missing project → kind-named
+    placeholder). [fallback_channel] is used when no project channel
+    matches — typically the channel where the resume was invoked
+    (Discord) or the bot's control channel (MCP). *)
+let resolve_resume_target t ~raw_working_dir ~kind_label ~fallback_channel =
+  let matched_project = List.find_opt (fun (p : Project.t) ->
+    raw_working_dir = p.path
+    || (String.length raw_working_dir > String.length p.path + 1
+        && String.sub raw_working_dir 0 (String.length p.path + 1)
+           = p.path ^ "/")
+  ) (projects t) in
+  let thread_parent = match matched_project with
+    | Some p ->
+      (match Channel_manager.find_or_create ~rest:t.rest
+               ~guild_id:t.config.guild_id ~project:p (channels t) with
+       | Some ch_id -> ch_id
+       | None -> fallback_channel)
+    | None -> fallback_channel
+  in
+  let working_dir = match matched_project with
+    | Some p when p.is_bare && raw_working_dir = p.path ->
+      (match working_dir_of_project p with
+       | Ok wd -> wd | Error _ -> raw_working_dir)
+    | _ -> raw_working_dir
+  in
+  let project_name = match matched_project with
+    | Some p -> p.name
+    | None ->
+      if raw_working_dir = "" then kind_label ^ "-session"
+      else Filename.basename raw_working_dir
+  in
+  { thread_parent; working_dir; project_name }
+
 (** Handle a parsed command. *)
 let handle_command t msg cmd =
   let channel_id = msg.Discord_types.channel_id in
@@ -357,7 +454,7 @@ let handle_command t msg cmd =
     let entries = Session_store.bindings t.sessions in
     let lines = List.map (fun (_tid, (s : Session_store.session)) ->
       Printf.sprintf "- **%s** / %s — %d messages (thread: <#%s>)"
-        s.project_name
+        (Resource.single_line s.project_name)
         (Config.string_of_agent_kind s.agent_kind)
         s.message_count s.thread_id
     ) entries in
@@ -365,20 +462,14 @@ let handle_command t msg cmd =
       else "**Sessions:**\n" ^ String.concat "\n" lines)
   | Command.List_claude_sessions ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
-      let sessions = Claude_sessions.discover ~hours:24 () in
-      let lines = List.map (fun (s : Claude_sessions.info) ->
-        let age_min = int_of_float ((Unix.gettimeofday () -. s.mtime) /. 60.0) in
-        let age_str = if age_min < 60 then Printf.sprintf "%dm ago" age_min
-          else Printf.sprintf "%dh ago" (age_min / 60) in
-        let sid_short = String.sub s.session_id 0
-          (min 8 (String.length s.session_id)) in
-        Printf.sprintf "- `%s` %s\n  %s — *%s*"
-          sid_short age_str s.working_dir
-          (if s.summary = "" then "(no summary)" else s.summary)
-      ) (List.filteri (fun i _ -> i < 10) sessions) in
-      reply (if lines = [] then "No recent Claude sessions found."
-        else "**Recent Claude sessions** (last 24h):\n" ^ String.concat "\n" lines
-             ^ "\n\nUse `!resume <session_id_prefix>` to attach."))
+      let entries =
+        Claude_sessions.discover ~hours:24 ()
+        |> List.filteri (fun i _ -> i < 10)
+        |> List.map (fun (s : Claude_sessions.info) ->
+          (s.session_id, s.working_dir, s.summary, s.mtime))
+      in
+      reply (format_session_listing ~label:"Claude"
+        ~resume_hint:"!resume <session_id_prefix>" entries))
   | Command.Start_agent { project; kind } ->
     let proj = Command.find_project_fuzzy (projects t) project in
     (match proj with
@@ -390,9 +481,15 @@ let handle_command t msg cmd =
            else if String.sub name i (String.length q) = q then true
            else has (i + 1) in has 0
        ) (projects t) in
+       (* Sanitize the user-supplied [project] before echoing it back:
+          Discord allows multi-line messages, so [project] can contain
+          a literal newline (Command.parse only splits on spaces). An
+          unsanitized echo would let the user inject markdown into
+          our error replies. *)
+       let project_safe = Resource.single_line project in
        (match suggestions with
-        | [] -> reply (Printf.sprintf "No project matching `%s`. Try `!projects`." project)
-        | _ -> reply (Printf.sprintf "No unique match for `%s`. Did you mean:\n%s" project
+        | [] -> reply (Printf.sprintf "No project matching `%s`. Try `!projects`." project_safe)
+        | _ -> reply (Printf.sprintf "No unique match for `%s`. Did you mean:\n%s" project_safe
             (String.concat "\n" (List.map (fun (p : Project.t) ->
               Printf.sprintf "- `!start %s`" p.name) suggestions))))
      | Some p ->
@@ -420,13 +517,11 @@ let handle_command t msg cmd =
                  ~name:(Printf.sprintf "%s / %s" kind_str p.name) () with
          | Error e -> reply (Printf.sprintf "Failed to create thread: %s" e)
          | Ok thread_ch ->
-           let session : Session_store.session = {
-             project_name = p.name; working_dir; agent_kind = kind;
-             session_id = Resource.generate_uuid ();
-             thread_id = thread_ch.Discord_types.id;
-             system_prompt = None; message_count = 0; processing = false;
-             pending_queue = Queue.create (); initial_prompt = None;
-           } in
+           let session = Session_store.make_session
+             ~project_name:p.name ~working_dir ~agent_kind:kind
+             ~session_id:(Resource.generate_uuid ())
+             ~thread_id:thread_ch.Discord_types.id
+             ~system_prompt:None ~initial_prompt:None () in
            Session_store.add t.sessions ~thread_id:thread_ch.id session;
            let branch_str = match branch_info with
              | Some b -> Printf.sprintf "\nBranch: `%s`" b | None -> "" in
@@ -435,57 +530,105 @@ let handle_command t msg cmd =
                "**%s** session started for **%s**%s\nWorking in: `%s`\nSend a message to interact."
                kind_str p.name branch_str working_dir) ())
        end)
-  | Command.Resume_session { session_id } ->
+  | Command.List_codex_sessions ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
-      let found = Eio_unix.run_in_systhread (fun () ->
-        Claude_sessions.find_by_prefix session_id) in
+      let entries =
+        Codex_sessions.discover ~hours:24 ()
+        |> List.filteri (fun i _ -> i < 10)
+        |> List.map (fun (s : Codex_sessions.info) ->
+          (s.session_id, s.working_dir, s.summary, s.mtime))
+      in
+      reply (format_session_listing ~label:"Codex"
+        ~resume_hint:"!resume codex <session_id_prefix>" entries))
+  | Command.List_gemini_sessions ->
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      let entries =
+        Gemini_sessions.discover ~hours:24 ()
+        |> List.filteri (fun i _ -> i < 10)
+        |> List.map (fun (s : Gemini_sessions.info) ->
+          (s.session_id, s.working_dir, s.summary, s.mtime))
+      in
+      reply (format_session_listing ~label:"Gemini"
+        ~resume_hint:"!resume gemini <session_id_prefix>" entries))
+  | Command.Resume_session { session_id; kind } ->
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      (* Locate the session in the requested store, or try
+         Claude → Codex → Gemini in order if [kind] is unspecified. *)
+      let try_claude () =
+        match Claude_sessions.find_by_prefix session_id with
+        | Some (sid, wd) -> Some (Config.Claude, sid, wd)
+        | None -> None
+      in
+      let try_codex () =
+        match Codex_sessions.find_by_prefix session_id with
+        | Some (sid, wd) -> Some (Config.Codex, sid, wd)
+        | None -> None
+      in
+      let try_gemini () =
+        match Gemini_sessions.find_by_prefix session_id with
+        | Some (sid, wd) -> Some (Config.Gemini, sid, wd)
+        | None -> None
+      in
+      (* Explicit kind hits exactly one store; an unspecified kind
+         tries Claude → Codex → Gemini in order. *)
+      let found = match kind with
+        | Some Config.Claude -> try_claude ()
+        | Some Config.Codex -> try_codex ()
+        | Some Config.Gemini -> try_gemini ()
+        | None ->
+          (match try_claude () with
+           | Some _ as r -> r
+           | None ->
+             match try_codex () with
+             | Some _ as r -> r
+             | None -> try_gemini ())
+      in
       match found with
-      | None -> reply (Printf.sprintf "No Claude session matching `%s`." session_id)
-      | Some (full_sid, raw_working_dir) ->
-        let sid_short = String.sub full_sid 0 (min 8 (String.length full_sid)) in
-        (* Match working directory to a known project for channel routing *)
-        let matched_project = List.find_opt (fun (p : Project.t) ->
-          raw_working_dir = p.path
-          || (String.length raw_working_dir > String.length p.path + 1
-              && String.sub raw_working_dir 0 (String.length p.path + 1)
-                 = p.path ^ "/")
-        ) (projects t) in
-        let thread_parent = match matched_project with
-          | Some p ->
-            (match Channel_manager.find_or_create ~rest:t.rest
-                     ~guild_id:t.config.guild_id ~project:p (channels t) with
-             | Some ch_id -> ch_id
-             | None -> channel_id)
-          | None -> channel_id
-        in
-        (* If working_dir is a bare repo root, use the main worktree instead *)
-        let working_dir = match matched_project with
-          | Some p when p.is_bare && raw_working_dir = p.path ->
-            (match working_dir_of_project p with
-             | Ok wd -> wd
-             | Error _ -> raw_working_dir)
-          | _ -> raw_working_dir
-        in
-        let project_name = match matched_project with
-          | Some p -> p.name
-          | None -> Filename.basename raw_working_dir
+      | None ->
+        reply (resume_not_found_message ~kind ~sid_prefix:session_id)
+      | Some (_, full_sid, "") ->
+        (* Gemini sessions whose projectHash isn't in
+           ~/.gemini/projects.json come back with working_dir = "".
+           Spawning a child with an empty cwd would write
+           [.gemini/settings.json] and [.git/info/exclude] in the
+           bot's own directory, polluting unrelated state. Reject
+           with a clear message; the session is still discoverable
+           via [!gemini-sessions], just not resumable. *)
+        reply (Printf.sprintf
+          "Cannot resume session `%s`: its working directory could \
+           not be resolved. Start a fresh session with \
+           `!start <project>` instead."
+          (Resource.short_id full_sid))
+      | Some (found_kind, full_sid, raw_working_dir) ->
+        let kind_label = Config.string_of_agent_kind found_kind in
+        let kind_title = String.capitalize_ascii kind_label in
+        let sid_short = Resource.short_id full_sid in
+        let { thread_parent; working_dir; project_name } =
+          resolve_resume_target t
+            ~raw_working_dir ~kind_label ~fallback_channel:channel_id
         in
         (match Discord_rest.create_thread_no_message t.rest
-                ~channel_id:thread_parent ~name:(Printf.sprintf "resume / %s" sid_short) () with
+                ~channel_id:thread_parent
+                ~name:(Printf.sprintf "resume %s / %s" kind_label sid_short) () with
         | Error e -> reply (Printf.sprintf "Failed to create thread: %s" e)
         | Ok thread_ch ->
-          let session : Session_store.session = {
-            project_name; working_dir;
-            agent_kind = Config.Claude; session_id = full_sid;
-            thread_id = thread_ch.Discord_types.id;
-            system_prompt = None; message_count = 1; processing = false;
-            pending_queue = Queue.create (); initial_prompt = None;
-          } in
+          (* session_id_confirmed:true is critical here: we resolved
+             [full_sid] from disk discovery, so it's a real id the
+             agent will recognize. Without this override the
+             make_session default for Gemini (caller_pinned=false)
+             would mark the session unconfirmed and the next turn's
+             gemini_args would omit --resume, starting a fresh chat. *)
+          let session = Session_store.make_session
+            ~project_name ~working_dir ~agent_kind:found_kind
+            ~session_id:full_sid ~session_id_confirmed:true
+            ~message_count:1
+            ~thread_id:thread_ch.Discord_types.id
+            ~system_prompt:None ~initial_prompt:None () in
           Session_store.add t.sessions ~thread_id:thread_ch.id session;
           ignore (Discord_rest.create_message t.rest ~channel_id:thread_ch.id
             ~content:(Printf.sprintf
-              "**Resumed** Claude session `%s`\nWorking in: `%s`\nSend a message to continue."
-              sid_short working_dir) ())))
+              "**Resumed** %s session `%s`\nWorking in: `%s`\nSend a message to continue."
+              kind_title sid_short working_dir) ())))
   | Command.Stop_session { thread_id } ->
     (match Session_store.find_opt t.sessions ~thread_id with
      | None -> reply "Session not found."
@@ -640,8 +783,10 @@ let handle_command t msg cmd =
       "`!projects` — list discovered projects";
       "`!sessions` — list active bot sessions";
       "`!claude-sessions` — list recent Claude sessions";
-      "`!start <project> [agent]` — start a session (defaults to claude)";
-      "`!resume <session_id>` — resume a Claude session";
+      "`!codex-sessions` — list recent Codex sessions";
+      "`!gemini-sessions` — list recent Gemini sessions";
+      "`!start <project> [agent]` — start a session (claude|codex|gemini; defaults to claude)";
+      "`!resume [agent] <session_id>` — resume a session (agent defaults to none; tries Claude → Codex → Gemini)";
       "`!stop <thread_id>` — stop a session";
       "`!rename [thread_id] <name>` — rename a thread";
       "`!status` — bot status and running processes";
@@ -846,13 +991,16 @@ let handle_thread_message t msg ?channel_info () =
                 state.blocks <- blocks;
                 state.current_block <- 1;
                 Hashtbl.replace t.scroll_states channel_id state in
+              let on_session_id sid =
+                Session_store.set_session_id t.sessions session
+                  ~session_id:sid in
               let result = Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
                       ~session ~channel_id ~prompt
                       ~attachments:msg.attachments
                       ~author_name ~channel_name ~channel_type
                       ~wrap_width:t.wrap_width
                       ~output_lines:t.output_lines
-                      ~on_scroll_content ~on_pid () in
+                      ~on_scroll_content ~on_pid ~on_session_id () in
               ignore (Discord_rest.delete_own_reaction t.rest ~channel_id
                 ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
               (match result with
@@ -887,12 +1035,11 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
   match Session_store.find_opt t.sessions ~thread_id:channel_id with
   | Some _ -> ()
   | None ->
-    let session : Session_store.session = {
-      project_name; working_dir; agent_kind = Config.Claude;
-      session_id = Resource.generate_uuid (); thread_id = channel_id;
-      system_prompt; message_count = 0; processing = false;
-      pending_queue = Queue.create (); initial_prompt = None;
-    } in
+    let session = Session_store.make_session
+      ~project_name ~working_dir ~agent_kind:Config.Claude
+      ~session_id:(Resource.generate_uuid ())
+      ~thread_id:channel_id
+      ~system_prompt ~initial_prompt:None () in
     Session_store.add t.sessions ~thread_id:channel_id session;
     Logs.info (fun m -> m "bot: auto-created session for %s" project_name)
 
@@ -906,7 +1053,9 @@ let handle_message t (msg : Discord_types.message) =
       let cmd = Command.parse msg.content in
       match cmd with
       | Command.Status | Command.List_projects | Command.List_sessions
-      | Command.List_claude_sessions | Command.Help ->
+      | Command.List_claude_sessions | Command.List_codex_sessions
+      | Command.List_gemini_sessions
+      | Command.Help ->
         handle_command t msg cmd
       | _ ->
         ignore (Discord_rest.create_message t.rest

@@ -1,8 +1,17 @@
 (** Agent subprocess management using Eio.
 
-    Spawns Claude/Codex/Gemini as subprocesses with proper I/O handling.
-    Claude and Gemini use stream-json output for real-time streaming.
-    Codex uses plain text output. *)
+    Spawns Claude/Codex/Gemini as subprocesses with proper I/O
+    handling. Each agent has its own JSONL event schema; we translate
+    them all into a common [stream_event] type that the runner
+    consumes:
+
+    - Claude   — [parse_stream_json_line] over [--output-format
+      stream-json].
+    - Codex    — [parse_codex_json_line] over [exec --json].
+    - Gemini   — [parse_gemini_stream_json_line] over [-o stream-json].
+
+    The shared event type is the abstraction; per-agent parsers are
+    the only place vendor-specific shapes appear. *)
 
 type tool_info = {
   tool_name: string;        (** Tool name (e.g. "Read", "Edit", "Bash") *)
@@ -310,6 +319,20 @@ let utf8_step s i =
   else if c < 0xF0 then 3    (* 3-byte sequence *)
   else 4                     (* 4-byte sequence *)
 
+(** Walk back to the nearest UTF-8 codepoint boundary at or before [pos].
+    A continuation byte (0x80–0xBF) means we're mid-codepoint; lead
+    bytes and ASCII bytes start a codepoint and are valid split points.
+    Used by [split_message] to keep its fallback (no separator within
+    budget) from chopping a multibyte character. *)
+let utf8_boundary_at_or_before s pos =
+  let n = String.length s in
+  let p = ref (min pos n) in
+  while !p > 0 && !p < n
+    && (let c = Char.code s.[!p] in c >= 0x80 && c < 0xC0) do
+    decr p
+  done;
+  !p
+
 (** Walk forward from byte [start] in [s], advancing one unit at a time
     (a triple-backtick counts as 6 budget bytes / 3 source bytes; any
     other UTF-8 codepoint costs its raw byte length).  Returns the byte
@@ -361,6 +384,15 @@ let take_fitting_prefix ?(start=0) ~max_chars s =
         && s.[start] = '`' && s.[start+1] = '`' && s.[start+2] = '`' in
       let raw_step = if is_triple then 3 else utf8_step s start in
       min raw_step (n - start)
+
+(** UTF-8 safe truncation for inline summary strings: caps at [max_chars]
+    bytes (post-fence-escape) and appends "...".  Returns [s] unchanged
+    if it already fits.  Always lands on a UTF-8 codepoint boundary. *)
+let truncate_inline ~max_chars s =
+  if escaped_length s <= max_chars then s
+  else
+    let taken = take_fitting_prefix ~max_chars s in
+    String.sub s 0 taken ^ "..."
 
 (** Split a single line into chunks each fitting within [max_chars]
     post-escape.  Short lines pass through unchanged. *)
@@ -464,7 +496,14 @@ let split_message ?(max_len=default_split_max) text =
         | None ->
           match try_find " " with
           | Some p -> p + 1
-          | None -> limit
+          | None ->
+            (* No whitespace within budget — split on a UTF-8
+               codepoint boundary so we never produce malformed
+               bytes for long unbroken non-ASCII content (Codex
+               JSON error blobs without spaces are the typical
+               case).  Boundary-walking is bounded by [pos] so a
+               full continuation-byte run still makes progress. *)
+            max (pos + 1) (utf8_boundary_at_or_before text limit)
     in
     (* code_state: None = not in code block, Some lang = in code block.
        lang may be "" for bare ``` fences. *)
@@ -517,10 +556,7 @@ let summarize_tool_input name input =
     | Some i -> String.sub s (i + 1) (String.length s - i - 1)
     | None -> s
   in
-  let truncate n s =
-    if String.length s <= n then s
-    else String.sub s 0 n ^ "..."
-  in
+  let truncate n s = truncate_inline ~max_chars:n s in
   let clean n s = truncate n (sanitize_for_inline_code s) in
   let safe_basename p = sanitize_for_inline_code (basename p) in
   match name with
@@ -606,11 +642,6 @@ let lang_of_path path =
     | "ex" | "exs" -> "elixir"
     | _ -> ""
 
-(** Truncate a string, adding "..." if truncated. *)
-let truncate_detail n s =
-  if String.length s <= n then s
-  else String.sub s 0 n ^ "\n..."
-
 (** Escape triple backticks in text destined for a Discord code block.
     Discord has no escape mechanism inside code blocks, so we replace
     ``` with `` ` (zero-width space before last backtick) to prevent
@@ -683,22 +714,25 @@ let escape_nested_fences text =
   ) lines;
   Buffer.contents buf
 
+(** Wrap [content] in a Discord code block with [lang] syntax hinting,
+    capping the post-escape byte length at [max_detail_len] (UTF-8 safe,
+    fence-aware) and rewriting any inner ``` so they cannot close the
+    outer fence. Used by both Claude's tool-detail rendering and Codex's
+    command/file-change detail rendering. *)
+let code_block_capped ~lang content =
+  let capped =
+    if escaped_length content <= max_detail_len then content
+    else
+      let taken = take_fitting_prefix ~max_chars:max_detail_len content in
+      String.sub content 0 taken ^ "\n... (truncated)"
+  in
+  Printf.sprintf "```%s\n%s\n```" lang (escape_code_fences capped)
+
 (** Generate a syntax-highlighted code block showing tool content details.
     Returns "" if the tool doesn't have interesting content to show. *)
 let detail_of_tool_input name input =
   let open Yojson.Safe.Util in
   let get key = input |> member key |> to_string_option in
-  (* Build a code block with fences escaped and capped at max_detail_len.
-     Cap is evaluated against escaped length (fence-aware, UTF-8 safe). *)
-  let code_block lang content =
-    let capped =
-      if escaped_length content <= max_detail_len then content
-      else
-        let taken = take_fitting_prefix ~max_chars:max_detail_len content in
-        String.sub content 0 taken ^ "\n... (truncated)"
-    in
-    Printf.sprintf "```%s\n%s\n```" lang (escape_code_fences capped)
-  in
   match name with
   | "Edit" ->
     let old_s = match get "old_string" with Some s -> s | None -> "" in
@@ -721,47 +755,59 @@ let detail_of_tool_input name input =
         else if new_s <> "" then new_s
         else old_s
       in
-      code_block "diff" content
+      code_block_capped ~lang:"diff" content
   | "Bash" ->
     (match get "command" with
-     | Some cmd when String.length cmd > 0 -> code_block "bash" cmd
+     | Some cmd when String.length cmd > 0 ->
+       code_block_capped ~lang:"bash" cmd
      | _ -> "")
   | "Write" ->
     let path = match get "file_path" with Some p -> p | None -> "" in
     let lang = lang_of_path path in
     (match get "content" with
-     | Some c when String.length c > 0 -> code_block lang c
+     | Some c when String.length c > 0 -> code_block_capped ~lang c
      | _ -> "")
   | "Grep" ->
     (match get "pattern" with
      | Some pat when String.length pat > 0 ->
-       code_block "" ("/" ^ truncate_detail 200 pat ^ "/")
+       code_block_capped ~lang:""
+         ("/" ^ truncate_inline ~max_chars:200 pat ^ "/")
      | _ -> "")
   | _ -> ""
 
-(** Parse a stream-json line into a list of events.
-    Returns a list because a single assistant message can contain
-    both text and tool_use content blocks. *)
+(** Yojson accessor helpers shared by all three parsers. Collapse the
+    noisy [j |> member k |> to_string_option |> Option.value ~default]
+    chain that recurs everywhere. *)
+
+let get_string_opt key json =
+  Yojson.Safe.Util.(json |> member key |> to_string_option)
+
+let get_string ~default key json =
+  Option.value (get_string_opt key json) ~default
+
+let get_int_opt key json =
+  Yojson.Safe.Util.(json |> member key |> to_int_option)
+
+(** Parse a stream-json line (Claude / Gemini share-the-shape, though
+    Gemini has its own parser).  Returns a list because a single
+    assistant message can contain both text and tool_use content blocks. *)
 let parse_stream_json_line line =
   try
     let json = Yojson.Safe.from_string line in
     let open Yojson.Safe.Util in
-    let typ = json |> member "type" |> to_string_option in
-    match typ with
+    match get_string_opt "type" json with
     | Some "assistant" ->
-      let msg = json |> member "message" in
-      let content = msg |> member "content" in
+      let content = json |> member "message" |> member "content" in
       let events = match content with
         | `List items ->
           List.filter_map (fun item ->
-            match item |> member "type" |> to_string_option with
+            match get_string_opt "type" item with
             | Some "text" ->
-              (match item |> member "text" |> to_string_option with
+              (match get_string_opt "text" item with
                | Some t -> Some (Text_delta t)
                | None -> None)
             | Some "tool_use" ->
-              let name = item |> member "name" |> to_string_option
-                |> Option.value ~default:"unknown" in
+              let name = get_string ~default:"unknown" "name" item in
               let input = item |> member "input" in
               let summary = summarize_tool_input name input in
               let detail = detail_of_tool_input name input in
@@ -774,8 +820,8 @@ let parse_stream_json_line line =
                 | `List parts ->
                   (* Content may be a list of {type: "text", text: "..."} *)
                   let texts = List.filter_map (fun p ->
-                    match p |> member "type" |> to_string_option with
-                    | Some "text" -> p |> member "text" |> to_string_option
+                    match get_string_opt "type" p with
+                    | Some "text" -> get_string_opt "text" p
                     | _ -> None
                   ) parts in
                   String.concat "\n" texts
@@ -789,9 +835,8 @@ let parse_stream_json_line line =
       in
       (match events with [] -> [Other line] | _ -> events)
     | Some "result" ->
-      let result_text = json |> member "result" |> to_string_option
-        |> Option.value ~default:"" in
-      let session_id = json |> member "session_id" |> to_string_option in
+      let result_text = get_string ~default:"" "result" json in
+      let session_id = get_string_opt "session_id" json in
       [Result { text = result_text; session_id }]
     | Some "user" ->
       (* User messages carry tool_result content blocks with tool output.
@@ -800,10 +845,8 @@ let parse_stream_json_line line =
         match json |> member "tool_use_result" with
         | `Null -> None
         | obj ->
-          let stdout = obj |> member "stdout" |> to_string_option
-            |> Option.value ~default:"" in
-          let stderr = obj |> member "stderr" |> to_string_option
-            |> Option.value ~default:"" in
+          let stdout = get_string ~default:"" "stdout" obj in
+          let stderr = get_string ~default:"" "stderr" obj in
           let combined = match stdout, stderr with
             | "", "" -> ""
             | s, "" -> s
@@ -817,12 +860,11 @@ let parse_stream_json_line line =
        | Some content -> [Tool_result { content }]
        | None ->
          (* Fall back to content blocks *)
-         let msg = json |> member "message" in
-         let content = msg |> member "content" in
+         let content = json |> member "message" |> member "content" in
          let results = match content with
            | `List items ->
              List.filter_map (fun item ->
-               match item |> member "type" |> to_string_option with
+               match get_string_opt "type" item with
                | Some "tool_result" ->
                  let c = match item |> member "content" with
                    | `String s -> s
@@ -837,6 +879,258 @@ let parse_stream_json_line line =
     | _ -> [Other line]
   with _ -> [Other line]
 
+(* ── Codex JSON parser ─────────────────────────────────────────────
+
+   Codex emits one JSON object per line on stdout when invoked with
+   [--json]. The dispatcher [parse_codex_json_line] matches on the
+   top-level [type] field and delegates to a small helper per shape:
+
+   | top-level type    | helper / treatment
+   |-------------------|---------------------------------------------
+   | thread.started    | capture session id via Result event
+   | turn.started      | ignored
+   | turn.completed    | flush via empty Result event
+   | turn.failed       | lift error message into Error event
+   | error             | lift error message into Error event
+   | item.started      | parse_codex_item ~completed:false
+   | item.completed    | parse_codex_item ~completed:true
+
+   Item-level shapes recognized inside item.* envelopes:
+
+   | item.type         | helper / treatment
+   |-------------------|---------------------------------------------
+   | agent_message     | Text_delta (one whole message, not a delta)
+   | command_execution | Tool_use on start, Tool_result on completion
+   | file_change       | Tool_use describing the path(s) modified
+   | error             | Error event (non-fatal)
+   | reasoning         | dropped
+
+   Anything unrecognized falls through to Other(raw line). Errors are
+   forwarded as [Error] events so [Agent_runner] can surface Codex's
+   stdout-only error frames; without this they vanish into [Other]
+   and the user sees an empty "agent exited with code N" message. *)
+
+(** Codex error frames carry the message in one of three shapes:
+    - top-level [{message}] (the [error] frame)
+    - nested object [{error: {message}}] (the [turn.failed] frame)
+    - nested string [{error: "..."}] (occasionally seen; the message
+      is inlined as a string)
+    Resolving each explicitly avoids a [Type_error] from the Yojson
+    accessors when [error] turns out to be a scalar. *)
+let codex_error_message json =
+  let default = "unspecified codex error" in
+  match Yojson.Safe.Util.member "error" json with
+  | `Assoc _ as nested -> get_string ~default "message" nested
+  | `String s -> s
+  | _ -> get_string ~default "message" json
+
+(** A single file-change entry. [kind] is normalized to the verb used
+    by Codex ("add", "update", "delete") — empty values become
+    "modified" so the rendered summary never says "path ()". *)
+type file_change_entry = { path : string; kind : string }
+
+let parse_file_change_entries item =
+  let raw = match Yojson.Safe.Util.member "changes" item with
+    | `List xs -> xs | _ -> [] in
+  List.filter_map (fun c ->
+    let path = get_string ~default:"" "path" c in
+    let kind = match get_string ~default:"" "kind" c with
+      | "" -> "modified" | k -> k in
+    if path = "" then None else Some { path; kind }
+  ) raw
+
+(* Per-item helpers. Each takes the raw [completed] flag so the
+   item.started / item.completed split is owned where the semantics
+   are actually understood, not in the dispatcher.
+
+   Codex emits [agent_message] / [file_change] / [error] only as
+   item.completed in the wild; the explicit no-op on item.started
+   future-proofs against a Codex change without polluting Other-line
+   debug logs. [command_execution] is the only shape with a real
+   start-and-end lifecycle. *)
+
+(** Fully-formed assistant text. Codex emits this once per item with
+    the complete message — there are no incremental deltas. We
+    normalize the tail to exactly "\n\n" so successive messages in one
+    turn render as separate paragraphs ([msg1msg2] would otherwise
+    corrupt markdown), without producing "\n\n\n+" when the message
+    already ended in newlines. *)
+let parse_codex_agent_message ~completed item =
+  let normalize_paragraph_end s =
+    let rec back i =
+      if i = 0 || s.[i-1] <> '\n' then i else back (i - 1)
+    in
+    String.sub s 0 (back (String.length s)) ^ "\n\n"
+  in
+  if not completed then []
+  else match get_string_opt "text" item with
+    | Some text when text <> "" -> [Text_delta (normalize_paragraph_end text)]
+    | _ -> []
+
+(** Bash command lifecycle. The started event opens the tool block;
+    the completed event closes it with the captured output. *)
+let parse_codex_command_execution ~completed item =
+  let cmd = get_string ~default:"" "command" item in
+  if not completed then
+    let summary = truncate_inline ~max_chars:120
+      (sanitize_for_inline_code cmd) in
+    let detail = if cmd = "" then ""
+      else code_block_capped ~lang:"bash" cmd in
+    [Tool_use { tool_name = "Bash";
+                tool_summary = summary; tool_detail = detail }]
+  else
+    let output = get_string ~default:"" "aggregated_output" item in
+    let header = match get_int_opt "exit_code" item with
+      | Some 0 | None -> ""
+      | Some n -> Printf.sprintf "[exit %d]\n" n in
+    let content = header ^ output in
+    if content = "" then [] else [Tool_result { content }]
+
+(** Files modified by Codex in a single item. Single-file changes get
+    a compact inline summary; multi-file changes use a code-block
+    detail listing each path on its own line. The tool name reflects
+    whether every entry is an [add] (Write) or there's at least one
+    in-place edit (Edit). Empty-path entries are dropped silently —
+    Codex doesn't emit them in practice and they would render as a
+    contentless tool_use. *)
+let parse_codex_file_change ~completed item =
+  if not completed then [] else
+  let entries = parse_file_change_entries item in
+  let tool_name_for entries =
+    if List.for_all (fun e -> e.kind = "add") entries then "Write"
+    else "Edit"
+  in
+  match entries with
+  | [] -> []
+  | [{ path; kind }] ->
+    let summary = truncate_inline ~max_chars:120
+      (Printf.sprintf "%s (%s)"
+         (sanitize_for_inline_code path) kind) in
+    [Tool_use { tool_name = tool_name_for entries;
+                tool_summary = summary; tool_detail = "" }]
+  | many ->
+    let buf = Buffer.create 256 in
+    List.iter (fun { path; kind } ->
+      Buffer.add_string buf (Printf.sprintf "%s %s\n" kind path)
+    ) many;
+    let detail = code_block_capped ~lang:"" (Buffer.contents buf) in
+    let summary = Printf.sprintf "%d files" (List.length many) in
+    [Tool_use { tool_name = tool_name_for many;
+                tool_summary = summary; tool_detail = detail }]
+
+(** Non-fatal error item. Forwarded as an [Error] event so
+    [Agent_runner] can surface the message to Discord. *)
+let parse_codex_error ~completed item =
+  if completed then [Error (codex_error_message item)] else []
+
+(** Item-level dispatch. Every known item type has explicit handling;
+    only genuinely unrecognized shapes fall through to [Other]. *)
+let parse_codex_item ~completed ~line item =
+  match get_string_opt "type" item with
+  | Some "agent_message" -> parse_codex_agent_message ~completed item
+  | Some "command_execution" -> parse_codex_command_execution ~completed item
+  | Some "file_change" -> parse_codex_file_change ~completed item
+  | Some "error" -> parse_codex_error ~completed item
+  | Some "reasoning" -> []
+  | _ -> [Other line]
+
+let parse_codex_json_line line =
+  try
+    let json = Yojson.Safe.from_string line in
+    match get_string_opt "type" json with
+    | Some "thread.started" ->
+      (match get_string_opt "thread_id" json with
+       | Some tid -> [Result { text = ""; session_id = Some tid }]
+       | None -> [Other line])
+    | Some "turn.completed" -> [Result { text = ""; session_id = None }]
+    | Some "turn.started" -> []
+    | Some ("turn.failed" | "error") -> [Error (codex_error_message json)]
+    | Some "item.started" ->
+      parse_codex_item ~completed:false ~line
+        (Yojson.Safe.Util.member "item" json)
+    | Some "item.completed" ->
+      parse_codex_item ~completed:true ~line
+        (Yojson.Safe.Util.member "item" json)
+    | _ -> [Other line]
+  with _ -> [Other line]
+
+(* ── Gemini JSON parser ────────────────────────────────────────────
+
+   Gemini's [-o stream-json] schema is flat — one event per line, each
+   with a top-level [type] field. The events we care about:
+
+   | type        | shape we read
+   |-------------|----------------------------------------------
+   | init        | {session_id} → captured for resume
+   | message     | {role: assistant, content, delta:true} → text
+   | message     | {role: user, ...} → ignored (echo of our prompt)
+   | tool_use    | {tool_name, parameters} → Tool_use after rename
+   | tool_result | {status, output, error?} → Tool_result
+   | result      | {status, stats} → flush
+
+   Gemini's tool names differ from Claude's; [gemini_tool_name_of]
+   maps the common ones so the runner's emoji/verb table stays agent-
+   agnostic. Unknown names pass through unchanged. *)
+
+let gemini_tool_name_of = function
+  | "run_shell_command" -> "Bash"
+  | "read_file" -> "Read"
+  | "write_file" -> "Write"
+  | "replace" | "edit" -> "Edit"
+  | "search_file_content" -> "Grep"
+  | "glob" -> "Glob"
+  | "web_fetch" -> "WebFetch"
+  | "google_web_search" | "web_search" -> "WebSearch"
+  | other -> other
+
+let parse_gemini_stream_json_line line =
+  try
+    let json = Yojson.Safe.from_string line in
+    match get_string_opt "type" json with
+    | Some "init" ->
+      (match get_string_opt "session_id" json with
+       | Some sid -> [Result { text = ""; session_id = Some sid }]
+       | None -> [])
+    | Some "message" ->
+      (match get_string_opt "role" json with
+       | Some "assistant" ->
+         (match get_string_opt "content" json with
+          | Some text when text <> "" -> [Text_delta text]
+          | _ -> [])
+       | _ -> [])  (* user echo or unknown role: ignored *)
+    | Some "tool_use" ->
+      let name = gemini_tool_name_of
+        (get_string ~default:"unknown" "tool_name" json) in
+      let params = Yojson.Safe.Util.member "parameters" json in
+      let summary = summarize_tool_input name params in
+      let detail = detail_of_tool_input name params in
+      [Tool_use { tool_name = name; tool_summary = summary;
+                  tool_detail = detail }]
+    | Some "tool_result" ->
+      let status = get_string ~default:"" "status" json in
+      let output = get_string ~default:"" "output" json in
+      let err_msg =
+        match Yojson.Safe.Util.member "error" json with
+        | `Assoc _ as obj -> get_string ~default:"" "message" obj
+        | `String s -> s
+        | _ -> ""
+      in
+      let content = match status, output, err_msg with
+        | _, "", "" -> ""
+        | "error", "", m -> Printf.sprintf "[error] %s" m
+        | "error", o, "" -> Printf.sprintf "[error] %s" o
+        | "error", o, m -> Printf.sprintf "[error] %s\n%s" m o
+        | _, o, _ -> o
+      in
+      if content = "" then [] else [Tool_result { content }]
+    | Some "result" ->
+      (* Turn complete. session_id was captured at init; assistant text
+         was already delivered as deltas. Empty Result triggers a flush
+         in agent_runner, matching Codex's turn.completed handling. *)
+      [Result { text = ""; session_id = None }]
+    | _ -> [Other line]
+  with _ -> [Other line]
+
 (** Build the command args for an agent invocation. *)
 let claude_args ~session_id ~message_count ~prompt =
   let session_flag =
@@ -845,60 +1139,311 @@ let claude_args ~session_id ~message_count ~prompt =
   in
   ["claude"; "-p"; "--verbose"; "--output-format"; "stream-json"] @ session_flag @ [prompt]
 
+(* ── MCP server config (shared by all three agents) ──────────────
+
+   All three agents expose the bot's MCP tools (start_session,
+   list_*, etc.) by pointing at scripts/mcp-server.py. They each
+   accept the pointer through a different mechanism:
+
+   - Claude takes a [--mcp-config <path>] flag; we write the JSON to
+     [~/.config/discord-agents/mcp-generated.json] and pass the path.
+   - Codex takes [-c key=value] TOML overrides per invocation; we
+     inject [mcp_servers.discord_agents.command/args] without
+     touching the user's [~/.codex/config.toml].
+   - Gemini has no flag; it loads [mcpServers] from
+     [<cwd>/.gemini/settings.json]. We write the file into the
+     worktree and add [.gemini/] to [.git/info/exclude]. *)
+
+let mcp_script_path = lazy (
+  (* Allow an explicit override for installs where the script doesn't
+     live next to the executable (e.g. a standalone binary, or a
+     packaged install). Falls through to the heuristic search if
+     unset. *)
+  match Sys.getenv_opt "DISCORD_AGENTS_MCP_SCRIPT" with
+  | Some path when path <> "" -> path
+  | _ ->
+    try
+      let exe = Sys.executable_name in
+      let exe = if Filename.is_relative exe
+        then Filename.concat (Sys.getcwd ()) exe else exe in
+      let rec find_root path =
+        let candidate = Filename.concat path "scripts/mcp-server.py" in
+        if Sys.file_exists candidate then candidate
+        else
+          let parent = Filename.dirname path in
+          if parent = path then "scripts/mcp-server.py"
+          else find_root parent
+      in
+      find_root (Filename.dirname exe)
+    with _ -> "scripts/mcp-server.py"
+)
+
+let mcp_json = lazy (
+  Printf.sprintf
+    {|{"mcpServers":{"discord-agents":{"command":"python3","args":["%s"]}}}|}
+    (Lazy.force mcp_script_path)
+)
+
+let write_file_safely ~path contents =
+  try
+    let oc = open_out path in
+    output_string oc contents;
+    close_out oc
+  with _ -> ()
+
+let read_file_opt path =
+  try
+    let ic = open_in path in
+    Fun.protect ~finally:(fun () -> close_in ic) (fun () ->
+      let n = in_channel_length ic in
+      let s = Bytes.create n in
+      really_input ic s 0 n;
+      Some (Bytes.to_string s))
+  with _ -> None
+
+let contains_substring text needle =
+  let nlen = String.length needle in
+  let tlen = String.length text in
+  if nlen = 0 then true
+  else
+    let rec scan i =
+      if i + nlen > tlen then false
+      else if String.sub text i nlen = needle then true
+      else scan (i + 1)
+    in scan 0
+
+(** Claude: write the MCP config to a well-known location and return
+    the path for [--mcp-config]. *)
+let claude_mcp_config_path () =
+  let config_dir = Filename.concat (Sys.getenv "HOME") ".config/discord-agents" in
+  let config_path = Filename.concat config_dir "mcp-generated.json" in
+  write_file_safely ~path:config_path (Lazy.force mcp_json);
+  config_path
+
+(** Inject our [discord-agents] entry into a Gemini settings JSON
+    string (preserving any other [mcpServers] and unrelated
+    top-level keys the user might have set). Falls back to a fresh
+    config when the input is missing, malformed, or parseable but
+    not an object — in any of those cases the existing content
+    couldn't have meaningfully held our entry, so we'd lose nothing
+    by replacing it. *)
+let merge_gemini_settings existing =
+  let our_entry = `Assoc [
+    ("command", `String "python3");
+    ("args", `List [`String (Lazy.force mcp_script_path)]);
+  ] in
+  let render_fresh () =
+    Yojson.Safe.pretty_to_string
+      (`Assoc [("mcpServers", `Assoc [("discord-agents", our_entry)])])
+  in
+  match existing with
+  | None -> render_fresh ()
+  | Some text ->
+    try
+      match Yojson.Safe.from_string text with
+      | `Assoc fields ->
+        let prior_servers = match List.assoc_opt "mcpServers" fields with
+          | Some (`Assoc servers) -> servers
+          | _ -> [] in
+        let new_servers =
+          ("discord-agents", our_entry)
+          :: List.filter (fun (k, _) -> k <> "discord-agents") prior_servers
+        in
+        let new_fields =
+          ("mcpServers", `Assoc new_servers)
+          :: List.filter (fun (k, _) -> k <> "mcpServers") fields
+        in
+        Yojson.Safe.pretty_to_string (`Assoc new_fields)
+      | _ -> render_fresh ()  (* parseable but non-object: discard *)
+    with _ -> render_fresh ()
+
+(** Resolve the [info/exclude] file Git actually reads for
+    [working_dir]. Uses [git rev-parse --git-path info/exclude],
+    which Does The Right Thing in both regular checkouts and linked
+    worktrees: the previous version used [--git-dir] and concatenated
+    [info/exclude], which in worktrees pointed at the per-worktree
+    gitdir's [info/exclude] — a file Git never reads, so the append
+    silently no-op'd from Git's perspective. Returns None if
+    [working_dir] isn't a git repo. *)
+let resolve_git_info_exclude ~working_dir =
+  if working_dir = "" then None
+  else
+    try
+      let cmd = Printf.sprintf
+        "git -C %s rev-parse --git-path info/exclude 2>/dev/null"
+        (Filename.quote working_dir) in
+      let ic = Unix.open_process_in cmd in
+      let line = try input_line ic with End_of_file -> "" in
+      let _ = Unix.close_process_in ic in
+      let trimmed = String.trim line in
+      if trimmed = "" then None
+      else if Filename.is_relative trimmed then
+        Some (Filename.concat working_dir trimmed)
+      else
+        Some trimmed
+    with _ -> None
+
+(** True if [text] already contains a line that is exactly the
+    pattern [.gemini/] (or [.gemini]) — ignoring leading/trailing
+    whitespace, but rejecting commented (`# .gemini/`) and negated
+    (`!.gemini/`) lines that look similar but don't actually
+    exclude the directory. *)
+let exclude_already_lists_gemini text =
+  String.split_on_char '\n' text
+  |> List.exists (fun line ->
+    let trimmed = String.trim line in
+    trimmed = ".gemini/" || trimmed = ".gemini")
+
+(** Gemini: drop our entry into [.gemini/settings.json] (merging into
+    any pre-existing user config) and ensure [.gemini/] is in the
+    repo's [info/exclude]. Both writes are idempotent — re-running
+    against a worktree we've already configured leaves the file and
+    the exclude line unchanged in shape. *)
+let setup_gemini_mcp ~working_dir =
+  if working_dir = "" then ()
+    (* Defense-in-depth: the resume handlers reject empty working_dir
+       before we get here, but a future caller shouldn't write
+       .gemini/ into the bot's own directory by accident. *)
+  else
+  let gemini_dir = Filename.concat working_dir ".gemini" in
+  (try
+     if not (Sys.file_exists gemini_dir) then Unix.mkdir gemini_dir 0o755
+   with _ -> ());
+  let settings_path = Filename.concat gemini_dir "settings.json" in
+  let merged = merge_gemini_settings (read_file_opt settings_path) in
+  write_file_safely ~path:settings_path merged;
+  match resolve_git_info_exclude ~working_dir with
+  | None -> ()
+  | Some exclude_path ->
+    match read_file_opt exclude_path with
+    | Some existing when exclude_already_lists_gemini existing -> ()
+    | _ ->
+      try
+        (* exclude_path may live in a directory git hasn't materialized
+           (e.g. a fresh worktree's info/). Create it if missing. *)
+        let info_dir = Filename.dirname exclude_path in
+        (try if not (Sys.file_exists info_dir) then Unix.mkdir info_dir 0o755
+         with _ -> ());
+        let oc = open_out_gen [Open_append; Open_creat] 0o644 exclude_path in
+        Fun.protect ~finally:(fun () -> close_out oc) (fun () ->
+          output_string oc "\n.gemini/\n")
+      with _ -> ()
+
+(** Escape a string for embedding inside a TOML double-quoted string.
+    Beyond backslash and double-quote (the cases we actually hit with
+    filesystem paths), the TOML spec also requires control characters
+    [U+0000..U+001F] and [U+007F] to be escaped — these would never
+    appear in a real path but we round-trip them faithfully so this
+    helper is correct in isolation. *)
+let escape_toml_string s =
+  let buf = Buffer.create (String.length s + 8) in
+  String.iter (fun c ->
+    let code = Char.code c in
+    match c with
+    | '\\' -> Buffer.add_string buf "\\\\"
+    | '"'  -> Buffer.add_string buf "\\\""
+    | '\n' -> Buffer.add_string buf "\\n"
+    | '\r' -> Buffer.add_string buf "\\r"
+    | '\t' -> Buffer.add_string buf "\\t"
+    | _ when code < 0x20 || code = 0x7F ->
+      Buffer.add_string buf (Printf.sprintf "\\u%04X" code)
+    | _ -> Buffer.add_char buf c) s;
+  Buffer.contents buf
+
+(** TOML overrides that register the discord-agents MCP server for a
+    Codex invocation, without touching the user's ~/.codex/config.toml.
+    Two key=value pairs because Codex parses each [-c] independently. *)
+let codex_mcp_overrides () =
+  let path = escape_toml_string (Lazy.force mcp_script_path) in
+  [ "-c"; {|mcp_servers.discord_agents.command="python3"|};
+    "-c"; Printf.sprintf
+      {|mcp_servers.discord_agents.args=["%s"]|} path ]
+
+(** Codex allocates its session id server-side in the thread.started
+    event, so the UUID the bot pre-generated is invalid for resume on
+    the first run. [parse_codex_json_line] emits the real id via
+    Result.session_id; the agent_runner forwards it through
+    [on_session_id], and bot.ml persists it together with
+    session_id_confirmed=true.
+
+    Subsequent runs resume only if [session_id_confirmed] — gating on
+    message_count would resume with the placeholder UUID after a
+    first-turn failure that happened before thread.started, or skip
+    resume after a first-turn failure that happened after it. The
+    "--" separator prevents prompts that happen to begin with "-"
+    from being mistaken for a Codex flag. *)
+let codex_args ~session_id ~session_id_confirmed ~prompt =
+  let base = ["codex"; "exec"; "--json"; "--full-auto";
+              "--skip-git-repo-check"]
+             @ codex_mcp_overrides () in
+  if not session_id_confirmed then base @ ["--"; prompt]
+  else base @ ["resume"; session_id; "--"; prompt]
+
+(** Like Codex, Gemini allocates its session id server-side in the
+    [init] event and we capture it from the parser's first emitted
+    Result. Subsequent runs resume only when [session_id_confirmed],
+    matching the same coherence contract Codex uses.
+
+    [--yolo] auto-approves tool calls; without it Gemini blocks on an
+    interactive approval prompt that the non-interactive subprocess
+    can't answer (mirrors Codex's [--full-auto]).
+
+    Gemini's MCP server config is written into [.gemini/settings.json]
+    by [setup_gemini_mcp], which run_streaming calls before invoking
+    [gemini_args]. *)
+let gemini_args ~session_id ~session_id_confirmed ~prompt =
+  let base = ["gemini"; "-p"; prompt; "-o"; "stream-json"; "--yolo"] in
+  if not session_id_confirmed then base
+  else base @ ["--resume"; session_id]
+
+(** Compose the per-turn prompt sent to a non-Claude agent, prepending
+    the session's system prompt on the first turn so MCP-aware agents
+    know what tools they have. Claude takes [--append-system-prompt]
+    via run_streaming and skips this. The conversation history carries
+    the system prompt forward on subsequent turns, so we only inject
+    it when [message_count = 0].
+
+    Pure function so it's testable without a subprocess. *)
+let compose_session_prompt ~agent_kind ~system_prompt ~message_count
+    ~user_prompt =
+  let needs_inline =
+    message_count = 0
+    && (match agent_kind with
+        | Config.Codex | Config.Gemini -> true
+        | Config.Claude -> false)
+  in
+  match system_prompt with
+  | Some sp when needs_inline ->
+    Printf.sprintf "<bot-context>\n%s\n</bot-context>\n\n%s" sp user_prompt
+  | _ -> user_prompt
+
 (** Spawn an agent and stream its output via a callback.
     The callback is called with each parsed event as it arrives.
     [?on_pid] is called with the child PID immediately after spawn,
     so the caller can track active subprocesses for cleanup.
     Returns when the process exits. *)
 let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
-    ?system_prompt ~prompt ~on_event ?on_pid () =
+    ?(session_id_confirmed=true) ?system_prompt ~prompt ~on_event ?on_pid () =
   let mgr = Eio.Stdenv.process_mgr env in
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
-  (* Generate MCP config with absolute path to the Python script.
-     The static mcp.json has a relative path that breaks when Claude
-     runs in a different working directory. *)
-  let mcp_config =
-    let script_path =
-      try
-        let exe = Sys.executable_name in
-        let exe = if Filename.is_relative exe then Filename.concat (Sys.getcwd ()) exe else exe in
-        let rec find_root path =
-          let candidate = Filename.concat path "scripts/mcp-server.py" in
-          if Sys.file_exists candidate then candidate
-          else
-            let parent = Filename.dirname path in
-            if parent = path then "scripts/mcp-server.py"
-            else find_root parent
-        in
-        find_root (Filename.dirname exe)
-      with _ -> "scripts/mcp-server.py"
-    in
-    (* Write a temp MCP config with the absolute script path *)
-    let config_dir = Filename.concat (Sys.getenv "HOME") ".config/discord-agents" in
-    let config_path = Filename.concat config_dir "mcp-generated.json" in
-    let json = Printf.sprintf
-      {|{"mcpServers":{"discord-agents":{"command":"python3","args":["%s"]}}}|}
-      script_path in
-    (try
-      let oc = open_out config_path in
-      output_string oc json;
-      close_out oc
-    with _ -> ());
-    config_path
-  in
+  (* Codex/Gemini get the system prompt prepended to the first user
+     turn (compose_session_prompt); Claude gets it via the dedicated
+     [--append-system-prompt] flag instead. *)
+  let prompt = compose_session_prompt
+    ~agent_kind:kind ~system_prompt ~message_count ~user_prompt:prompt in
   let args = match kind with
     | Config.Claude ->
       let base = claude_args ~session_id ~message_count ~prompt in
-      (* All Claude sessions get MCP tools for thread/session management *)
-      let base = base @ ["--mcp-config"; mcp_config] in
-      let base = match system_prompt with
-        | Some sp -> base @ ["--append-system-prompt"; sp]
-        | None -> base
-      in
-      base
-    | Config.Codex -> ["codex"; "exec"; prompt]
-    | Config.Gemini -> ["gemini"; "-p"; prompt; "-o"; "stream-json"]
+      let base = base @ ["--mcp-config"; claude_mcp_config_path ()] in
+      (match system_prompt with
+       | Some sp -> base @ ["--append-system-prompt"; sp]
+       | None -> base)
+    | Config.Codex ->
+      codex_args ~session_id ~session_id_confirmed ~prompt
+    | Config.Gemini ->
+      setup_gemini_mcp ~working_dir;
+      gemini_args ~session_id ~session_id_confirmed ~prompt
   in
   let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in
   let stderr_r, stderr_w = Eio.Process.pipe ~sw mgr in
@@ -927,12 +1472,12 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
         while true do
           let line = Eio.Buf_read.line reader in
           if String.length line > 0 then begin
-            match kind with
-            | Config.Claude | Config.Gemini ->
-              let events = parse_stream_json_line line in
-              List.iter on_event events
-            | Config.Codex ->
-              on_event (Text_delta line)
+            let events = match kind with
+              | Config.Claude -> parse_stream_json_line line
+              | Config.Codex -> parse_codex_json_line line
+              | Config.Gemini -> parse_gemini_stream_json_line line
+            in
+            List.iter on_event events
           end
         done
       with End_of_file -> ());
