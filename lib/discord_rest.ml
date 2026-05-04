@@ -124,7 +124,18 @@ let request t ~meth ~path ?body () =
     if code = 404 then
       Logs.debug (fun m -> m "REST %s %s: %d %s" meth_str path code body)
     else
-      Logs.warn (fun m -> m "REST %s %s: %d %s" meth_str path code body)
+      Logs.warn (fun m -> m "REST %s %s: %d %s" meth_str path code body);
+    (* On 400, also log a snippet of the request body. Discord's
+       50109 ("invalid JSON") tells us nothing about which bytes
+       offended; without the request body it's near-impossible to
+       diagnose. The Resource.sanitize_utf8 patch should keep
+       50109 from the [content] path, but other endpoints / fields
+       can still hit it. *)
+    if code = 400 then
+      Option.iter (fun b ->
+        Logs.warn (fun m -> m "REST %s %s: 400 request body: %s"
+          meth_str path (truncate_for_log b))
+      ) body_str
   in
   let handle_response (resp, resp_body) =
     let status = Http.Response.status resp in
@@ -200,6 +211,12 @@ let plan_message_chunks ?reply_to content =
     callers that need "all-or-nothing" must clean up themselves. *)
 let create_message t ~(channel_id : Discord_types.channel_id) ~content
     ?(reply_to : Discord_types.message_id option) () =
+  (* Strip invalid UTF-8 before splitting / sending: Discord's API
+     returns 400 / code 50109 for any raw invalid-UTF-8 byte sequence
+     in the request body, and [agent_runner.send] doesn't retry on 400
+     — the chunk just vanishes from the user's view. See
+     [Resource.sanitize_utf8] for the full rationale. *)
+  let content = Resource.sanitize_utf8 content in
   let post_one (chunk, chunk_reply_to) =
     let body = `Assoc ([
       ("content", `String chunk);
@@ -238,6 +255,7 @@ let create_message t ~(channel_id : Discord_types.channel_id) ~content
 (** Edit an existing message. *)
 let edit_message t ~(channel_id : Discord_types.channel_id)
     ~(message_id : Discord_types.message_id) ~content () =
+  let content = Resource.sanitize_utf8 content in
   let body = `Assoc [("content", `String content)] in
   match request t ~meth:`PATCH
     ~path:(Printf.sprintf "/channels/%s/messages/%s" channel_id message_id)
