@@ -144,13 +144,26 @@ let sanitize_utf8 s =
   Buffer.contents buf
 
 (** Truncate [s] to at most [max_bytes] bytes, walking back to the
-    nearest UTF-8 codepoint boundary so we never emit a half-encoded
-    character. Whitespace is preserved (no [single_line] collapse) —
-    use [normalize_summary] when you also want bullet-leak defense.
+    nearest UTF-8 codepoint boundary so we never split a previously-
+    valid codepoint in half. Whitespace is preserved (no [single_line]
+    collapse) — use [normalize_summary] when you also want bullet-leak
+    defense.
 
-    The walk-back is bounded by [max_bytes] and by remaining length,
-    so termination is guaranteed regardless of input validity. *)
+    [max_bytes] is clamped to 0 if negative, so this is safe to call
+    with attacker-supplied or arithmetic-derived bounds.
+
+    UTF-8 validity guarantee: if input is valid UTF-8, output is too.
+    If input contains pre-existing invalid bytes (lone leaders,
+    truncated multi-byte sequences, lone continuations, surrogates),
+    those bytes can survive into the output — this function only
+    refuses to introduce *new* invalidity at the cut point. Pair with
+    [sanitize_utf8] (which the Discord send path applies automatically)
+    for strict validity on the wire.
+
+    Termination: walk-back is bounded by [max_bytes] and by the
+    decrement on each iteration, so always halts. *)
 let truncate_utf8 ~max_bytes s =
+  let max_bytes = max 0 max_bytes in
   let n = String.length s in
   if n <= max_bytes then s
   else

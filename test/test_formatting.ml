@@ -1741,6 +1741,13 @@ let test_truncate_utf8_no_single_line_collapse () =
   Alcotest.(check string) "newlines/tabs preserved"
     s (Discord_agents.Resource.truncate_utf8 ~max_bytes:1000 s)
 
+let test_truncate_utf8_negative_max_bytes () =
+  (* Negative max_bytes is clamped to 0; no Invalid_argument. *)
+  Alcotest.(check string) "negative clamps to empty"
+    "" (Discord_agents.Resource.truncate_utf8 ~max_bytes:(-1) "any input");
+  Alcotest.(check string) "zero stays empty"
+    "" (Discord_agents.Resource.truncate_utf8 ~max_bytes:0 "any input")
+
 let truncate_utf8_tests = [
   Alcotest.test_case "preserves \\n in multi-line input" `Quick
     test_truncate_utf8_preserves_newlines;
@@ -1752,6 +1759,8 @@ let truncate_utf8_tests = [
     test_truncate_utf8_passthrough_under_cap;
   Alcotest.test_case "no single_line collapse (critical for prompts)" `Quick
     test_truncate_utf8_no_single_line_collapse;
+  Alcotest.test_case "negative max_bytes is clamped to 0" `Quick
+    test_truncate_utf8_negative_max_bytes;
 ]
 
 (* ── sanitize_utf8 ─────────────────────────────────────────────────── *)

@@ -320,6 +320,13 @@ let handle_resume_session (bot : Bot.t) params =
   let open Yojson.Safe.Util in
   let params = match params with Some p -> p | None ->
     failwith "missing params" in
+  (* Same drain refusal as handle_start_session: resume creates a
+     thread + persistent session, and accepting one mid-restart
+     either delays the restart or leaves a half-set-up session
+     stranded. The MCP caller can retry after restart. *)
+  if bot.draining then
+    error_response "Bot is restarting; try again shortly."
+  else
   let sid_prefix = params |> member "session_id" |> to_string in
   let kind = match params |> member "kind" |> to_string_option with
     | None -> None

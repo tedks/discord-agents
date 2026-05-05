@@ -915,7 +915,7 @@ let resolve_channel_context t ~(channel_id : Discord_types.channel_id)
     in the fiber that called us).
 
     Extracted from the body of [handle_thread_message] so the auto-trigger
-    path in [run_initial_prompt_synchronous] can reuse it without going
+    path in [fork_initial_prompt_run] can reuse it without going
     back through the queue check (which would cause it to queue itself
     behind the very flag we set to close the gateway race). *)
 let rec process_session_message t session
@@ -1144,17 +1144,38 @@ let handle_message t (msg : Discord_types.message) =
             (match parent_project with
              | Some proj_name ->
                (* Thread under a project channel with no session —
-                  auto-create one (e.g. manually created in Discord). *)
+                  auto-create one (e.g. manually created in Discord).
+
+                  Race-safety: defer the auto-create by 2s and re-
+                  check the session store, in case
+                  [control_api.handle_start_session] is in the middle
+                  of an HTTP roundtrip to create a session for this
+                  thread. Without the wait, a user typing into a
+                  freshly-bot-created thread would race the
+                  start_session HTTP and get a default-worktree
+                  session here instead of the agent-specific
+                  worktree the MCP caller asked for. The cost is a
+                  one-time 2s delay for messages in manually-
+                  created threads (rare in this bot's usage). *)
                let proj = List.find_opt (fun (p : Project.t) ->
                  p.name = proj_name) (projects t) in
                (match proj with
                 | Some p ->
                   let wd = match working_dir_of_project p with
                     | Ok d -> d | Error _ -> p.path in
-                  ensure_channel_session t ~channel_id:msg.channel_id
-                    ~project_name:p.name ~working_dir:wd
-                    ~system_prompt:None;
-                  handle_thread_message t msg ~channel_info:ch ()
+                  Eio.Fiber.fork ~sw:t.sw (fun () ->
+                    Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
+                    match Session_store.find_opt t.sessions
+                            ~thread_id:msg.channel_id with
+                    | Some _ ->
+                      (* start_session won the race; route normally
+                         (handle_thread_message queues if processing). *)
+                      handle_thread_message t msg ~channel_info:ch ()
+                    | None ->
+                      ensure_channel_session t ~channel_id:msg.channel_id
+                        ~project_name:p.name ~working_dir:wd
+                        ~system_prompt:None;
+                      handle_thread_message t msg ~channel_info:ch ())
                 | None -> handle_thread_message t msg ())
              | None -> handle_thread_message t msg ())
           | Error e ->
