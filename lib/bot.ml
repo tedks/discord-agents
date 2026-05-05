@@ -1165,17 +1165,28 @@ let handle_message t (msg : Discord_types.message) =
                     | Ok d -> d | Error _ -> p.path in
                   Eio.Fiber.fork ~sw:t.sw (fun () ->
                     Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
-                    match Session_store.find_opt t.sessions
-                            ~thread_id:msg.channel_id with
-                    | Some _ ->
-                      (* start_session won the race; route normally
-                         (handle_thread_message queues if processing). *)
-                      handle_thread_message t msg ~channel_info:ch ()
-                    | None ->
-                      ensure_channel_session t ~channel_id:msg.channel_id
-                        ~project_name:p.name ~working_dir:wd
-                        ~system_prompt:None;
-                      handle_thread_message t msg ~channel_info:ch ())
+                    (* If the bot started draining during the wait,
+                       don't start fresh work — the restart's drain
+                       phase may have already moved on past its
+                       processing-flag wait, and a session born now
+                       could orphan its child at handoff timeout. *)
+                    if t.draining then
+                      ignore (Discord_rest.create_message t.rest
+                        ~channel_id:msg.channel_id
+                        ~content:"Bot is restarting. Try again \
+                                  shortly." ())
+                    else
+                      match Session_store.find_opt t.sessions
+                              ~thread_id:msg.channel_id with
+                      | Some _ ->
+                        (* start_session won the race; route normally
+                           (handle_thread_message queues if processing). *)
+                        handle_thread_message t msg ~channel_info:ch ()
+                      | None ->
+                        ensure_channel_session t ~channel_id:msg.channel_id
+                          ~project_name:p.name ~working_dir:wd
+                          ~system_prompt:None;
+                        handle_thread_message t msg ~channel_info:ch ())
                 | None -> handle_thread_message t msg ())
              | None -> handle_thread_message t msg ())
           | Error e ->

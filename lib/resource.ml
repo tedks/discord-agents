@@ -143,35 +143,66 @@ let sanitize_utf8 s =
   done;
   Buffer.contents buf
 
-(** Truncate [s] to at most [max_bytes] bytes, walking back to the
-    nearest UTF-8 codepoint boundary so we never split a previously-
-    valid codepoint in half. Whitespace is preserved (no [single_line]
-    collapse) — use [normalize_summary] when you also want bullet-leak
-    defense.
+(** Truncate [s] to at most [max_bytes] bytes, dropping any
+    incomplete multi-byte sequence at the cut so the output never
+    contains a half-encoded character introduced *by truncation*.
+    Whitespace is preserved (no [single_line] collapse) — use
+    [normalize_summary] when you also want bullet-leak defense.
 
     [max_bytes] is clamped to 0 if negative, so this is safe to call
     with attacker-supplied or arithmetic-derived bounds.
 
-    UTF-8 validity guarantee: if input is valid UTF-8, output is too.
-    If input contains pre-existing invalid bytes (lone leaders,
-    truncated multi-byte sequences, lone continuations, surrogates),
-    those bytes can survive into the output — this function only
-    refuses to introduce *new* invalidity at the cut point. Pair with
-    [sanitize_utf8] (which the Discord send path applies automatically)
-    for strict validity on the wire.
+    Two-step boundary walk:
+    1. Walk back from [max_bytes] over continuation bytes (0x80..0xBF)
+       so we don't cut mid-codepoint when the cut byte itself is part
+       of a still-in-progress sequence.
+    2. Identify the last would-be-included codepoint by walking back
+       from there over continuations to its lead byte. If the lead's
+       declared length doesn't fit within the truncated prefix
+       (e.g. cap=2 over [\\xE2\\x80a]: lead \\xE2 declares 3 bytes,
+       only 2 fit), drop that codepoint too.
 
-    Termination: walk-back is bounded by [max_bytes] and by the
-    decrement on each iteration, so always halts. *)
+    Validity guarantee — for VALID UTF-8 input, the output is valid
+    UTF-8 (no half-encoded characters introduced at the cut). For
+    input that's already invalid (lone continuations, lone leaders
+    away from the cut, overlongs, surrogates), those bytes survive
+    into the output unchanged — this function refuses to introduce
+    new invalidity but cannot repair pre-existing invalidity. Pair
+    with [sanitize_utf8] (which the Discord send path applies
+    automatically, and which [normalize_summary] now applies for
+    session-listing callers) for strict validity at the boundary.
+
+    Termination: each loop decrements a non-negative counter or
+    bails on a non-continuation byte, so always halts. *)
 let truncate_utf8 ~max_bytes s =
   let max_bytes = max 0 max_bytes in
   let n = String.length s in
   if n <= max_bytes then s
   else
+    let is_cont c = c >= 0x80 && c < 0xC0 in
+    (* Step 1: walk back from max_bytes over continuation bytes. *)
     let p = ref max_bytes in
-    while !p > 0 && !p < n
-      && (let c = Char.code s.[!p] in c >= 0x80 && c < 0xC0) do
+    while !p > 0 && !p < n && is_cont (Char.code s.[!p]) do
       decr p
     done;
+    (* Step 2: find the start of the last codepoint in [0..!p) and
+       check whether its declared length fits. If not, drop it. *)
+    if !p > 0 then begin
+      let lead_pos = ref (!p - 1) in
+      while !lead_pos > 0 && is_cont (Char.code s.[!lead_pos]) do
+        decr lead_pos
+      done;
+      let lead = Char.code s.[!lead_pos] in
+      let expected =
+        if lead < 0x80 then 1
+        else if lead < 0xC0 then 1   (* lone continuation; treat as 1 *)
+        else if lead < 0xE0 then 2
+        else if lead < 0xF0 then 3
+        else 4
+      in
+      if !p - !lead_pos < expected then
+        p := !lead_pos
+    end;
     String.sub s 0 !p
 
 (** Normalize a session-summary string for any downstream renderer:
@@ -191,4 +222,11 @@ let truncate_utf8 ~max_bytes s =
     (code blocks, bullets, paragraph breaks) — the [single_line]
     pass destroys it. See [truncate_utf8] for that case. *)
 let normalize_summary ~max_bytes s =
-  truncate_utf8 ~max_bytes (single_line s)
+  (* sanitize_utf8 first: session files are JSON (so should be valid
+     UTF-8 by yojson decode), but yojson tolerates raw bytes in JSON
+     strings, so a session file with malformed bytes can leak invalid
+     UTF-8 into a summary, then into the JSON the control_api
+     serializes for MCP, where the Python proxy decodes
+     [data.decode()] strictly and would raise UnicodeDecodeError.
+     Sanitizing here makes the session-listing boundary safe. *)
+  truncate_utf8 ~max_bytes (sanitize_utf8 (single_line s))
