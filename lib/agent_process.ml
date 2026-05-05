@@ -1371,9 +1371,20 @@ let codex_mcp_overrides () =
     first-turn failure that happened before thread.started, or skip
     resume after a first-turn failure that happened after it. The
     "--" separator prevents prompts that happen to begin with "-"
-    from being mistaken for a Codex flag. *)
+    from being mistaken for a Codex flag.
+
+    [--dangerously-bypass-approvals-and-sandbox] disables both the
+    approval prompts (which a non-interactive subprocess can't
+    answer anyway) and Codex's workspace-write filesystem sandbox.
+    The lighter-weight [--full-auto] only handles the approval
+    half. We pick the heavier flag because the bot's stated trust
+    model (README.md "no sandboxing in discord-agents itself") is
+    that the user runs it on a personal machine and Codex's sandbox
+    has historically blocked legitimate edits inside the worktree.
+    See issue #35 for making this configurable. *)
 let codex_args ~session_id ~session_id_confirmed ~prompt =
-  let base = ["codex"; "exec"; "--json"; "--full-auto";
+  let base = ["codex"; "exec"; "--json";
+              "--dangerously-bypass-approvals-and-sandbox";
               "--skip-git-repo-check"]
              @ codex_mcp_overrides () in
   if not session_id_confirmed then base @ ["--"; prompt]
@@ -1384,9 +1395,13 @@ let codex_args ~session_id ~session_id_confirmed ~prompt =
     Result. Subsequent runs resume only when [session_id_confirmed],
     matching the same coherence contract Codex uses.
 
-    [--yolo] auto-approves tool calls; without it Gemini blocks on an
+    [--yolo] auto-approves tool calls so Gemini doesn't block on an
     interactive approval prompt that the non-interactive subprocess
-    can't answer (mirrors Codex's [--full-auto]).
+    can't answer. It is *not* a full equivalent of Codex's
+    [--dangerously-bypass-approvals-and-sandbox]: that flag also
+    drops Codex's filesystem sandbox, while Gemini's [--yolo] only
+    covers approvals. The closer Codex analogue for [--yolo] is
+    [--full-auto].
 
     Gemini's MCP server config is written into [.gemini/settings.json]
     by [setup_gemini_mcp], which run_streaming calls before invoking
