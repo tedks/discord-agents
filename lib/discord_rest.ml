@@ -130,7 +130,15 @@ let request t ~meth ~path ?body () =
        offended; without the request body it's near-impossible to
        diagnose. The Resource.sanitize_utf8 patch should keep
        50109 from the [content] path, but other endpoints / fields
-       can still hit it. *)
+       can still hit it.
+
+       Privacy note: for create_message / edit_message the body holds
+       the agent's text or tool output verbatim — same content the
+       channel already sees, so this just mirrors it to the operator
+       log. Bot tokens are not in the body (auth is header-only).
+       Acceptable for the self-hosted single-user bot this codebase
+       targets; a multi-tenant deployment would want per-method
+       redaction. *)
     if code = 400 then
       Option.iter (fun b ->
         Logs.warn (fun m -> m "REST %s %s: 400 request body: %s"
