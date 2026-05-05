@@ -103,6 +103,7 @@ Non-command messages in control/project channels are routed to a Claude session 
 - **Channel reordering**: Active project channels float to the top of the category.
 - **Worktrees**: Each `start` command creates an isolated git worktree (`agent/<kind>-<uuid>`).
 - **Graceful restart**: `!restart` drains active sessions, rebuilds, and respawns.
+- **Codex sandbox**: Codex sessions run with `--dangerously-bypass-approvals-and-sandbox` (no filesystem sandbox, no approval prompts). The bot is single-tenant on a personal machine and the lighter `--full-auto` blocks edits the user routinely makes; see issue #35 for plumbing this through configuration so the sandboxed mode can be opted into.
 
 ## Discord formatting gotchas
 
