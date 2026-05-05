@@ -144,11 +144,16 @@ let handle_start_session (bot : Bot.t) params =
   let initial_prompt = match initial_prompt with
     | Some s ->
       let s = String.trim s in
-      (* Cap below Discord's 2000-char message limit so the prompt
+      (* Cap below Discord's 2000-byte message limit so the prompt
          posts as a single message; we use that message as the
-         reaction anchor for the auto-triggered agent run. *)
-      let s = if String.length s > 1900
-        then String.sub s 0 1900 else s in
+         reaction anchor for the auto-triggered agent run.
+         [Resource.normalize_summary] truncates on a UTF-8 codepoint
+         boundary so we never split a multi-byte character — a raw
+         [String.sub] would do that, and the new send-path
+         sanitization in PR #33 would then "repair" the cut byte to
+         U+FFFD, silently corrupting the last character.
+         Cap is 1900 *bytes*; the MCP schema description matches. *)
+      let s = Resource.normalize_summary ~max_bytes:1900 s in
       if s = "" then None else Some s
     | None -> None in
   match Command.find_project_fuzzy (Bot.projects bot) project_str with
@@ -198,17 +203,6 @@ let handle_start_session (bot : Bot.t) params =
         | Error e -> error_response (Printf.sprintf "Failed to create thread: %s" e)
         | Ok thread_ch ->
           let session_id = Resource.generate_uuid () in
-          (* initial_prompt:None — when set, we post it as a visible
-             Discord message below and feed that message to
-             [Bot.handle_thread_message] to auto-trigger the agent.
-             Stashing it in [session.initial_prompt] would silently
-             prepend it to whatever the user sends next instead, so the
-             user never sees what context the agent received. *)
-          let session = Session_store.make_session
-            ~project_name:p.name ~working_dir ~agent_kind:kind
-            ~session_id ~thread_id:thread_ch.Discord_types.id
-            ~system_prompt:None ~initial_prompt:None () in
-          Session_store.add bot.sessions ~thread_id:thread_ch.id session;
           let branch_str = match branch_info with
             | Some b -> Printf.sprintf "\nBranch: `%s`" b | None -> "" in
           let starter_text = match initial_prompt with
@@ -216,25 +210,61 @@ let handle_start_session (bot : Bot.t) params =
               "Working on the prompt below \u{2014} send a message any \
                time to add to the conversation."
             | None -> "Send a message to interact." in
-          ignore (Discord_rest.create_message bot.rest ~channel_id:thread_ch.id
+          ignore (Discord_rest.create_message bot.rest
+            ~channel_id:thread_ch.id
             ~content:(Printf.sprintf
               "**%s** session started for **%s**%s\nWorking in: `%s`\n%s"
               kind_str p.name branch_str working_dir starter_text) ());
-          (* Phase 3: post the initial_prompt as a visible message so
-             the user can see what task the agent is starting on, then
-             route that message through the normal thread-message path
-             so the agent runs immediately (with reactions and queue
-             handling identical to a user-typed message). *)
+          (* Build the session struct with [initial_prompt:None] —
+             when an initial_prompt was supplied, we post it as a
+             visible Discord message below and feed that message to
+             the agent runner directly. Stashing it in
+             [session.initial_prompt] would silently prepend it to
+             whatever the user sends next instead, so the user never
+             sees what context the agent received. *)
+          let session = Session_store.make_session
+            ~project_name:p.name ~working_dir ~agent_kind:kind
+            ~session_id ~thread_id:thread_ch.Discord_types.id
+            ~system_prompt:None ~initial_prompt:None () in
+          (* Auto-trigger path: post the initial_prompt visibly, then
+             fire the agent on it without waiting for a user message.
+
+             Order matters for two failure modes:
+
+             1. Race with gateway: a user typing in the new thread
+                could arrive between [Session_store.add] and the
+                fork that runs the agent. If the session is added
+                while [processing = false], that user message would
+                run *first* and our auto-trigger would queue behind
+                it — defeating the point of the auto-trigger. We
+                pre-set [processing <- true] *before*
+                [Session_store.add] so any racing user message
+                lands in the pending_queue; the auto-trigger fiber
+                drains the queue when its agent run finishes.
+
+             2. Post failure: if [create_message] fails, persisting
+                an empty session leaves the user with a thread that
+                shows no agent activity and no way to recover the
+                lost prompt. We post first, only persist on success. *)
           (match initial_prompt with
-           | None -> ()
+           | None ->
+             Session_store.add bot.sessions ~thread_id:thread_ch.id session
            | Some prompt ->
              match Discord_rest.create_message bot.rest
                      ~channel_id:thread_ch.id ~content:prompt () with
              | Error e ->
+               (* Don't persist the session — caller sees the failure
+                  in the response and can retry without an orphan
+                  thread/session pair lying around. *)
                Logs.warn (fun m -> m
-                 "control_api: failed to post initial_prompt: %s" e)
+                 "control_api: failed to post initial_prompt: %s" e);
+               failwith ("failed to post initial_prompt: " ^ e)
              | Ok prompt_msg ->
-               Bot.handle_thread_message bot prompt_msg ());
+               session.processing <- true;
+               Session_store.add bot.sessions
+                 ~thread_id:thread_ch.id session;
+               Bot.run_initial_prompt_synchronous bot
+                 ~session ~msg:prompt_msg);
           ok_response [
             ("thread_id", `String thread_ch.id);
             ("working_dir", `String working_dir);
