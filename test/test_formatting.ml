@@ -2336,8 +2336,9 @@ let test_codex_args_fresh () =
     (List.length args >= 2 && List.nth args 0 = "codex"
      && List.nth args 1 = "exec");
   Alcotest.(check bool) "includes --json" true (List.mem "--json" args);
-  Alcotest.(check bool) "includes --full-auto" true
-    (List.mem "--full-auto" args);
+  Alcotest.(check bool) "includes --dangerously-bypass-approvals-and-sandbox"
+    true
+    (List.mem "--dangerously-bypass-approvals-and-sandbox" args);
   Alcotest.(check bool) "includes --skip-git-repo-check" true
     (List.mem "--skip-git-repo-check" args);
   Alcotest.(check bool) "no resume on fresh" false (List.mem "resume" args);

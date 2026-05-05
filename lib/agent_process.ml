@@ -1373,7 +1373,8 @@ let codex_mcp_overrides () =
     "--" separator prevents prompts that happen to begin with "-"
     from being mistaken for a Codex flag. *)
 let codex_args ~session_id ~session_id_confirmed ~prompt =
-  let base = ["codex"; "exec"; "--json"; "--full-auto";
+  let base = ["codex"; "exec"; "--json";
+              "--dangerously-bypass-approvals-and-sandbox";
               "--skip-git-repo-check"]
              @ codex_mcp_overrides () in
   if not session_id_confirmed then base @ ["--"; prompt]
@@ -1386,7 +1387,8 @@ let codex_args ~session_id ~session_id_confirmed ~prompt =
 
     [--yolo] auto-approves tool calls; without it Gemini blocks on an
     interactive approval prompt that the non-interactive subprocess
-    can't answer (mirrors Codex's [--full-auto]).
+    can't answer (mirrors Codex's
+    [--dangerously-bypass-approvals-and-sandbox]).
 
     Gemini's MCP server config is written into [.gemini/settings.json]
     by [setup_gemini_mcp], which run_streaming calls before invoking
