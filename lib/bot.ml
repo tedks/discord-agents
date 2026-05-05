@@ -909,6 +909,118 @@ let resolve_channel_context t ~(channel_id : Discord_types.channel_id)
     the user is warned. This is intentional: blocking messages during drain
     would prevent using other sessions while a long-running task finishes.
     The restart waits for all session.processing flags to go false. *)
+(** Run the agent for one message and drain any messages that queued
+    behind it. Caller must have set [session.processing <- true] and
+    is responsible for resetting it on exit (typically via Fun.protect
+    in the fiber that called us).
+
+    Extracted from the body of [handle_thread_message] so the auto-trigger
+    path in [fork_initial_prompt_run] can reuse it without going
+    back through the queue check (which would cause it to queue itself
+    behind the very flag we set to close the gateway race). *)
+let rec process_session_message t session
+    (msg : Discord_types.message) channel_info =
+  let child_pid = ref None in
+  Fun.protect ~finally:(fun () ->
+    Option.iter (unregister_child_pid t) !child_pid
+  ) (fun () ->
+    let channel_id = msg.channel_id in
+    let message_id = msg.id in
+    ignore (Discord_rest.create_reaction t.rest ~channel_id
+      ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
+    Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
+      ~project_name:session.Session_store.project_name (channels t);
+    let author_name = msg.author.username in
+    let (channel_name, channel_type) =
+      resolve_channel_context t ~channel_id ~session ?channel_info () in
+    let on_pid pid =
+      child_pid := Some pid;
+      register_child_pid t pid;
+      Logs.info (fun m -> m "bot: registered child pid %d" pid) in
+    (* Forward-compat: [session.initial_prompt] is no longer set by any
+       current caller (control_api now posts the prompt visibly and
+       feeds it to handle_thread_message directly — see
+       control_api.handle_start_session). The prepend stays so a
+       sessions.json persisted before that change still gets the
+       intended preface on its first message after a bot restart.
+       Removable once we're sure no on-disk session still carries
+       a non-None [initial_prompt]. *)
+    let had_initial_prompt = Option.is_some session.initial_prompt in
+    let prompt = match session.initial_prompt with
+      | Some ctx ->
+        Printf.sprintf "<session-context>\n%s\n</session-context>\n\n%s"
+          ctx msg.content
+      | None -> msg.content
+    in
+    let on_scroll_content chunks lines_used =
+      (* Cap stored content at ~100KB to prevent memory bloat.
+         The cap is a budget for take_fitting_prefix (which is
+         fence-aware: ``` costs 6); for fence-free text this
+         matches raw bytes within ±a single chunk. Tail-recursive
+         to avoid stack growth on highly fragmented output. *)
+      let rec take_bytes budget acc = function
+        | [] -> List.rev acc
+        | _ when budget <= 0 -> List.rev acc
+        | c :: rest ->
+          let len = String.length c in
+          if len >= budget then
+            List.rev (
+              String.sub c 0
+                (Agent_process.take_fitting_prefix
+                   ~max_chars:budget c)
+              :: acc)
+          else
+            take_bytes (budget - len - 1) (c :: acc) rest
+      in
+      let capped = take_bytes 100_000 [] chunks in
+      let block = { lines = Array.of_list capped;
+                    output_lines_used = lines_used;
+                    next_line = lines_used } in
+      let state = match Hashtbl.find_opt t.scroll_states channel_id with
+        | Some s -> s
+        | None -> { blocks = []; current_block = 1 } in
+      (* Push new block to front (most recent first), cap at 20 *)
+      let blocks = block :: (if List.length state.blocks >= 20
+        then List.filteri (fun i _ -> i < 19) state.blocks
+        else state.blocks) in
+      state.blocks <- blocks;
+      state.current_block <- 1;
+      Hashtbl.replace t.scroll_states channel_id state in
+    let on_session_id sid =
+      Session_store.set_session_id t.sessions session
+        ~session_id:sid in
+    let result = Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
+            ~session ~channel_id ~prompt
+            ~attachments:msg.attachments
+            ~author_name ~channel_name ~channel_type
+            ~wrap_width:t.wrap_width
+            ~output_lines:t.output_lines
+            ~on_scroll_content ~on_pid ~on_session_id () in
+    ignore (Discord_rest.delete_own_reaction t.rest ~channel_id
+      ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
+    (match result with
+    | Ok () ->
+      ignore (Discord_rest.create_reaction t.rest ~channel_id
+        ~message_id ~emoji:"\xE2\x9C\x85" ());
+      (* Clear initial_prompt only after successful run so it
+         survives failures and retries. Cleared before
+         increment_message_count to persist in a single save. *)
+      if had_initial_prompt then
+        session.initial_prompt <- None;
+      Session_store.increment_message_count t.sessions session
+    | Error _ ->
+      ignore (Discord_rest.create_reaction t.rest ~channel_id
+        ~message_id ~emoji:"\xE2\x9D\x8C" ())));
+  (* Drain the queue: process next pending message if any *)
+  match Queue.take_opt session.pending_queue with
+  | None -> ()
+  | Some pending ->
+    (* Remove hourglass, will get eyes when processing starts *)
+    ignore (Discord_rest.delete_own_reaction t.rest
+      ~channel_id:pending.msg.channel_id
+      ~message_id:pending.msg.id ~emoji:"\xE2\x8F\xB3" ());
+    process_session_message t session pending.msg pending.channel_info
+
 let handle_thread_message t msg ?channel_info () =
   if t.draining then
     ignore (Discord_rest.create_message t.rest
@@ -929,105 +1041,27 @@ let handle_thread_message t msg ?channel_info () =
         Fun.protect ~finally:(fun () ->
           session.processing <- false
         ) (fun () ->
-          let rec process_message (msg : Discord_types.message) channel_info =
-            let child_pid = ref None in
-            Fun.protect ~finally:(fun () ->
-              Option.iter (unregister_child_pid t) !child_pid
-            ) (fun () ->
-              let channel_id = msg.channel_id in
-              let message_id = msg.id in
-              ignore (Discord_rest.create_reaction t.rest ~channel_id
-                ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
-              Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
-                ~project_name:session.project_name (channels t);
-              let author_name = msg.author.username in
-              let (channel_name, channel_type) =
-                resolve_channel_context t ~channel_id ~session ?channel_info () in
-              let on_pid pid =
-                child_pid := Some pid;
-                register_child_pid t pid;
-                Logs.info (fun m -> m "bot: registered child pid %d" pid) in
-              (* On the first message, prepend any initial context from the
-                 session creator (e.g. the project channel agent that started
-                 this thread). Consumed once, then cleared. *)
-              let had_initial_prompt = Option.is_some session.initial_prompt in
-              let prompt = match session.initial_prompt with
-                | Some ctx ->
-                  Printf.sprintf "<session-context>\n%s\n</session-context>\n\n%s"
-                    ctx msg.content
-                | None -> msg.content
-              in
-              let on_scroll_content chunks lines_used =
-                (* Cap stored content at ~100KB to prevent memory bloat.
-                   The cap is a budget for take_fitting_prefix (which is
-                   fence-aware: ``` costs 6); for fence-free text this
-                   matches raw bytes within ±a single chunk. Tail-recursive
-                   to avoid stack growth on highly fragmented output. *)
-                let rec take_bytes budget acc = function
-                  | [] -> List.rev acc
-                  | _ when budget <= 0 -> List.rev acc
-                  | c :: rest ->
-                    let len = String.length c in
-                    if len >= budget then
-                      List.rev (
-                        String.sub c 0
-                          (Agent_process.take_fitting_prefix
-                             ~max_chars:budget c)
-                        :: acc)
-                    else
-                      take_bytes (budget - len - 1) (c :: acc) rest
-                in
-                let capped = take_bytes 100_000 [] chunks in
-                let block = { lines = Array.of_list capped;
-                              output_lines_used = lines_used;
-                              next_line = lines_used } in
-                let state = match Hashtbl.find_opt t.scroll_states channel_id with
-                  | Some s -> s
-                  | None -> { blocks = []; current_block = 1 } in
-                (* Push new block to front (most recent first), cap at 20 *)
-                let blocks = block :: (if List.length state.blocks >= 20
-                  then List.filteri (fun i _ -> i < 19) state.blocks
-                  else state.blocks) in
-                state.blocks <- blocks;
-                state.current_block <- 1;
-                Hashtbl.replace t.scroll_states channel_id state in
-              let on_session_id sid =
-                Session_store.set_session_id t.sessions session
-                  ~session_id:sid in
-              let result = Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
-                      ~session ~channel_id ~prompt
-                      ~attachments:msg.attachments
-                      ~author_name ~channel_name ~channel_type
-                      ~wrap_width:t.wrap_width
-                      ~output_lines:t.output_lines
-                      ~on_scroll_content ~on_pid ~on_session_id () in
-              ignore (Discord_rest.delete_own_reaction t.rest ~channel_id
-                ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
-              (match result with
-              | Ok () ->
-                ignore (Discord_rest.create_reaction t.rest ~channel_id
-                  ~message_id ~emoji:"\xE2\x9C\x85" ());
-                (* Clear initial_prompt only after successful run so it
-                   survives failures and retries. Cleared before
-                   increment_message_count to persist in a single save. *)
-                if had_initial_prompt then
-                  session.initial_prompt <- None;
-                Session_store.increment_message_count t.sessions session
-              | Error _ ->
-                ignore (Discord_rest.create_reaction t.rest ~channel_id
-                  ~message_id ~emoji:"\xE2\x9D\x8C" ())));
-            (* Drain the queue: process next pending message if any *)
-            match Queue.take_opt session.pending_queue with
-            | None -> ()
-            | Some pending ->
-              (* Remove hourglass, will get eyes when processing starts *)
-              ignore (Discord_rest.delete_own_reaction t.rest
-                ~channel_id:pending.msg.channel_id
-                ~message_id:pending.msg.id ~emoji:"\xE2\x8F\xB3" ());
-              process_message pending.msg pending.channel_info
-          in
-          process_message msg channel_info))
+          process_session_message t session msg channel_info))
     end
+
+(** Fork an agent run on a fresh session whose [processing] flag is
+    already locked by the caller. Used by
+    control_api.handle_start_session to fire the auto-trigger
+    immediately, bypassing the queue check that
+    [handle_thread_message] would otherwise impose on a busy session.
+
+    Order requirement: caller MUST set [session.processing <- true]
+    *before* calling [Session_store.add], so that any user message
+    landing in the new thread between [add] and our fork queues
+    correctly behind us — and MUST keep that flag set until calling
+    here. The fork's [Fun.protect] resets the flag when the run
+    completes (after the queue drain). *)
+let fork_initial_prompt_run t ~session ~msg =
+  Eio.Fiber.fork ~sw:t.sw (fun () ->
+    Fun.protect ~finally:(fun () ->
+      session.Session_store.processing <- false
+    ) (fun () ->
+      process_session_message t session msg None))
 
 (** Ensure a session exists for a channel (control or project channels).
     Creates a persistent Claude session so the channel can handle chat directly. *)
@@ -1110,17 +1144,49 @@ let handle_message t (msg : Discord_types.message) =
             (match parent_project with
              | Some proj_name ->
                (* Thread under a project channel with no session —
-                  auto-create one (e.g. manually created in Discord). *)
+                  auto-create one (e.g. manually created in Discord).
+
+                  Race-safety: defer the auto-create by 2s and re-
+                  check the session store, in case
+                  [control_api.handle_start_session] is in the middle
+                  of an HTTP roundtrip to create a session for this
+                  thread. Without the wait, a user typing into a
+                  freshly-bot-created thread would race the
+                  start_session HTTP and get a default-worktree
+                  session here instead of the agent-specific
+                  worktree the MCP caller asked for. The cost is a
+                  one-time 2s delay for messages in manually-
+                  created threads (rare in this bot's usage). *)
                let proj = List.find_opt (fun (p : Project.t) ->
                  p.name = proj_name) (projects t) in
                (match proj with
                 | Some p ->
                   let wd = match working_dir_of_project p with
                     | Ok d -> d | Error _ -> p.path in
-                  ensure_channel_session t ~channel_id:msg.channel_id
-                    ~project_name:p.name ~working_dir:wd
-                    ~system_prompt:None;
-                  handle_thread_message t msg ~channel_info:ch ()
+                  Eio.Fiber.fork ~sw:t.sw (fun () ->
+                    Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
+                    (* If the bot started draining during the wait,
+                       don't start fresh work — the restart's drain
+                       phase may have already moved on past its
+                       processing-flag wait, and a session born now
+                       could orphan its child at handoff timeout. *)
+                    if t.draining then
+                      ignore (Discord_rest.create_message t.rest
+                        ~channel_id:msg.channel_id
+                        ~content:"Bot is restarting. Try again \
+                                  shortly." ())
+                    else
+                      match Session_store.find_opt t.sessions
+                              ~thread_id:msg.channel_id with
+                      | Some _ ->
+                        (* start_session won the race; route normally
+                           (handle_thread_message queues if processing). *)
+                        handle_thread_message t msg ~channel_info:ch ()
+                      | None ->
+                        ensure_channel_session t ~channel_id:msg.channel_id
+                          ~project_name:p.name ~working_dir:wd
+                          ~system_prompt:None;
+                        handle_thread_message t msg ~channel_info:ch ())
                 | None -> handle_thread_message t msg ())
              | None -> handle_thread_message t msg ())
           | Error e ->

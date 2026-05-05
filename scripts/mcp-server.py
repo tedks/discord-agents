@@ -81,8 +81,8 @@ TOOLS = [
                 },
                 "initial_prompt": {
                     "type": "string",
-                    "description": "Context for the new session agent about what task to work on. Passed to the agent on its first interaction. Keep it concise — describe the goal, not step-by-step instructions.",
-                    "maxLength": 4000
+                    "description": "First message to send to the new agent. Posted visibly in the thread, then the agent starts working on it immediately — the user does not need to send a follow-up. Keep it concise: describe the goal and any key context, not step-by-step instructions. Capped at 1900 *bytes* on the server (UTF-8 codepoint-aware truncation, so multi-byte characters can shorten the effective char count); the maxLength below is the worst case (all-ASCII).",
+                    "maxLength": 1900
                 }
             },
             "required": ["project"]

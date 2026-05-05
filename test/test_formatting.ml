@@ -1682,6 +1682,23 @@ let test_normalize_summary_well_formed_utf8 () =
   in
   Alcotest.(check bool) "output is well-formed UTF-8" true (walk 0)
 
+let test_normalize_summary_sanitizes_invalid_utf8 () =
+  (* Round-4 finding: session-listing path serializes summaries to
+     JSON for the MCP proxy, which decodes strictly. normalize_summary
+     must therefore guarantee valid UTF-8 even if the underlying
+     session file leaked malformed bytes through yojson. *)
+  let s = "before \x80 after" in  (* lone continuation byte *)
+  let out = Discord_agents.Resource.normalize_summary ~max_bytes:100 s in
+  (* The lone 0x80 must be sanitized to U+FFFD (3 bytes 0xEF 0xBF 0xBD). *)
+  Alcotest.(check bool) "no lone 0x80 survives"
+    false (String.contains out '\x80'
+           && not (String.contains out '\xEF'));
+  Alcotest.(check bool) "U+FFFD replacement appears"
+    true (try
+      ignore (Str.search_forward (Str.regexp_string "\xEF\xBF\xBD") out 0);
+      true
+    with Not_found -> false)
+
 let test_normalize_summary_combined () =
   (* Multi-paragraph user prompt with non-ASCII content — exactly the
      shape that triggered the original bullet-leak bug. *)
@@ -1707,6 +1724,92 @@ let normalize_summary_tests = [
     test_normalize_summary_well_formed_utf8;
   Alcotest.test_case "newline + UTF-8 combined input" `Quick
     test_normalize_summary_combined;
+  Alcotest.test_case "sanitizes invalid UTF-8 (MCP-listing safety)" `Quick
+    test_normalize_summary_sanitizes_invalid_utf8;
+]
+
+(* ── truncate_utf8 (preserves whitespace; codepoint-boundary cap) ── *)
+
+let test_truncate_utf8_preserves_newlines () =
+  let s = "line one\nline two\nline three" in
+  Alcotest.(check string) "newlines survive truncate (under cap)"
+    s (Discord_agents.Resource.truncate_utf8 ~max_bytes:1000 s)
+
+let test_truncate_utf8_preserves_tabs () =
+  let s = "col1\tcol2\tcol3" in
+  Alcotest.(check string) "tabs survive truncate (under cap)"
+    s (Discord_agents.Resource.truncate_utf8 ~max_bytes:1000 s)
+
+let test_truncate_utf8_codepoint_boundary () =
+  (* "héllo" — é is 0xC3 0xA9, two bytes. Cap at 2 bytes lands inside é;
+     truncate must walk back to 1 byte. *)
+  let s = "h\xC3\xA9llo" in
+  let out = Discord_agents.Resource.truncate_utf8 ~max_bytes:2 s in
+  Alcotest.(check string) "walks back past mid-codepoint cut"
+    "h" out
+
+let test_truncate_utf8_passthrough_under_cap () =
+  let s = "any string under cap" in
+  Alcotest.(check string) "under cap is identical"
+    s (Discord_agents.Resource.truncate_utf8 ~max_bytes:9999 s)
+
+let test_truncate_utf8_no_single_line_collapse () =
+  (* Critical: this is the property normalize_summary destroys.
+     truncate_utf8 must NOT collapse \n \r \t. *)
+  let s = "before\n\r\tafter" in
+  Alcotest.(check string) "newlines/tabs preserved"
+    s (Discord_agents.Resource.truncate_utf8 ~max_bytes:1000 s)
+
+let test_truncate_utf8_negative_max_bytes () =
+  (* Negative max_bytes is clamped to 0; no Invalid_argument. *)
+  Alcotest.(check string) "negative clamps to empty"
+    "" (Discord_agents.Resource.truncate_utf8 ~max_bytes:(-1) "any input");
+  Alcotest.(check string) "zero stays empty"
+    "" (Discord_agents.Resource.truncate_utf8 ~max_bytes:0 "any input")
+
+let test_truncate_utf8_drops_incomplete_3byte_at_cut () =
+  (* Round-4 finding: cap that lands inside an in-progress 3-byte
+     sequence (lead at pos 0, only 1 of 2 needed continuations
+     fits) must drop the lead too. Otherwise we ship a truncated
+     E2 80 with no third byte — invalid UTF-8 introduced at the cut. *)
+  let s = "\xE2\x80\xA9after" in  (* U+2029 LINE SEP, then "after" *)
+  let out = Discord_agents.Resource.truncate_utf8 ~max_bytes:2 s in
+  Alcotest.(check string) "incomplete lead dropped"
+    "" out
+
+let test_truncate_utf8_keeps_complete_codepoint_at_cut () =
+  (* If the last codepoint completes within the cap, keep it. *)
+  let s = "x\xC3\xA9y" in  (* x + é + y *)
+  let out = Discord_agents.Resource.truncate_utf8 ~max_bytes:3 s in
+  Alcotest.(check string) "complete é stays"
+    "x\xC3\xA9" out
+
+let test_truncate_utf8_drops_2byte_lead_at_cut () =
+  (* 2-byte lead alone with cap=1: drop. *)
+  let s = "x\xC3\xA9" in
+  let out = Discord_agents.Resource.truncate_utf8 ~max_bytes:2 s in
+  Alcotest.(check string) "incomplete 2-byte lead dropped"
+    "x" out
+
+let truncate_utf8_tests = [
+  Alcotest.test_case "preserves \\n in multi-line input" `Quick
+    test_truncate_utf8_preserves_newlines;
+  Alcotest.test_case "preserves \\t in tabular input" `Quick
+    test_truncate_utf8_preserves_tabs;
+  Alcotest.test_case "walks back past mid-codepoint cut" `Quick
+    test_truncate_utf8_codepoint_boundary;
+  Alcotest.test_case "passthrough when under cap" `Quick
+    test_truncate_utf8_passthrough_under_cap;
+  Alcotest.test_case "no single_line collapse (critical for prompts)" `Quick
+    test_truncate_utf8_no_single_line_collapse;
+  Alcotest.test_case "negative max_bytes is clamped to 0" `Quick
+    test_truncate_utf8_negative_max_bytes;
+  Alcotest.test_case "incomplete 3-byte sequence dropped at cut" `Quick
+    test_truncate_utf8_drops_incomplete_3byte_at_cut;
+  Alcotest.test_case "complete codepoint at cut is kept" `Quick
+    test_truncate_utf8_keeps_complete_codepoint_at_cut;
+  Alcotest.test_case "incomplete 2-byte lead dropped at cut" `Quick
+    test_truncate_utf8_drops_2byte_lead_at_cut;
 ]
 
 (* ── sanitize_utf8 ─────────────────────────────────────────────────── *)
@@ -2585,6 +2688,7 @@ let () =
     "session_store", session_store_tests;
     "resume_helpers", resume_helpers_tests;
     "normalize_summary", normalize_summary_tests;
+    "truncate_utf8", truncate_utf8_tests;
     "sanitize_utf8", sanitize_utf8_tests;
     "discoverer_sanitization", discoverer_sanitization_tests;
     "setup_gemini_mcp_e2e", setup_gemini_mcp_e2e_tests;
