@@ -143,6 +143,24 @@ let sanitize_utf8 s =
   done;
   Buffer.contents buf
 
+(** Truncate [s] to at most [max_bytes] bytes, walking back to the
+    nearest UTF-8 codepoint boundary so we never emit a half-encoded
+    character. Whitespace is preserved (no [single_line] collapse) —
+    use [normalize_summary] when you also want bullet-leak defense.
+
+    The walk-back is bounded by [max_bytes] and by remaining length,
+    so termination is guaranteed regardless of input validity. *)
+let truncate_utf8 ~max_bytes s =
+  let n = String.length s in
+  if n <= max_bytes then s
+  else
+    let p = ref max_bytes in
+    while !p > 0 && !p < n
+      && (let c = Char.code s.[!p] in c >= 0x80 && c < 0xC0) do
+      decr p
+    done;
+    String.sub s 0 !p
+
 (** Normalize a session-summary string for any downstream renderer:
     [single_line] it (multi-paragraph user prompts would otherwise
     leak as sibling top-level bullets when Discord renders them
@@ -154,19 +172,10 @@ let sanitize_utf8 s =
     (claude_sessions, codex_sessions, gemini_sessions) so the
     [info.summary] field is safe regardless of which renderer
     consumes it (Bot.format_session_listing, MCP server,
-    control_api JSON, etc). *)
+    control_api JSON, etc).
+
+    Do NOT use this for free-form text where structure matters
+    (code blocks, bullets, paragraph breaks) — the [single_line]
+    pass destroys it. See [truncate_utf8] for that case. *)
 let normalize_summary ~max_bytes s =
-  let cleaned = single_line s in
-  let n = String.length cleaned in
-  if n <= max_bytes then cleaned
-  else
-    (* Walk back from max_bytes to a codepoint boundary. A
-       continuation byte (0x80–0xBF) is mid-codepoint; lead and
-       ASCII bytes are valid split points. Bounded by [max_bytes]
-       and by remaining length so we always make progress. *)
-    let p = ref max_bytes in
-    while !p > 0 && !p < n
-      && (let c = Char.code cleaned.[!p] in c >= 0x80 && c < 0xC0) do
-      decr p
-    done;
-    String.sub cleaned 0 !p
+  truncate_utf8 ~max_bytes (single_line s)

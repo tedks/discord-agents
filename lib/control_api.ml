@@ -134,6 +134,16 @@ let handle_start_session (bot : Bot.t) params =
   let open Yojson.Safe.Util in
   let params = match params with Some p -> p | None ->
     failwith "missing params" in
+  (* Refuse new sessions during a graceful restart: the bot is
+     waiting for in-flight session.processing flags to clear before
+     exec'ing the new build, so accepting a new session here either
+     delays the restart (fork holds the flag) or races with handoff.
+     Mirrors the warning [handle_thread_message] posts to in-flight
+     threads while draining; for start_session there's no thread to
+     warn in yet, so we just refuse. *)
+  if bot.draining then
+    error_response "Bot is restarting; try again shortly."
+  else
   let project_str = params |> member "project" |> to_string in
   let kind_str = match params |> member "agent" |> to_string_option with
     | Some s -> s | None -> "claude" in
@@ -147,13 +157,18 @@ let handle_start_session (bot : Bot.t) params =
       (* Cap below Discord's 2000-byte message limit so the prompt
          posts as a single message; we use that message as the
          reaction anchor for the auto-triggered agent run.
-         [Resource.normalize_summary] truncates on a UTF-8 codepoint
-         boundary so we never split a multi-byte character — a raw
-         [String.sub] would do that, and the new send-path
-         sanitization in PR #33 would then "repair" the cut byte to
-         U+FFFD, silently corrupting the last character.
+         [Resource.truncate_utf8] is codepoint-aware (a raw
+         [String.sub] would split a multi-byte character, and the
+         send-path sanitization in PR #33 would then "repair" the
+         cut byte to U+FFFD, silently corrupting the last character).
+         We DON'T use [normalize_summary] here because its
+         [single_line] pass collapses \\n / \\r / \\t and would
+         flatten a structured prompt (code blocks, bullets,
+         paragraph breaks) into one line — and the prompt is posted
+         as a standalone Discord message, not embedded in a markdown
+         list, so there are no sibling bullets to defend against.
          Cap is 1900 *bytes*; the MCP schema description matches. *)
-      let s = Resource.normalize_summary ~max_bytes:1900 s in
+      let s = Resource.truncate_utf8 ~max_bytes:1900 s in
       if s = "" then None else Some s
     | None -> None in
   match Command.find_project_fuzzy (Bot.projects bot) project_str with
@@ -210,11 +225,6 @@ let handle_start_session (bot : Bot.t) params =
               "Working on the prompt below \u{2014} send a message any \
                time to add to the conversation."
             | None -> "Send a message to interact." in
-          ignore (Discord_rest.create_message bot.rest
-            ~channel_id:thread_ch.id
-            ~content:(Printf.sprintf
-              "**%s** session started for **%s**%s\nWorking in: `%s`\n%s"
-              kind_str p.name branch_str working_dir starter_text) ());
           (* Build the session struct with [initial_prompt:None] —
              when an initial_prompt was supplied, we post it as a
              visible Discord message below and feed that message to
@@ -226,53 +236,85 @@ let handle_start_session (bot : Bot.t) params =
             ~project_name:p.name ~working_dir ~agent_kind:kind
             ~session_id ~thread_id:thread_ch.Discord_types.id
             ~system_prompt:None ~initial_prompt:None () in
-          (* Auto-trigger path: post the initial_prompt visibly, then
-             fire the agent on it without waiting for a user message.
+          (* Race-safe ordering for the auto-trigger.
 
-             Order matters for two failure modes:
+             When an initial_prompt is set, we MUST publish the
+             session to the store with [processing = true] *before*
+             posting any visible Discord message. Any of those posts
+             (announcement OR prompt) yields, and a user typing
+             into the freshly-created thread during that yield will
+             reach the gateway before us. If we hadn't added the
+             session yet, [Bot.handle_thread_message] would
+             [find_opt -> None] and silently drop the message; if
+             we'd added it with [processing = false], the user's
+             message would run *first* and our auto-trigger would
+             queue behind it. Setting [processing <- true] first
+             and then [Session_store.add] makes any racing user
+             message queue correctly into [pending_queue]. The
+             [fork_initial_prompt_run] fiber drains that queue when
+             its agent run finishes.
 
-             1. Race with gateway: a user typing in the new thread
-                could arrive between [Session_store.add] and the
-                fork that runs the agent. If the session is added
-                while [processing = false], that user message would
-                run *first* and our auto-trigger would queue behind
-                it — defeating the point of the auto-trigger. We
-                pre-set [processing <- true] *before*
-                [Session_store.add] so any racing user message
-                lands in the pending_queue; the auto-trigger fiber
-                drains the queue when its agent run finishes.
-
-             2. Post failure: if [create_message] fails, persisting
-                an empty session leaves the user with a thread that
-                shows no agent activity and no way to recover the
-                lost prompt. We post first, only persist on success. *)
+             For the no-prompt path we add normally (no
+             [processing] lock); the user's first message goes
+             through the standard [handle_thread_message] flow. *)
           (match initial_prompt with
            | None ->
-             Session_store.add bot.sessions ~thread_id:thread_ch.id session
+             Session_store.add bot.sessions ~thread_id:thread_ch.id session;
+             ignore (Discord_rest.create_message bot.rest
+               ~channel_id:thread_ch.id
+               ~content:(Printf.sprintf
+                 "**%s** session started for **%s**%s\nWorking in: `%s`\n%s"
+                 kind_str p.name branch_str working_dir starter_text) ());
+             ok_response [
+               ("thread_id", `String thread_ch.id);
+               ("working_dir", `String working_dir);
+               ("branch", match branch_info with
+                 | Some b -> `String b | None -> `Null);
+               ("project_name", `String p.name);
+               ("session_id", `String session_id);
+             ]
            | Some prompt ->
+             session.processing <- true;
+             Session_store.add bot.sessions ~thread_id:thread_ch.id session;
+             ignore (Discord_rest.create_message bot.rest
+               ~channel_id:thread_ch.id
+               ~content:(Printf.sprintf
+                 "**%s** session started for **%s**%s\nWorking in: `%s`\n%s"
+                 kind_str p.name branch_str working_dir starter_text) ());
              match Discord_rest.create_message bot.rest
                      ~channel_id:thread_ch.id ~content:prompt () with
              | Error e ->
-               (* Don't persist the session — caller sees the failure
-                  in the response and can retry without an orphan
-                  thread/session pair lying around. *)
+               (* Roll back: the session is half-published (in store
+                  but [processing] locked, no agent fiber will fire),
+                  and the thread holds an orphan announcement. Remove
+                  the session, delete the thread, and surface the
+                  error to the MCP caller. *)
                Logs.warn (fun m -> m
                  "control_api: failed to post initial_prompt: %s" e);
-               failwith ("failed to post initial_prompt: " ^ e)
+               session.processing <- false;
+               Session_store.remove bot.sessions
+                 ~thread_id:thread_ch.id;
+               (match Discord_rest.delete_channel bot.rest
+                       ~channel_id:thread_ch.id () with
+                | Ok _ -> ()
+                | Error de ->
+                  Logs.warn (fun m -> m
+                    "control_api: failed to clean up orphan thread \
+                     %s after prompt-post failure: %s"
+                    thread_ch.id de));
+               error_response (Printf.sprintf
+                 "Failed to post initial_prompt: %s" e)
              | Ok prompt_msg ->
-               session.processing <- true;
-               Session_store.add bot.sessions
-                 ~thread_id:thread_ch.id session;
-               Bot.run_initial_prompt_synchronous bot
-                 ~session ~msg:prompt_msg);
-          ok_response [
-            ("thread_id", `String thread_ch.id);
-            ("working_dir", `String working_dir);
-            ("branch", match branch_info with
-              | Some b -> `String b | None -> `Null);
-            ("project_name", `String p.name);
-            ("session_id", `String session_id);
-          ]
+               Bot.fork_initial_prompt_run bot
+                 ~session ~msg:prompt_msg;
+               ok_response [
+                 ("thread_id", `String thread_ch.id);
+                 ("working_dir", `String working_dir);
+                 ("branch", match branch_info with
+                   | Some b -> `String b | None -> `Null);
+                 ("project_name", `String p.name);
+                 ("session_id", `String session_id);
+               ])
 
 let handle_resume_session (bot : Bot.t) params =
   let open Yojson.Safe.Util in

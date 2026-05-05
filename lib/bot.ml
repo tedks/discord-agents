@@ -1044,8 +1044,8 @@ let handle_thread_message t msg ?channel_info () =
           process_session_message t session msg channel_info))
     end
 
-(** Run [process_session_message] on a fresh session whose
-    [processing] flag is already locked by the caller. Used by
+(** Fork an agent run on a fresh session whose [processing] flag is
+    already locked by the caller. Used by
     control_api.handle_start_session to fire the auto-trigger
     immediately, bypassing the queue check that
     [handle_thread_message] would otherwise impose on a busy session.
@@ -1053,8 +1053,10 @@ let handle_thread_message t msg ?channel_info () =
     Order requirement: caller MUST set [session.processing <- true]
     *before* calling [Session_store.add], so that any user message
     landing in the new thread between [add] and our fork queues
-    correctly behind us. *)
-let run_initial_prompt_synchronous t ~session ~msg =
+    correctly behind us — and MUST keep that flag set until calling
+    here. The fork's [Fun.protect] resets the flag when the run
+    completes (after the queue drain). *)
+let fork_initial_prompt_run t ~session ~msg =
   Eio.Fiber.fork ~sw:t.sw (fun () ->
     Fun.protect ~finally:(fun () ->
       session.Session_store.processing <- false

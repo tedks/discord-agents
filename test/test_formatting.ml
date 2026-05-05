@@ -1709,6 +1709,51 @@ let normalize_summary_tests = [
     test_normalize_summary_combined;
 ]
 
+(* ── truncate_utf8 (preserves whitespace; codepoint-boundary cap) ── *)
+
+let test_truncate_utf8_preserves_newlines () =
+  let s = "line one\nline two\nline three" in
+  Alcotest.(check string) "newlines survive truncate (under cap)"
+    s (Discord_agents.Resource.truncate_utf8 ~max_bytes:1000 s)
+
+let test_truncate_utf8_preserves_tabs () =
+  let s = "col1\tcol2\tcol3" in
+  Alcotest.(check string) "tabs survive truncate (under cap)"
+    s (Discord_agents.Resource.truncate_utf8 ~max_bytes:1000 s)
+
+let test_truncate_utf8_codepoint_boundary () =
+  (* "héllo" — é is 0xC3 0xA9, two bytes. Cap at 2 bytes lands inside é;
+     truncate must walk back to 1 byte. *)
+  let s = "h\xC3\xA9llo" in
+  let out = Discord_agents.Resource.truncate_utf8 ~max_bytes:2 s in
+  Alcotest.(check string) "walks back past mid-codepoint cut"
+    "h" out
+
+let test_truncate_utf8_passthrough_under_cap () =
+  let s = "any string under cap" in
+  Alcotest.(check string) "under cap is identical"
+    s (Discord_agents.Resource.truncate_utf8 ~max_bytes:9999 s)
+
+let test_truncate_utf8_no_single_line_collapse () =
+  (* Critical: this is the property normalize_summary destroys.
+     truncate_utf8 must NOT collapse \n \r \t. *)
+  let s = "before\n\r\tafter" in
+  Alcotest.(check string) "newlines/tabs preserved"
+    s (Discord_agents.Resource.truncate_utf8 ~max_bytes:1000 s)
+
+let truncate_utf8_tests = [
+  Alcotest.test_case "preserves \\n in multi-line input" `Quick
+    test_truncate_utf8_preserves_newlines;
+  Alcotest.test_case "preserves \\t in tabular input" `Quick
+    test_truncate_utf8_preserves_tabs;
+  Alcotest.test_case "walks back past mid-codepoint cut" `Quick
+    test_truncate_utf8_codepoint_boundary;
+  Alcotest.test_case "passthrough when under cap" `Quick
+    test_truncate_utf8_passthrough_under_cap;
+  Alcotest.test_case "no single_line collapse (critical for prompts)" `Quick
+    test_truncate_utf8_no_single_line_collapse;
+]
+
 (* ── sanitize_utf8 ─────────────────────────────────────────────────── *)
 
 (* Validate the byte string is valid UTF-8 per RFC 3629. Same rules
@@ -2585,6 +2630,7 @@ let () =
     "session_store", session_store_tests;
     "resume_helpers", resume_helpers_tests;
     "normalize_summary", normalize_summary_tests;
+    "truncate_utf8", truncate_utf8_tests;
     "sanitize_utf8", sanitize_utf8_tests;
     "discoverer_sanitization", discoverer_sanitization_tests;
     "setup_gemini_mcp_e2e", setup_gemini_mcp_e2e_tests;
