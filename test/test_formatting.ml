@@ -1709,6 +1709,135 @@ let normalize_summary_tests = [
     test_normalize_summary_combined;
 ]
 
+(* ── sanitize_utf8 ─────────────────────────────────────────────────── *)
+
+(* Validate the byte string is valid UTF-8 per RFC 3629. Same rules
+   the function under test enforces — used to assert "output is
+   always valid". *)
+let is_valid_utf8 s =
+  let n = String.length s in
+  let is_cont b = b land 0xC0 = 0x80 in
+  let i = ref 0 in
+  let ok = ref true in
+  while !ok && !i < n do
+    let c = Char.code s.[!i] in
+    if c < 0x80 then incr i
+    else if c < 0xC2 then (ok := false)
+    else if c < 0xE0 then begin
+      if !i + 1 < n && is_cont (Char.code s.[!i + 1]) then i := !i + 2
+      else ok := false
+    end else if c < 0xF0 then begin
+      if !i + 2 < n
+      && is_cont (Char.code s.[!i + 1])
+      && is_cont (Char.code s.[!i + 2]) then begin
+        let cp = ((c land 0x0F) lsl 12)
+              lor ((Char.code s.[!i + 1] land 0x3F) lsl 6)
+              lor (Char.code s.[!i + 2] land 0x3F) in
+        if cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF) then ok := false
+        else i := !i + 3
+      end else ok := false
+    end else if c < 0xF5 then begin
+      if !i + 3 < n
+      && is_cont (Char.code s.[!i + 1])
+      && is_cont (Char.code s.[!i + 2])
+      && is_cont (Char.code s.[!i + 3]) then begin
+        let cp = ((c land 0x07) lsl 18)
+              lor ((Char.code s.[!i + 1] land 0x3F) lsl 12)
+              lor ((Char.code s.[!i + 2] land 0x3F) lsl 6)
+              lor (Char.code s.[!i + 3] land 0x3F) in
+        if cp < 0x10000 || cp > 0x10FFFF then ok := false
+        else i := !i + 4
+      end else ok := false
+    end else ok := false
+  done;
+  !ok
+
+let test_sanitize_utf8_passthrough_ascii () =
+  Alcotest.(check string) "ASCII unchanged" "hello world"
+    (Discord_agents.Resource.sanitize_utf8 "hello world")
+
+let test_sanitize_utf8_passthrough_emoji () =
+  let s = "hello \xF0\x9F\x91\x80 world" in  (* 👀 *)
+  Alcotest.(check string) "valid 4-byte unchanged" s (Discord_agents.Resource.sanitize_utf8 s)
+
+let test_sanitize_utf8_passthrough_combined () =
+  let s = "ASCII \xC3\xA9 \xE2\x80\x94 \xF0\x9F\x91\x80 mixed" in
+  Alcotest.(check string) "all-valid mix unchanged" s (Discord_agents.Resource.sanitize_utf8 s)
+
+let test_sanitize_utf8_lone_continuation () =
+  let s = "hi \x80 there" in
+  let out = Discord_agents.Resource.sanitize_utf8 s in
+  Alcotest.(check bool) "is valid UTF-8" true (is_valid_utf8 out);
+  Alcotest.(check string) "replaced with U+FFFD" "hi \xEF\xBF\xBD there" out
+
+let test_sanitize_utf8_lone_lead_byte () =
+  let s = "hi \xC2 there" in  (* lead byte with no continuation *)
+  let out = Discord_agents.Resource.sanitize_utf8 s in
+  Alcotest.(check bool) "is valid UTF-8" true (is_valid_utf8 out)
+
+let test_sanitize_utf8_truncated_3byte () =
+  let s = "hi \xE2\x80 there" in  (* 3-byte lead with only 1 continuation *)
+  let out = Discord_agents.Resource.sanitize_utf8 s in
+  Alcotest.(check bool) "is valid UTF-8" true (is_valid_utf8 out)
+
+let test_sanitize_utf8_raw_surrogate_bytes () =
+  (* 0xED 0xA0 0x80 is the UTF-8 encoding of U+D800 (a surrogate),
+     which is the most common 50109 trigger in practice — yojson
+     decodes [\uD800] into these three bytes. *)
+  let s = "hi \xED\xA0\x80 there" in
+  let out = Discord_agents.Resource.sanitize_utf8 s in
+  Alcotest.(check bool) "is valid UTF-8" true (is_valid_utf8 out);
+  Alcotest.(check bool) "surrogate bytes are gone"
+    false (String.equal s out)
+
+let test_sanitize_utf8_overlong_encoding () =
+  (* "/" encoded overlong as 0xC0 0xAF (should be 0x2F). Strict
+     UTF-8 rejects overlongs because they enable equality bypasses. *)
+  let s = "x\xC0\xAFy" in
+  let out = Discord_agents.Resource.sanitize_utf8 s in
+  Alcotest.(check bool) "is valid UTF-8" true (is_valid_utf8 out);
+  Alcotest.(check bool) "overlong bytes stripped"
+    true (not (String.equal s out))
+
+let test_sanitize_utf8_lead_at_end () =
+  let s = "tail\xC2" in  (* lead byte with nothing after it *)
+  let out = Discord_agents.Resource.sanitize_utf8 s in
+  Alcotest.(check bool) "is valid UTF-8" true (is_valid_utf8 out)
+
+let test_sanitize_utf8_nul_passthrough () =
+  (* NUL is valid UTF-8 (it's just U+0000). Discord accepts it
+     in JSON content (it round-trips as  ). Don't strip. *)
+  let s = "before\x00after" in
+  Alcotest.(check string) "NUL unchanged" s (Discord_agents.Resource.sanitize_utf8 s)
+
+let test_sanitize_utf8_empty () =
+  Alcotest.(check string) "empty unchanged" "" (Discord_agents.Resource.sanitize_utf8 "")
+
+let sanitize_utf8_tests = [
+  Alcotest.test_case "ASCII passthrough" `Quick
+    test_sanitize_utf8_passthrough_ascii;
+  Alcotest.test_case "valid 4-byte UTF-8 passthrough" `Quick
+    test_sanitize_utf8_passthrough_emoji;
+  Alcotest.test_case "mix of valid 1/2/3/4-byte sequences passthrough" `Quick
+    test_sanitize_utf8_passthrough_combined;
+  Alcotest.test_case "lone continuation byte 0x80 → U+FFFD" `Quick
+    test_sanitize_utf8_lone_continuation;
+  Alcotest.test_case "lone lead byte 0xC2 → output is valid" `Quick
+    test_sanitize_utf8_lone_lead_byte;
+  Alcotest.test_case "truncated 3-byte sequence → output is valid" `Quick
+    test_sanitize_utf8_truncated_3byte;
+  Alcotest.test_case "raw surrogate bytes (0xED 0xA0 0x80) sanitized" `Quick
+    test_sanitize_utf8_raw_surrogate_bytes;
+  Alcotest.test_case "overlong encoding stripped" `Quick
+    test_sanitize_utf8_overlong_encoding;
+  Alcotest.test_case "lead byte at end of string handled" `Quick
+    test_sanitize_utf8_lead_at_end;
+  Alcotest.test_case "NUL byte preserved" `Quick
+    test_sanitize_utf8_nul_passthrough;
+  Alcotest.test_case "empty string" `Quick
+    test_sanitize_utf8_empty;
+]
+
 (* ── Per-discoverer integration tests ────────────────────────────────
 
    These prove the at-source sanitization actually fires: a synthetic
@@ -2456,6 +2585,7 @@ let () =
     "session_store", session_store_tests;
     "resume_helpers", resume_helpers_tests;
     "normalize_summary", normalize_summary_tests;
+    "sanitize_utf8", sanitize_utf8_tests;
     "discoverer_sanitization", discoverer_sanitization_tests;
     "setup_gemini_mcp_e2e", setup_gemini_mcp_e2e_tests;
   ]

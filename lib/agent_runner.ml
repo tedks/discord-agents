@@ -197,12 +197,23 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       (Buffer.contents current_msg_buf) in
     let text = Agent_process.wrap_text ~max_width:wrap_width text in
     let text = Agent_process.escape_nested_fences text in
+    (* Sanitize BEFORE the size decision: each invalid byte expands to
+       3-byte U+FFFD, so a buffer that fit the 2000-byte limit raw can
+       grow past it sanitized. If we sanitized later (inside
+       Discord_rest.create_message / edit_message), edit_message would
+       already have committed to a single PATCH and Discord would reject
+       it — the chunk would vanish, which is exactly what this whole
+       sanitization layer was added to prevent. The defensive call in
+       Discord_rest is still useful for non-runner send sites and for
+       any future caller that bypasses the runner. *)
+    let text = Resource.sanitize_utf8 text in
     if String.length text = 0 then ()
     else if String.length text <= Agent_process.discord_max_len then
       send_single_message text
     else
-      (* Table wrapping expanded text beyond Discord's limit — split it.
-         First chunk updates the existing message; overflow creates new ones. *)
+      (* Table wrapping or sanitization expanded text beyond Discord's
+         limit — split it. First chunk updates the existing message;
+         overflow creates new ones. *)
       let chunks = Agent_process.split_message text in
       List.iteri (fun i chunk ->
         if i = 0 then send_single_message chunk
@@ -250,12 +261,18 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       flush_and_reset ()
   in
   (* Flush accumulated tool status lines to a single Discord message.
-     Consecutive tool calls get batched into one message, edited in-place. *)
+     Consecutive tool calls get batched into one message, edited in-place.
+     Sanitization here mirrors flush_to_discord — tool inputs (file paths,
+     diffs, command outputs) can carry invalid UTF-8 bytes from binary-ish
+     files, and edit_message has no fallback if the sanitized text grows
+     past Discord's 2000-byte limit. The projected_len budget at the
+     Tool_use / Tool_result call sites also runs on sanitized strings so
+     the size estimate matches what we actually send. *)
   let flush_tool_status () =
     match !tool_status_lines with
     | [] -> ()
     | lines ->
-      let text = String.concat "\n" (List.rev lines) in
+      let text = Resource.sanitize_utf8 (String.concat "\n" (List.rev lines)) in
       (match !tool_status_msg_id with
        | None ->
          (match Discord_rest.create_message rest ~channel_id ~content:text () with
@@ -322,8 +339,10 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
         start_new_message ();
       (* Accumulate tool status lines into a single batched message.
          Each new tool call appends a line and edits the message in-place.
-         Start a new status message if we'd exceed Discord's 2000-char limit. *)
-      let status = format_tool_status info in
+         Start a new status message if we'd exceed Discord's 2000-char limit.
+         Sanitize at construction so the projected_len budget below
+         reflects what we actually send. *)
+      let status = Resource.sanitize_utf8 (format_tool_status info) in
       let projected_len =
         let existing = List.fold_left (fun acc l -> acc + String.length l + 1)
           0 !tool_status_lines in
@@ -360,11 +379,12 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
             Printf.sprintf "%s\n*... (%d/%d lines \u{2014} use `!scroll` for more)*"
               text t.shown t.total
           else text in
-        let output_block = Printf.sprintf "```\n%s\n```"
-          (Agent_process.escape_code_fences display_text) in
+        let output_block = Resource.sanitize_utf8 (Printf.sprintf "```\n%s\n```"
+          (Agent_process.escape_code_fences display_text)) in
         (* Size guard: if adding the output block would exceed Discord's
            limit, flush the existing status first so the output gets its
-           own message. Same logic as the Tool_use overflow guard. *)
+           own message. Same logic as the Tool_use overflow guard.
+           Sanitize first so the budget reflects post-sanitization bytes. *)
         let projected_len =
           let existing = List.fold_left (fun acc l -> acc + String.length l + 1)
             0 !tool_status_lines in
@@ -398,9 +418,12 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
      Discord's 2000-char limit. Codex's turn.failed payloads can be
      very large JSON blobs; without splitting, Discord rejects the
      message and the user sees nothing. Empty input is a no-op so
-     no caller can accidentally post a blank message. *)
+     no caller can accidentally post a blank message. Sanitize before
+     splitting so each chunk's size includes any U+FFFD expansion —
+     same reason flush_to_discord sanitizes first. *)
   let send text =
     if text <> "" then
+      let text = Resource.sanitize_utf8 text in
       List.iter (fun chunk ->
         ignore (Discord_rest.create_message rest ~channel_id ~content:chunk ())
       ) (Agent_process.split_message text)
