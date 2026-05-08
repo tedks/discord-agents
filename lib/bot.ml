@@ -902,13 +902,6 @@ let resolve_channel_context t ~(channel_id : Discord_types.channel_id)
       in
       (name, "thread")
 
-(** Handle a message in a session thread.
-    [channel_info] is passed through when the caller already fetched it.
-
-    During drain mode (restart pending), messages are still processed but
-    the user is warned. This is intentional: blocking messages during drain
-    would prevent using other sessions while a long-running task finishes.
-    The restart waits for all session.processing flags to go false. *)
 (** Run the agent for one message and drain any messages that queued
     behind it. Caller must have set [session.processing <- true] and
     is responsible for resetting it on exit (typically via Fun.protect
@@ -917,8 +910,18 @@ let resolve_channel_context t ~(channel_id : Discord_types.channel_id)
     Extracted from the body of [handle_thread_message] so the auto-trigger
     path in [fork_initial_prompt_run] can reuse it without going
     back through the queue check (which would cause it to queue itself
-    behind the very flag we set to close the gateway race). *)
+    behind the very flag we set to close the gateway race).
+
+    [?prompt_override] — when [Some p], the agent receives [p] instead
+    of [msg.content], and [session.initial_prompt]'s prepend is skipped
+    (the override caller has already woven the prompt into the agent
+    input themselves). The auto-trigger uses this so the agent gets
+    the FULL pre-sanitize prompt rather than the first chunk of a
+    multi-part visible-message split. [session.initial_prompt] still
+    gets cleared on success — the durable copy was only insurance
+    against a crash before the override-driven run completed. *)
 let rec process_session_message t session
+    ?prompt_override
     (msg : Discord_types.message) channel_info =
   let child_pid = ref None in
   Fun.protect ~finally:(fun () ->
@@ -937,20 +940,25 @@ let rec process_session_message t session
       child_pid := Some pid;
       register_child_pid t pid;
       Logs.info (fun m -> m "bot: registered child pid %d" pid) in
-    (* Forward-compat: [session.initial_prompt] is no longer set by any
-       current caller (control_api now posts the prompt visibly and
-       feeds it to handle_thread_message directly — see
-       control_api.handle_start_session). The prepend stays so a
-       sessions.json persisted before that change still gets the
-       intended preface on its first message after a bot restart.
-       Removable once we're sure no on-disk session still carries
-       a non-None [initial_prompt]. *)
+    (* [session.initial_prompt] is set by [control_api.handle_start_session]
+       (mirroring the prompt content for crash-safe recovery), and by
+       any pre-existing on-disk session persisted before PR #32. The
+       prepend kicks in when no [prompt_override] was provided —
+       i.e., a normal user-typed message after a crash, or a session
+       reloaded from sessions.json with [initial_prompt] still set.
+       The auto-trigger path passes the full prompt via
+       [prompt_override] and bypasses the prepend. In both cases we
+       clear [initial_prompt] on success below so the next user message
+       isn't rewrapped. *)
     let had_initial_prompt = Option.is_some session.initial_prompt in
-    let prompt = match session.initial_prompt with
-      | Some ctx ->
-        Printf.sprintf "<session-context>\n%s\n</session-context>\n\n%s"
-          ctx msg.content
-      | None -> msg.content
+    let prompt = match prompt_override with
+      | Some p -> p
+      | None ->
+        (match session.initial_prompt with
+         | Some ctx ->
+           Printf.sprintf "<session-context>\n%s\n</session-context>\n\n%s"
+             ctx msg.content
+         | None -> msg.content)
     in
     let on_scroll_content chunks lines_used =
       (* Cap stored content at ~100KB to prevent memory bloat.
@@ -1021,6 +1029,13 @@ let rec process_session_message t session
       ~message_id:pending.msg.id ~emoji:"\xE2\x8F\xB3" ());
     process_session_message t session pending.msg pending.channel_info
 
+(** Handle a message in a session thread.
+    [channel_info] is passed through when the caller already fetched it.
+
+    During drain mode (restart pending), messages are still processed but
+    the user is warned. This is intentional: blocking messages during drain
+    would prevent using other sessions while a long-running task finishes.
+    The restart waits for all session.processing flags to go false. *)
 let handle_thread_message t msg ?channel_info () =
   if t.draining then
     ignore (Discord_rest.create_message t.rest
@@ -1050,18 +1065,31 @@ let handle_thread_message t msg ?channel_info () =
     immediately, bypassing the queue check that
     [handle_thread_message] would otherwise impose on a busy session.
 
-    Order requirement: caller MUST set [session.processing <- true]
-    *before* calling [Session_store.add], so that any user message
-    landing in the new thread between [add] and our fork queues
-    correctly behind us — and MUST keep that flag set until calling
-    here. The fork's [Fun.protect] resets the flag when the run
-    completes (after the queue drain). *)
-let fork_initial_prompt_run t ~session ~msg =
+    [~prompt] is what the agent sees as its first user turn — passed
+    via [prompt_override] so we use the full pre-sanitize content the
+    MCP caller supplied, not [msg.content] (which holds only the first
+    Discord chunk after any UTF-8-expansion-driven split).
+
+    [?channel_info] lets the caller hand in the [Discord_types.channel]
+    they already received from [create_thread_no_message], so
+    [resolve_channel_context] doesn't have to make a redundant
+    [get_channel] REST call to recover the name.
+
+    Preconditions (caller must uphold; checked by assertion below):
+    - [session.processing] MUST already be [true] before
+      [Session_store.add] published the session, so any user message
+      landing in the new thread queues into [pending_queue] instead
+      of racing through [handle_thread_message]'s idle path.
+    The fork's [Fun.protect] resets [processing] to [false] when the
+    run completes (after the queue drain). *)
+let fork_initial_prompt_run t ~session ~msg ~prompt ?channel_info () =
+  assert session.Session_store.processing;
   Eio.Fiber.fork ~sw:t.sw (fun () ->
     Fun.protect ~finally:(fun () ->
       session.Session_store.processing <- false
     ) (fun () ->
-      process_session_message t session msg None))
+      process_session_message t session
+        ~prompt_override:prompt msg channel_info))
 
 (** Ensure a session exists for a channel (control or project channels).
     Creates a persistent Claude session so the channel can handle chat directly. *)

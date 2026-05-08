@@ -225,17 +225,27 @@ let handle_start_session (bot : Bot.t) params =
               "Working on the prompt below \u{2014} send a message any \
                time to add to the conversation."
             | None -> "Send a message to interact." in
-          (* Build the session struct with [initial_prompt:None] —
-             when an initial_prompt was supplied, we post it as a
-             visible Discord message below and feed that message to
-             the agent runner directly. Stashing it in
-             [session.initial_prompt] would silently prepend it to
-             whatever the user sends next instead, so the user never
-             sees what context the agent received. *)
+          (* Build the session. When an [initial_prompt] is supplied we
+             store it on the session as a *durable* backup: the visible
+             prompt message we post below is the agent's first turn on
+             the success path, but if the bot crashes between
+             [Session_store.add] and the auto-trigger fiber's
+             completion, the persisted [initial_prompt] lets the next
+             user message after restart resurrect the task via the
+             [<session-context>] prepend in [process_session_message].
+
+             Importantly the auto-trigger path passes the prompt to
+             [fork_initial_prompt_run] via [~prompt] (a [prompt_override])
+             so the agent gets the full pre-sanitize content, and
+             [process_session_message] does NOT prepend [initial_prompt]
+             a second time. On success the field is cleared. On crash
+             the field survives, and the user's next message picks it
+             up — same observable behavior as the pre-PR-#32 hidden
+             context, just with the prompt also visibly posted. *)
           let session = Session_store.make_session
             ~project_name:p.name ~working_dir ~agent_kind:kind
             ~session_id ~thread_id:thread_ch.Discord_types.id
-            ~system_prompt:None ~initial_prompt:None () in
+            ~system_prompt:None ~initial_prompt () in
           (* Race-safe ordering for the auto-trigger.
 
              When an initial_prompt is set, we MUST publish the
@@ -284,16 +294,19 @@ let handle_start_session (bot : Bot.t) params =
              match Discord_rest.create_message bot.rest
                      ~channel_id:thread_ch.id ~content:prompt () with
              | Error e ->
-               (* Roll back: the session is half-published (in store
-                  but [processing] locked, no agent fiber will fire),
-                  and the thread holds an orphan announcement. Remove
-                  the session, delete the thread, and surface the
-                  error to the MCP caller. *)
+               (* Roll back. Delete the thread FIRST: it nukes the
+                  announcement, the user-typed messages that may have
+                  raced into [pending_queue], and the
+                  hourglass/eyes reactions on them in one shot. If
+                  [delete_channel] fails (network, permissions),
+                  surface an in-thread error so the user sees
+                  *something* before we drop the session — handle_message
+                  would otherwise treat the now-orphan thread as
+                  "unknown thread under project channel" and auto-create
+                  a default-worktree session for any subsequent message,
+                  with no record of what just happened. *)
                Logs.warn (fun m -> m
                  "control_api: failed to post initial_prompt: %s" e);
-               session.processing <- false;
-               Session_store.remove bot.sessions
-                 ~thread_id:thread_ch.id;
                (match Discord_rest.delete_channel bot.rest
                        ~channel_id:thread_ch.id () with
                 | Ok _ -> ()
@@ -301,12 +314,22 @@ let handle_start_session (bot : Bot.t) params =
                   Logs.warn (fun m -> m
                     "control_api: failed to clean up orphan thread \
                      %s after prompt-post failure: %s"
-                    thread_ch.id de));
+                    thread_ch.id de);
+                  ignore (Discord_rest.create_message bot.rest
+                    ~channel_id:thread_ch.id
+                    ~content:(Printf.sprintf
+                      "Session setup failed (%s); this thread is no \
+                       longer attached to an agent."
+                      e) ()));
+               session.processing <- false;
+               Session_store.remove bot.sessions
+                 ~thread_id:thread_ch.id;
                error_response (Printf.sprintf
                  "Failed to post initial_prompt: %s" e)
              | Ok prompt_msg ->
                Bot.fork_initial_prompt_run bot
-                 ~session ~msg:prompt_msg;
+                 ~session ~msg:prompt_msg ~prompt
+                 ~channel_info:thread_ch ();
                ok_response [
                  ("thread_id", `String thread_ch.id);
                  ("working_dir", `String working_dir);
