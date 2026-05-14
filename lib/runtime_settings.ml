@@ -62,10 +62,13 @@ let save t =
     Error (Printexc.to_string exn)
 
 let set_default_agent t agent =
-  let prior = t.default_agent in
-  t.default_agent <- agent;
-  match save t with
-  | Ok () as ok -> ok
-  | Error _ as err ->
-    t.default_agent <- prior;
-    err
+  if Config.equal_agent_kind t.default_agent agent then
+    Ok ()
+  else
+    let next = { default_agent = agent } in
+    match save next with
+    | Ok () as ok ->
+      t.default_agent <- agent;
+      ok
+    | Error _ as err ->
+      err

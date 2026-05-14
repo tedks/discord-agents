@@ -68,6 +68,7 @@ type t = {
   mutable refreshing : bool;
   mutable output_lines : int;
   scroll_states : (Discord_types.channel_id, scroll_state) Hashtbl.t;
+  pending_persistent_resets : (Discord_types.channel_id, unit) Hashtbl.t;
 }
 
 (** Convenience accessors for the current project state snapshot. *)
@@ -85,6 +86,55 @@ let is_project_channel t ~(channel_id : Discord_types.channel_id) =
 
 let is_persistent_channel t ~(channel_id : Discord_types.channel_id) =
   is_control_channel t ~channel_id || is_project_channel t ~channel_id
+
+type persistent_rotation = {
+  reset_count : int;
+  busy_count : int;
+  current_busy_kind : Config.agent_kind option;
+}
+
+let rotate_persistent_idle_sessions t ~current_channel_id ~new_agent =
+  let stale_sessions =
+    Session_store.bindings t.sessions
+    |> List.filter (fun (thread_id, (session : Session_store.session)) ->
+      is_persistent_channel t ~channel_id:thread_id
+      && not (Config.equal_agent_kind session.agent_kind new_agent))
+  in
+  let current_busy_kind = ref None in
+  let reset_count = ref 0 in
+  let busy_count = ref 0 in
+  List.iter (fun (thread_id, (session : Session_store.session)) ->
+    if session.processing || not (Queue.is_empty session.pending_queue) then begin
+      incr busy_count;
+      Hashtbl.replace t.pending_persistent_resets thread_id ();
+      if thread_id = current_channel_id then
+        current_busy_kind := Some session.agent_kind
+    end else begin
+      Session_store.remove t.sessions ~thread_id;
+      Hashtbl.remove t.scroll_states thread_id;
+      Hashtbl.remove t.pending_persistent_resets thread_id;
+      incr reset_count
+    end
+  ) stale_sessions;
+  { reset_count = !reset_count;
+    busy_count = !busy_count;
+    current_busy_kind = !current_busy_kind; }
+
+let maybe_reset_persistent_channel_session t session =
+  let channel_id = session.Session_store.thread_id in
+  if Hashtbl.mem t.pending_persistent_resets channel_id then
+    if Config.equal_agent_kind session.agent_kind (default_agent t) then
+      Hashtbl.remove t.pending_persistent_resets channel_id
+    else if is_persistent_channel t ~channel_id
+            && not session.processing
+            && Queue.is_empty session.pending_queue then begin
+      Session_store.remove t.sessions ~thread_id:channel_id;
+      Hashtbl.remove t.scroll_states channel_id;
+      Hashtbl.remove t.pending_persistent_resets channel_id;
+      Logs.info (fun m ->
+        m "bot: reset persistent channel %s after default-agent change"
+          channel_id)
+    end
 
 (** Drop scroll-state entries for threads that no longer have an active
     session.  Called when sessions are removed wholesale (e.g. after
@@ -598,15 +648,7 @@ let handle_command t msg cmd =
          current default first, then the remaining stores. *)
       let found = match kind with
         | Some k -> try_kind k
-        | None ->
-          let rec first_found = function
-            | [] -> None
-            | k :: rest ->
-              match try_kind k with
-              | Some _ as found -> found
-              | None -> first_found rest
-          in
-          first_found (Config.preferred_agent_order (default_agent t))
+        | None -> Config.find_with_preferred_agent (default_agent t) try_kind
       in
       match found with
       | None ->
@@ -670,24 +712,40 @@ let handle_command t msg cmd =
      | Error err ->
        reply (Printf.sprintf "Failed to save default agent: %s" err)
      | Ok () ->
-       if is_persistent_channel t ~channel_id then
-         (match Session_store.find_opt t.sessions ~thread_id:channel_id with
-          | Some session when session.processing ->
-            reply (Printf.sprintf
-              "Default agent set to `%s`. This channel is still running `%s`; send the next message after it finishes."
-              kind_str (Config.string_of_agent_kind session.agent_kind))
-          | Some session when not (Config.equal_agent_kind session.agent_kind kind) ->
-            Session_store.remove t.sessions ~thread_id:channel_id;
-            Hashtbl.remove t.scroll_states channel_id;
-            reply (Printf.sprintf
-              "Default agent set to `%s`. Reset this channel's idle `%s` session; your next message will start `%s`."
-              kind_str
-              (Config.string_of_agent_kind session.agent_kind)
-              kind_str)
-          | _ ->
-            reply (Printf.sprintf "Default agent set to `%s`." kind_str))
-       else
-         reply (Printf.sprintf "Default agent set to `%s`." kind_str))
+       let rotation =
+         rotate_persistent_idle_sessions t
+           ~current_channel_id:channel_id ~new_agent:kind
+       in
+       let reset_suffix =
+         if rotation.reset_count = 0 then ""
+         else
+           Printf.sprintf " Reset %d idle persistent session%s."
+             rotation.reset_count
+             (if rotation.reset_count = 1 then "" else "s")
+       in
+       let busy_suffix =
+         match rotation.current_busy_kind with
+         | Some current_kind ->
+           let other_busy = rotation.busy_count - 1 in
+           let others =
+             if other_busy <= 0 then ""
+             else
+               Printf.sprintf " %d other busy persistent session%s will switch after finishing."
+                 other_busy
+                 (if other_busy = 1 then "" else "s")
+           in
+           Printf.sprintf
+             " This channel is still running `%s`; it will switch after the current run finishes.%s"
+             (Config.string_of_agent_kind current_kind) others
+         | None ->
+           if rotation.busy_count = 0 then ""
+           else
+             Printf.sprintf " %d busy persistent session%s will switch after finishing."
+               rotation.busy_count
+               (if rotation.busy_count = 1 then "" else "s")
+       in
+       reply (Printf.sprintf "Default agent set to `%s`.%s%s"
+         kind_str reset_suffix busy_suffix))
   | Command.Cleanup_channels ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       match Channel_manager.cleanup ~rest:t.rest
@@ -1094,7 +1152,8 @@ let handle_thread_message t msg ?channel_info () =
       session.processing <- true;
       Eio.Fiber.fork ~sw:t.sw (fun () ->
         Fun.protect ~finally:(fun () ->
-          session.processing <- false
+          session.processing <- false;
+          maybe_reset_persistent_channel_session t session
         ) (fun () ->
           process_session_message t session msg channel_info))
     end
@@ -1114,7 +1173,8 @@ let handle_thread_message t msg ?channel_info () =
 let fork_initial_prompt_run t ~session ~msg =
   Eio.Fiber.fork ~sw:t.sw (fun () ->
     Fun.protect ~finally:(fun () ->
-      session.Session_store.processing <- false
+      session.Session_store.processing <- false;
+      maybe_reset_persistent_channel_session t session
     ) (fun () ->
       process_session_message t session msg None))
 
@@ -1275,7 +1335,8 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
                wrap_width = Agent_process.desktop_width;
                refreshing = false;
                output_lines = Agent_process.default_output_lines;
-               scroll_states = Hashtbl.create 64 } in
+               scroll_states = Hashtbl.create 64;
+               pending_persistent_resets = Hashtbl.create 16 } in
   bot.gateway.handler <- (fun event ->
     match event with
     | Discord_gateway.Connected user ->
