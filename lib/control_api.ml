@@ -14,6 +14,11 @@ let socket_path () =
   let home = Sys.getenv "HOME" in
   Filename.concat home ".config/discord-agents/control.sock"
 
+let raise_if_cancelled exn =
+  match exn with
+  | Eio.Cancel.Cancelled _ -> raise exn
+  | _ -> ()
+
 (** Read one line from a buffered reader, up to a size limit. *)
 let read_line_limited reader =
   try
@@ -24,13 +29,17 @@ let read_line_limited reader =
       Ok line
   with
   | End_of_file -> Error "empty request"
-  | exn -> Error (Printexc.to_string exn)
+  | exn ->
+    raise_if_cancelled exn;
+    Error (Printexc.to_string exn)
 
 (** Send a JSON response and close. *)
 let send_response flow json =
   let data = Yojson.Safe.to_string json ^ "\n" in
   try Eio.Flow.copy_string data flow
-  with _ -> ()  (* client may have disconnected *)
+  with exn ->
+    raise_if_cancelled exn;
+    ()
 
 let ok_response body =
   `Assoc (("ok", `Bool true) :: body)
@@ -71,12 +80,31 @@ let handle_health (bot : Bot.t) =
     | Some err -> optional_error_field "last_rest_transport_error" err
     | None -> []
   in
+  let gateway_fields = [
+    ("gateway_connected", `Bool (Option.is_some bot.gateway.ws));
+    ("gateway_resuming", `Bool bot.gateway.resuming);
+    ("gateway_sequence",
+     match bot.gateway.sequence with Some s -> `Int s | None -> `Null);
+  ] in
+  let optional_gateway_fields =
+    (match bot.gateway.last_error with
+     | Some err ->
+       [("last_gateway_error",
+         `String (Resource.truncate_utf8 ~max_bytes:1000
+           (Resource.sanitize_utf8 (Resource.single_line err))))]
+     | None -> [])
+    @
+    (match bot.gateway.last_payload_summary with
+     | Some summary -> [("last_gateway_payload", `String summary)]
+     | None -> [])
+  in
   ok_response ([
     ("uptime_seconds", `Int uptime);
     ("sessions", `Int (Session_store.count bot.sessions));
     ("projects", `Int (List.length (Bot.projects bot)));
     ("channels", `Int (Channel_manager.count (Bot.channels bot)));
-  ] @ rest_fields @ optional_rest_fields @ optional_transport_fields)
+  ] @ rest_fields @ optional_rest_fields
+    @ optional_transport_fields @ gateway_fields @ optional_gateway_fields)
 
 let handle_list_projects (bot : Bot.t) =
   let projects = List.map (fun (p : Project.t) ->
@@ -496,17 +524,20 @@ let dispatch (bot : Bot.t) method_ params =
     | "refresh_projects" -> handle_refresh_projects bot
     | _ -> error_response (Printf.sprintf "Unknown method: %s" method_)
   with exn ->
+    raise_if_cancelled exn;
     Logs.warn (fun m -> m "control_api: handler error: %s" (Printexc.to_string exn));
     error_response (Printexc.to_string exn)
 
 (* ── Connection handler ────────────────────────────────────────── *)
 
 let handle_connection bot flow =
+  let started_at = Unix.gettimeofday () in
   let reader = Eio.Buf_read.of_flow ~max_size:(1024 * 1024) flow in
   match read_line_limited reader with
   | Error e ->
     send_response flow (error_response e)
   | Ok line ->
+    let method_name = ref "<invalid>" in
     let response = match Yojson.Safe.from_string line with
       | exception _ -> error_response "invalid JSON"
       | json ->
@@ -516,9 +547,15 @@ let handle_connection bot flow =
           | `Null -> None | p -> Some p in
         (match method_ with
          | None -> error_response "missing 'method' field"
-         | Some m -> dispatch bot m params)
+         | Some m ->
+           method_name := m;
+           dispatch bot m params)
     in
-    send_response flow response
+    send_response flow response;
+    let elapsed = Unix.gettimeofday () -. started_at in
+    if elapsed >= 0.5 then
+      Logs.warn (fun m -> m "control_api: slow request method=%s elapsed=%.3fs"
+        !method_name elapsed)
 
 (* ── Server ────────────────────────────────────────────────────── *)
 
@@ -527,15 +564,27 @@ let start ~(bot : Bot.t) ~sw ~(env : Eio_unix.Stdenv.base) =
   (* Remove stale socket from a previous run *)
   (try Unix.unlink path with Unix.Unix_error _ -> ());
   let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
   let addr = `Unix path in
-  let socket = Eio.Net.listen ~sw ~backlog:5 ~reuse_addr:true net addr in
+  let socket = Eio.Net.listen ~sw ~backlog:64 ~reuse_addr:true net addr in
   Logs.info (fun m -> m "control_api: listening on %s" path);
   (* Accept loop — each connection handled in its own fiber *)
   let rec accept_loop () =
-    let flow, _addr = Eio.Net.accept ~sw socket in
-    Eio.Fiber.fork ~sw (fun () ->
-      Fun.protect ~finally:(fun () -> Eio.Flow.close flow) (fun () ->
-        handle_connection bot flow));
-    accept_loop ()
+    match
+      try Ok (Eio.Net.accept ~sw socket)
+      with exn ->
+        raise_if_cancelled exn;
+        Error exn
+    with
+    | Ok (flow, _addr) ->
+      Eio.Fiber.fork ~sw (fun () ->
+        Fun.protect ~finally:(fun () -> Eio.Flow.close flow) (fun () ->
+          handle_connection bot flow));
+      accept_loop ()
+    | Error exn ->
+      Logs.warn (fun m -> m "control_api: accept failed: %s"
+        (Printexc.to_string exn));
+      Eio.Time.sleep clock 0.1;
+      accept_loop ()
   in
   accept_loop ()

@@ -33,6 +33,8 @@ type t = {
   mutable heartbeat_gen : int;  (* generation counter: daemon stops when it mismatches *)
   mutable resuming : bool;
   mutable shutdown : bool;
+  mutable last_error : string option;
+  mutable last_payload_summary : string option;
   mutable handler : handler;
 }
 
@@ -47,6 +49,8 @@ let create ~token ~intents ~handler =
     heartbeat_gen = 0;
     resuming = false;
     shutdown = false;
+    last_error = None;
+    last_payload_summary = None;
     handler }
 
 let default_intents =
@@ -56,12 +60,18 @@ let default_intents =
   lor Intent.direct_messages
   lor Intent.message_content
 
+let raise_if_cancelled exn =
+  match exn with
+  | Eio.Cancel.Cancelled _ -> raise exn
+  | _ -> ()
+
 (** Send a JSON payload over the WebSocket. *)
 let send_json t json =
   match t.ws with
   | Some ws ->
     (try Websocket.send_text ws (Yojson.Safe.to_string json)
      with exn ->
+       raise_if_cancelled exn;
        Logs.warn (fun m -> m "gateway: send_json error: %s" (Printexc.to_string exn)))
   | None -> Logs.warn (fun m -> m "gateway: send_json but no ws connection")
 
@@ -102,6 +112,48 @@ let resume_payload t =
 let can_resume t =
   Option.is_some t.session_id && Option.is_some t.sequence
 
+let string_of_gateway_opcode = function
+  | Dispatch -> "Dispatch"
+  | Heartbeat -> "Heartbeat"
+  | Identify -> "Identify"
+  | Resume -> "Resume"
+  | Reconnect -> "Reconnect"
+  | Invalid_session -> "Invalid_session"
+  | Hello -> "Hello"
+  | Heartbeat_ack -> "Heartbeat_ack"
+  | Unknown_op n -> Printf.sprintf "Unknown_op(%d)" n
+
+let payload_diagnostics payload =
+  let bytes = String.length payload in
+  match Yojson.Safe.from_string payload with
+  | exception _ ->
+    Printf.sprintf "bytes=%d invalid_json" bytes
+  | json ->
+    let open Yojson.Safe.Util in
+    let op =
+      match json |> member "op" |> to_int_option with
+      | Some n -> string_of_gateway_opcode (gateway_opcode_of_int n)
+      | None -> "?"
+    in
+    let event_name =
+      json |> member "t" |> to_string_option |> Option.value ~default:"UNKNOWN"
+    in
+    let seq =
+      json |> member "s" |> to_int_option
+      |> Option.map string_of_int |> Option.value ~default:"?"
+    in
+    Printf.sprintf "bytes=%d op=%s event=%s seq=%s"
+      bytes op event_name seq
+
+let exn_with_backtrace exn =
+  let bt = Printexc.get_backtrace () |> String.trim in
+  if bt = "" then
+    Printexc.to_string exn
+  else
+    Printf.sprintf "%s\n%s" (Printexc.to_string exn) bt
+
+let large_payload_warn_threshold = 512 * 1024
+
 (** Parse a gateway payload and dispatch events. *)
 let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
   let open Yojson.Safe.Util in
@@ -125,14 +177,17 @@ let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
           let resume_url = d |> member "resume_gateway_url" |> to_string_option in
           t.resume_gateway_url <- resume_url;
           t.resuming <- false;
+          t.last_error <- None;
           Logs.info (fun m -> m "gateway: READY as %s (session %s)"
             user.username (Option.value ~default:"?" t.session_id));
           t.handler (Connected user)
         with exn ->
+          raise_if_cancelled exn;
           Logs.warn (fun m -> m "gateway: failed to parse READY: %s"
             (Printexc.to_string exn)))
      | "RESUMED" ->
        t.resuming <- false;
+       t.last_error <- None;
        Logs.info (fun m -> m "gateway: RESUMED successfully (session %s)"
          (Option.value ~default:"?" t.session_id))
      | "MESSAGE_CREATE" ->
@@ -140,6 +195,7 @@ let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
           let msg = message_of_yojson d in
           t.handler (Message_received msg)
         with exn ->
+          raise_if_cancelled exn;
           Logs.warn (fun m -> m "gateway: failed to parse MESSAGE_CREATE: %s"
             (Printexc.to_string exn)))
      | "THREAD_CREATE" ->
@@ -147,6 +203,7 @@ let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
           let ch = channel_of_yojson d in
           t.handler (Thread_created ch)
         with exn ->
+          raise_if_cancelled exn;
           Logs.warn (fun m -> m "gateway: failed to parse THREAD_CREATE: %s"
             (Printexc.to_string exn)))
      | _ ->
@@ -242,10 +299,14 @@ let connect ~sw ~(env : Eio_unix.Stdenv.base) t =
     Logs.info (fun m -> m "gateway: connecting to %s" host);
     (match
       (try Ok (Websocket.connect ~sw ~net ~host ~port:443 ~path:gateway_path)
-       with exn -> Error exn)
+       with exn ->
+         raise_if_cancelled exn;
+         Error exn)
     with
     | Error exn ->
-      Logs.warn (fun m -> m "gateway: connect failed: %s" (Printexc.to_string exn));
+      let err = exn_with_backtrace exn in
+      t.last_error <- Some err;
+      Logs.warn (fun m -> m "gateway: connect failed: %s" err);
       Logs.info (fun m -> m "gateway: retrying in %.0fs..." !backoff);
       Eio.Time.sleep clock !backoff;
       backoff := min (!backoff *. 2.0) 60.0;
@@ -259,21 +320,36 @@ let connect ~sw ~(env : Eio_unix.Stdenv.base) t =
       let rec recv_loop () =
         match Websocket.recv_frame ws with
         | { Websocket.opcode = Text; payload } ->
+          if String.length payload >= large_payload_warn_threshold then begin
+            let summary = payload_diagnostics payload in
+            t.last_payload_summary <- Some summary;
+            Logs.warn (fun m -> m "gateway: large payload received (%s)" summary)
+          end;
           (try
              let json = Yojson.Safe.from_string payload in
              handle_payload t ~sw ~clock json
            with exn ->
-             Logs.warn (fun m -> m "gateway: failed to parse payload: %s"
-               (Printexc.to_string exn)));
+             raise_if_cancelled exn;
+             let summary = payload_diagnostics payload in
+             t.last_payload_summary <- Some summary;
+             let err = exn_with_backtrace exn in
+             t.last_error <- Some err;
+             Logs.warn (fun m -> m "gateway: failed to parse payload (%s): %s"
+               summary err));
           recv_loop ()
         | { opcode = Close; _ } ->
           Logs.info (fun m -> m "gateway: received close frame")
         | { opcode = _; _ } ->
           recv_loop ()
         | exception exn ->
-          Logs.warn (fun m -> m "gateway: recv error: %s" (Printexc.to_string exn))
+          raise_if_cancelled exn;
+          let err = exn_with_backtrace exn in
+          t.last_error <- Some err;
+          Logs.warn (fun m -> m "gateway: recv error: %s" err);
+          t.handler (Disconnected ("recv error: " ^ Printexc.to_string exn))
       in
       recv_loop ();
+      Websocket.close ws;
       t.ws <- None;
       t.heartbeat_gen <- t.heartbeat_gen + 1;
       if can_resume t then

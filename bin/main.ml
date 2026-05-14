@@ -10,6 +10,7 @@
     --test CHANNEL   Also send a test message to the given channel *)
 
 let setup_logging () =
+  Printexc.record_backtrace true;
   Fmt_tty.setup_std_outputs ();
   Logs.set_reporter (Logs_fmt.reporter ());
   Logs.set_level (Some Logs.Info)

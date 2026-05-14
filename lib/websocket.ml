@@ -105,6 +105,11 @@ let read_exactly reader n =
 (** Maximum payload size we'll accept (100MB). Prevents OOM from malicious frames. *)
 let max_payload_size = 100 * 1024 * 1024
 
+(** Keep Eio's buffered-reader cap aligned with the explicit frame cap.
+    [Eio.Buf_read.take] raises [Buffer_limit_exceeded] before our own
+    payload-length checks if this is smaller than [max_payload_size]. *)
+let reader_max_size = max_payload_size
+
 let recv_frame t =
   if t.closed then failwith "websocket: connection closed";
   let acc_buf = Buffer.create 4096 in
@@ -172,6 +177,10 @@ let send_close t =
     t.closed <- true
   end
 
+let close t =
+  t.closed <- true;
+  try Eio.Flow.shutdown t.flow `All with _ -> ()
+
 (** Perform the WebSocket upgrade handshake over an existing TLS connection. *)
 let handshake t ~host ~path =
   let key = generate_ws_key () in
@@ -229,7 +238,7 @@ let connect ~sw ~net ~host ~port ~path =
   match
     let tls_flow = Tls_eio.client_of_flow tls_config ?host:host_dn tcp_flow in
     let flow = (tls_flow :> Eio.Flow.two_way_ty Eio.Resource.t) in
-    let reader = Eio.Buf_read.of_flow ~max_size:(1024 * 1024) flow in
+    let reader = Eio.Buf_read.of_flow ~max_size:reader_max_size flow in
     let t = { flow; reader; closed = false } in
     handshake t ~host ~path;
     t
