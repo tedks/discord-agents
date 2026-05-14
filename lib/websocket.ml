@@ -23,8 +23,10 @@ type frame = {
   payload : string;
 }
 
+type closable_flow = [ Eio.Flow.two_way_ty | Eio.Resource.close_ty ]
+
 type t = {
-  flow : Eio.Flow.two_way_ty Eio.Resource.t;
+  flow : closable_flow Eio.Resource.t;
   reader : Eio.Buf_read.t;
   mutable closed : bool;
 }
@@ -179,7 +181,8 @@ let send_close t =
 
 let close t =
   t.closed <- true;
-  try Eio.Flow.shutdown t.flow `All with _ -> ()
+  (try Eio.Flow.shutdown t.flow `All with _ -> ());
+  try Eio.Flow.close t.flow with _ -> ()
 
 (** Perform the WebSocket upgrade handshake over an existing TLS connection. *)
 let handshake t ~host ~path =
@@ -237,7 +240,7 @@ let connect ~sw ~net ~host ~port ~path =
   (* If TLS or handshake fails, close the TCP flow to avoid leaking it *)
   match
     let tls_flow = Tls_eio.client_of_flow tls_config ?host:host_dn tcp_flow in
-    let flow = (tls_flow :> Eio.Flow.two_way_ty Eio.Resource.t) in
+    let flow = (tls_flow :> closable_flow Eio.Resource.t) in
     let reader = Eio.Buf_read.of_flow ~max_size:reader_max_size flow in
     let t = { flow; reader; closed = false } in
     handshake t ~host ~path;
