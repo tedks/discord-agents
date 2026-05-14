@@ -42,12 +42,27 @@ let error_response msg =
 
 let handle_health (bot : Bot.t) =
   let uptime = int_of_float (Unix.gettimeofday () -. bot.started_at) in
-  ok_response [
+  let rest_fields = [
+    ("rest_degraded", `Bool (Discord_rest.transport_degraded bot.rest));
+    ("rest_consecutive_transport_failures",
+     `Int (Discord_rest.consecutive_transport_failures bot.rest));
+    ("rest_retry_delay_ms",
+     `Int (int_of_float (1000.0 *. Discord_rest.transport_retry_delay_s bot.rest)));
+  ] in
+  let optional_rest_fields =
+    match Discord_rest.last_transport_error bot.rest with
+    | Some err ->
+      [("last_rest_transport_error",
+        `String (Resource.truncate_utf8 ~max_bytes:1000
+          (Resource.single_line err)))]
+    | None -> []
+  in
+  ok_response ([
     ("uptime_seconds", `Int uptime);
     ("sessions", `Int (Session_store.count bot.sessions));
     ("projects", `Int (List.length (Bot.projects bot)));
     ("channels", `Int (Channel_manager.count (Bot.channels bot)));
-  ]
+  ] @ rest_fields @ optional_rest_fields)
 
 let handle_list_projects (bot : Bot.t) =
   let projects = List.map (fun (p : Project.t) ->
