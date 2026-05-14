@@ -49,6 +49,7 @@ All commands use a `!` prefix:
 |---------|-------------|
 | `!start <project>` | Start a session with the current default agent |
 | `!default-agent [agent]` | Show or set the default agent (`claude`, `codex`, `gemini`) |
+| `!session-agent [agent]` | Show or set the current channel's session agent |
 | `!start` | Show numbered project list |
 | `!resume [agent] <session_id>` | Resume an existing session |
 | `!projects` | List discovered projects |
@@ -64,7 +65,7 @@ All commands use a `!` prefix:
 | `!restart` | Rebuild and restart the bot |
 | `!help` | Command reference |
 
-All channels -- control and project -- have the same capabilities. The agent knows which channel it's in and has context about the associated project. Non-command messages are routed to the channel's current default-agent session automatically.
+All channels -- control and project -- have the same capabilities. The agent knows which channel it's in and has context about the associated project. Non-command messages are routed to the channel's current session automatically; new top-level channel sessions start with the current default agent unless you override that channel with `!session-agent`.
 
 File attachments (screenshots, code, logs, PDFs, etc.) are downloaded and passed to the agent, which can read them directly.
 

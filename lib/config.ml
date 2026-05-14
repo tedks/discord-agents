@@ -24,6 +24,16 @@ let preferred_agent_order preferred =
   :: List.filter (fun kind -> not (equal_agent_kind kind preferred))
        [Claude; Codex; Gemini]
 
+let find_with_preferred_agent preferred f =
+  let rec first_found = function
+    | [] -> None
+    | kind :: rest ->
+      match f kind with
+      | Some _ as found -> found
+      | None -> first_found rest
+  in
+  first_found (preferred_agent_order preferred)
+
 (** Whether this agent accepts a caller-supplied session id at startup
     (Claude's [--session-id]) or allocates its own server-side and
     emits it on first run (Codex's [thread.started], Gemini's [init]).

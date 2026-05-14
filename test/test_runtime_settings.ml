@@ -20,7 +20,7 @@ let with_tmp_home f =
     ~finally:(fun () ->
       (match old_home with
        | Some home -> Unix.putenv "HOME" home
-       | None -> Unix.unsetenv "HOME");
+       | None -> Unix.putenv "HOME" "");
       rm_rf base)
     (fun () -> f base)
 

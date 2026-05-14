@@ -428,16 +428,7 @@ let handle_resume_session (bot : Bot.t) params =
   let found = match kind with
     | Some k -> try_kind k
     | None ->
-      let rec first_found = function
-        | [] -> None
-        | k :: rest ->
-          match try_kind k with
-          | Some _ as found -> found
-          | None -> first_found rest
-      in
-      first_found
-        (Config.preferred_agent_order
-           bot.settings.default_agent)
+      Config.find_with_preferred_agent bot.settings.default_agent try_kind
   in
   match found with
   | None ->

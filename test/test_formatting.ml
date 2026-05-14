@@ -682,6 +682,10 @@ let cmd_testable =
       | Default_agent (Some k) ->
         Printf.sprintf "Default_agent(%s)"
           (Discord_agents.Config.string_of_agent_kind k)
+      | Session_agent None -> "Session_agent"
+      | Session_agent (Some k) ->
+        Printf.sprintf "Session_agent(%s)"
+          (Discord_agents.Config.string_of_agent_kind k)
       | Restart -> "Restart"
       | Refresh -> "Refresh"
       | Rename_thread _ -> "Rename_thread"
@@ -866,6 +870,29 @@ let test_parse_default_agent_invalid_kind () =
     Alcotest.(check pass) "invalid default agent is Unknown" () ()
   | _ -> Alcotest.fail "expected Unknown for invalid default agent kind"
 
+let test_parse_session_agent_no_arg () =
+  Alcotest.(check cmd_testable) "session-agent no arg"
+    (Discord_agents.Command.Session_agent None)
+    (Discord_agents.Command.parse "!session-agent")
+
+let test_parse_session_agent_set () =
+  Alcotest.(check cmd_testable) "session-agent claude"
+    (Discord_agents.Command.Session_agent
+       (Some Discord_agents.Config.Claude))
+    (Discord_agents.Command.parse "!session-agent claude")
+
+let test_parse_session_agent_underscore_alias () =
+  Alcotest.(check cmd_testable) "session_agent alias"
+    (Discord_agents.Command.Session_agent
+       (Some Discord_agents.Config.Codex))
+    (Discord_agents.Command.parse "!session_agent codex")
+
+let test_parse_session_agent_invalid_kind () =
+  match Discord_agents.Command.parse "!session-agent nonesuch" with
+  | Discord_agents.Command.Unknown _ ->
+    Alcotest.(check pass) "invalid session agent is Unknown" () ()
+  | _ -> Alcotest.fail "expected Unknown for invalid session agent kind"
+
 let command_tests = [
   Alcotest.test_case "desktop" `Quick test_parse_desktop;
   Alcotest.test_case "mobile" `Quick test_parse_mobile;
@@ -895,6 +922,10 @@ let command_tests = [
   Alcotest.test_case "default-agent set" `Quick test_parse_default_agent_set;
   Alcotest.test_case "default_agent alias" `Quick test_parse_default_agent_underscore_alias;
   Alcotest.test_case "default-agent invalid kind" `Quick test_parse_default_agent_invalid_kind;
+  Alcotest.test_case "session-agent no arg" `Quick test_parse_session_agent_no_arg;
+  Alcotest.test_case "session-agent set" `Quick test_parse_session_agent_set;
+  Alcotest.test_case "session_agent alias" `Quick test_parse_session_agent_underscore_alias;
+  Alcotest.test_case "session-agent invalid kind" `Quick test_parse_session_agent_invalid_kind;
 ]
 
 (* ── tool detail formatting ────────────────────────────────────── *)
