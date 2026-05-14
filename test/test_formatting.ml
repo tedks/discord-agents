@@ -666,7 +666,11 @@ let cmd_testable =
       | List_claude_sessions -> "List_claude_sessions"
       | List_codex_sessions -> "List_codex_sessions"
       | List_gemini_sessions -> "List_gemini_sessions"
-      | Start_agent { project; _ } -> "Start_agent(" ^ project ^ ")"
+      | Start_agent { project; kind = None } ->
+        "Start_agent(" ^ project ^ ")"
+      | Start_agent { project; kind = Some k } ->
+        Printf.sprintf "Start_agent(%s,%s)"
+          project (Discord_agents.Config.string_of_agent_kind k)
       | Resume_session { session_id; kind = None } ->
         "Resume_session(" ^ session_id ^ ")"
       | Resume_session { session_id; kind = Some k } ->
@@ -674,6 +678,10 @@ let cmd_testable =
           (Discord_agents.Config.string_of_agent_kind k) session_id
       | Stop_session { thread_id } -> "Stop_session(" ^ thread_id ^ ")"
       | Cleanup_channels -> "Cleanup_channels"
+      | Default_agent None -> "Default_agent"
+      | Default_agent (Some k) ->
+        Printf.sprintf "Default_agent(%s)"
+          (Discord_agents.Config.string_of_agent_kind k)
       | Restart -> "Restart"
       | Refresh -> "Refresh"
       | Rename_thread _ -> "Rename_thread"
@@ -826,8 +834,37 @@ let test_parse_gemini_sessions () =
 let test_parse_start_gemini () =
   Alcotest.(check cmd_testable) "start project gemini"
     (Discord_agents.Command.Start_agent
-       { project = "myproj"; kind = Discord_agents.Config.Gemini })
+       { project = "myproj"; kind = Some Discord_agents.Config.Gemini })
     (Discord_agents.Command.parse "!start myproj gemini")
+
+let test_parse_start_default_agent () =
+  Alcotest.(check cmd_testable) "start project default agent"
+    (Discord_agents.Command.Start_agent
+       { project = "myproj"; kind = None })
+    (Discord_agents.Command.parse "!start myproj")
+
+let test_parse_default_agent_no_arg () =
+  Alcotest.(check cmd_testable) "default-agent no arg"
+    (Discord_agents.Command.Default_agent None)
+    (Discord_agents.Command.parse "!default-agent")
+
+let test_parse_default_agent_set () =
+  Alcotest.(check cmd_testable) "default-agent codex"
+    (Discord_agents.Command.Default_agent
+       (Some Discord_agents.Config.Codex))
+    (Discord_agents.Command.parse "!default-agent codex")
+
+let test_parse_default_agent_underscore_alias () =
+  Alcotest.(check cmd_testable) "default_agent alias"
+    (Discord_agents.Command.Default_agent
+       (Some Discord_agents.Config.Gemini))
+    (Discord_agents.Command.parse "!default_agent gemini")
+
+let test_parse_default_agent_invalid_kind () =
+  match Discord_agents.Command.parse "!default-agent nonesuch" with
+  | Discord_agents.Command.Unknown _ ->
+    Alcotest.(check pass) "invalid default agent is Unknown" () ()
+  | _ -> Alcotest.fail "expected Unknown for invalid default agent kind"
 
 let command_tests = [
   Alcotest.test_case "desktop" `Quick test_parse_desktop;
@@ -853,6 +890,11 @@ let command_tests = [
   Alcotest.test_case "gemini-sessions" `Quick test_parse_gemini_sessions;
   Alcotest.test_case "resume with codex kind" `Quick test_parse_resume_with_codex_kind;
   Alcotest.test_case "start with gemini kind" `Quick test_parse_start_gemini;
+  Alcotest.test_case "start with default agent" `Quick test_parse_start_default_agent;
+  Alcotest.test_case "default-agent no arg" `Quick test_parse_default_agent_no_arg;
+  Alcotest.test_case "default-agent set" `Quick test_parse_default_agent_set;
+  Alcotest.test_case "default_agent alias" `Quick test_parse_default_agent_underscore_alias;
+  Alcotest.test_case "default-agent invalid kind" `Quick test_parse_default_agent_invalid_kind;
 ]
 
 (* ── tool detail formatting ────────────────────────────────────── *)

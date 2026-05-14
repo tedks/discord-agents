@@ -2,6 +2,7 @@
 
 module Resource = Resource
 module Config = Config
+module Runtime_settings = Runtime_settings
 module Project = Project
 module Agent_process = Agent_process
 module Agent_runner = Agent_runner

@@ -2,8 +2,8 @@
 
     Routes Discord messages to the appropriate handler:
     - Commands (! prefix) → Command module → handlers
-    - Control channel chat → Claude session with MCP tools
-    - Project channel chat → Claude session scoped to project
+    - Control channel chat → default-agent session with MCP tools
+    - Project channel chat → default-agent session scoped to project
     - Thread messages → Agent_runner
 
     Owns no mutable state directly — delegates to Session_store
@@ -54,6 +54,7 @@ type scroll_state = {
 
 type t = {
   config : Config.t;
+  settings : Runtime_settings.t;
   rest : Discord_rest.t;
   gateway : Discord_gateway.t;
   mutable project_state : project_state;
@@ -72,6 +73,18 @@ type t = {
 (** Convenience accessors for the current project state snapshot. *)
 let projects t = t.project_state.projects
 let channels t = t.project_state.channels
+let default_agent t = t.settings.default_agent
+
+let is_control_channel t ~(channel_id : Discord_types.channel_id) =
+  match t.config.control_channel_id with
+  | Some ctl_id -> channel_id = ctl_id
+  | None -> false
+
+let is_project_channel t ~(channel_id : Discord_types.channel_id) =
+  Option.is_some (Channel_manager.project_for_channel (channels t) ~channel_id)
+
+let is_persistent_channel t ~(channel_id : Discord_types.channel_id) =
+  is_control_channel t ~channel_id || is_project_channel t ~channel_id
 
 (** Drop scroll-state entries for threads that no longer have an active
     session.  Called when sessions are removed wholesale (e.g. after
@@ -141,7 +154,7 @@ You have MCP tools available:
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume
 - list_gemini_sessions: Find recent Gemini CLI sessions to resume
-- resume_session: Resume an existing session (pass kind=codex or kind=gemini to disambiguate; default tries Claude → Codex → Gemini)
+- resume_session: Resume an existing session (pass kind=codex or kind=gemini to disambiguate; default tries the current default agent first)
 - restart_bot: Rebuild and restart the bot
 - rename_thread: Rename a Discord thread
 - cleanup_channels: Delete stale Discord channels
@@ -166,7 +179,7 @@ IMPORTANT: When linking to GitHub PRs, issues, or commits, always use full URLs 
 Discord does not render GitHub shorthand as clickable links."
   session_starting_instructions project_list
 
-(** System prompt for project channel Claude — scoped to one project. *)
+(** System prompt for the project overview session — scoped to one project. *)
 let project_system_prompt (project : Project.t) =
   Printf.sprintf
 "You are the project overview agent for **%s** (at `%s`).
@@ -178,7 +191,7 @@ You have MCP tools available:
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume
 - list_gemini_sessions: Find recent Gemini CLI sessions to resume
-- resume_session: Resume an existing session (pass kind=codex or kind=gemini to disambiguate; default tries Claude → Codex → Gemini)
+- resume_session: Resume an existing session (pass kind=codex or kind=gemini to disambiguate; default tries the current default agent first)
 - rename_thread: Rename a Discord thread
 - restart_bot: Rebuild and restart the bot
 - cleanup_channels: Delete stale Discord channels
@@ -477,6 +490,7 @@ let handle_command t msg cmd =
       reply (format_session_listing ~label:"Claude"
         ~resume_hint:"!resume <session_id_prefix>" entries))
   | Command.Start_agent { project; kind } ->
+    let kind = Option.value kind ~default:(default_agent t) in
     let proj = Command.find_project_fuzzy (projects t) project in
     (match proj with
      | None ->
@@ -558,8 +572,8 @@ let handle_command t msg cmd =
         ~resume_hint:"!resume gemini <session_id_prefix>" entries))
   | Command.Resume_session { session_id; kind } ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
-      (* Locate the session in the requested store, or try
-         Claude → Codex → Gemini in order if [kind] is unspecified. *)
+      (* Locate the session in the requested store, or try the
+         current default first if [kind] is unspecified. *)
       let try_claude () =
         match Claude_sessions.find_by_prefix session_id with
         | Some (sid, wd) -> Some (Config.Claude, sid, wd)
@@ -575,19 +589,24 @@ let handle_command t msg cmd =
         | Some (sid, wd) -> Some (Config.Gemini, sid, wd)
         | None -> None
       in
-      (* Explicit kind hits exactly one store; an unspecified kind
-         tries Claude → Codex → Gemini in order. *)
+      let try_kind = function
+        | Config.Claude -> try_claude ()
+        | Config.Codex -> try_codex ()
+        | Config.Gemini -> try_gemini ()
+      in
+      (* Explicit kind hits exactly one store; otherwise try the
+         current default first, then the remaining stores. *)
       let found = match kind with
-        | Some Config.Claude -> try_claude ()
-        | Some Config.Codex -> try_codex ()
-        | Some Config.Gemini -> try_gemini ()
+        | Some k -> try_kind k
         | None ->
-          (match try_claude () with
-           | Some _ as r -> r
-           | None ->
-             match try_codex () with
-             | Some _ as r -> r
-             | None -> try_gemini ())
+          let rec first_found = function
+            | [] -> None
+            | k :: rest ->
+              match try_kind k with
+              | Some _ as found -> found
+              | None -> first_found rest
+          in
+          first_found (Config.preferred_agent_order (default_agent t))
       in
       match found with
       | None ->
@@ -642,6 +661,33 @@ let handle_command t msg cmd =
        Session_store.remove t.sessions ~thread_id;
        Hashtbl.remove t.scroll_states thread_id;
        reply (Printf.sprintf "Stopped session for **%s**." session.project_name))
+  | Command.Default_agent None ->
+    reply (Printf.sprintf "Default agent: `%s`."
+      (Config.string_of_agent_kind (default_agent t)))
+  | Command.Default_agent (Some kind) ->
+    let kind_str = Config.string_of_agent_kind kind in
+    (match Runtime_settings.set_default_agent t.settings kind with
+     | Error err ->
+       reply (Printf.sprintf "Failed to save default agent: %s" err)
+     | Ok () ->
+       if is_persistent_channel t ~channel_id then
+         (match Session_store.find_opt t.sessions ~thread_id:channel_id with
+          | Some session when session.processing ->
+            reply (Printf.sprintf
+              "Default agent set to `%s`. This channel is still running `%s`; send the next message after it finishes."
+              kind_str (Config.string_of_agent_kind session.agent_kind))
+          | Some session when not (Config.equal_agent_kind session.agent_kind kind) ->
+            Session_store.remove t.sessions ~thread_id:channel_id;
+            Hashtbl.remove t.scroll_states channel_id;
+            reply (Printf.sprintf
+              "Default agent set to `%s`. Reset this channel's idle `%s` session; your next message will start `%s`."
+              kind_str
+              (Config.string_of_agent_kind session.agent_kind)
+              kind_str)
+          | _ ->
+            reply (Printf.sprintf "Default agent set to `%s`." kind_str))
+       else
+         reply (Printf.sprintf "Default agent set to `%s`." kind_str))
   | Command.Cleanup_channels ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       match Channel_manager.cleanup ~rest:t.rest
@@ -766,6 +812,8 @@ let handle_command t msg cmd =
         in
         let lines = [
           Printf.sprintf "**%s** (pid %d, up %s)" (Build_info.version_string ()) pid uptime_str;
+          Printf.sprintf "Default agent: %s"
+            (Config.string_of_agent_kind (default_agent t));
           Printf.sprintf "Sessions: %d (%d processing)"
             (Session_store.count t.sessions)
             (List.length (List.filter (fun (_, (s : Session_store.session)) ->
@@ -791,8 +839,9 @@ let handle_command t msg cmd =
       "`!claude-sessions` — list recent Claude sessions";
       "`!codex-sessions` — list recent Codex sessions";
       "`!gemini-sessions` — list recent Gemini sessions";
-      "`!start <project> [agent]` — start a session (claude|codex|gemini; defaults to claude)";
-      "`!resume [agent] <session_id>` — resume a session (agent defaults to none; tries Claude → Codex → Gemini)";
+      "`!start <project> [agent]` — start a session (defaults to the current default agent)";
+      "`!default-agent [agent]` — show or set the default agent (claude|codex|gemini)";
+      "`!resume [agent] <session_id>` — resume a session (no agent = try the current default first)";
       "`!stop <thread_id>` — stop a session";
       "`!rename [thread_id] <name>` — rename a thread";
       "`!status` — bot status and running processes";
@@ -1070,13 +1119,13 @@ let fork_initial_prompt_run t ~session ~msg =
       process_session_message t session msg None))
 
 (** Ensure a session exists for a channel (control or project channels).
-    Creates a persistent Claude session so the channel can handle chat directly. *)
+    Creates a persistent session using the current default agent. *)
 let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prompt =
   match Session_store.find_opt t.sessions ~thread_id:channel_id with
   | Some _ -> ()
   | None ->
     let session = Session_store.make_session
-      ~project_name ~working_dir ~agent_kind:Config.Claude
+      ~project_name ~working_dir ~agent_kind:(default_agent t)
       ~session_id:(Resource.generate_uuid ())
       ~thread_id:channel_id
       ~system_prompt ~initial_prompt:None () in
@@ -1219,7 +1268,8 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
     ~handler:(fun _event -> ())
   in
   let project_state = { projects = discovered_projects; channels = initial_channels } in
-  let bot = { config; rest; gateway; project_state; sessions; env; sw;
+  let bot = { config; settings = Runtime_settings.load ();
+               rest; gateway; project_state; sessions; env; sw;
                started_at = Unix.gettimeofday ();
                draining = false; child_pids = (ref Pid_set.empty, Mutex.create ());
                wrap_width = Agent_process.desktop_width;

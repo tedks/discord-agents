@@ -106,6 +106,8 @@ let handle_health (bot : Bot.t) =
   in
   ok_response ([
     ("uptime_seconds", `Int uptime);
+    ("default_agent",
+     `String (Config.string_of_agent_kind bot.settings.default_agent));
     ("sessions", `Int (Session_store.count bot.sessions));
     ("projects", `Int (List.length (Bot.projects bot)));
     ("channels", `Int (Channel_manager.count (Bot.channels bot)));
@@ -209,7 +211,10 @@ let handle_start_session (bot : Bot.t) params =
   else
   let project_str = params |> member "project" |> to_string in
   let kind_str = match params |> member "agent" |> to_string_option with
-    | Some s -> s | None -> "claude" in
+    | Some s -> s
+    | None ->
+      Config.string_of_agent_kind bot.settings.default_agent
+  in
   let kind = match Config.agent_kind_of_string kind_str with
     | Ok k -> k | Error _ -> failwith ("unknown agent: " ^ kind_str) in
   let thread_name = params |> member "thread_name" |> to_string_option in
@@ -401,7 +406,8 @@ let handle_resume_session (bot : Bot.t) params =
        | Ok k -> Some k | Error _ -> None)
   in
   (* Mirror Bot.handle_command's Resume_session dispatch: explicit
-     kind looks up its own store; None tries Claude then Gemini. *)
+     kind looks up its own store; None tries the current default
+     first, then the remaining stores. *)
   let try_claude () =
     match Claude_sessions.find_by_prefix sid_prefix with
     | Some (sid, wd) -> Some (Config.Claude, sid, wd) | None -> None
@@ -414,17 +420,24 @@ let handle_resume_session (bot : Bot.t) params =
     match Gemini_sessions.find_by_prefix sid_prefix with
     | Some (sid, wd) -> Some (Config.Gemini, sid, wd) | None -> None
   in
+  let try_kind = function
+    | Config.Claude -> try_claude ()
+    | Config.Codex -> try_codex ()
+    | Config.Gemini -> try_gemini ()
+  in
   let found = match kind with
-    | Some Config.Claude -> try_claude ()
-    | Some Config.Codex -> try_codex ()
-    | Some Config.Gemini -> try_gemini ()
+    | Some k -> try_kind k
     | None ->
-      (match try_claude () with
-       | Some _ as r -> r
-       | None ->
-         match try_codex () with
-         | Some _ as r -> r
-         | None -> try_gemini ())
+      let rec first_found = function
+        | [] -> None
+        | k :: rest ->
+          match try_kind k with
+          | Some _ as found -> found
+          | None -> first_found rest
+      in
+      first_found
+        (Config.preferred_agent_order
+           bot.settings.default_agent)
   in
   match found with
   | None ->

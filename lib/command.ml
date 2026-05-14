@@ -9,12 +9,11 @@ type t =
   | List_claude_sessions
   | List_codex_sessions
   | List_gemini_sessions
-  | Start_agent of { project : string; kind : Config.agent_kind }
-  (* [kind] disambiguates which session store to search. None = the
-     handler tries Claude → Codex → Gemini in that order. *)
+  | Start_agent of { project : string; kind : Config.agent_kind option }
   | Resume_session of { session_id : string; kind : Config.agent_kind option }
   | Stop_session of { thread_id : string }
   | Cleanup_channels
+  | Default_agent of Config.agent_kind option
   | Restart
   | Refresh
   | Rename_thread of { thread_id : string option; name : string }
@@ -46,17 +45,22 @@ let parse content =
   | ["codex-sessions"] -> List_codex_sessions
   | ["gemini-sessions"] -> List_gemini_sessions
   | "start" :: project :: kind_str :: _ ->
-    let kind = match Config.agent_kind_of_string (String.lowercase_ascii kind_str) with
-      | Ok k -> k | Error _ -> Config.Claude in
-    Start_agent { project; kind }
+    (match Config.agent_kind_of_string (String.lowercase_ascii kind_str) with
+     | Ok kind -> Start_agent { project; kind = Some kind }
+     | Error _ -> Unknown content)
   | ["start"; project] ->
-    Start_agent { project; kind = Config.Claude }
+    Start_agent { project; kind = None }
   | ["start"] ->
     List_projects
   | ["resume"; session_id] -> Resume_session { session_id; kind = None }
   | ["resume"; kind_str; session_id] ->
     (match Config.agent_kind_of_string (String.lowercase_ascii kind_str) with
      | Ok k -> Resume_session { session_id; kind = Some k }
+     | Error _ -> Unknown content)
+  | ["default-agent"] | ["default_agent"] -> Default_agent None
+  | ["default-agent"; kind_str] | ["default_agent"; kind_str] ->
+    (match Config.agent_kind_of_string (String.lowercase_ascii kind_str) with
+     | Ok k -> Default_agent (Some k)
      | Error _ -> Unknown content)
   | ["stop"; thread_id] -> Stop_session { thread_id }
   | ["cleanup-channels"] | ["cleanup"] -> Cleanup_channels

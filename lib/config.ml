@@ -19,6 +19,11 @@ let string_of_agent_kind = function
   | Codex -> "codex"
   | Gemini -> "gemini"
 
+let preferred_agent_order preferred =
+  preferred
+  :: List.filter (fun kind -> not (equal_agent_kind kind preferred))
+       [Claude; Codex; Gemini]
+
 (** Whether this agent accepts a caller-supplied session id at startup
     (Claude's [--session-id]) or allocates its own server-side and
     emits it on first run (Codex's [thread.started], Gemini's [init]).
