@@ -283,7 +283,14 @@ let request ?(retry_mode = No_retry) t ~meth ~path ?body () =
   let handle_response code body_str =
     if code >= 200 && code < 300 then begin
       if String.length body_str = 0 then Ok `Null
-      else Ok (Yojson.Safe.from_string body_str)
+      else
+        try Ok (Yojson.Safe.from_string body_str)
+        with exn ->
+          Logs.warn (fun m ->
+            m "REST %s %s: response parse error: %s"
+              meth_str path (Printexc.to_string exn));
+          Error (Printf.sprintf "discord REST %s %s: response parse error %s"
+            meth_str path (body_snippet (Printexc.to_string exn)))
     end else begin
       (* Log the full body (up to truncate_for_log's cap) centrally for
          operator debugging, and include a short body snippet in the
@@ -586,16 +593,13 @@ let get_channel t ~(channel_id : Discord_types.channel_id) () =
     Returns the raw bytes on success. *)
 let download_url t ~url () =
   let uri = Uri.of_string url in
-  let host = Uri.host uri |> Option.value ~default:"<unknown>" in
   let headers = Http.Header.of_list [
     ("User-Agent", "DiscordBot (discord-agents/0.1.0, OCaml)");
   ] in
   let rec loop attempt =
-    wait_for_transport_backoff t;
     try
       let (resp, body) =
         Cohttp_eio.Client.call t.client ~sw:t.sw ~headers `GET uri in
-      note_transport_recovery t;
       let status = Http.Response.status resp in
       let code = Http.Status.to_int status in
       let body_str = read_body body in
@@ -611,7 +615,13 @@ let download_url t ~url () =
         Error (Printf.sprintf "download_url %s: HTTP %d" url code)
     with exn ->
       raise_if_cancelled exn;
-      let (summary, delay) = note_transport_failure t ~host exn in
+      let summary =
+        Printf.sprintf "kind=%s error=%s"
+          (classify_transport_error_message (Printexc.to_string exn)
+           |> string_of_transport_error_kind)
+          (Printexc.to_string exn)
+      in
+      let delay = transport_backoff_seconds attempt in
       if attempt < max_transient_attempts then begin
         Logs.warn (fun m ->
           m "download_url %s: transport failure on attempt %d/%d, retrying in %.1fs (%s)"
