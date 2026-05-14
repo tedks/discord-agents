@@ -10,6 +10,8 @@ type t =
   | List_codex_sessions
   | List_gemini_sessions
   | Start_agent of { project : string; kind : Config.agent_kind option }
+  (** [kind = None] means "try the current default agent first, then
+      the remaining agent stores". *)
   | Resume_session of { session_id : string; kind : Config.agent_kind option }
   | Stop_session of { thread_id : string }
   | Cleanup_channels

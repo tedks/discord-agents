@@ -1608,6 +1608,77 @@ let test_make_session_default_claude_confirmed () =
     "Claude default is confirmed (--session-id pins it)"
     true s.session_id_confirmed
 
+let test_pending_agent_kind_roundtrip () =
+  let session = Discord_agents.Session_store.make_session
+    ~project_name:"foo" ~working_dir:"/tmp/foo"
+    ~agent_kind:Discord_agents.Config.Claude
+    ~session_id:"caller-pinned"
+    ~thread_id:"123" ~system_prompt:None ~initial_prompt:None
+    ~pending_agent_change:(Some
+      Discord_agents.Session_store.{
+        kind = Discord_agents.Config.Codex;
+        origin = Session_override;
+      }) ()
+  in
+  let map =
+    Discord_agents.Session_store.SessionMap.empty
+    |> Discord_agents.Session_store.SessionMap.add "123" session
+  in
+  let json = Discord_agents.Session_store.sessions_to_json map in
+  let reparsed = Discord_agents.Session_store.sessions_of_json json in
+  let sessions = Discord_agents.Session_store.SessionMap.bindings reparsed in
+  match sessions with
+  | [(_, s)] ->
+    let pending_kind =
+      Option.map
+        (fun (pending : Discord_agents.Session_store.pending_agent_change) ->
+          Discord_agents.Config.string_of_agent_kind pending.kind)
+        s.pending_agent_change
+    in
+    let pending_origin =
+      Option.map
+        (fun (pending : Discord_agents.Session_store.pending_agent_change) ->
+          match pending.origin with
+          | Discord_agents.Session_store.Default_rotation -> "default_rotation"
+          | Discord_agents.Session_store.Session_override -> "session_override")
+        s.pending_agent_change
+    in
+    Alcotest.(check (option string))
+      "pending agent kind survives roundtrip"
+      (Some "codex") pending_kind;
+    Alcotest.(check (option string))
+      "pending agent origin survives roundtrip"
+      (Some "session_override") pending_origin
+  | _ -> Alcotest.fail "expected exactly one session"
+
+let test_legacy_pending_agent_defaults_to_default_rotation () =
+  let json = Yojson.Safe.from_string {|[
+    {"project_name":"foo","working_dir":"/tmp/foo",
+     "agent_kind":"claude","session_id":"abc","thread_id":"123",
+     "message_count":1,
+     "pending_agent_kind":"codex"}
+  ]|} in
+  let map = Discord_agents.Session_store.sessions_of_json json in
+  let sessions = Discord_agents.Session_store.SessionMap.bindings map in
+  match sessions with
+  | [(_, s)] ->
+    let pending =
+      match s.pending_agent_change with
+      | None -> Alcotest.fail "expected pending agent change"
+      | Some pending -> pending
+    in
+    Alcotest.(check string)
+      "legacy pending kind parsed"
+      "codex"
+      (Discord_agents.Config.string_of_agent_kind pending.kind);
+    Alcotest.(check string)
+      "legacy pending defaults to default rotation"
+      "default_rotation"
+      (match pending.origin with
+       | Discord_agents.Session_store.Default_rotation -> "default_rotation"
+       | Discord_agents.Session_store.Session_override -> "session_override")
+  | _ -> Alcotest.fail "expected exactly one session"
+
 let session_store_tests = [
   Alcotest.test_case "legacy Codex session unconfirmed" `Quick
     test_legacy_codex_session_defaults_unconfirmed;
@@ -1625,6 +1696,10 @@ let session_store_tests = [
     test_make_session_default_gemini_unconfirmed;
   Alcotest.test_case "fresh Claude default confirmed" `Quick
     test_make_session_default_claude_confirmed;
+  Alcotest.test_case "pending agent kind roundtrip" `Quick
+    test_pending_agent_kind_roundtrip;
+  Alcotest.test_case "legacy pending agent defaults to default rotation" `Quick
+    test_legacy_pending_agent_defaults_to_default_rotation;
 ]
 
 (* ── Bot.resume_not_found_message + Bot.merge_gemini_settings ───── *)

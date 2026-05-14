@@ -77,8 +77,7 @@ let default = {
 }
 
 let config_path () =
-  let home = Sys.getenv "HOME" in
-  Filename.concat home ".config/discord-agents/config.json"
+  Filename.concat (Resource.app_config_dir ()) "config.json"
 
 let load_file path =
   let ic = open_in path in
@@ -106,9 +105,7 @@ let load () =
 
 let save config =
   let path = config_path () in
-  let dir = Filename.dirname path in
-  if not (Sys.file_exists dir) then
-    Sys.mkdir dir 0o700;
+  Resource.ensure_parent_dir path;
   let json = yojson_of_t config in
   (* Write with restricted permissions — file contains discord token *)
   let fd = Unix.openfile path [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o600 in

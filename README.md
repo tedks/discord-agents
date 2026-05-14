@@ -2,7 +2,7 @@
 
 discord-agents is a Discord server interface for coding agents. Every channel is a project, and every agent session is a thread. Channels are connected to their own management agent sessions that can spawn new threads conversationally. You can drop in your existing projects or resume the sessions that are already on your machine. New sessions automatically get their own worktrees.
 
-There is a `!command` interface to server management, but control channels also have access to an MCP that can perform all commands. See the commands section for a full list or ask your agent.
+There is a `!command` interface to server management, and control channels also have access to an MCP for session and project operations, including changing the default agent. Per-channel session overrides remain command-driven via `!session-agent`.
 
 discord-agents is intended to be a simple interface to agentic coding on your personal machines and is not intended to be used in shared Discord servers. There is no authentication, and it has the full capabilities of a coding agent launched as the user you started it as. There is no sandboxing in discord-agents itself; use Unix and Claude sandboxing if you require it.
 
@@ -66,6 +66,10 @@ All commands use a `!` prefix:
 | `!help` | Command reference |
 
 All channels -- control and project -- have the same capabilities. The agent knows which channel it's in and has context about the associated project. Non-command messages are routed to the channel's current session automatically; new top-level channel sessions start with the current default agent unless you override that channel with `!session-agent`.
+
+`!default_agent` and `!session_agent` are accepted as underscore aliases.
+
+Changing an agent starts a fresh backend session for that channel. It does not migrate conversation state between Claude, Codex, and Gemini.
 
 File attachments (screenshots, code, logs, PDFs, etc.) are downloaded and passed to the agent, which can read them directly.
 

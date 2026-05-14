@@ -11,8 +11,7 @@
     Replaces the MCP server's direct session file / Discord REST access. *)
 
 let socket_path () =
-  let home = Sys.getenv "HOME" in
-  Filename.concat home ".config/discord-agents/control.sock"
+  Filename.concat (Resource.app_config_dir ()) "control.sock"
 
 let raise_if_cancelled exn =
   match exn with
@@ -483,6 +482,35 @@ let handle_resume_session (bot : Bot.t) params =
           ("agent_kind", `String kind_label);
         ])
 
+let handle_default_agent (bot : Bot.t) params =
+  let open Yojson.Safe.Util in
+  let requested =
+    match params with
+    | Some p ->
+      (match p |> member "agent" |> to_string_option with
+       | None -> None
+       | Some s ->
+         (match Config.agent_kind_of_string (String.lowercase_ascii s) with
+          | Ok kind -> Some kind
+          | Error msg -> failwith msg))
+    | None -> None
+  in
+  match requested with
+  | None ->
+    ok_response [
+      ("agent",
+       `String (Config.string_of_agent_kind bot.settings.default_agent));
+    ]
+  | Some kind ->
+    (match Bot.set_default_agent bot kind with
+     | Error err -> error_response err
+     | Ok rotation ->
+       ok_response [
+         ("agent", `String (Config.string_of_agent_kind kind));
+         ("reset_count", `Int rotation.Bot.reset_count);
+         ("busy_count", `Int rotation.Bot.busy_count);
+       ])
+
 let handle_restart (bot : Bot.t) =
   Bot.trigger_restart bot ~notify:(fun msg ->
     Logs.info (fun m -> m "control_api restart: %s" msg));
@@ -528,6 +556,7 @@ let dispatch (bot : Bot.t) method_ params =
     | "list_gemini_sessions" -> handle_list_gemini_sessions bot params
     | "start_session" -> handle_start_session bot params
     | "resume_session" -> handle_resume_session bot params
+    | "default_agent" -> handle_default_agent bot params
     | "restart" -> handle_restart bot
     | "rename_thread" -> handle_rename_thread bot params
     | "cleanup_channels" -> handle_cleanup_channels bot
@@ -571,6 +600,7 @@ let handle_connection bot flow =
 
 let start ~(bot : Bot.t) ~sw ~(env : Eio_unix.Stdenv.base) =
   let path = socket_path () in
+  Resource.ensure_parent_dir path;
   (* Remove stale socket from a previous run *)
   (try Unix.unlink path with Unix.Unix_error _ -> ());
   let net = Eio.Stdenv.net env in

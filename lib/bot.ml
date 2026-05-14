@@ -68,14 +68,16 @@ type t = {
   mutable refreshing : bool;
   mutable output_lines : int;
   scroll_states : (Discord_types.channel_id, scroll_state) Hashtbl.t;
-  pending_session_agent_changes :
-    (Discord_types.channel_id, Config.agent_kind) Hashtbl.t;
 }
 
 (** Convenience accessors for the current project state snapshot. *)
 let projects t = t.project_state.projects
 let channels t = t.project_state.channels
 let default_agent t = t.settings.default_agent
+let pending_default_rotation kind =
+  Session_store.{ kind; origin = Default_rotation }
+let pending_session_override kind =
+  Session_store.{ kind; origin = Session_override }
 
 let is_control_channel t ~(channel_id : Discord_types.channel_id) =
   match t.config.control_channel_id with
@@ -103,52 +105,6 @@ let fresh_session_like (session : Session_store.session) ~agent_kind =
     ~thread_id:session.thread_id
     ~system_prompt:session.system_prompt
     ~initial_prompt:None ()
-
-let replace_session_agent t (session : Session_store.session) ~agent_kind =
-  let replacement = fresh_session_like session ~agent_kind in
-  Session_store.add t.sessions ~thread_id:session.thread_id replacement;
-  Hashtbl.remove t.scroll_states session.thread_id;
-  Hashtbl.remove t.pending_session_agent_changes session.thread_id
-
-let align_persistent_sessions_to_default t ~current_channel_id ~new_agent =
-  let stale_sessions =
-    Session_store.bindings t.sessions
-    |> List.filter (fun (thread_id, (session : Session_store.session)) ->
-      is_persistent_channel t ~channel_id:thread_id
-      && not (Config.equal_agent_kind session.agent_kind new_agent))
-  in
-  let current_busy_kind = ref None in
-  let reset_count = ref 0 in
-  let busy_count = ref 0 in
-  List.iter (fun (thread_id, (session : Session_store.session)) ->
-    if session.processing || not (Queue.is_empty session.pending_queue) then begin
-      incr busy_count;
-      Hashtbl.replace t.pending_session_agent_changes thread_id new_agent;
-      if thread_id = current_channel_id then
-        current_busy_kind := Some session.agent_kind
-    end else begin
-      replace_session_agent t session ~agent_kind:new_agent;
-      incr reset_count
-    end
-  ) stale_sessions;
-  { reset_count = !reset_count;
-    busy_count = !busy_count;
-    current_busy_kind = !current_busy_kind; }
-
-let maybe_apply_pending_session_agent_change t (session : Session_store.session) =
-  let channel_id = session.Session_store.thread_id in
-  match Hashtbl.find_opt t.pending_session_agent_changes channel_id with
-  | None -> ()
-  | Some target_kind ->
-    if Config.equal_agent_kind session.agent_kind target_kind then
-      Hashtbl.remove t.pending_session_agent_changes channel_id
-    else if not session.processing
-            && Queue.is_empty session.pending_queue then begin
-      replace_session_agent t session ~agent_kind:target_kind;
-      Logs.info (fun m ->
-        m "bot: switched channel %s to %s after pending agent change"
-          channel_id (Config.string_of_agent_kind target_kind))
-    end
 
 (** Drop scroll-state entries for threads that no longer have an active
     session.  Called when sessions are removed wholesale (e.g. after
@@ -218,7 +174,8 @@ You have MCP tools available:
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume
 - list_gemini_sessions: Find recent Gemini CLI sessions to resume
-- resume_session: Resume an existing session (pass kind=codex or kind=gemini to disambiguate; default tries the current default agent first)
+- resume_session: Resume an existing session (pass kind=claude, kind=codex, or kind=gemini to disambiguate; default tries the current default agent first)
+- default_agent: Show or set the default agent used for new top-level sessions
 - restart_bot: Rebuild and restart the bot
 - rename_thread: Rename a Discord thread
 - cleanup_channels: Delete stale Discord channels
@@ -255,7 +212,8 @@ You have MCP tools available:
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume
 - list_gemini_sessions: Find recent Gemini CLI sessions to resume
-- resume_session: Resume an existing session (pass kind=codex or kind=gemini to disambiguate; default tries the current default agent first)
+- resume_session: Resume an existing session (pass kind=claude, kind=codex, or kind=gemini to disambiguate; default tries the current default agent first)
+- default_agent: Show or set the default agent used for new top-level sessions
 - rename_thread: Rename a Discord thread
 - restart_bot: Rebuild and restart the bot
 - cleanup_channels: Delete stale Discord channels
@@ -282,6 +240,123 @@ Discord does not render GitHub shorthand as clickable links.
 IMPORTANT: When starting sessions, always create a fresh worktree so agents don't \
 stomp on each other's work."
   project.name project.path session_starting_instructions
+
+let refreshed_system_prompt t (session : Session_store.session) =
+  if is_control_channel t ~channel_id:session.thread_id then
+    Some (control_system_prompt (projects t))
+  else
+    match Channel_manager.project_for_channel (channels t)
+            ~channel_id:session.thread_id with
+    | Some project_name ->
+      (match List.find_opt (fun (p : Project.t) -> p.name = project_name)
+               (projects t) with
+       | Some project -> Some (project_system_prompt project)
+       | None -> session.system_prompt)
+    | None -> session.system_prompt
+
+let replace_session_agent t (session : Session_store.session) ~agent_kind =
+  let replacement = {
+    (fresh_session_like session ~agent_kind) with
+    system_prompt = refreshed_system_prompt t session;
+  } in
+  Session_store.add t.sessions ~thread_id:session.thread_id replacement;
+  Hashtbl.remove t.scroll_states session.thread_id
+
+let align_persistent_sessions_to_default t ~current_channel_id ~new_agent =
+  let dirty = ref false in
+  let prior_pending = ref [] in
+  let record_prior session =
+    prior_pending := (session, session.Session_store.pending_agent_change) :: !prior_pending
+  in
+  Session_store.bindings t.sessions
+  |> List.iter (fun (thread_id, (session : Session_store.session)) ->
+    if is_persistent_channel t ~channel_id:thread_id
+       && Config.equal_agent_kind session.agent_kind new_agent
+    then
+      match session.pending_agent_change with
+      | Some { origin = Session_store.Default_rotation; _ } ->
+        record_prior session;
+        session.pending_agent_change <- None;
+        dirty := true
+      | _ -> ());
+  let stale_sessions =
+    Session_store.bindings t.sessions
+    |> List.filter (fun (thread_id, (session : Session_store.session)) ->
+      is_persistent_channel t ~channel_id:thread_id
+      && not (Config.equal_agent_kind session.agent_kind new_agent))
+  in
+  let current_busy_kind = ref None in
+  let reset_count = ref 0 in
+  let busy_count = ref 0 in
+  List.iter (fun (thread_id, (session : Session_store.session)) ->
+    if session.processing || not (Queue.is_empty session.pending_queue) then begin
+      match session.pending_agent_change with
+      | Some { origin = Session_store.Session_override; _ } -> ()
+      | _ ->
+        incr busy_count;
+        let target = pending_default_rotation new_agent in
+        if session.pending_agent_change <> Some target then begin
+          record_prior session;
+          session.pending_agent_change <- Some target;
+          dirty := true
+        end;
+        (match current_channel_id with
+         | Some current_channel_id when thread_id = current_channel_id ->
+           current_busy_kind := Some session.agent_kind
+         | _ -> ())
+    end else begin
+      replace_session_agent t session ~agent_kind:new_agent;
+      incr reset_count
+    end
+  ) stale_sessions;
+  if !dirty then
+    (try Session_store.save t.sessions with exn ->
+       List.iter (fun (session, prior) ->
+         session.Session_store.pending_agent_change <- prior
+       ) !prior_pending;
+       raise exn);
+  { reset_count = !reset_count;
+    busy_count = !busy_count;
+    current_busy_kind = !current_busy_kind; }
+
+let set_default_agent t ?(current_channel_id=None) kind =
+  match Runtime_settings.set_default_agent t.settings kind with
+  | Error _ as err -> err
+  | Ok () ->
+    Ok (align_persistent_sessions_to_default t ~current_channel_id ~new_agent:kind)
+
+let maybe_apply_pending_session_agent_change t (session : Session_store.session) =
+  match session.pending_agent_change with
+  | None -> ()
+  | Some pending ->
+    if Config.equal_agent_kind session.agent_kind pending.kind then
+      (match Session_store.set_pending_agent_change t.sessions session None with
+       | Ok () -> ()
+       | Error err ->
+         Logs.warn (fun m ->
+           m "bot: failed to clear pending agent change for %s: %s"
+             session.thread_id err))
+    else if not session.processing
+            && Queue.is_empty session.pending_queue then begin
+      (try
+         replace_session_agent t session ~agent_kind:pending.kind;
+         Logs.info (fun m ->
+           m "bot: switched channel %s to %s after pending agent change"
+             session.thread_id (Config.string_of_agent_kind pending.kind))
+       with exn ->
+         Logs.warn (fun m ->
+           m "bot: failed to switch channel %s to %s: %s"
+             session.thread_id
+             (Config.string_of_agent_kind pending.kind)
+             (Printexc.to_string exn)))
+    end
+
+let reconcile_persisted_pending_agent_changes t =
+  Session_store.bindings t.sessions
+  |> List.iter (fun (_thread_id, (session : Session_store.session)) ->
+    maybe_apply_pending_session_agent_change t session);
+  ignore (align_persistent_sessions_to_default t
+    ~current_channel_id:None ~new_agent:(default_agent t))
 
 (** Trigger a graceful restart: drain → reap → build → spawn.
     Callable from command handler or signal handler.
@@ -527,8 +602,7 @@ let create_persistent_channel_session t ~channel_id ~project_name ~working_dir
     ~session_id:(Resource.generate_uuid ())
     ~thread_id:channel_id
     ~system_prompt ~initial_prompt:None () in
-  Session_store.add t.sessions ~thread_id:channel_id session;
-  Hashtbl.remove t.pending_session_agent_changes channel_id
+  Session_store.add t.sessions ~thread_id:channel_id session
 
 (** Ensure or create a persistent top-level channel session for an
     explicit agent. Returns [true] if the channel context was known and
@@ -754,7 +828,6 @@ let handle_command t msg cmd =
      | None -> reply "Session not found."
      | Some session ->
        Session_store.remove t.sessions ~thread_id;
-       Hashtbl.remove t.pending_session_agent_changes thread_id;
        Hashtbl.remove t.scroll_states thread_id;
        reply (Printf.sprintf "Stopped session for **%s**." session.project_name))
   | Command.Default_agent None ->
@@ -762,14 +835,10 @@ let handle_command t msg cmd =
       (Config.string_of_agent_kind (default_agent t)))
   | Command.Default_agent (Some kind) ->
     let kind_str = Config.string_of_agent_kind kind in
-    (match Runtime_settings.set_default_agent t.settings kind with
+    (match set_default_agent t ~current_channel_id:(Some channel_id) kind with
      | Error err ->
        reply (Printf.sprintf "Failed to save default agent: %s" err)
-     | Ok () ->
-       let rotation =
-         align_persistent_sessions_to_default t
-           ~current_channel_id:channel_id ~new_agent:kind
-       in
+     | Ok rotation ->
        let reset_suffix =
          if rotation.reset_count = 0 then ""
          else
@@ -784,31 +853,31 @@ let handle_command t msg cmd =
            let others =
              if other_busy <= 0 then ""
              else
-               Printf.sprintf " %d other busy top-level session%s will switch after finishing."
+               Printf.sprintf " %d other busy top-level session%s will switch after their queued work finishes."
                  other_busy
                  (if other_busy = 1 then "" else "s")
            in
            Printf.sprintf
-             " This channel is still running `%s`; it will switch after the current run finishes.%s"
+             " This channel is still running `%s`; it will reset to the new default after its queued work finishes.%s"
              (Config.string_of_agent_kind current_kind) others
          | None ->
            if rotation.busy_count = 0 then ""
            else
-             Printf.sprintf " %d busy top-level session%s will switch after finishing."
+             Printf.sprintf " %d busy top-level session%s will switch after their queued work finishes."
                rotation.busy_count
                (if rotation.busy_count = 1 then "" else "s")
-       in
+      in
        reply (Printf.sprintf "Default agent set to `%s`.%s%s"
          kind_str reset_suffix busy_suffix))
   | Command.Session_agent None ->
     (match Session_store.find_opt t.sessions ~thread_id:channel_id with
      | Some session ->
-       (match Hashtbl.find_opt t.pending_session_agent_changes channel_id with
-        | Some target when not (Config.equal_agent_kind target session.agent_kind) ->
+       (match session.pending_agent_change with
+        | Some pending when not (Config.equal_agent_kind pending.kind session.agent_kind) ->
           reply (Printf.sprintf
-            "Session agent: `%s` (will switch to `%s` after current work finishes)."
+            "Session agent: `%s` (will start a fresh `%s` session after queued work finishes)."
             (Config.string_of_agent_kind session.agent_kind)
-            (Config.string_of_agent_kind target))
+            (Config.string_of_agent_kind pending.kind))
         | _ ->
           reply (Printf.sprintf "Session agent: `%s`."
             (Config.string_of_agent_kind session.agent_kind)))
@@ -822,19 +891,23 @@ let handle_command t msg cmd =
     let kind_str = Config.string_of_agent_kind kind in
     (match Session_store.find_opt t.sessions ~thread_id:channel_id with
      | Some session when Config.equal_agent_kind session.agent_kind kind
-                         && not (Hashtbl.mem t.pending_session_agent_changes channel_id) ->
+                         && Option.is_none session.pending_agent_change ->
        reply (Printf.sprintf "Session agent is already `%s`." kind_str)
      | Some session when session.processing || not (Queue.is_empty session.pending_queue) ->
-       Hashtbl.replace t.pending_session_agent_changes channel_id kind;
-       reply (Printf.sprintf
-         "Session agent will switch to `%s` after the current work finishes."
-         kind_str)
+       (match Session_store.set_pending_agent_change t.sessions session
+                (Some (pending_session_override kind)) with
+        | Ok () ->
+          reply (Printf.sprintf
+            "A fresh `%s` session will start for this channel after queued work finishes."
+            kind_str)
+        | Error err ->
+          reply (Printf.sprintf "Failed to persist session agent change: %s" err))
      | Some session ->
        replace_session_agent t session ~agent_kind:kind;
-       reply (Printf.sprintf "Session agent set to `%s` for this channel."
+       reply (Printf.sprintf "Started a fresh `%s` session for this channel."
          kind_str)
      | None when create_explicit_channel_session t ~channel_id ~agent_kind:kind ->
-       reply (Printf.sprintf "Session agent set to `%s` for this channel."
+       reply (Printf.sprintf "Started a fresh `%s` session for this channel."
          kind_str)
      | None ->
        reply "No session exists in this channel. Use `!start` or `!resume`.")
@@ -990,8 +1063,8 @@ let handle_command t msg cmd =
       "`!codex-sessions` — list recent Codex sessions";
       "`!gemini-sessions` — list recent Gemini sessions";
       "`!start <project> [agent]` — start a session (defaults to the current default agent)";
-      "`!default-agent [agent]` — show or set the default agent (claude|codex|gemini)";
-      "`!session-agent [agent]` — show or set the current channel session agent";
+      "`!default-agent [agent]` / `!default_agent [agent]` — show or set the default agent (claude|codex|gemini)";
+      "`!session-agent [agent]` / `!session_agent [agent]` — show or set the current channel session agent";
       "`!resume [agent] <session_id>` — resume a session (no agent = try the current default first)";
       "`!stop <thread_id>` — stop a session";
       "`!rename [thread_id] <name>` — rename a thread";
@@ -1193,8 +1266,14 @@ let rec process_session_message t session
       state.current_block <- 1;
       Hashtbl.replace t.scroll_states channel_id state in
     let on_session_id sid =
-      Session_store.set_session_id t.sessions session
-        ~session_id:sid in
+      try
+        Session_store.set_session_id t.sessions session
+          ~session_id:sid
+      with exn ->
+        Logs.warn (fun m ->
+          m "bot: failed to persist session id for %s: %s"
+            session.thread_id (Printexc.to_string exn))
+    in
     let result = Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
             ~session ~channel_id ~prompt
             ~attachments:msg.attachments
@@ -1208,12 +1287,19 @@ let rec process_session_message t session
     | Ok () ->
       ignore (Discord_rest.create_reaction t.rest ~channel_id
         ~message_id ~emoji:"\xE2\x9C\x85" ());
-      (* Clear initial_prompt only after successful run so it
-         survives failures and retries. Cleared before
-         increment_message_count to persist in a single save. *)
+      let prior_message_count = session.message_count in
+      let prior_initial_prompt = session.initial_prompt in
       if had_initial_prompt then
         session.initial_prompt <- None;
-      Session_store.increment_message_count t.sessions session
+      session.message_count <- session.message_count + 1;
+      (try
+         Session_store.save t.sessions
+       with exn ->
+         session.message_count <- prior_message_count;
+         session.initial_prompt <- prior_initial_prompt;
+         Logs.warn (fun m ->
+           m "bot: failed to persist message completion for %s: %s"
+             session.thread_id (Printexc.to_string exn)))
     | Error _ ->
       ignore (Discord_rest.create_reaction t.rest ~channel_id
         ~message_id ~emoji:"\xE2\x9D\x8C" ())));
@@ -1281,6 +1367,17 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
       ~working_dir ~system_prompt ~agent_kind:(default_agent t);
     Logs.info (fun m -> m "bot: auto-created session for %s" project_name)
 
+let handle_command_safely t msg cmd =
+  try
+    handle_command t msg cmd
+  with exn ->
+    Logs.warn (fun m ->
+      m "bot: command failed in %s: %s"
+        msg.Discord_types.channel_id (Printexc.to_string exn));
+    ignore (Discord_rest.create_message t.rest
+      ~channel_id:msg.Discord_types.channel_id
+      ~content:(Printf.sprintf "Command failed: %s" (Printexc.to_string exn)) ())
+
 (** Route an incoming Discord message. *)
 let handle_message t (msg : Discord_types.message) =
   Session_store.maybe_reload t.sessions;
@@ -1294,7 +1391,7 @@ let handle_message t (msg : Discord_types.message) =
       | Command.List_claude_sessions | Command.List_codex_sessions
       | Command.List_gemini_sessions
       | Command.Help ->
-        handle_command t msg cmd
+        handle_command_safely t msg cmd
       | _ ->
         ignore (Discord_rest.create_message t.rest
           ~channel_id:msg.Discord_types.channel_id
@@ -1305,7 +1402,7 @@ let handle_message t (msg : Discord_types.message) =
         ~content:"Bot is restarting. Try again shortly." ())
   end else
   if Command.is_command msg.content then
-    handle_command t msg (Command.parse msg.content)
+    handle_command_safely t msg (Command.parse msg.content)
   else begin
     let is_control = match t.config.control_channel_id with
       | Some ctl_id -> msg.channel_id = ctl_id | None -> false in
@@ -1424,8 +1521,8 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
                wrap_width = Agent_process.desktop_width;
                refreshing = false;
                output_lines = Agent_process.default_output_lines;
-               scroll_states = Hashtbl.create 64;
-               pending_session_agent_changes = Hashtbl.create 16 } in
+               scroll_states = Hashtbl.create 64 } in
+  reconcile_persisted_pending_agent_changes bot;
   bot.gateway.handler <- (fun event ->
     match event with
     | Discord_gateway.Connected user ->

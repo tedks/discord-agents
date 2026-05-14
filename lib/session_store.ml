@@ -11,6 +11,24 @@ type pending_message = {
   channel_info : Discord_types.channel option;
 }
 
+type pending_agent_origin =
+  | Default_rotation
+  | Session_override
+
+type pending_agent_change = {
+  kind : Config.agent_kind;
+  origin : pending_agent_origin;
+}
+
+let string_of_pending_agent_origin = function
+  | Default_rotation -> "default_rotation"
+  | Session_override -> "session_override"
+
+let pending_agent_origin_of_string = function
+  | "default_rotation" -> Some Default_rotation
+  | "session_override" -> Some Session_override
+  | _ -> None
+
 type session = {
   project_name : string;
   working_dir : string;
@@ -33,6 +51,7 @@ type session = {
   mutable message_count : int;
   mutable processing : bool;
   pending_queue : pending_message Queue.t;
+  mutable pending_agent_change : pending_agent_change option;
   mutable initial_prompt : string option;  (* One-shot context for the first message *)
 }
 
@@ -42,8 +61,7 @@ type t = {
 }
 
 let sessions_file () =
-  let home = Sys.getenv "HOME" in
-  Filename.concat home ".config/discord-agents/sessions.json"
+  Filename.concat (Resource.app_config_dir ()) "sessions.json"
 
 let lock_file () = sessions_file () ^ ".lock"
 
@@ -61,6 +79,13 @@ let sessions_to_json sessions =
       ("message_count", `Int s.message_count);
     ] @ (match s.system_prompt with
          | Some sp -> [("system_prompt", `String sp)]
+         | None -> [])
+      @ (match s.pending_agent_change with
+         | Some pending ->
+           [ ("pending_agent_kind",
+              `String (Config.string_of_agent_kind pending.kind));
+             ("pending_agent_origin",
+              `String (string_of_pending_agent_origin pending.origin)) ]
          | None -> [])
       @ (match s.initial_prompt with
          | Some ip -> [("initial_prompt", `String ip)]
@@ -84,6 +109,21 @@ let sessions_of_json json =
       let session_id_confirmed = match j |> member "session_id_confirmed" with
         | `Bool b -> b
         | _ -> Config.caller_pinned_session_id agent_kind in
+      let pending_agent_change =
+        match j |> member "pending_agent_kind" with
+        | `String s ->
+          (match Config.agent_kind_of_string s with
+           | Ok kind ->
+             let origin =
+               match j |> member "pending_agent_origin" with
+               | `String origin ->
+                 pending_agent_origin_of_string origin
+               | _ -> Some Default_rotation
+             in
+             Option.map (fun origin -> { kind; origin }) origin
+           | Error _ -> None)
+        | _ -> None
+      in
       let session = {
         project_name = j |> member "project_name" |> to_string;
         working_dir = j |> member "working_dir" |> to_string;
@@ -95,6 +135,7 @@ let sessions_of_json json =
         message_count = j |> member "message_count" |> to_int;
         processing = false;
         pending_queue = Queue.create ();
+        pending_agent_change;
         initial_prompt = j |> member "initial_prompt" |> to_string_option;
       } in
       (thread_id, session)
@@ -136,6 +177,7 @@ let create () =
 let make_session ~project_name ~working_dir ~agent_kind ~session_id
     ~thread_id ~system_prompt ~initial_prompt
     ?(message_count = 0)
+    ?(pending_agent_change = None)
     ?session_id_confirmed () =
   let session_id_confirmed = match session_id_confirmed with
     | Some b -> b
@@ -144,17 +186,31 @@ let make_session ~project_name ~working_dir ~agent_kind ~session_id
   { project_name; working_dir; agent_kind; session_id;
     session_id_confirmed; thread_id; system_prompt;
     message_count; processing = false;
-    pending_queue = Queue.create (); initial_prompt }
+    pending_queue = Queue.create (); pending_agent_change; initial_prompt }
+
+let persist_or_rollback rollback f =
+  try
+    let result = f () in
+    Ok result
+  with exn ->
+    rollback ();
+    Error (Printexc.to_string exn)
 
 (** Add a session and persist to disk. *)
 let add t ~(thread_id : Discord_types.channel_id) session =
+  let prior = t.sessions in
   t.sessions <- SessionMap.add thread_id session t.sessions;
-  save t
+  match persist_or_rollback (fun () -> t.sessions <- prior) (fun () -> save t) with
+  | Ok () -> ()
+  | Error err -> failwith err
 
 (** Remove a session and persist to disk. *)
 let remove t ~(thread_id : Discord_types.channel_id) =
+  let prior = t.sessions in
   t.sessions <- SessionMap.remove thread_id t.sessions;
-  save t
+  match persist_or_rollback (fun () -> t.sessions <- prior) (fun () -> save t) with
+  | Ok () -> ()
+  | Error err -> failwith err
 
 (** Find a session by thread ID. *)
 let find_opt t ~(thread_id : Discord_types.channel_id) =
@@ -168,8 +224,23 @@ let count t = SessionMap.cardinal t.sessions
 
 (** Increment message count for a session and persist. *)
 let increment_message_count t session =
+  let prior = session.message_count in
   session.message_count <- session.message_count + 1;
-  save t
+  match persist_or_rollback (fun () -> session.message_count <- prior)
+          (fun () -> save t) with
+  | Ok () -> ()
+  | Error err -> failwith err
+
+let set_pending_agent_change t session pending_agent_change =
+  let prior = session.pending_agent_change in
+  if prior = pending_agent_change then
+    Ok ()
+  else begin
+    session.pending_agent_change <- pending_agent_change;
+    persist_or_rollback
+      (fun () -> session.pending_agent_change <- prior)
+      (fun () -> save t)
+  end
 
 (** Update a session's id and mark it confirmed for resume.
     Used when an agent assigns its id server-side (Codex's
@@ -181,9 +252,17 @@ let set_session_id t session ~session_id =
   let already = session.session_id = session_id
                 && session.session_id_confirmed in
   if not already then begin
+    let prior_id = session.session_id in
+    let prior_confirmed = session.session_id_confirmed in
     session.session_id <- session_id;
     session.session_id_confirmed <- true;
-    save t
+    match persist_or_rollback
+            (fun () ->
+              session.session_id <- prior_id;
+              session.session_id_confirmed <- prior_confirmed)
+            (fun () -> save t) with
+    | Ok () -> ()
+    | Error err -> failwith err
   end
 
 (** Reload sessions from disk if the file changed.
