@@ -162,9 +162,9 @@ let recv_frame t =
       t.closed <- true;
       { opcode = Close; payload }
     | _ ->
-      Buffer.add_string acc_buf payload;
-      if Buffer.length acc_buf > max_payload_size then
+      if Buffer.length acc_buf + String.length payload > max_payload_size then
         failwith "websocket: accumulated fragments too large";
+      Buffer.add_string acc_buf payload;
       if fin then
         { opcode = effective_opcode; payload = Buffer.contents acc_buf }
       else

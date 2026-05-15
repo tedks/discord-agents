@@ -19,16 +19,19 @@ let raise_if_cancelled exn =
   | Eio.Cancel.Cancelled _ -> raise exn
   | _ -> ()
 
+let max_request_size = 1_000_000
+
 (** Read one line from a buffered reader, up to a size limit. *)
 let read_line_limited reader =
   try
     let line = Eio.Buf_read.line reader in
-    if String.length line > 1_000_000 then
+    if String.length line > max_request_size then
       Error "request too large"
     else
       Ok line
   with
   | End_of_file -> Error "empty request"
+  | Eio.Buf_read.Buffer_limit_exceeded -> Error "request too large"
   | exn ->
     raise_if_cancelled exn;
     Error (Printexc.to_string exn)
@@ -532,7 +535,7 @@ let dispatch (bot : Bot.t) method_ params =
 
 let handle_connection bot flow =
   let started_at = Unix.gettimeofday () in
-  let reader = Eio.Buf_read.of_flow ~max_size:(1024 * 1024) flow in
+  let reader = Eio.Buf_read.of_flow ~max_size:max_request_size flow in
   match read_line_limited reader with
   | Error e ->
     send_response flow (error_response e)

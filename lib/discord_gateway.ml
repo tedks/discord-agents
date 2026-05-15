@@ -123,33 +123,35 @@ let string_of_gateway_opcode = function
   | Heartbeat_ack -> "Heartbeat_ack"
   | Unknown_op n -> Printf.sprintf "Unknown_op(%d)" n
 
+let payload_summary_of_json ~bytes json =
+  let open Yojson.Safe.Util in
+  let safe f ~default =
+    try f () with _ -> default
+  in
+  let op =
+    match safe (fun () -> json |> member "op" |> to_int_option) ~default:None with
+    | Some n -> string_of_gateway_opcode (gateway_opcode_of_int n)
+    | None -> "?"
+  in
+  let event_name = safe
+    (fun () -> json |> member "t" |> to_string_option
+      |> Option.value ~default:"UNKNOWN")
+    ~default:"?"
+  in
+  let seq = safe
+    (fun () -> json |> member "s" |> to_int_option
+      |> Option.map string_of_int |> Option.value ~default:"?")
+    ~default:"?"
+  in
+  Printf.sprintf "bytes=%d op=%s event=%s seq=%s"
+    bytes op event_name seq
+
 let payload_diagnostics payload =
   let bytes = String.length payload in
   match Yojson.Safe.from_string payload with
   | exception _ ->
     Printf.sprintf "bytes=%d invalid_json" bytes
-  | json ->
-    let open Yojson.Safe.Util in
-    let safe f ~default =
-      try f () with _ -> default
-    in
-    let op =
-      match safe (fun () -> json |> member "op" |> to_int_option) ~default:None with
-      | Some n -> string_of_gateway_opcode (gateway_opcode_of_int n)
-      | None -> "?"
-    in
-    let event_name = safe
-      (fun () -> json |> member "t" |> to_string_option
-        |> Option.value ~default:"UNKNOWN")
-      ~default:"?"
-    in
-    let seq = safe
-      (fun () -> json |> member "s" |> to_int_option
-        |> Option.map string_of_int |> Option.value ~default:"?")
-      ~default:"?"
-    in
-    Printf.sprintf "bytes=%d op=%s event=%s seq=%s"
-      bytes op event_name seq
+  | json -> payload_summary_of_json ~bytes json
 
 let exn_with_backtrace exn =
   let bt = Printexc.get_backtrace () |> String.trim in
@@ -328,13 +330,15 @@ let connect ~sw ~(env : Eio_unix.Stdenv.base) t =
       let rec recv_loop () =
         match Websocket.recv_frame ws with
         | { Websocket.opcode = Text; payload } ->
-          if String.length payload >= large_payload_warn_threshold then begin
-            let summary = payload_diagnostics payload in
-            t.last_payload_summary <- Some summary;
-            Logs.warn (fun m -> m "gateway: large payload received (%s)" summary)
-          end;
           (try
              let json = Yojson.Safe.from_string payload in
+             if String.length payload >= large_payload_warn_threshold then begin
+               let summary =
+                 payload_summary_of_json ~bytes:(String.length payload) json
+               in
+               t.last_payload_summary <- Some summary;
+               Logs.warn (fun m -> m "gateway: large payload received (%s)" summary)
+             end;
              handle_payload t ~sw ~clock json
            with exn ->
              raise_if_cancelled exn;
