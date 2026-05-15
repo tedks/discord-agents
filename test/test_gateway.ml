@@ -15,6 +15,15 @@ let test_payload_diagnostics_invalid_json () =
   Alcotest.(check string) "invalid payload summary"
     expected (Discord_agents.Discord_gateway.payload_diagnostics payload)
 
+let test_payload_diagnostics_wrong_types () =
+  let payload = {|{"op":"x","t":42,"s":"oops"}|} in
+  let expected =
+    Printf.sprintf "bytes=%d op=? event=? seq=?"
+      (String.length payload)
+  in
+  Alcotest.(check string) "wrong-typed payload summary"
+    expected (Discord_agents.Discord_gateway.payload_diagnostics payload)
+
 let test_websocket_reader_limit_tracks_payload_limit () =
   Alcotest.(check int) "reader limit matches payload cap"
     Discord_agents.Websocket.max_payload_size
@@ -27,6 +36,8 @@ let () =
         test_payload_diagnostics_valid;
       Alcotest.test_case "payload diagnostics invalid json" `Quick
         test_payload_diagnostics_invalid_json;
+      Alcotest.test_case "payload diagnostics wrong types" `Quick
+        test_payload_diagnostics_wrong_types;
       Alcotest.test_case "reader limit tracks payload cap" `Quick
         test_websocket_reader_limit_tracks_payload_limit;
     ]);

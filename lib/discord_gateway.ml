@@ -130,17 +130,23 @@ let payload_diagnostics payload =
     Printf.sprintf "bytes=%d invalid_json" bytes
   | json ->
     let open Yojson.Safe.Util in
+    let safe f ~default =
+      try f () with _ -> default
+    in
     let op =
-      match json |> member "op" |> to_int_option with
+      match safe (fun () -> json |> member "op" |> to_int_option) ~default:None with
       | Some n -> string_of_gateway_opcode (gateway_opcode_of_int n)
       | None -> "?"
     in
-    let event_name =
-      json |> member "t" |> to_string_option |> Option.value ~default:"UNKNOWN"
+    let event_name = safe
+      (fun () -> json |> member "t" |> to_string_option
+        |> Option.value ~default:"UNKNOWN")
+      ~default:"?"
     in
-    let seq =
-      json |> member "s" |> to_int_option
-      |> Option.map string_of_int |> Option.value ~default:"?"
+    let seq = safe
+      (fun () -> json |> member "s" |> to_int_option
+        |> Option.map string_of_int |> Option.value ~default:"?")
+      ~default:"?"
     in
     Printf.sprintf "bytes=%d op=%s event=%s seq=%s"
       bytes op event_name seq
@@ -178,6 +184,7 @@ let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
           t.resume_gateway_url <- resume_url;
           t.resuming <- false;
           t.last_error <- None;
+          t.last_payload_summary <- None;
           Logs.info (fun m -> m "gateway: READY as %s (session %s)"
             user.username (Option.value ~default:"?" t.session_id));
           t.handler (Connected user)
@@ -188,6 +195,7 @@ let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
      | "RESUMED" ->
        t.resuming <- false;
        t.last_error <- None;
+       t.last_payload_summary <- None;
        Logs.info (fun m -> m "gateway: RESUMED successfully (session %s)"
          (Option.value ~default:"?" t.session_id))
      | "MESSAGE_CREATE" ->
@@ -338,7 +346,8 @@ let connect ~sw ~(env : Eio_unix.Stdenv.base) t =
                summary err));
           recv_loop ()
         | { opcode = Close; _ } ->
-          Logs.info (fun m -> m "gateway: received close frame")
+          Logs.info (fun m -> m "gateway: received close frame");
+          t.handler (Disconnected "close frame")
         | { opcode = _; _ } ->
           recv_loop ()
         | exception exn ->

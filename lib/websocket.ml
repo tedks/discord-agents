@@ -104,8 +104,10 @@ let read_exactly reader n =
 (** Read a WebSocket frame from the connection.
     Handles fragmented incoming messages by accumulating continuation frames.
     Server frames are NOT masked per the spec. *)
-(** Maximum payload size we'll accept (100MB). Prevents OOM from malicious frames. *)
-let max_payload_size = 100 * 1024 * 1024
+(** Discord gateway payloads are typically far smaller than this. Keep the
+    cap comfortably above observed sizes, but low enough that a malicious
+    peer can't force an outsized buffer allocation before we reject. *)
+let max_payload_size = 16 * 1024 * 1024
 
 (** Keep Eio's buffered-reader cap aligned with the explicit frame cap.
     [Eio.Buf_read.take] raises [Buffer_limit_exceeded] before our own
@@ -179,10 +181,17 @@ let send_close t =
     t.closed <- true
   end
 
+let raise_if_cancelled exn =
+  match exn with
+  | Eio.Cancel.Cancelled _ -> raise exn
+  | _ -> ()
+
 let close t =
   t.closed <- true;
-  (try Eio.Flow.shutdown t.flow `All with _ -> ());
-  try Eio.Flow.close t.flow with _ -> ()
+  (try Eio.Flow.shutdown t.flow `All with exn ->
+     raise_if_cancelled exn);
+  try Eio.Flow.close t.flow with exn ->
+    raise_if_cancelled exn
 
 (** Perform the WebSocket upgrade handshake over an existing TLS connection. *)
 let handshake t ~host ~path =
