@@ -94,6 +94,7 @@ type persistent_rotation = {
   reset_count : int;
   busy_count : int;
   current_busy_kind : Config.agent_kind option;
+  current_override_kind : Config.agent_kind option;
 }
 
 let fresh_session_like (session : Session_store.session) ~agent_kind =
@@ -259,26 +260,29 @@ let replace_session_agent t (session : Session_store.session) ~agent_kind =
     (fresh_session_like session ~agent_kind) with
     system_prompt = refreshed_system_prompt t session;
   } in
-  Session_store.add t.sessions ~thread_id:session.thread_id replacement;
-  Hashtbl.remove t.scroll_states session.thread_id
+  try
+    Session_store.add t.sessions ~thread_id:session.thread_id replacement;
+    Hashtbl.remove t.scroll_states session.thread_id;
+    Ok ()
+  with exn ->
+    Error (Printexc.to_string exn)
 
 let align_persistent_sessions_to_default t ~current_channel_id ~new_agent =
-  let dirty = ref false in
-  let prior_pending = ref [] in
-  let record_prior session =
-    prior_pending := (session, session.Session_store.pending_agent_change) :: !prior_pending
-  in
-  Session_store.bindings t.sessions
-  |> List.iter (fun (thread_id, (session : Session_store.session)) ->
+  let clear_redundant_default_rotation thread_id (session : Session_store.session) =
     if is_persistent_channel t ~channel_id:thread_id
        && Config.equal_agent_kind session.agent_kind new_agent
     then
       match session.pending_agent_change with
       | Some { origin = Session_store.Default_rotation; _ } ->
-        record_prior session;
-        session.pending_agent_change <- None;
-        dirty := true
-      | _ -> ());
+        Session_store.set_pending_agent_change t.sessions session None
+        |> Result.map_error (fun err ->
+          Printf.sprintf
+            "failed to clear a completed default-agent rotation for channel %s: %s"
+            thread_id err)
+      | _ -> Ok ()
+    else
+      Ok ()
+  in
   let stale_sessions =
     Session_store.bindings t.sessions
     |> List.filter (fun (thread_id, (session : Session_store.session)) ->
@@ -286,44 +290,77 @@ let align_persistent_sessions_to_default t ~current_channel_id ~new_agent =
       && not (Config.equal_agent_kind session.agent_kind new_agent))
   in
   let current_busy_kind = ref None in
+  let current_override_kind = ref None in
   let reset_count = ref 0 in
   let busy_count = ref 0 in
-  List.iter (fun (thread_id, (session : Session_store.session)) ->
-    if session.processing || not (Queue.is_empty session.pending_queue) then begin
-      match session.pending_agent_change with
-      | Some { origin = Session_store.Session_override; _ } -> ()
-      | _ ->
-        incr busy_count;
-        let target = pending_default_rotation new_agent in
-        if session.pending_agent_change <> Some target then begin
-          record_prior session;
-          session.pending_agent_change <- Some target;
-          dirty := true
-        end;
-        (match current_channel_id with
-         | Some current_channel_id when thread_id = current_channel_id ->
-           current_busy_kind := Some session.agent_kind
-         | _ -> ())
-    end else begin
-      replace_session_agent t session ~agent_kind:new_agent;
-      incr reset_count
-    end
-  ) stale_sessions;
-  if !dirty then
-    (try Session_store.save t.sessions with exn ->
-       List.iter (fun (session, prior) ->
-         session.Session_store.pending_agent_change <- prior
-       ) !prior_pending;
-       raise exn);
-  { reset_count = !reset_count;
-    busy_count = !busy_count;
-    current_busy_kind = !current_busy_kind; }
+  let rec clear_redundant = function
+    | [] -> Ok ()
+    | (thread_id, session) :: rest ->
+      (match clear_redundant_default_rotation thread_id session with
+       | Error _ as err -> err
+       | Ok () -> clear_redundant rest)
+  in
+  let rec align = function
+    | [] ->
+      Ok {
+        reset_count = !reset_count;
+        busy_count = !busy_count;
+        current_busy_kind = !current_busy_kind;
+        current_override_kind = !current_override_kind;
+      }
+    | (thread_id, (session : Session_store.session)) :: rest ->
+      if session.processing || not (Queue.is_empty session.pending_queue) then begin
+        match session.pending_agent_change with
+        | Some { origin = Session_store.Session_override; kind } ->
+          (match current_channel_id with
+           | Some current_channel_id when thread_id = current_channel_id ->
+             current_override_kind := Some kind
+           | _ -> ());
+          align rest
+        | _ ->
+          let target = pending_default_rotation new_agent in
+          let scheduled =
+            Session_store.set_pending_agent_change t.sessions session (Some target)
+            |> Result.map_error (fun err ->
+              Printf.sprintf
+                "failed to persist a deferred default-agent rotation for channel %s: %s"
+                thread_id err)
+          in
+          (match current_channel_id with
+           | Some current_channel_id when thread_id = current_channel_id ->
+             current_busy_kind := Some session.agent_kind
+           | _ -> ());
+          match scheduled with
+          | Error _ as err -> err
+          | Ok () ->
+            incr busy_count;
+            align rest
+      end else
+        match replace_session_agent t session ~agent_kind:new_agent with
+        | Error err ->
+          Error (Printf.sprintf
+            "failed to start a fresh %s session for channel %s: %s"
+            (Config.string_of_agent_kind new_agent) thread_id err)
+        | Ok () ->
+          incr reset_count;
+          align rest
+  in
+  match clear_redundant (Session_store.bindings t.sessions) with
+  | Error _ as err -> err
+  | Ok () -> align stale_sessions
 
 let set_default_agent t ?(current_channel_id=None) kind =
   match Runtime_settings.set_default_agent t.settings kind with
-  | Error _ as err -> err
+  | Error err ->
+    Error (Printf.sprintf "Failed to persist the default agent setting: %s" err)
   | Ok () ->
-    Ok (align_persistent_sessions_to_default t ~current_channel_id ~new_agent:kind)
+    (match align_persistent_sessions_to_default t
+             ~current_channel_id ~new_agent:kind with
+     | Ok rotation -> Ok rotation
+     | Error err ->
+       Error (Printf.sprintf
+         "Default agent is now `%s`, but top-level session rotation was incomplete: %s"
+         (Config.string_of_agent_kind kind) err))
 
 let maybe_apply_pending_session_agent_change t (session : Session_store.session) =
   match session.pending_agent_change with
@@ -338,25 +375,29 @@ let maybe_apply_pending_session_agent_change t (session : Session_store.session)
              session.thread_id err))
     else if not session.processing
             && Queue.is_empty session.pending_queue then begin
-      (try
-         replace_session_agent t session ~agent_kind:pending.kind;
+      match replace_session_agent t session ~agent_kind:pending.kind with
+      | Ok () ->
          Logs.info (fun m ->
            m "bot: switched channel %s to %s after pending agent change"
              session.thread_id (Config.string_of_agent_kind pending.kind))
-       with exn ->
-         Logs.warn (fun m ->
-           m "bot: failed to switch channel %s to %s: %s"
-             session.thread_id
-             (Config.string_of_agent_kind pending.kind)
-             (Printexc.to_string exn)))
+      | Error err ->
+        Logs.warn (fun m ->
+          m "bot: failed to switch channel %s to %s: %s"
+            session.thread_id
+            (Config.string_of_agent_kind pending.kind)
+            err)
     end
 
 let reconcile_persisted_pending_agent_changes t =
   Session_store.bindings t.sessions
   |> List.iter (fun (_thread_id, (session : Session_store.session)) ->
     maybe_apply_pending_session_agent_change t session);
-  ignore (align_persistent_sessions_to_default t
-    ~current_channel_id:None ~new_agent:(default_agent t))
+  match align_persistent_sessions_to_default t
+          ~current_channel_id:None ~new_agent:(default_agent t) with
+  | Ok _ -> ()
+  | Error err ->
+    Logs.warn (fun m ->
+      m "bot: failed to reconcile top-level default agent sessions: %s" err)
 
 (** Trigger a graceful restart: drain → reap → build → spawn.
     Callable from command handler or signal handler.
@@ -836,8 +877,7 @@ let handle_command t msg cmd =
   | Command.Default_agent (Some kind) ->
     let kind_str = Config.string_of_agent_kind kind in
     (match set_default_agent t ~current_channel_id:(Some channel_id) kind with
-     | Error err ->
-       reply (Printf.sprintf "Failed to save default agent: %s" err)
+     | Error err -> reply err
      | Ok rotation ->
        let reset_suffix =
          if rotation.reset_count = 0 then ""
@@ -847,8 +887,20 @@ let handle_command t msg cmd =
              (if rotation.reset_count = 1 then "" else "s")
        in
        let busy_suffix =
-         match rotation.current_busy_kind with
-         | Some current_kind ->
+         match rotation.current_override_kind, rotation.current_busy_kind with
+         | Some override_kind, _ ->
+           let others =
+             if rotation.busy_count = 0 then ""
+             else
+               Printf.sprintf
+                 " %d other busy top-level session%s will switch after their queued work finishes."
+                 rotation.busy_count
+                 (if rotation.busy_count = 1 then "" else "s")
+           in
+           Printf.sprintf
+             " This channel keeps its session override on `%s`.%s"
+             (Config.string_of_agent_kind override_kind) others
+         | None, Some current_kind ->
            let other_busy = rotation.busy_count - 1 in
            let others =
              if other_busy <= 0 then ""
@@ -860,7 +912,7 @@ let handle_command t msg cmd =
            Printf.sprintf
              " This channel is still running `%s`; it will reset to the new default after its queued work finishes.%s"
              (Config.string_of_agent_kind current_kind) others
-         | None ->
+         | None, None ->
            if rotation.busy_count = 0 then ""
            else
              Printf.sprintf " %d busy top-level session%s will switch after their queued work finishes."
@@ -903,9 +955,14 @@ let handle_command t msg cmd =
         | Error err ->
           reply (Printf.sprintf "Failed to persist session agent change: %s" err))
      | Some session ->
-       replace_session_agent t session ~agent_kind:kind;
-       reply (Printf.sprintf "Started a fresh `%s` session for this channel."
-         kind_str)
+       (match replace_session_agent t session ~agent_kind:kind with
+        | Ok () ->
+          reply (Printf.sprintf "Started a fresh `%s` session for this channel."
+            kind_str)
+        | Error err ->
+          reply (Printf.sprintf
+            "Failed to start a fresh `%s` session for this channel: %s"
+            kind_str err))
      | None when create_explicit_channel_session t ~channel_id ~agent_kind:kind ->
        reply (Printf.sprintf "Started a fresh `%s` session for this channel."
          kind_str)

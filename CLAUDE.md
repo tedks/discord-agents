@@ -70,14 +70,16 @@ test/test_formatting.ml  — Tests for formatting, wrapping, escaping, command p
 
 Commands require a `!` prefix:
 
-- `start <project> [agent]` — start a session (agent ∈ {claude, codex, gemini}; defaults to claude)
+- `start <project> [agent]` — start a session (agent ∈ {claude, codex, gemini}; defaults to the current default agent)
 - `start` — show numbered project list
-- `resume [agent] <session_id>` — resume an existing session (agent defaults to none; tries Claude → Codex → Gemini)
+- `resume [agent] <session_id>` — resume an existing session (agent defaults to none; tries the current default agent first, then the others)
 - `projects` — list discovered projects with numbers
 - `sessions` — list active bot sessions
 - `claude-sessions` — list recent Claude Code sessions on this machine
 - `codex-sessions` — list recent Codex CLI sessions on this machine
 - `gemini-sessions` — list recent Gemini CLI sessions on this machine
+- `default-agent [agent]` — show or set the default agent for new top-level sessions
+- `session-agent [agent]` — show or set the current channel session agent
 - `stop <thread_id>` — stop a session
 - `rename [thread_id] <name>` — rename a thread
 - `desktop` — set wrapping to desktop width (120 chars)
@@ -89,7 +91,7 @@ Commands require a `!` prefix:
 - `restart` — rebuild and restart the bot
 - `help` — command reference
 
-Non-command messages in control/project channels are routed to a Claude session automatically.
+Non-command messages in control/project channels are routed to the channel's current session automatically. New top-level sessions start with the current default agent unless overridden with `session-agent`.
 
 ## Key behaviors
 
@@ -162,7 +164,7 @@ Per-session system prompts (set via `Session_store.session.system_prompt`) tell 
 - **Claude** — `--append-system-prompt <text>` flag (persistent across all turns).
 - **Codex / Gemini** — neither CLI exposes a system-instruction flag, so the bot prepends the prompt as a `<bot-context>...</bot-context>` block to the user's first-turn message. The conversation history carries it forward on subsequent turns. See `Agent_process.compose_session_prompt`.
 
-Today only the control/project channel sessions (created by `ensure_channel_session`) set a system prompt, and those are hardcoded to Claude. The Codex/Gemini paths are wired and tested so a future feature could back a control/project channel with a different agent without further plumbing.
+Today only the control/project channel sessions (created by `ensure_channel_session`) set a system prompt. Those sessions now start with the current default agent rather than being hardcoded to Claude, and the Codex/Gemini paths are wired and tested for that flow.
 
 ## Bare repo / worktree setup
 
