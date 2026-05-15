@@ -91,7 +91,7 @@ Commands require a `!` prefix:
 - `restart` — rebuild and restart the bot
 - `help` — command reference
 
-Non-command messages in control/project channels are routed to the channel's current session automatically. New top-level sessions start with the current default agent unless overridden with `session-agent`.
+Non-command messages in control/project channels are routed to the channel's current session automatically. New top-level sessions start with the current default agent unless you set a `session-agent` override on that session.
 
 ## Key behaviors
 

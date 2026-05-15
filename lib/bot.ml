@@ -868,9 +868,13 @@ let handle_command t msg cmd =
     (match Session_store.find_opt t.sessions ~thread_id with
      | None -> reply "Session not found."
      | Some session ->
-       Session_store.remove t.sessions ~thread_id;
-       Hashtbl.remove t.scroll_states thread_id;
-       reply (Printf.sprintf "Stopped session for **%s**." session.project_name))
+       if session.processing || not (Queue.is_empty session.pending_queue) then
+         reply "Session is still running or has queued work. Wait for it to go idle before stopping it."
+       else begin
+         Session_store.remove t.sessions ~thread_id;
+         Hashtbl.remove t.scroll_states thread_id;
+         reply (Printf.sprintf "Stopped session for **%s**." session.project_name)
+       end)
   | Command.Default_agent None ->
     reply (Printf.sprintf "Default agent: `%s`."
       (Config.string_of_agent_kind (default_agent t)))
