@@ -42,19 +42,25 @@ let error_response msg =
 
 let handle_health (bot : Bot.t) =
   let uptime = int_of_float (Unix.gettimeofday () -. bot.started_at) in
+  let rest_failures = Discord_rest.consecutive_rest_failures bot.rest in
   let rest_fields = [
-    ("rest_degraded", `Bool (Discord_rest.transport_degraded bot.rest));
-    ("rest_consecutive_transport_failures",
-     `Int (Discord_rest.consecutive_transport_failures bot.rest));
+    ("rest_degraded", `Bool (Discord_rest.rest_degraded bot.rest));
+    ("rest_consecutive_failures", `Int rest_failures);
+    ("rest_consecutive_transport_failures", `Int rest_failures);
     ("rest_retry_delay_ms",
-     `Int (int_of_float (1000.0 *. Discord_rest.transport_retry_delay_s bot.rest)));
+     `Int (int_of_float (1000.0 *. Discord_rest.rest_retry_delay_s bot.rest)));
   ] in
   let optional_rest_fields =
-    match Discord_rest.last_transport_error bot.rest with
+    match Discord_rest.last_rest_error bot.rest with
     | Some err ->
-      [("last_rest_transport_error",
+      let err =
         `String (Resource.truncate_utf8 ~max_bytes:1000
-          (Resource.single_line err)))]
+          (Resource.single_line err))
+      in
+      [
+        ("last_rest_error", err);
+        ("last_rest_transport_error", err);
+      ]
     | None -> []
   in
   ok_response ([
