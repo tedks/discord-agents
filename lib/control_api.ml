@@ -52,10 +52,24 @@ let ok_response body =
 let error_response msg =
   `Assoc [("error", `String msg)]
 
+let json_of_int64 n =
+  `Intlit (Int64.to_string n)
+
+let cleanup_orphan_thread rest ~thread_id ~context =
+  match Discord_rest.delete_channel rest ~channel_id:thread_id () with
+  | Ok _ -> ()
+  | Error err ->
+    Logs.warn (fun m ->
+      m "control_api: failed to clean up orphan thread %s after %s: %s"
+        thread_id context err)
+
 (* ── Handlers ──────────────────────────────────────────────────── *)
 
 let handle_health (bot : Bot.t) =
+  ignore (Eio_unix.run_in_systhread (fun () ->
+    Disk_health.preflight_state_mutation ()));
   let uptime = int_of_float (Unix.gettimeofday () -. bot.started_at) in
+  let disk = Disk_health.snapshot () in
   let rest_failures = Discord_rest.consecutive_rest_failures bot.rest in
   let transport_failures =
     Discord_rest.consecutive_transport_failures bot.rest
@@ -103,6 +117,32 @@ let handle_health (bot : Bot.t) =
      | Some summary -> [("last_gateway_payload", `String summary)]
      | None -> [])
   in
+  let disk_fields = [
+    ("disk_mode", `String (Disk_health.string_of_mode disk.mode));
+    ("disk_pressure", `Bool (Disk_health.pressure disk));
+    ("disk_degraded", `Bool (disk.mode = Disk_health.Read_only));
+    ("disk_warning_threshold_bytes",
+     json_of_int64 disk.warning_threshold_bytes);
+    ("disk_read_only_threshold_bytes",
+     json_of_int64 disk.read_only_threshold_bytes);
+  ] in
+  let optional_disk_fields =
+    (match disk.available_bytes with
+     | Some available ->
+       [("disk_free_bytes", json_of_int64 available)]
+     | None -> [])
+    @
+    (match disk.checked_path with
+     | Some path -> [("disk_path", `String path)]
+     | None -> [])
+    @
+    (match disk.last_error with
+     | Some err ->
+       [("last_disk_error",
+         `String (Resource.truncate_utf8 ~max_bytes:1000
+           (Resource.single_line err)))]
+     | None -> [])
+  in
   ok_response ([
     ("uptime_seconds", `Int uptime);
     ("default_agent",
@@ -111,7 +151,9 @@ let handle_health (bot : Bot.t) =
     ("projects", `Int (List.length (Bot.projects bot)));
     ("channels", `Int (Channel_manager.count (Bot.channels bot)));
   ] @ rest_fields @ optional_rest_fields
-    @ optional_transport_fields @ gateway_fields @ optional_gateway_fields)
+    @ optional_transport_fields
+    @ gateway_fields @ optional_gateway_fields
+    @ disk_fields @ optional_disk_fields)
 
 let handle_list_projects (bot : Bot.t) =
   let projects = List.map (fun (p : Project.t) ->
@@ -208,85 +250,88 @@ let handle_start_session (bot : Bot.t) params =
   if bot.draining then
     error_response "Bot is restarting; try again shortly."
   else
-  let project_str = params |> member "project" |> to_string in
-  let kind_str = match params |> member "agent" |> to_string_option with
-    | Some s -> s
-    | None ->
-      Config.string_of_agent_kind bot.settings.default_agent
-  in
-  let kind = match Config.agent_kind_of_string kind_str with
-    | Ok k -> k | Error _ -> failwith ("unknown agent: " ^ kind_str) in
-  let thread_name = params |> member "thread_name" |> to_string_option in
-  let initial_prompt = params |> member "initial_prompt" |> to_string_option in
-  let initial_prompt = match initial_prompt with
-    | Some s ->
-      let s = String.trim s in
-      (* Cap below Discord's 2000-byte message limit so the prompt
-         posts as a single message; we use that message as the
-         reaction anchor for the auto-triggered agent run.
-         [Resource.truncate_utf8] is codepoint-aware (a raw
-         [String.sub] would split a multi-byte character, and the
-         send-path sanitization in PR #33 would then "repair" the
-         cut byte to U+FFFD, silently corrupting the last character).
-         We DON'T use [normalize_summary] here because its
-         [single_line] pass collapses \\n / \\r / \\t and would
-         flatten a structured prompt (code blocks, bullets,
-         paragraph breaks) into one line — and the prompt is posted
-         as a standalone Discord message, not embedded in a markdown
-         list, so there are no sibling bullets to defend against.
-         Cap is 1900 *bytes*; the MCP schema description matches. *)
-      let s = Resource.truncate_utf8 ~max_bytes:1900 s in
-      if s = "" then None else Some s
-    | None -> None in
-  match Command.find_project_fuzzy (Bot.projects bot) project_str with
-  | None ->
-    (* Sanitize the MCP-supplied project string before echoing it
-       back: the MCP client renders the error into Discord, where a
-       literal newline in the input would let the rest of the error
-       land at column 0 and parse as a sibling bullet. Same defense
-       Bot.handle_command applies for the Discord !start path. *)
-    error_response (Printf.sprintf "No project matching '%s'."
-      (Resource.single_line project_str))
-  | Some p ->
-    let kind_str = Config.string_of_agent_kind kind in
-    let branch_name = Printf.sprintf "agent/%s-%s"
-      kind_str (String.sub (Resource.generate_uuid ()) 0 8) in
-    let working_dir, branch_info =
-      match Project.create_worktree p ~branch_name with
-      | Ok wt -> wt, Some branch_name
-      | Error e ->
-        Logs.warn (fun m -> m "control_api: worktree failed: %s" e);
-        (match Bot.working_dir_of_project p with
-         | Ok wd -> wd, None
-         | Error _ -> "", None)
-    in
-    if working_dir = "" then
-      error_response "No working directory available."
-    else
-      let thread_display_name = match thread_name with
-        | Some n when String.length (String.trim n) > 0 ->
-          let n = String.trim n in
-          if String.length n > 80 then
-            Resource.truncate_utf8 ~max_bytes:80 n
-          else
-            n
-        | _ -> Printf.sprintf "%s / %s" kind_str p.name
-      in
-      let thread_parent =
-        match Channel_manager.find_or_create ~rest:bot.rest
-                ~guild_id:bot.config.guild_id ~project:p (Bot.channels bot) with
-        | Some ch_id -> ch_id
+    match Disk_health.preflight_state_mutation () with
+    | Error err -> error_response err
+    | Ok () ->
+      let project_str = params |> member "project" |> to_string in
+      let kind_str = match params |> member "agent" |> to_string_option with
+        | Some s -> s
         | None ->
-          (match bot.config.control_channel_id with
-           | Some ctl -> ctl | None -> "")
+          Config.string_of_agent_kind bot.settings.default_agent
       in
-      if thread_parent = "" then
-        error_response "No channel found for thread creation."
-      else
-        match Discord_rest.create_thread_no_message bot.rest
-                ~channel_id:thread_parent ~name:thread_display_name () with
-        | Error e -> error_response (Printf.sprintf "Failed to create thread: %s" e)
-        | Ok thread_ch ->
+      let kind = match Config.agent_kind_of_string kind_str with
+        | Ok k -> k | Error _ -> failwith ("unknown agent: " ^ kind_str) in
+      let thread_name = params |> member "thread_name" |> to_string_option in
+      let initial_prompt = params |> member "initial_prompt" |> to_string_option in
+      let initial_prompt = match initial_prompt with
+        | Some s ->
+          let s = String.trim s in
+          (* Cap below Discord's 2000-byte message limit so the prompt
+             posts as a single message; we use that message as the
+             reaction anchor for the auto-triggered agent run.
+             [Resource.truncate_utf8] is codepoint-aware (a raw
+             [String.sub] would split a multi-byte character, and the
+             send-path sanitization in PR #33 would then "repair" the
+             cut byte to U+FFFD, silently corrupting the last character).
+             We DON'T use [normalize_summary] here because its
+             [single_line] pass collapses \\n / \\r / \\t and would
+             flatten a structured prompt (code blocks, bullets,
+             paragraph breaks) into one line — and the prompt is posted
+             as a standalone Discord message, not embedded in a markdown
+             list, so there are no sibling bullets to defend against.
+             Cap is 1900 *bytes*; the MCP schema description matches. *)
+          let s = Resource.truncate_utf8 ~max_bytes:1900 s in
+          if s = "" then None else Some s
+        | None -> None in
+      match Command.find_project_fuzzy (Bot.projects bot) project_str with
+      | None ->
+        (* Sanitize the MCP-supplied project string before echoing it
+           back: the MCP client renders the error into Discord, where a
+           literal newline in the input would let the rest of the error
+           land at column 0 and parse as a sibling bullet. Same defense
+           Bot.handle_command applies for the Discord !start path. *)
+        error_response (Printf.sprintf "No project matching '%s'."
+          (Resource.single_line project_str))
+      | Some p ->
+        let kind_str = Config.string_of_agent_kind kind in
+        let branch_name = Printf.sprintf "agent/%s-%s"
+          kind_str (String.sub (Resource.generate_uuid ()) 0 8) in
+        let working_dir, branch_info =
+          match Project.create_worktree p ~branch_name with
+          | Ok wt -> wt, Some branch_name
+          | Error e ->
+            Logs.warn (fun m -> m "control_api: worktree failed: %s" e);
+            (match Bot.working_dir_of_project p with
+             | Ok wd -> wd, None
+             | Error _ -> "", None)
+        in
+        if working_dir = "" then
+          error_response "No working directory available."
+        else
+          let thread_display_name = match thread_name with
+            | Some n when String.length (String.trim n) > 0 ->
+              let n = String.trim n in
+              if String.length n > 80 then
+                Resource.truncate_utf8 ~max_bytes:80 n
+              else
+                n
+            | _ -> Printf.sprintf "%s / %s" kind_str p.name
+          in
+          let thread_parent =
+            match Channel_manager.find_or_create ~rest:bot.rest
+                    ~guild_id:bot.config.guild_id ~project:p (Bot.channels bot) with
+            | Some ch_id -> ch_id
+            | None ->
+              (match bot.config.control_channel_id with
+               | Some ctl -> ctl | None -> "")
+          in
+          if thread_parent = "" then
+            error_response "No channel found for thread creation."
+          else
+            match Discord_rest.create_thread_no_message bot.rest
+                    ~channel_id:thread_parent ~name:thread_display_name () with
+            | Error e -> error_response (Printf.sprintf "Failed to create thread: %s" e)
+            | Ok thread_ch ->
           let session_id = Resource.generate_uuid () in
           let branch_str = match branch_info with
             | Some b -> Printf.sprintf "\nBranch: `%s`" b | None -> "" in
@@ -327,56 +372,15 @@ let handle_start_session (bot : Bot.t) params =
              For the no-prompt path we add normally (no
              [processing] lock); the user's first message goes
              through the standard [handle_thread_message] flow. *)
-          (match initial_prompt with
-           | None ->
-             Session_store.add bot.sessions ~thread_id:thread_ch.id session;
-             ignore (Discord_rest.create_message bot.rest
-               ~channel_id:thread_ch.id
-               ~content:(Printf.sprintf
-                 "**%s** session started for **%s**%s\nWorking in: `%s`\n%s"
-                 kind_str p.name branch_str working_dir starter_text) ());
-             ok_response [
-               ("thread_id", `String thread_ch.id);
-               ("working_dir", `String working_dir);
-               ("branch", match branch_info with
-                 | Some b -> `String b | None -> `Null);
-               ("project_name", `String p.name);
-               ("session_id", `String session_id);
-             ]
-           | Some prompt ->
-             session.processing <- true;
-             Session_store.add bot.sessions ~thread_id:thread_ch.id session;
-             ignore (Discord_rest.create_message bot.rest
-               ~channel_id:thread_ch.id
-               ~content:(Printf.sprintf
-                 "**%s** session started for **%s**%s\nWorking in: `%s`\n%s"
-                 kind_str p.name branch_str working_dir starter_text) ());
-             match Discord_rest.create_message bot.rest
-                     ~channel_id:thread_ch.id ~content:prompt () with
-             | Error e ->
-               (* Roll back: the session is half-published (in store
-                  but [processing] locked, no agent fiber will fire),
-                  and the thread holds an orphan announcement. Remove
-                  the session, delete the thread, and surface the
-                  error to the MCP caller. *)
-               Logs.warn (fun m -> m
-                 "control_api: failed to post initial_prompt: %s" e);
-               session.processing <- false;
-               Session_store.remove bot.sessions
-                 ~thread_id:thread_ch.id;
-               (match Discord_rest.delete_channel bot.rest
-                       ~channel_id:thread_ch.id () with
-                | Ok _ -> ()
-                | Error de ->
-                  Logs.warn (fun m -> m
-                    "control_api: failed to clean up orphan thread \
-                     %s after prompt-post failure: %s"
-                    thread_ch.id de));
-               error_response (Printf.sprintf
-                 "Failed to post initial_prompt: %s" e)
-             | Ok prompt_msg ->
-               Bot.fork_initial_prompt_run bot
-                 ~session ~msg:prompt_msg;
+          match initial_prompt with
+          | None ->
+            (try
+               Session_store.add bot.sessions ~thread_id:thread_ch.id session;
+               ignore (Discord_rest.create_message bot.rest
+                 ~channel_id:thread_ch.id
+                 ~content:(Printf.sprintf
+                   "**%s** session started for **%s**%s\nWorking in: `%s`\n%s"
+                   kind_str p.name branch_str working_dir starter_text) ());
                ok_response [
                  ("thread_id", `String thread_ch.id);
                  ("working_dir", `String working_dir);
@@ -384,7 +388,55 @@ let handle_start_session (bot : Bot.t) params =
                    | Some b -> `String b | None -> `Null);
                  ("project_name", `String p.name);
                  ("session_id", `String session_id);
-               ])
+               ]
+             with exn ->
+               cleanup_orphan_thread bot.rest ~thread_id:thread_ch.id
+                 ~context:"session persistence failure";
+               error_response (Printf.sprintf "Failed to persist session: %s"
+                 (Printexc.to_string exn)))
+          | Some prompt ->
+            session.processing <- true;
+            (try
+               Session_store.add bot.sessions ~thread_id:thread_ch.id session;
+               ignore (Discord_rest.create_message bot.rest
+                 ~channel_id:thread_ch.id
+                 ~content:(Printf.sprintf
+                   "**%s** session started for **%s**%s\nWorking in: `%s`\n%s"
+                   kind_str p.name branch_str working_dir starter_text) ());
+               match Discord_rest.create_message bot.rest
+                       ~channel_id:thread_ch.id ~content:prompt () with
+               | Error e ->
+                 (* Roll back: the session is half-published (in store
+                    but [processing] locked, no agent fiber will fire),
+                    and the thread holds an orphan announcement. Remove
+                    the session, delete the thread, and surface the
+                    error to the MCP caller. *)
+                 Logs.warn (fun m -> m
+                   "control_api: failed to post initial_prompt: %s" e);
+                 session.processing <- false;
+                 Session_store.remove bot.sessions
+                   ~thread_id:thread_ch.id;
+                 cleanup_orphan_thread bot.rest ~thread_id:thread_ch.id
+                   ~context:"prompt-post failure";
+                 error_response (Printf.sprintf
+                   "Failed to post initial_prompt: %s" e)
+               | Ok prompt_msg ->
+                 Bot.fork_initial_prompt_run bot
+                   ~session ~msg:prompt_msg;
+                 ok_response [
+                   ("thread_id", `String thread_ch.id);
+                   ("working_dir", `String working_dir);
+                   ("branch", match branch_info with
+                     | Some b -> `String b | None -> `Null);
+                   ("project_name", `String p.name);
+                   ("session_id", `String session_id);
+                 ]
+             with exn ->
+               session.processing <- false;
+               cleanup_orphan_thread bot.rest ~thread_id:thread_ch.id
+                 ~context:"session persistence failure";
+               error_response (Printf.sprintf "Failed to persist session: %s"
+                 (Printexc.to_string exn)))
 
 let handle_resume_session (bot : Bot.t) params =
   let open Yojson.Safe.Util in
@@ -397,69 +449,72 @@ let handle_resume_session (bot : Bot.t) params =
   if bot.draining then
     error_response "Bot is restarting; try again shortly."
   else
-  let sid_prefix = params |> member "session_id" |> to_string in
-  let kind = match params |> member "kind" |> to_string_option with
-    | None -> None
-    | Some s ->
-      (match Config.agent_kind_of_string (String.lowercase_ascii s) with
-       | Ok k -> Some k | Error _ -> None)
-  in
-  (* Mirror Bot.handle_command's Resume_session dispatch: explicit
-     kind looks up its own store; None tries the current default
-     first, then the remaining stores. *)
-  let try_claude () =
-    match Claude_sessions.find_by_prefix sid_prefix with
-    | Some (sid, wd) -> Some (Config.Claude, sid, wd) | None -> None
-  in
-  let try_codex () =
-    match Codex_sessions.find_by_prefix sid_prefix with
-    | Some (sid, wd) -> Some (Config.Codex, sid, wd) | None -> None
-  in
-  let try_gemini () =
-    match Gemini_sessions.find_by_prefix sid_prefix with
-    | Some (sid, wd) -> Some (Config.Gemini, sid, wd) | None -> None
-  in
-  let try_kind = function
-    | Config.Claude -> try_claude ()
-    | Config.Codex -> try_codex ()
-    | Config.Gemini -> try_gemini ()
-  in
-  let found = match kind with
-    | Some k -> try_kind k
-    | None ->
-      Config.find_with_preferred_agent bot.settings.default_agent try_kind
-  in
-  match found with
-  | None ->
-    error_response (Bot.resume_not_found_message ~kind ~sid_prefix)
-  | Some (_, full_sid, "") ->
+    match Disk_health.preflight_state_mutation () with
+    | Error err -> error_response err
+    | Ok () ->
+      let sid_prefix = params |> member "session_id" |> to_string in
+      let kind = match params |> member "kind" |> to_string_option with
+        | None -> None
+        | Some s ->
+          (match Config.agent_kind_of_string (String.lowercase_ascii s) with
+           | Ok k -> Some k | Error _ -> None)
+      in
+      (* Mirror Bot.handle_command's Resume_session dispatch: explicit
+         kind looks up its own store; None tries the current default
+         first, then the remaining stores. *)
+      let try_claude () =
+        match Claude_sessions.find_by_prefix sid_prefix with
+        | Some (sid, wd) -> Some (Config.Claude, sid, wd) | None -> None
+      in
+      let try_codex () =
+        match Codex_sessions.find_by_prefix sid_prefix with
+        | Some (sid, wd) -> Some (Config.Codex, sid, wd) | None -> None
+      in
+      let try_gemini () =
+        match Gemini_sessions.find_by_prefix sid_prefix with
+        | Some (sid, wd) -> Some (Config.Gemini, sid, wd) | None -> None
+      in
+      let try_kind = function
+        | Config.Claude -> try_claude ()
+        | Config.Codex -> try_codex ()
+        | Config.Gemini -> try_gemini ()
+      in
+      let found = match kind with
+        | Some k -> try_kind k
+        | None ->
+          Config.find_with_preferred_agent bot.settings.default_agent try_kind
+      in
+      match found with
+      | None ->
+        error_response (Bot.resume_not_found_message ~kind ~sid_prefix)
+      | Some (_, full_sid, "") ->
     (* See Bot.handle_command Resume_session for the rationale —
        Gemini sessions with unresolvable projectHash arrive here
        with an empty working_dir; running gemini with an empty cwd
        writes settings.json into the bot's directory. *)
-    error_response (Printf.sprintf
-      "Cannot resume session '%s': its working directory could not \
-       be resolved." (Resource.short_id full_sid))
-  | Some (resolved_kind, full_sid, raw_working_dir) ->
-    let kind_label = Config.string_of_agent_kind resolved_kind in
-    let kind_title = String.capitalize_ascii kind_label in
-    let sid_short = Resource.short_id full_sid in
-    let fallback_channel = match bot.config.control_channel_id with
-      | Some ctl -> ctl | None -> ""
-    in
-    let { Bot.thread_parent; working_dir; project_name } =
-      Bot.resolve_resume_target bot
-        ~raw_working_dir ~kind_label ~fallback_channel
-    in
-    if thread_parent = "" then
-      error_response "No channel found for thread creation."
-    else
-      let thread_name =
-        Printf.sprintf "resume %s / %s" kind_label sid_short in
-      (match Discord_rest.create_thread_no_message bot.rest
-              ~channel_id:thread_parent ~name:thread_name () with
-      | Error e -> error_response (Printf.sprintf "Failed to create thread: %s" e)
-      | Ok thread_ch ->
+        error_response (Printf.sprintf
+          "Cannot resume session '%s': its working directory could not \
+           be resolved." (Resource.short_id full_sid))
+      | Some (resolved_kind, full_sid, raw_working_dir) ->
+        let kind_label = Config.string_of_agent_kind resolved_kind in
+        let kind_title = String.capitalize_ascii kind_label in
+        let sid_short = Resource.short_id full_sid in
+        let fallback_channel = match bot.config.control_channel_id with
+          | Some ctl -> ctl | None -> ""
+        in
+        let { Bot.thread_parent; working_dir; project_name } =
+          Bot.resolve_resume_target bot
+            ~raw_working_dir ~kind_label ~fallback_channel
+        in
+        if thread_parent = "" then
+          error_response "No channel found for thread creation."
+        else
+          let thread_name =
+            Printf.sprintf "resume %s / %s" kind_label sid_short in
+          (match Discord_rest.create_thread_no_message bot.rest
+                  ~channel_id:thread_parent ~name:thread_name () with
+          | Error e -> error_response (Printf.sprintf "Failed to create thread: %s" e)
+          | Ok thread_ch ->
         (* session_id_confirmed:true is critical: see Bot.handle_command
            Resume_session for the rationale — without it, Gemini resumes
            start fresh chats instead of resuming. *)
@@ -469,18 +524,25 @@ let handle_resume_session (bot : Bot.t) params =
           ~message_count:1
           ~thread_id:thread_ch.Discord_types.id
           ~system_prompt:None ~initial_prompt:None () in
-        Session_store.add bot.sessions ~thread_id:thread_ch.id session;
-        ignore (Discord_rest.create_message bot.rest ~channel_id:thread_ch.id
-          ~content:(Printf.sprintf
-            "**Resumed** %s session `%s`\nWorking in: `%s`\nSend a message to continue."
-            kind_title sid_short working_dir) ());
-        ok_response [
-          ("thread_id", `String thread_ch.id);
-          ("working_dir", `String working_dir);
-          ("session_id", `String full_sid);
-          ("project_name", `String project_name);
-          ("agent_kind", `String kind_label);
-        ])
+        (try
+           Session_store.add bot.sessions ~thread_id:thread_ch.id session;
+           ignore (Discord_rest.create_message bot.rest ~channel_id:thread_ch.id
+             ~content:(Printf.sprintf
+               "**Resumed** %s session `%s`\nWorking in: `%s`\nSend a message to continue."
+               kind_title sid_short working_dir) ());
+           ok_response [
+             ("thread_id", `String thread_ch.id);
+             ("working_dir", `String working_dir);
+             ("session_id", `String full_sid);
+             ("project_name", `String project_name);
+             ("agent_kind", `String kind_label);
+           ]
+         with exn ->
+           cleanup_orphan_thread bot.rest ~thread_id:thread_ch.id
+             ~context:"resume persistence failure";
+           error_response (Printf.sprintf
+             "Failed to persist resumed session: %s"
+             (Printexc.to_string exn))))
 
 let handle_default_agent (bot : Bot.t) params =
   let open Yojson.Safe.Util in

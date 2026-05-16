@@ -1185,11 +1185,19 @@ let mcp_json = lazy (
 )
 
 let write_file_safely ~path contents =
-  try
-    let oc = open_out path in
-    output_string oc contents;
-    close_out oc
-  with _ -> ()
+  match Disk_health.preflight_write path with
+  | Error err ->
+    Logs.warn (fun m ->
+      m "agent_process: refused write to %s: %s" path err)
+  | Ok () ->
+    (try
+       Resource.write_file_atomic path contents;
+       Disk_health.note_write_success path
+     with exn ->
+       Disk_health.note_write_failure path exn;
+       Logs.warn (fun m ->
+         m "agent_process: failed to write %s: %s"
+           path (Printexc.to_string exn)))
 
 let read_file_opt path =
   try

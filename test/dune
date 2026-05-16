@@ -1,5 +1,5 @@
 (tests
  (names test_formatting test_project test_agent_contracts test_discord_rest test_gateway
-  test_runtime_settings test_bot_defaults test_session_store)
+  test_runtime_settings test_bot_defaults test_session_store test_disk_health)
  (libraries discord_agents alcotest str unix yojson eio.mock eio_main cohttp-eio
   uri mirage-crypto-rng.unix))
