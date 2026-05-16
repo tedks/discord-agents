@@ -65,22 +65,41 @@ let load () =
          Logs.warn (fun m ->
            m "runtime_settings: backup load error from %s: %s"
              backup (Printexc.to_string backup_exn));
-         default ())
+        default ())
 
-let save t =
+let log_visible_but_unconfirmed path exn =
+  Logs.warn (fun m ->
+    m "runtime_settings: write to %s is visible but durability could not be confirmed: %s"
+      path (Printexc.to_string exn))
+
+let save_with ~write_file t =
   let path = settings_path () in
   let backup = backup_path () in
   let rendered = Yojson.Safe.pretty_to_string (to_yojson t) in
+  let primary_warning = ref None in
   try
     Resource.with_flock (lock_path ()) (fun () ->
-      Resource.write_file_atomic path rendered;
-      (try Resource.write_file_atomic backup rendered with exn ->
+      Resource.cleanup_atomic_write_temps path;
+      Resource.cleanup_atomic_write_temps backup;
+      (try write_file path rendered with
+       | Resource.Durable_write_visible_but_unconfirmed (path, exn) ->
+         primary_warning := Some (path, exn));
+      (try write_file backup rendered with
+       | Resource.Durable_write_visible_but_unconfirmed (path, exn) ->
+         log_visible_but_unconfirmed path exn
+       | exn ->
          Logs.warn (fun m ->
            m "runtime_settings: failed to update backup %s: %s"
              backup (Printexc.to_string exn))));
+    Option.iter (fun (path, exn) ->
+      log_visible_but_unconfirmed path exn) !primary_warning;
     Ok ()
   with exn ->
     Error (Printexc.to_string exn)
+
+let save t =
+  save_with ~write_file:(fun path rendered ->
+    Resource.write_file_atomic path rendered) t
 
 let set_default_agent t agent =
   if Config.equal_agent_kind t.default_agent agent then

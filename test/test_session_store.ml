@@ -9,10 +9,7 @@ let rec rm_rf path =
     Unix.unlink path
 
 let make_tmp_dir prefix =
-  let base = Filename.temp_file prefix "" in
-  Sys.remove base;
-  Unix.mkdir base 0o755;
-  base
+  Filename.temp_dir prefix ""
 
 let restore_env name = function
   | Some value -> Unix.putenv name value
@@ -94,6 +91,31 @@ let test_load_uses_backup_when_primary_missing () =
     Alcotest.(check string) "project recovered from backup"
       "control" recovered.Discord_agents.Session_store.project_name)
 
+let test_save_with_visible_but_unconfirmed_primary_updates_backup () =
+  with_tmp_home (fun home ->
+    let store = Discord_agents.Session_store.create () in
+    let session = make_session () in
+    Discord_agents.Session_store.add store ~thread_id:"control" session;
+    session.stop_requested <- true;
+    let write_file path content =
+      if String.equal path (sessions_path home) then
+        Discord_agents.Resource.write_file_atomic
+          ~fsync_parent:(fun dir ->
+            raise (Unix.Unix_error (Unix.EINVAL, "fsync", dir)))
+          path content
+      else
+        Discord_agents.Resource.write_file_atomic path content
+    in
+    Discord_agents.Session_store.save_with ~write_file store;
+    Alcotest.(check string) "backup mirrors primary after warning"
+      (Discord_agents.Resource.read_file (sessions_path home))
+      (Discord_agents.Resource.read_file (backup_path home));
+    Sys.remove (sessions_path home);
+    let reloaded = Discord_agents.Session_store.create () in
+    let recovered = find_control_session reloaded in
+    Alcotest.(check bool) "backup captured updated stop_requested"
+      true recovered.Discord_agents.Session_store.stop_requested)
+
 let () =
   Alcotest.run "session_store" [
     ("persistence", [
@@ -103,5 +125,7 @@ let () =
         test_load_uses_backup_when_primary_corrupt;
       Alcotest.test_case "load uses backup when primary missing" `Quick
         test_load_uses_backup_when_primary_missing;
+      Alcotest.test_case "visible but unconfirmed primary still updates backup" `Quick
+        test_save_with_visible_but_unconfirmed_primary_updates_backup;
     ]);
   ]
