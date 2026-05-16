@@ -80,6 +80,7 @@ type t = {
 let sessions_file () =
   Filename.concat (Resource.app_config_dir ()) "sessions.json"
 
+let backup_file () = sessions_file () ^ ".bak"
 let lock_file () = sessions_file () ^ ".lock"
 
 (** Serialize sessions to JSON. *)
@@ -184,20 +185,53 @@ let sessions_of_json json =
 let save (t : t) =
   let json = sessions_to_json t.sessions in
   let path = sessions_file () in
+  let backup = backup_file () in
+  let rendered = Yojson.Safe.pretty_to_string json in
   Resource.with_flock (lock_file ()) (fun () ->
-    Resource.write_file_atomic path (Yojson.Safe.pretty_to_string json))
+    Resource.write_file_atomic path rendered;
+    (try Resource.write_file_atomic backup rendered with exn ->
+       Logs.warn (fun m ->
+         m "session_store: failed to update backup %s: %s"
+           backup (Printexc.to_string exn))))
+
+let load_file path =
+  let contents = Resource.read_file path in
+  sessions_of_json (Yojson.Safe.from_string contents)
 
 (** Load sessions from disk. *)
 let load_from_disk () =
   let path = sessions_file () in
-  if not (Sys.file_exists path) then SessionMap.empty
-  else
-    try
-      let contents = Resource.read_file path in
-      sessions_of_json (Yojson.Safe.from_string contents)
-    with exn ->
-      Logs.warn (fun m -> m "session_store: load error: %s" (Printexc.to_string exn));
-      SessionMap.empty
+  let backup = backup_file () in
+  match Sys.file_exists path, Sys.file_exists backup with
+  | false, false -> SessionMap.empty
+  | false, true ->
+    (match load_file backup with
+     | sessions ->
+       Logs.warn (fun m ->
+         m "session_store: primary missing; recovered from backup %s" backup);
+       sessions
+     | exception backup_exn ->
+       Logs.warn (fun m ->
+         m "session_store: backup load error from %s: %s"
+           backup (Printexc.to_string backup_exn));
+       SessionMap.empty)
+  | true, _ ->
+    match load_file path with
+    | sessions -> sessions
+    | exception exn ->
+      Logs.warn (fun m ->
+        m "session_store: load error from %s: %s"
+          path (Printexc.to_string exn));
+      (match load_file backup with
+       | sessions ->
+         Logs.warn (fun m ->
+           m "session_store: recovered from backup %s" backup);
+         sessions
+       | exception backup_exn ->
+         Logs.warn (fun m ->
+           m "session_store: backup load error from %s: %s"
+             backup (Printexc.to_string backup_exn));
+         SessionMap.empty)
 
 (** Create a session store, loading persisted sessions from disk. *)
 let create () =

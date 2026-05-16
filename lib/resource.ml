@@ -79,15 +79,38 @@ let read_file path =
     really_input ic s 0 n;
     Bytes.to_string s)
 
-(** Write string to file atomically (temp + rename). *)
+(** Best-effort fsync of a parent directory after a rename. *)
+let fsync_dir path =
+  let fd = Unix.openfile path [Unix.O_RDONLY] 0 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
+    Unix.fsync fd)
+
+let rec write_all fd content offset length =
+  if length > 0 then
+    let wrote = Unix.single_write_substring fd content offset length in
+    if wrote <= 0 then
+      failwith "resource: short write"
+    else
+      write_all fd content (offset + wrote) (length - wrote)
+
+(** Write string to file atomically and durably:
+    - write to a temp file in the same directory
+    - fsync the temp file
+    - rename into place
+    - fsync the parent directory so the rename is durable *)
 let write_file_atomic path content =
   let tmp = path ^ ".tmp" in
   (try
     ensure_parent_dir path;
-    with_file_out tmp (fun oc ->
-      output_string oc content;
-      output_char oc '\n');
+    let fd = Unix.openfile tmp
+      [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o600 in
+    Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
+      write_all fd content 0 (String.length content);
+      write_all fd "\n" 0 1;
+      Unix.fsync fd);
     Unix.rename tmp path
+    ;
+    fsync_dir (Filename.dirname path)
   with exn ->
     (try Sys.remove tmp with _ -> ());
     raise exn)

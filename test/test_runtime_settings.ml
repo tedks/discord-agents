@@ -42,6 +42,11 @@ let with_tmp_home f =
     (fun () ->
       with_tmp_env ~home:base ~xdg_config_home:"" (fun () -> f base))
 
+let settings_path home =
+  Filename.concat home ".config/discord-agents/settings.json"
+
+let backup_path home = settings_path home ^ ".bak"
+
 let test_load_defaults_to_claude () =
   with_tmp_home (fun _home ->
     let settings = Discord_agents.Runtime_settings.load () in
@@ -50,12 +55,17 @@ let test_load_defaults_to_claude () =
       (Discord_agents.Config.string_of_agent_kind settings.default_agent))
 
 let test_save_and_reload_roundtrip () =
-  with_tmp_home (fun _home ->
+  with_tmp_home (fun home ->
     let settings = Discord_agents.Runtime_settings.load () in
     match Discord_agents.Runtime_settings.set_default_agent
             settings Discord_agents.Config.Codex with
     | Error err -> Alcotest.failf "save failed: %s" err
     | Ok () ->
+      Alcotest.(check bool) "backup exists"
+        true (Sys.file_exists (backup_path home));
+      Alcotest.(check string) "backup mirrors primary"
+        (Discord_agents.Resource.read_file (settings_path home))
+        (Discord_agents.Resource.read_file (backup_path home));
       let reloaded = Discord_agents.Runtime_settings.load () in
       Alcotest.(check string) "saved default agent"
         "codex"
@@ -68,10 +78,7 @@ let test_load_uses_backup_when_primary_corrupt () =
             settings Discord_agents.Config.Codex with
     | Error err -> Alcotest.failf "save failed: %s" err
     | Ok () ->
-      let settings_path =
-        Filename.concat home ".config/discord-agents/settings.json"
-      in
-      let oc = open_out settings_path in
+      let oc = open_out (settings_path home) in
       output_string oc "{ definitely not json";
       close_out oc;
       let recovered = Discord_agents.Runtime_settings.load () in
