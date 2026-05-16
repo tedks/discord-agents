@@ -68,6 +68,8 @@ type session = {
   pending_queue : pending_message Queue.t;
   mutable pending_agent_change : pending_agent_change option;
   mutable initial_prompt : string option;  (* One-shot context for the first message *)
+  mutable child_pid : int option;  (* Runtime-only current agent subprocess *)
+  mutable stop_requested : bool;  (* Runtime-only stop latch for active sessions *)
 }
 
 type t = {
@@ -107,6 +109,9 @@ let sessions_to_json sessions =
              ("pending_agent_origin",
               `String (string_of_pending_agent_origin pending.origin)) ]
          | None -> [])
+      @ (if s.stop_requested then
+           [("stop_requested", `Bool true)]
+         else [])
       @ (match s.initial_prompt with
          | Some ip -> [("initial_prompt", `String ip)]
          | None -> []))
@@ -161,6 +166,11 @@ let sessions_of_json json =
         pending_queue = Queue.create ();
         pending_agent_change;
         initial_prompt = j |> member "initial_prompt" |> to_string_option;
+        child_pid = None;
+        stop_requested =
+          (match j |> member "stop_requested" with
+           | `Bool b -> b
+           | _ -> false);
       } in
       (thread_id, session)
     ) in
@@ -211,7 +221,8 @@ let make_session ~project_name ~working_dir ~agent_kind ~session_id
   { project_name; working_dir; agent_kind; session_override_kind; session_id;
     session_id_confirmed; thread_id; system_prompt;
     message_count; processing = false;
-    pending_queue = Queue.create (); pending_agent_change; initial_prompt }
+    pending_queue = Queue.create (); pending_agent_change; initial_prompt;
+    child_pid = None; stop_requested = false }
 
 let persist_or_rollback rollback f =
   try
@@ -317,6 +328,17 @@ let set_session_id t session ~session_id =
             (fun () -> save t) with
     | Ok () -> ()
     | Error err -> failwith err
+  end
+
+let set_stop_requested t session stop_requested =
+  let prior = session.stop_requested in
+  if prior = stop_requested then
+    Ok ()
+  else begin
+    session.stop_requested <- stop_requested;
+    persist_or_rollback
+      (fun () -> session.stop_requested <- prior)
+      (fun () -> save t)
   end
 
 (** Reload sessions from disk if the file changed.

@@ -91,6 +91,23 @@ let make_session ?(processing=false) ?session_override_kind
   session.pending_agent_change <- pending_agent_change;
   session
 
+let make_message ?(message_id="message-1") ?(channel_id="control") content =
+  let author : Discord_agents.Discord_types.user = {
+    id = "user-1";
+    username = "tester";
+    bot = Some false;
+  } in
+  {
+    Discord_agents.Discord_types.id = message_id;
+    channel_id;
+    author;
+    content;
+    timestamp = "2026-01-01T00:00:00.000000+00:00";
+    guild_id = Some "guild-1";
+    attachments = [];
+    referenced_message = None;
+  }
+
 let expect_pending session ~kind ~origin =
   match session.Discord_agents.Session_store.pending_agent_change with
   | Some pending ->
@@ -325,6 +342,127 @@ let test_reconcile_applies_persisted_pending_default_rotation () =
          (fun pending -> kind_string pending.Discord_agents.Session_store.kind)
          saved.pending_agent_change))
 
+let test_stop_idle_session_removes_it () =
+  with_test_bot (fun bot ->
+    let session = make_session Discord_agents.Config.Claude in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    match Discord_agents.Bot.stop_session bot ~thread_id:"control" with
+    | Discord_agents.Bot.Session_stopped { project_name; dropped_count } ->
+      Alcotest.(check string) "project name" "control" project_name;
+      Alcotest.(check int) "no dropped queue" 0 dropped_count;
+      Alcotest.(check bool) "session removed"
+        true
+        (Option.is_none
+           (Discord_agents.Session_store.find_opt bot.sessions ~thread_id:"control"))
+    | _ -> Alcotest.fail "expected idle session to stop immediately")
+
+let test_stop_idle_queued_session_clears_and_removes_it () =
+  with_test_bot (fun bot ->
+    let session = make_session Discord_agents.Config.Claude in
+    Queue.add
+      Discord_agents.Session_store.{
+        msg = make_message "queued while idle";
+        channel_info = None;
+      }
+      session.pending_queue;
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    match Discord_agents.Bot.stop_session bot ~thread_id:"control" with
+    | Discord_agents.Bot.Session_stopped { project_name; dropped_count } ->
+      Alcotest.(check string) "project name" "control" project_name;
+      Alcotest.(check int) "dropped queued message" 1 dropped_count;
+      Alcotest.(check int) "queue cleared" 0 (Queue.length session.pending_queue);
+      Alcotest.(check bool) "session removed"
+        true
+        (Option.is_none
+           (Discord_agents.Session_store.find_opt bot.sessions ~thread_id:"control"))
+    | _ -> Alcotest.fail "expected idle queued session to stop immediately")
+
+let test_stop_busy_session_requests_stop () =
+  with_test_bot (fun bot ->
+    let session = make_session ~processing:true Discord_agents.Config.Claude in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    match Discord_agents.Bot.stop_session bot ~thread_id:"control" with
+    | Discord_agents.Bot.Session_stopping stop ->
+      Alcotest.(check string) "project name" "control" stop.project_name;
+      Alcotest.(check bool) "no pid yet" false stop.had_running_process;
+      Alcotest.(check int) "no dropped queue" 0 stop.dropped_count;
+      Alcotest.(check bool) "stop requested latched" true session.stop_requested;
+      Alcotest.(check bool) "session retained while stopping"
+        true
+        (Option.is_some
+           (Discord_agents.Session_store.find_opt bot.sessions ~thread_id:"control"))
+    | _ -> Alcotest.fail "expected busy session to enter stopping state")
+
+let test_stop_busy_session_is_idempotent () =
+  with_test_bot (fun bot ->
+    let session = make_session ~processing:true Discord_agents.Config.Claude in
+    session.stop_requested <- true;
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    match Discord_agents.Bot.stop_session bot ~thread_id:"control" with
+    | Discord_agents.Bot.Session_already_stopping { project_name } ->
+      Alcotest.(check string) "project name" "control" project_name
+    | _ -> Alcotest.fail "expected repeated stop to be idempotent")
+
+let test_stop_idle_stopping_session_retries_removal () =
+  with_test_bot (fun bot ->
+    let session = make_session Discord_agents.Config.Claude in
+    session.stop_requested <- true;
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    match Discord_agents.Bot.stop_session bot ~thread_id:"control" with
+    | Discord_agents.Bot.Session_stopped { project_name; dropped_count } ->
+      Alcotest.(check string) "project name" "control" project_name;
+      Alcotest.(check int) "no dropped queue" 0 dropped_count;
+      Alcotest.(check bool) "session removed"
+        true
+        (Option.is_none
+           (Discord_agents.Session_store.find_opt bot.sessions ~thread_id:"control"))
+    | _ -> Alcotest.fail "expected idle stopping session to be removed")
+
+let test_finalize_session_run_removes_stopped_session () =
+  with_test_bot (fun bot ->
+    let session = make_session ~processing:true Discord_agents.Config.Claude in
+    session.stop_requested <- true;
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    Discord_agents.Bot.finalize_session_run ~notify_stopped:false bot session;
+    Alcotest.(check bool) "session removed"
+      true
+      (Option.is_none
+         (Discord_agents.Session_store.find_opt bot.sessions ~thread_id:"control"));
+    Alcotest.(check bool) "processing cleared" false session.processing)
+
+let test_ppid_of_proc_stat_line_handles_spaces_and_parens () =
+  let line = "12345 (codex exec (worker 1)) S 6789 12345 12345 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 123 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0" in
+  Alcotest.(check (option int)) "parsed ppid"
+    (Some 6789)
+    (Discord_agents.Bot.ppid_of_proc_stat_line line)
+
+let test_stop_requested_roundtrips_through_disk () =
+  with_tmp_home (fun () ->
+    let store = Discord_agents.Session_store.create () in
+    let session = make_session Discord_agents.Config.Claude in
+    Discord_agents.Session_store.add store ~thread_id:"control" session;
+    (match Discord_agents.Session_store.set_stop_requested store session true with
+     | Ok () -> ()
+     | Error err -> Alcotest.failf "set_stop_requested failed: %s" err);
+    let reloaded = Discord_agents.Session_store.create () in
+    match Discord_agents.Session_store.find_opt reloaded ~thread_id:"control" with
+    | Some saved ->
+      Alcotest.(check bool) "stop requested persisted" true saved.stop_requested
+    | None -> Alcotest.fail "expected reloaded session")
+
+let test_reconcile_persisted_stop_requests_removes_session () =
+  with_test_bot (fun bot ->
+    let session = make_session Discord_agents.Config.Claude in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    (match Discord_agents.Session_store.set_stop_requested bot.sessions session true with
+     | Ok () -> ()
+     | Error err -> Alcotest.failf "set_stop_requested failed: %s" err);
+    Discord_agents.Bot.reconcile_persisted_stop_requests bot;
+    Alcotest.(check bool) "session removed"
+      true
+      (Option.is_none
+         (Discord_agents.Session_store.find_opt bot.sessions ~thread_id:"control")))
+
 let () =
   Alcotest.run "bot_defaults" [
     ("default agent", [
@@ -348,5 +486,23 @@ let () =
         test_reconcile_rotates_idle_session_to_default_agent;
       Alcotest.test_case "reconcile applies persisted default rotation" `Quick
         test_reconcile_applies_persisted_pending_default_rotation;
+      Alcotest.test_case "stop idle session removes it" `Quick
+        test_stop_idle_session_removes_it;
+      Alcotest.test_case "stop idle queued session clears and removes it" `Quick
+        test_stop_idle_queued_session_clears_and_removes_it;
+      Alcotest.test_case "stop busy session requests stop" `Quick
+        test_stop_busy_session_requests_stop;
+      Alcotest.test_case "stop busy session is idempotent" `Quick
+        test_stop_busy_session_is_idempotent;
+      Alcotest.test_case "stop idle stopping session retries removal" `Quick
+        test_stop_idle_stopping_session_retries_removal;
+      Alcotest.test_case "finalize removes stopped session" `Quick
+        test_finalize_session_run_removes_stopped_session;
+      Alcotest.test_case "proc stat parser handles spaces and parens" `Quick
+        test_ppid_of_proc_stat_line_handles_spaces_and_parens;
+      Alcotest.test_case "stop_requested roundtrips through disk" `Quick
+        test_stop_requested_roundtrips_through_disk;
+      Alcotest.test_case "startup reconcile removes persisted stopping sessions" `Quick
+        test_reconcile_persisted_stop_requests_removes_session;
     ]);
   ]

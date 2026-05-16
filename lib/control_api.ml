@@ -511,6 +511,52 @@ let handle_default_agent (bot : Bot.t) params =
          ("busy_count", `Int rotation.Bot.busy_count);
        ])
 
+let handle_stop_session (bot : Bot.t) params =
+  let open Yojson.Safe.Util in
+  let params = match params with Some p -> p | None ->
+    failwith "missing params" in
+  let thread_id = params |> member "thread_id" |> to_string in
+  match Bot.stop_session bot ~thread_id with
+  | Bot.Session_not_found ->
+    error_response "Session not found."
+  | Bot.Session_stopped { project_name; dropped_count } ->
+    ok_response [
+      ("state", `String "stopped");
+      ("project_name", `String project_name);
+      ("thread_id", `String thread_id);
+      ("dropped_count", `Int dropped_count);
+      ("message",
+       `String (Printf.sprintf "Stopped session for %s." project_name));
+    ]
+  | Bot.Session_stopping { project_name; had_running_process; dropped_count } ->
+    let message =
+      if had_running_process then
+        Printf.sprintf "Stopping session for %s. Terminating the active agent process."
+          project_name
+      else
+        Printf.sprintf
+          "Stopping session for %s. The active session will stop as soon as its current turn or agent startup finishes."
+          project_name
+    in
+    ok_response [
+      ("state", `String "stopping");
+      ("project_name", `String project_name);
+      ("thread_id", `String thread_id);
+      ("had_running_process", `Bool had_running_process);
+      ("dropped_count", `Int dropped_count);
+      ("message", `String message);
+    ]
+  | Bot.Session_already_stopping { project_name } ->
+    ok_response [
+      ("state", `String "already_stopping");
+      ("project_name", `String project_name);
+      ("thread_id", `String thread_id);
+      ("message",
+       `String (Printf.sprintf "Session for %s is already stopping." project_name));
+    ]
+  | Bot.Session_stop_failed err ->
+    error_response (Printf.sprintf "Failed to stop session: %s" err)
+
 let handle_restart (bot : Bot.t) =
   Bot.trigger_restart bot ~notify:(fun msg ->
     Logs.info (fun m -> m "control_api restart: %s" msg));
@@ -556,6 +602,7 @@ let dispatch (bot : Bot.t) method_ params =
     | "list_gemini_sessions" -> handle_list_gemini_sessions bot params
     | "start_session" -> handle_start_session bot params
     | "resume_session" -> handle_resume_session bot params
+    | "stop_session" -> handle_stop_session bot params
     | "default_agent" -> handle_default_agent bot params
     | "restart" -> handle_restart bot
     | "rename_thread" -> handle_rename_thread bot params

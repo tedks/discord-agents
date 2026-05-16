@@ -97,6 +97,20 @@ type persistent_rotation = {
   current_override_kind : Config.agent_kind option;
 }
 
+type stop_outcome =
+  | Session_not_found
+  | Session_stopped of {
+      project_name : string;
+      dropped_count : int;
+    }
+  | Session_stopping of {
+      project_name : string;
+      had_running_process : bool;
+      dropped_count : int;
+    }
+  | Session_already_stopping of { project_name : string }
+  | Session_stop_failed of string
+
 let fresh_session_like (session : Session_store.session)
     ~agent_kind ~session_override_kind =
   Session_store.make_session
@@ -121,16 +135,20 @@ let prune_stale_scroll_states t =
   List.iter (Hashtbl.remove t.scroll_states) stale;
   List.length stale
 
-let register_child_pid t pid =
+let register_child_pid t (session : Session_store.session) pid =
   let (pids, mu) = t.child_pids in
   Mutex.lock mu;
   pids := Pid_set.add pid !pids;
+  session.child_pid <- Some pid
+  ;
   Mutex.unlock mu
 
-let unregister_child_pid t pid =
+let unregister_child_pid t (session : Session_store.session) pid =
   let (pids, mu) = t.child_pids in
   Mutex.lock mu;
   pids := Pid_set.remove pid !pids;
+  if session.child_pid = Some pid then
+    session.child_pid <- None;
   Mutex.unlock mu
 
 let get_child_pids t =
@@ -139,6 +157,168 @@ let get_child_pids t =
   let result = !pids in
   Mutex.unlock mu;
   result
+
+let ppid_of_proc_stat_line line =
+  match String.rindex_opt line ')' with
+  | None -> None
+  | Some close_idx ->
+    let rest_start = close_idx + 2 in
+    if rest_start >= String.length line then
+      None
+    else
+      let rest =
+        String.sub line rest_start (String.length line - rest_start)
+        |> String.trim
+      in
+      match String.split_on_char ' ' rest |> List.filter ((<>) "") with
+      | _state :: ppid :: _ -> int_of_string_opt ppid
+      | _ -> None
+
+type pid_ownership =
+  | Direct_child
+  | Not_direct_child
+  | Unknown_child_ownership
+
+let pid_ownership pid =
+  let stat_path = Printf.sprintf "/proc/%d/stat" pid in
+  if not (Sys.file_exists stat_path) then
+    Not_direct_child
+  else
+    match
+      try Some (Resource.read_file stat_path) with _ -> None
+    with
+    | None -> Unknown_child_ownership
+    | Some stat ->
+      match ppid_of_proc_stat_line stat with
+      | Some ppid ->
+        if ppid = Unix.getpid () then Direct_child else Not_direct_child
+      | None -> Unknown_child_ownership
+
+let drop_queued_messages ?(mark_failed=true) ?(async_marking=false) t
+    (session : Session_store.session) ~reason =
+  let dropped = ref 0 in
+  let pending_to_mark : Session_store.pending_message list ref = ref [] in
+  while not (Queue.is_empty session.pending_queue) do
+    let pending = Queue.pop session.pending_queue in
+    incr dropped;
+    if mark_failed then
+      pending_to_mark := pending :: !pending_to_mark
+  done;
+  let mark_failed_messages () =
+    List.rev !pending_to_mark |> List.iter (fun pending ->
+      ignore (Discord_rest.delete_own_reaction t.rest
+        ~channel_id:pending.Session_store.msg.Discord_types.channel_id
+        ~message_id:pending.Session_store.msg.id ~emoji:"\xE2\x8F\xB3" ());
+      ignore (Discord_rest.create_reaction t.rest
+        ~channel_id:pending.Session_store.msg.Discord_types.channel_id
+        ~message_id:pending.Session_store.msg.id ~emoji:"\xE2\x9D\x8C" ())
+    )
+  in
+  if mark_failed && !pending_to_mark <> [] then
+    if async_marking then
+      Eio.Fiber.fork ~sw:t.sw mark_failed_messages
+    else
+      mark_failed_messages ();
+  if !dropped > 0 then
+    Logs.info (fun m ->
+      m "bot: dropped %d queued message(s) for %s during %s"
+        !dropped session.project_name reason);
+  !dropped
+
+let request_session_process_stop t (session : Session_store.session) =
+  match session.child_pid with
+  | None -> false
+  | Some pid ->
+    let signalled = Eio_unix.run_in_systhread (fun () ->
+      match pid_ownership pid with
+      | Direct_child ->
+        (try
+           Unix.kill pid Sys.sigterm;
+           true
+         with Unix.Unix_error _ -> false)
+      | Not_direct_child -> false
+      | Unknown_child_ownership ->
+        Logs.warn (fun m ->
+          m "bot: skipping stop signal for pid %d; could not verify ownership"
+            pid);
+        false)
+    in
+    if signalled then
+      Eio.Fiber.fork ~sw:t.sw (fun () ->
+        Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
+        match session.child_pid with
+        | Some live_pid when live_pid = pid ->
+          Eio_unix.run_in_systhread (fun () ->
+            match pid_ownership pid with
+            | Direct_child ->
+              (try
+                 Unix.kill pid 0;
+                 Unix.kill pid Sys.sigkill
+               with Unix.Unix_error _ -> ())
+            | Not_direct_child -> ()
+            | Unknown_child_ownership ->
+              Logs.warn (fun m ->
+                m "bot: skipping forced stop for pid %d; could not verify ownership"
+                  pid))
+        | _ -> ());
+    signalled
+
+let remove_session_now t (session : Session_store.session) =
+  try
+    Session_store.remove t.sessions ~thread_id:session.thread_id;
+    Hashtbl.remove t.scroll_states session.thread_id;
+    Ok ()
+  with exn ->
+    Error (Printexc.to_string exn)
+
+let stop_session t ~thread_id =
+  match Session_store.find_opt t.sessions ~thread_id with
+  | None -> Session_not_found
+  | Some session when session.stop_requested ->
+    if session.processing then
+      Session_already_stopping { project_name = session.project_name }
+    else
+      let dropped_count =
+        if Queue.is_empty session.pending_queue then 0
+        else drop_queued_messages ~async_marking:true t session ~reason:"session stop"
+      in
+      (match remove_session_now t session with
+       | Ok () ->
+         Session_stopped {
+           project_name = session.project_name;
+           dropped_count;
+         }
+       | Error err -> Session_stop_failed err)
+  | Some session ->
+    if session.processing then begin
+      match Session_store.set_stop_requested t.sessions session true with
+      | Error err -> Session_stop_failed err
+      | Ok () ->
+        let dropped_count =
+          if Queue.is_empty session.pending_queue then 0
+          else drop_queued_messages ~async_marking:true t session ~reason:"session stop"
+        in
+        let had_running_process = request_session_process_stop t session in
+        Session_stopping {
+          project_name = session.project_name;
+          had_running_process;
+          dropped_count;
+        }
+    end else
+      let dropped_count =
+        if Queue.is_empty session.pending_queue then 0
+        else
+          (* No runner will come back to reconcile these queued messages,
+             so prefer deterministic cleanup over best-effort reaction updates. *)
+          drop_queued_messages ~mark_failed:false t session ~reason:"session stop"
+      in
+      match remove_session_now t session with
+      | Ok () ->
+        Session_stopped {
+          project_name = session.project_name;
+          dropped_count;
+        }
+      | Error err -> Session_stop_failed err
 
 (** Find a usable working directory for a project. *)
 let working_dir_of_project (p : Project.t) =
@@ -174,6 +354,7 @@ You have MCP tools available:
 - start_session: Start a new agent session for a project
 - list_projects: List all discovered projects
 - list_sessions: List active bot sessions
+- stop_session: Stop an active bot session by Discord thread ID
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume
 - list_gemini_sessions: Find recent Gemini CLI sessions to resume
@@ -212,6 +393,7 @@ You have MCP tools available:
 - start_session: Start a new agent session (creates a thread + worktree)
 - list_projects: List all discovered projects
 - list_sessions: List active bot sessions
+- stop_session: Stop an active bot session by Discord thread ID
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume
 - list_gemini_sessions: Find recent Gemini CLI sessions to resume
@@ -433,6 +615,38 @@ let maybe_apply_pending_session_agent_change t (session : Session_store.session)
             err)
     end
 
+let finalize_session_run ?(notify_stopped=true) t
+    (session : Session_store.session) =
+  session.processing <- false;
+  if session.stop_requested then begin
+    ignore (drop_queued_messages ~async_marking:true t session ~reason:"session stop");
+    (match remove_session_now t session with
+     | Ok () ->
+       if notify_stopped then
+         ignore (Discord_rest.create_message t.rest
+           ~channel_id:session.thread_id
+           ~content:"Session stopped." ())
+     | Error err ->
+       Logs.warn (fun m ->
+         m "bot: failed to remove stopped session %s: %s"
+           session.thread_id err))
+  end else
+    maybe_apply_pending_session_agent_change t session
+
+let reconcile_persisted_stop_requests t =
+  Session_store.bindings t.sessions
+  |> List.iter (fun (_thread_id, (session : Session_store.session)) ->
+    if session.stop_requested then
+      match remove_session_now t session with
+      | Ok () ->
+        Logs.info (fun m ->
+          m "bot: removed persisted stopping session %s on startup"
+            session.thread_id)
+      | Error err ->
+        Logs.warn (fun m ->
+          m "bot: failed to remove persisted stopping session %s: %s"
+            session.thread_id err))
+
 let reconcile_persisted_pending_agent_changes t =
   Session_store.bindings t.sessions
   |> List.iter (fun (_thread_id, (session : Session_store.session)) ->
@@ -483,20 +697,7 @@ let trigger_restart t ~notify =
       end;
       (* Clear any remaining queued messages and notify users *)
       List.iter (fun (_tid, (s : Session_store.session)) ->
-        let dropped = ref 0 in
-        while not (Queue.is_empty s.pending_queue) do
-          let pending = Queue.pop s.pending_queue in
-          incr dropped;
-          ignore (Discord_rest.delete_own_reaction t.rest
-            ~channel_id:pending.msg.Discord_types.channel_id
-            ~message_id:pending.msg.id ~emoji:"\xE2\x8F\xB3" ());
-          ignore (Discord_rest.create_reaction t.rest
-            ~channel_id:pending.msg.Discord_types.channel_id
-            ~message_id:pending.msg.id ~emoji:"\xE2\x9D\x8C" ())
-        done;
-        if !dropped > 0 then
-          Logs.info (fun m -> m "bot: dropped %d queued message(s) for %s during restart"
-            !dropped s.project_name)
+        ignore (drop_queued_messages t s ~reason:"restart")
       ) (Session_store.bindings t.sessions);
       (* Phase 2: Reap child processes.
          Split SIGTERM and SIGKILL into separate systhread calls with
@@ -506,14 +707,28 @@ let trigger_restart t ~notify =
         notify (Printf.sprintf "Terminating %d child process(es)..." (Pid_set.cardinal pids));
         Eio_unix.run_in_systhread (fun () ->
           Pid_set.iter (fun pid ->
-            (try Unix.kill pid Sys.sigterm
-             with Unix.Unix_error _ -> ())
+            match pid_ownership pid with
+            | Direct_child ->
+              (try Unix.kill pid Sys.sigterm
+               with Unix.Unix_error _ -> ())
+            | Not_direct_child -> ()
+            | Unknown_child_ownership ->
+              Logs.warn (fun m ->
+                m "bot: skipping restart SIGTERM for pid %d; could not verify ownership"
+                  pid)
           ) pids);
         Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
         Eio_unix.run_in_systhread (fun () ->
           Pid_set.iter (fun pid ->
-            (try Unix.kill pid 0; Unix.kill pid Sys.sigkill
-             with Unix.Unix_error _ -> ())
+            match pid_ownership pid with
+            | Direct_child ->
+              (try Unix.kill pid 0; Unix.kill pid Sys.sigkill
+               with Unix.Unix_error _ -> ())
+            | Not_direct_child -> ()
+            | Unknown_child_ownership ->
+              Logs.warn (fun m ->
+                m "bot: skipping restart SIGKILL for pid %d; could not verify ownership"
+                  pid)
           ) pids)
       end;
       (* Phase 3: Build and restart *)
@@ -911,16 +1126,36 @@ let handle_command t msg cmd =
               "**Resumed** %s session `%s`\nWorking in: `%s`\nSend a message to continue."
               kind_title sid_short working_dir) ())))
   | Command.Stop_session { thread_id } ->
-    (match Session_store.find_opt t.sessions ~thread_id with
-     | None -> reply "Session not found."
-     | Some session ->
-       if session.processing || not (Queue.is_empty session.pending_queue) then
-         reply "Session is still running or has queued work. Wait for it to go idle before stopping it."
-       else begin
-         Session_store.remove t.sessions ~thread_id;
-         Hashtbl.remove t.scroll_states thread_id;
-         reply (Printf.sprintf "Stopped session for **%s**." session.project_name)
-       end)
+    (match stop_session t ~thread_id with
+     | Session_not_found ->
+       reply "Session not found."
+    | Session_stopped { project_name; dropped_count } ->
+      let dropped_text =
+        if dropped_count = 0 then ""
+        else Printf.sprintf " Dropped %d queued message%s."
+          dropped_count (if dropped_count = 1 then "" else "s")
+      in
+      reply (Printf.sprintf "Stopped session for **%s**.%s"
+        project_name dropped_text)
+     | Session_stopping { project_name; had_running_process; dropped_count } ->
+      let process_text =
+        if had_running_process then
+          " Terminating the active agent process."
+        else
+          " The active session will stop as soon as its current turn or agent startup finishes."
+       in
+       let dropped_text =
+         if dropped_count = 0 then ""
+         else Printf.sprintf " Dropped %d queued message%s."
+           dropped_count (if dropped_count = 1 then "" else "s")
+       in
+       reply (Printf.sprintf
+         "Stopping session for **%s**.%s%s"
+         project_name process_text dropped_text)
+     | Session_already_stopping { project_name } ->
+       reply (Printf.sprintf "Session for **%s** is already stopping." project_name)
+     | Session_stop_failed err ->
+       reply (Printf.sprintf "Failed to stop session: %s" err))
   | Command.Default_agent None ->
     reply (Printf.sprintf "Default agent: `%s`."
       (Config.string_of_agent_kind (default_agent t)))
@@ -1322,7 +1557,7 @@ let rec process_session_message t session
     (msg : Discord_types.message) channel_info =
   let child_pid = ref None in
   Fun.protect ~finally:(fun () ->
-    Option.iter (unregister_child_pid t) !child_pid
+    Option.iter (unregister_child_pid t session) !child_pid
   ) (fun () ->
     let channel_id = msg.channel_id in
     let message_id = msg.id in
@@ -1335,7 +1570,9 @@ let rec process_session_message t session
       resolve_channel_context t ~channel_id ~session ?channel_info () in
     let on_pid pid =
       child_pid := Some pid;
-      register_child_pid t pid;
+      register_child_pid t session pid;
+      if session.stop_requested then
+        ignore (request_session_process_stop t session);
       Logs.info (fun m -> m "bot: registered child pid %d" pid) in
     (* Forward-compat: [session.initial_prompt] is no longer set by any
        current caller (control_api now posts the prompt visibly and
@@ -1425,14 +1662,17 @@ let rec process_session_message t session
       ignore (Discord_rest.create_reaction t.rest ~channel_id
         ~message_id ~emoji:"\xE2\x9D\x8C" ())));
   (* Drain the queue: process next pending message if any *)
-  match Queue.take_opt session.pending_queue with
-  | None -> ()
-  | Some pending ->
-    (* Remove hourglass, will get eyes when processing starts *)
-    ignore (Discord_rest.delete_own_reaction t.rest
-      ~channel_id:pending.msg.channel_id
-      ~message_id:pending.msg.id ~emoji:"\xE2\x8F\xB3" ());
-    process_session_message t session pending.msg pending.channel_info
+  if session.stop_requested then
+    ()
+  else
+    match Queue.take_opt session.pending_queue with
+    | None -> ()
+    | Some pending ->
+      (* Remove hourglass, will get eyes when processing starts *)
+      ignore (Discord_rest.delete_own_reaction t.rest
+        ~channel_id:pending.msg.channel_id
+        ~message_id:pending.msg.id ~emoji:"\xE2\x8F\xB3" ());
+      process_session_message t session pending.msg pending.channel_info
 
 let handle_thread_message t msg ?channel_info () =
   if t.draining then
@@ -1442,7 +1682,11 @@ let handle_thread_message t msg ?channel_info () =
   match Session_store.find_opt t.sessions ~thread_id:msg.Discord_types.channel_id with
   | None -> ()
   | Some session ->
-    if session.processing then begin
+    if session.stop_requested then
+      ignore (Discord_rest.create_message t.rest
+        ~channel_id:msg.Discord_types.channel_id
+        ~content:"Session is stopping. Start or resume a new session after it finishes." ())
+    else if session.processing then begin
       (* Queue the message and react with hourglass *)
       Queue.add { Session_store.msg; channel_info } session.pending_queue;
       ignore (Discord_rest.create_reaction t.rest
@@ -1452,8 +1696,7 @@ let handle_thread_message t msg ?channel_info () =
       session.processing <- true;
       Eio.Fiber.fork ~sw:t.sw (fun () ->
         Fun.protect ~finally:(fun () ->
-          session.processing <- false;
-          maybe_apply_pending_session_agent_change t session
+          finalize_session_run t session
         ) (fun () ->
           process_session_message t session msg channel_info))
     end
@@ -1473,8 +1716,7 @@ let handle_thread_message t msg ?channel_info () =
 let fork_initial_prompt_run t ~session ~msg =
   Eio.Fiber.fork ~sw:t.sw (fun () ->
     Fun.protect ~finally:(fun () ->
-      session.Session_store.processing <- false;
-      maybe_apply_pending_session_agent_change t session
+      finalize_session_run t session
     ) (fun () ->
       process_session_message t session msg None))
 
@@ -1644,6 +1886,7 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
                refreshing = false;
                output_lines = Agent_process.default_output_lines;
                scroll_states = Hashtbl.create 64 } in
+  reconcile_persisted_stop_requests bot;
   reconcile_persisted_pending_agent_changes bot;
   bot.gateway.handler <- (fun event ->
     match event with

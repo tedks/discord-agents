@@ -2,7 +2,7 @@
 
 discord-agents is a Discord server interface for coding agents. Every channel is a project, and every agent session is a thread. Channels are connected to their own management agent sessions that can spawn new threads conversationally. You can drop in your existing projects or resume the sessions that are already on your machine. New sessions automatically get their own worktrees.
 
-There is a `!command` interface to server management, and control channels also have access to an MCP for session and project operations, including changing the default agent. Session-level overrides inside a channel remain command-driven via `!session-agent`.
+There is a `!command` interface to server management, and control channels also have access to an MCP for session and project operations, including changing the default agent and stopping active sessions. Session-level overrides inside a channel remain command-driven via `!session-agent`.
 
 discord-agents is intended to be a simple interface to agentic coding on your personal machines and is not intended to be used in shared Discord servers. There is no authentication, and it has the full capabilities of a coding agent launched as the user you started it as. There is no sandboxing in discord-agents itself; use Unix and Claude sandboxing if you require it.
 
