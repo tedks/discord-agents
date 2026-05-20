@@ -97,7 +97,7 @@ TOOLS = [
                 },
                 "agent": {
                     "type": "string",
-                    "description": "Agent type: claude, codex, or gemini. If omitted, uses the bot's current default agent.",
+                    "description": "Agent type: claude, codex, or gemini. If omitted, uses the bot's current effective top-level agent (default agent unless a rescue agent is active under disk pressure).",
                     "enum": ["claude", "codex", "gemini"]
                 },
                 "thread_name": {
@@ -201,8 +201,22 @@ TOOLS = [
         }
     },
     {
+        "name": "rescue_agent",
+        "description": "Show or set the rescue agent automatically used for new top-level sessions under disk pressure. Use agent=off to disable it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "description": "Agent type to use as the rescue agent, or off to disable rescue mode. Omit to read the current setting.",
+                    "enum": ["claude", "codex", "gemini", "off"]
+                }
+            }
+        }
+    },
+    {
         "name": "resume_session",
-        "description": "Resume an existing Claude, Codex, or Gemini session in a new Discord thread. Use list_claude_sessions / list_codex_sessions / list_gemini_sessions to find a session ID. With kind unspecified, the bot tries the current default agent first, then the others.",
+        "description": "Resume an existing Claude, Codex, or Gemini session in a new Discord thread. Use list_claude_sessions / list_codex_sessions / list_gemini_sessions to find a session ID. With kind unspecified, the bot tries the current effective top-level agent first, then the others.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -370,8 +384,17 @@ def handle_tool_call(name, arguments):
         if "error" in result:
             return result["error"]
         agent = result.get("agent", "")
+        effective = result.get("effective_top_level_agent", agent)
+        rescue = result.get("rescue_agent")
+        rescue_active = result.get("disk_rescue_active", False)
         if (arguments or {}).get("agent") is None:
-            return f"Default agent: `{agent}`."
+            parts = [f"Default agent: `{agent}`."]
+            if rescue:
+                suffix = " (active)" if rescue_active else ""
+                parts.append(f"Rescue agent: `{rescue}`{suffix}.")
+            if effective and effective != agent:
+                parts.append(f"Effective top-level agent: `{effective}`.")
+            return " ".join(parts)
         reset_count = result.get("reset_count", 0)
         busy_count = result.get("busy_count", 0)
         parts = [f"Default agent set to `{agent}`."]
@@ -381,6 +404,36 @@ def handle_tool_call(name, arguments):
         if busy_count:
             noun = "session" if busy_count == 1 else "sessions"
             parts.append(f"{busy_count} busy top-level {noun} will switch after queued work finishes.")
+        if rescue_active and effective and effective != agent:
+            parts.append(f"Disk pressure is active, so top-level sessions currently use rescue agent `{effective}`.")
+        return " ".join(parts)
+
+    elif name == "rescue_agent":
+        result = control_request("rescue_agent", arguments)
+        if "error" in result:
+            return result["error"]
+        agent = result.get("agent")
+        effective = result.get("effective_top_level_agent", "")
+        rescue_active = result.get("disk_rescue_active", False)
+        if "agent" not in (arguments or {}):
+            if agent:
+                parts = [f"Rescue agent: `{agent}`."]
+            else:
+                parts = ["Rescue agent: disabled."]
+            if rescue_active and effective:
+                parts.append(f"Disk pressure is active, so top-level sessions currently use `{effective}`.")
+            return " ".join(parts)
+        reset_count = result.get("reset_count", 0)
+        busy_count = result.get("busy_count", 0)
+        parts = [f"Rescue agent set to `{agent}`." if agent else "Rescue agent disabled."]
+        if reset_count:
+            noun = "session" if reset_count == 1 else "sessions"
+            parts.append(f"Reset {reset_count} idle top-level {noun} immediately.")
+        if busy_count:
+            noun = "session" if busy_count == 1 else "sessions"
+            parts.append(f"{busy_count} busy top-level {noun} will switch after queued work finishes.")
+        if rescue_active and effective:
+            parts.append(f"Disk pressure is active, so top-level sessions currently use `{effective}`.")
         return " ".join(parts)
 
     elif name == "restart_bot":

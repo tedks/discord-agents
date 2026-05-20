@@ -35,8 +35,10 @@ let with_test_bot f =
   with_tmp_home (fun () ->
     Eio_main.run @@ fun env ->
     Eio.Switch.run @@ fun sw ->
+      Discord_agents.Disk_health.For_testing.reset ();
       let settings : Discord_agents.Runtime_settings.t = {
         default_agent = Discord_agents.Config.Claude;
+        rescue_agent = None;
       } in
       let config : Discord_agents.Config.t = {
         Discord_agents.Config.default with
@@ -67,12 +69,18 @@ let with_test_bot f =
         output_lines = Discord_agents.Agent_process.default_output_lines;
         scroll_states = Hashtbl.create 8;
       } in
-      f bot)
+      Fun.protect
+        ~finally:(fun () -> Discord_agents.Disk_health.For_testing.reset ())
+        (fun () -> f bot))
 
 let kind_string = Discord_agents.Config.string_of_agent_kind
 
-let make_session ?(processing=false) ?session_override_kind
-    ?pending_agent_change agent_kind =
+let set_disk_warning_mode () =
+  Discord_agents.Disk_health.For_testing.set_probe_available_bytes
+    (fun _path -> Discord_agents.Disk_health.For_testing.mib 96)
+
+let make_session ?(processing=false) ?session_override_kind ?pending_agent_change
+    agent_kind =
   let session = Discord_agents.Session_store.make_session
     ~project_name:"control"
     ~working_dir:"/tmp/project"
@@ -239,7 +247,7 @@ let test_apply_pending_same_kind_session_override_pins_existing_session () =
     Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
     Discord_agents.Bot.maybe_apply_pending_session_agent_change bot session;
     let saved = find_control_session bot in
-    Alcotest.(check string) "agent unchanged" "codex" (kind_string saved.agent_kind);
+    Alcotest.(check string) "agent stays codex" "codex" (kind_string saved.agent_kind);
     Alcotest.(check (option string)) "session override persisted"
       (Some "codex")
       (Option.map kind_string saved.session_override_kind);
@@ -338,6 +346,93 @@ let test_reconcile_applies_persisted_pending_default_rotation () =
       (Option.map
          (fun pending -> kind_string pending.Discord_agents.Session_store.kind)
          saved.pending_agent_change))
+
+let test_effective_top_level_agent_uses_rescue_under_pressure () =
+  with_test_bot (fun bot ->
+    bot.settings.rescue_agent <- Some Discord_agents.Config.Codex;
+    set_disk_warning_mode ();
+    ignore (Discord_agents.Disk_health.preflight_state_mutation ());
+    Alcotest.(check string) "effective top-level agent"
+      "codex"
+      (kind_string (Discord_agents.Bot.effective_top_level_agent bot)))
+
+let test_set_rescue_agent_rotates_idle_control_session_under_pressure () =
+  with_test_bot (fun bot ->
+    set_disk_warning_mode ();
+    ignore (Discord_agents.Disk_health.preflight_state_mutation ());
+    let session = make_session Discord_agents.Config.Claude in
+    let original_session_id = session.session_id in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    match Discord_agents.Bot.set_rescue_agent bot
+            ~current_channel_id:(Some "control")
+            (Some Discord_agents.Config.Codex) with
+    | Error err -> Alcotest.failf "set_rescue_agent failed: %s" err
+    | Ok rotation ->
+      Alcotest.(check int) "idle reset count" 1 rotation.reset_count;
+      let saved = find_control_session bot in
+      Alcotest.(check string) "agent rotated to rescue"
+        "codex" (kind_string saved.agent_kind);
+      Alcotest.(check bool) "fresh session id allocated"
+        true (saved.session_id <> original_session_id))
+
+let test_set_rescue_agent_preserves_idle_session_override_under_pressure () =
+  with_test_bot (fun bot ->
+    set_disk_warning_mode ();
+    ignore (Discord_agents.Disk_health.preflight_state_mutation ());
+    let session =
+      make_session
+        ~session_override_kind:(Some Discord_agents.Config.Gemini)
+        Discord_agents.Config.Gemini
+    in
+    let original_session_id = session.session_id in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    match Discord_agents.Bot.set_rescue_agent bot
+            ~current_channel_id:(Some "control")
+            (Some Discord_agents.Config.Codex) with
+    | Error err -> Alcotest.failf "set_rescue_agent failed: %s" err
+    | Ok rotation ->
+      Alcotest.(check int) "override reset count" 0 rotation.reset_count;
+      Alcotest.(check (option string)) "current override kind"
+        (Some "gemini")
+        (Option.map kind_string rotation.current_override_kind);
+      let saved = find_control_session bot in
+      Alcotest.(check string) "session override agent preserved"
+        "gemini" (kind_string saved.agent_kind);
+      Alcotest.(check string) "session id unchanged"
+        original_session_id saved.session_id)
+
+let test_set_default_agent_under_active_rescue_preserves_rescue_target () =
+  with_test_bot (fun bot ->
+    bot.settings.rescue_agent <- Some Discord_agents.Config.Codex;
+    set_disk_warning_mode ();
+    ignore (Discord_agents.Disk_health.preflight_state_mutation ());
+    let session = make_session Discord_agents.Config.Claude in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    match Discord_agents.Bot.set_default_agent bot
+            ~current_channel_id:(Some "control")
+            Discord_agents.Config.Gemini with
+    | Error err -> Alcotest.failf "set_default_agent failed: %s" err
+    | Ok rotation ->
+      Alcotest.(check int) "idle reset count" 1 rotation.reset_count;
+      Alcotest.(check string) "default persisted"
+        "gemini" (kind_string bot.settings.default_agent);
+      let saved = find_control_session bot in
+      Alcotest.(check string) "session still uses rescue agent"
+        "codex" (kind_string saved.agent_kind))
+
+let test_reconcile_rotates_idle_session_to_rescue_agent_under_pressure () =
+  with_test_bot (fun bot ->
+    bot.settings.rescue_agent <- Some Discord_agents.Config.Codex;
+    set_disk_warning_mode ();
+    ignore (Discord_agents.Disk_health.preflight_state_mutation ());
+    let session = make_session Discord_agents.Config.Claude in
+    let original_session_id = session.session_id in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    Discord_agents.Bot.reconcile_persisted_pending_agent_changes bot;
+    let saved = find_control_session bot in
+    Alcotest.(check string) "agent rotated" "codex" (kind_string saved.agent_kind);
+    Alcotest.(check bool) "fresh session id allocated"
+      true (saved.session_id <> original_session_id))
 
 let test_stop_idle_session_removes_it () =
   with_test_bot (fun bot ->
@@ -483,6 +578,16 @@ let () =
         test_reconcile_rotates_idle_session_to_default_agent;
       Alcotest.test_case "reconcile applies persisted default rotation" `Quick
         test_reconcile_applies_persisted_pending_default_rotation;
+      Alcotest.test_case "effective top-level agent uses rescue under pressure" `Quick
+        test_effective_top_level_agent_uses_rescue_under_pressure;
+      Alcotest.test_case "set rescue agent rotates idle top-level session under pressure" `Quick
+        test_set_rescue_agent_rotates_idle_control_session_under_pressure;
+      Alcotest.test_case "set rescue agent preserves idle session override under pressure" `Quick
+        test_set_rescue_agent_preserves_idle_session_override_under_pressure;
+      Alcotest.test_case "set default agent under active rescue preserves rescue target" `Quick
+        test_set_default_agent_under_active_rescue_preserves_rescue_target;
+      Alcotest.test_case "reconcile rotates idle session to rescue under pressure" `Quick
+        test_reconcile_rotates_idle_session_to_rescue_agent_under_pressure;
       Alcotest.test_case "stop idle session removes it" `Quick
         test_stop_idle_session_removes_it;
       Alcotest.test_case "stop idle queued session clears and removes it" `Quick

@@ -16,6 +16,7 @@ type t =
   | Stop_session of { thread_id : string }
   | Cleanup_channels
   | Default_agent of Config.agent_kind option
+  | Rescue_agent of Config.agent_kind option option
   | Session_agent of Config.agent_kind option
   | Restart
   | Refresh
@@ -64,6 +65,14 @@ let parse content =
   | ["default-agent"; kind_str] | ["default_agent"; kind_str] ->
     (match Config.agent_kind_of_string (String.lowercase_ascii kind_str) with
      | Ok k -> Default_agent (Some k)
+     | Error _ -> Unknown content)
+  | ["rescue-agent"] | ["rescue_agent"] -> Rescue_agent None
+  | ["rescue-agent"; "off"] | ["rescue_agent"; "off"]
+  | ["rescue-agent"; "none"] | ["rescue_agent"; "none"] ->
+    Rescue_agent (Some None)
+  | ["rescue-agent"; kind_str] | ["rescue_agent"; kind_str] ->
+    (match Config.agent_kind_of_string (String.lowercase_ascii kind_str) with
+     | Ok k -> Rescue_agent (Some (Some k))
      | Error _ -> Unknown content)
   | ["session-agent"] | ["session_agent"] -> Session_agent None
   | ["session-agent"; kind_str] | ["session_agent"; kind_str] ->

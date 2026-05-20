@@ -50,15 +50,22 @@ let test_load_defaults_to_claude () =
     let settings = Discord_agents.Runtime_settings.load () in
     Alcotest.(check string) "default agent"
       "claude"
-      (Discord_agents.Config.string_of_agent_kind settings.default_agent))
+      (Discord_agents.Config.string_of_agent_kind settings.default_agent);
+    Alcotest.(check (option string)) "rescue agent defaults to none"
+      None
+      (Option.map Discord_agents.Config.string_of_agent_kind settings.rescue_agent))
 
 let test_save_and_reload_roundtrip () =
   with_tmp_home (fun home ->
     let settings = Discord_agents.Runtime_settings.load () in
     match Discord_agents.Runtime_settings.set_default_agent
             settings Discord_agents.Config.Codex with
-    | Error err -> Alcotest.failf "save failed: %s" err
+    | Error err -> Alcotest.failf "default save failed: %s" err
     | Ok () ->
+      (match Discord_agents.Runtime_settings.set_rescue_agent
+               settings (Some Discord_agents.Config.Gemini) with
+       | Error err -> Alcotest.failf "rescue save failed: %s" err
+       | Ok () -> ());
       Alcotest.(check bool) "backup exists"
         true (Sys.file_exists (backup_path home));
       Alcotest.(check string) "backup mirrors primary"
@@ -67,7 +74,12 @@ let test_save_and_reload_roundtrip () =
       let reloaded = Discord_agents.Runtime_settings.load () in
       Alcotest.(check string) "saved default agent"
         "codex"
-        (Discord_agents.Config.string_of_agent_kind reloaded.default_agent))
+        (Discord_agents.Config.string_of_agent_kind reloaded.default_agent);
+      Alcotest.(check (option string)) "saved rescue agent"
+        (Some "gemini")
+        (Option.map
+           Discord_agents.Config.string_of_agent_kind
+           reloaded.rescue_agent))
 
 let test_load_uses_backup_when_primary_corrupt () =
   with_tmp_home (fun home ->
@@ -88,6 +100,7 @@ let test_save_with_visible_but_unconfirmed_primary_updates_backup () =
   with_tmp_home (fun home ->
     let settings = Discord_agents.Runtime_settings.load () in
     settings.default_agent <- Discord_agents.Config.Codex;
+    settings.rescue_agent <- Some Discord_agents.Config.Gemini;
     let write_file path content =
       if String.equal path (settings_path home) then
         Discord_agents.Resource.write_file_atomic
@@ -126,6 +139,7 @@ let test_save_refuses_read_only_preflight () =
   with_tmp_home (fun home ->
     let settings = Discord_agents.Runtime_settings.load () in
     settings.default_agent <- Discord_agents.Config.Codex;
+    settings.rescue_agent <- Some Discord_agents.Config.Gemini;
     let write_attempted = ref false in
     let write_file _path _content =
       write_attempted := true;

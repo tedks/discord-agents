@@ -45,7 +45,7 @@ type session = {
   working_dir : string;
   agent_kind : Config.agent_kind;
   (* Persisted top-level session pin set via [!session-agent]. When
-     present, default-agent rotations must leave this session on the
+     present, default/rescue rotations must leave this session on the
      recorded agent kind. *)
   mutable session_override_kind : Config.agent_kind option;
   (* Mutable because Codex and Gemini assign their session ids
@@ -95,13 +95,13 @@ let sessions_to_json sessions =
       ("session_id_confirmed", `Bool s.session_id_confirmed);
       ("thread_id", `String s.thread_id);
       ("message_count", `Int s.message_count);
-    ] @ (match s.system_prompt with
-         | Some sp -> [("system_prompt", `String sp)]
-         | None -> [])
-      @ (match s.session_override_kind with
+    ] @ (match s.session_override_kind with
          | Some kind ->
            [("session_override_kind",
              `String (Config.string_of_agent_kind kind))]
+         | None -> [])
+      @ (match s.system_prompt with
+         | Some sp -> [("system_prompt", `String sp)]
          | None -> [])
       @ (match s.pending_agent_change with
          | Some pending ->

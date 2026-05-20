@@ -5,6 +5,7 @@
 
 type t = {
   mutable default_agent : Config.agent_kind;
+  mutable rescue_agent : Config.agent_kind option;
 }
 
 let settings_path () =
@@ -15,18 +16,34 @@ let backup_path () = settings_path () ^ ".bak"
 
 let default () = {
   default_agent = Config.Claude;
+  rescue_agent = None;
 }
 
 let to_yojson t =
-  `Assoc [("default_agent", Config.yojson_of_agent_kind t.default_agent)]
+  `Assoc ([
+    ("default_agent", Config.yojson_of_agent_kind t.default_agent)
+  ] @
+  match t.rescue_agent with
+  | Some agent -> [("rescue_agent", Config.yojson_of_agent_kind agent)]
+  | None -> [])
 
 let of_yojson = function
   | `Assoc fields ->
-    (match List.assoc_opt "default_agent" fields with
-     | Some (`String _ as json) ->
-       { default_agent = Config.agent_kind_of_yojson json }
-     | Some _ -> failwith "default_agent: expected string"
-     | None -> default ())
+    let default_agent =
+      match List.assoc_opt "default_agent" fields with
+      | Some (`String _ as json) ->
+        Config.agent_kind_of_yojson json
+      | Some _ -> failwith "default_agent: expected string"
+      | None -> (default ()).default_agent
+    in
+    let rescue_agent =
+      match List.assoc_opt "rescue_agent" fields with
+      | Some `Null | None -> None
+      | Some (`String _ as json) ->
+        Some (Config.agent_kind_of_yojson json)
+      | Some _ -> failwith "rescue_agent: expected string or null"
+    in
+    { default_agent; rescue_agent }
   | _ -> failwith "runtime settings: expected object"
 
 let load_file path =
@@ -121,10 +138,28 @@ let set_default_agent t agent =
   if Config.equal_agent_kind t.default_agent agent then
     Ok ()
   else
-    let next = { default_agent = agent } in
+    let next = {
+      default_agent = agent;
+      rescue_agent = t.rescue_agent;
+    } in
     match save next with
     | Ok () as ok ->
       t.default_agent <- agent;
+      ok
+    | Error _ as err ->
+      err
+
+let set_rescue_agent t agent =
+  if t.rescue_agent = agent then
+    Ok ()
+  else
+    let next = {
+      default_agent = t.default_agent;
+      rescue_agent = agent;
+    } in
+    match save next with
+    | Ok () as ok ->
+      t.rescue_agent <- agent;
       ok
     | Error _ as err ->
       err
