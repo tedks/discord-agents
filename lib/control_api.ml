@@ -199,6 +199,8 @@ let handle_health (bot : Bot.t) =
      `String (Config.string_of_agent_kind bot.settings.default_agent));
     ("effective_top_level_agent",
      `String (Config.string_of_agent_kind effective_top_level_agent));
+    ("top_level_policy_sync_pending",
+     `Bool (Bot.policy_sync_pending bot));
     ("disk_rescue_active",
      `Bool (Bot.rescue_mode_active_from_snapshot bot.settings disk));
     ("sessions", `Int (Session_store.count bot.sessions));
@@ -652,6 +654,8 @@ let handle_default_agent (bot : Bot.t) params =
       ("effective_top_level_agent",
        `String (Config.string_of_agent_kind
          (Bot.effective_top_level_agent_from_snapshot bot.settings disk)));
+      ("top_level_policy_sync_pending",
+       `Bool (Bot.policy_sync_pending bot));
       ("disk_rescue_active",
        `Bool (Bot.rescue_mode_active_from_snapshot bot.settings disk));
     ] @
@@ -667,6 +671,8 @@ let handle_default_agent (bot : Bot.t) params =
          ("agent", `String (Config.string_of_agent_kind kind));
          ("effective_top_level_agent",
           `String (Config.string_of_agent_kind (Bot.effective_top_level_agent bot)));
+         ("top_level_policy_sync_pending",
+          `Bool (Bot.policy_sync_pending bot));
          ("disk_rescue_active", `Bool (Bot.rescue_mode_active bot));
          ("reset_count", `Int rotation.Bot.reset_count);
          ("busy_count", `Int rotation.Bot.busy_count);
@@ -696,6 +702,8 @@ let handle_rescue_agent (bot : Bot.t) params =
     ok_response ([
       ("effective_top_level_agent",
        `String (Config.string_of_agent_kind (Bot.effective_top_level_agent bot)));
+      ("top_level_policy_sync_pending",
+       `Bool (Bot.policy_sync_pending bot));
       ("disk_rescue_active", `Bool (Bot.rescue_mode_active bot));
     ] @
     match bot.settings.rescue_agent with
@@ -713,6 +721,8 @@ let handle_rescue_agent (bot : Bot.t) params =
           | None -> `Null);
          ("effective_top_level_agent",
           `String (Config.string_of_agent_kind (Bot.effective_top_level_agent bot)));
+         ("top_level_policy_sync_pending",
+          `Bool (Bot.policy_sync_pending bot));
          ("disk_rescue_active", `Bool (Bot.rescue_mode_active bot));
          ("reset_count", `Int rotation.Bot.reset_count);
          ("busy_count", `Int rotation.Bot.busy_count);

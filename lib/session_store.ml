@@ -198,25 +198,50 @@ let save_with
     failwith err
   | Ok () ->
     let saw_disk_issue = ref false in
+    let stamp_write_epoch target write_epoch =
+      try Resource.stamp_file_mtime target write_epoch with
+      | exn ->
+        Logs.warn (fun m ->
+          m "session_store: failed to stamp write epoch on %s: %s"
+            target (Printexc.to_string exn))
+    in
     (try
        Resource.with_flock (lock_file ()) (fun () ->
          Resource.cleanup_atomic_write_temps path;
          Resource.cleanup_atomic_write_temps backup;
-         (try write_file path rendered with
-          | Resource.Durable_write_visible_but_unconfirmed (path, exn) ->
-            saw_disk_issue := true;
-            note_write_failure path exn;
-            primary_warning := Some (path, exn));
-         (try write_file backup rendered with
-          | Resource.Durable_write_visible_but_unconfirmed (path, exn) ->
-            saw_disk_issue := true;
-            note_write_failure path exn;
-            log_visible_but_unconfirmed path exn
-          | exn ->
-            note_write_failure backup exn;
-            Logs.warn (fun m ->
-              m "session_store: failed to update backup %s: %s"
-                backup (Printexc.to_string exn))));
+         let write_epoch = Resource.next_write_epoch [path; backup] in
+         let wrote_primary =
+           try
+             write_file path rendered;
+             true
+           with
+           | Resource.Durable_write_visible_but_unconfirmed (path, exn) ->
+             saw_disk_issue := true;
+             note_write_failure path exn;
+             primary_warning := Some (path, exn);
+             true
+         in
+         if wrote_primary then
+           stamp_write_epoch path write_epoch;
+         let wrote_backup =
+           try
+             write_file backup rendered;
+             true
+           with
+           | Resource.Durable_write_visible_but_unconfirmed (path, exn) ->
+             saw_disk_issue := true;
+             note_write_failure path exn;
+             log_visible_but_unconfirmed path exn;
+             true
+           | exn ->
+             note_write_failure backup exn;
+             Logs.warn (fun m ->
+               m "session_store: failed to update backup %s: %s"
+                 backup (Printexc.to_string exn));
+             false
+         in
+         if wrote_backup then
+           stamp_write_epoch backup write_epoch);
        Option.iter (fun (path, exn) ->
          log_visible_but_unconfirmed path exn) !primary_warning;
        if not !saw_disk_issue then
@@ -232,6 +257,19 @@ let save t =
 let load_file path =
   let contents = Resource.read_file path in
   sessions_of_json (Yojson.Safe.from_string contents)
+
+let file_mtime path =
+  try Some (Unix.stat path).Unix.st_mtime
+  with _ -> None
+
+let backup_is_stale ~primary ~backup =
+  match file_mtime primary, file_mtime backup with
+  (* A newer primary with an older backup means the latest primary
+     publish never made it to the backup, so replaying the backup
+     would resurrect older session state. Equal mtimes are accepted
+     because successful saves stamp both files to the same epoch. *)
+  | Some primary_mtime, Some backup_mtime -> backup_mtime < primary_mtime
+  | _ -> false
 
 (** Load sessions from disk. *)
 let load_from_disk () =
@@ -257,16 +295,22 @@ let load_from_disk () =
        Logs.warn (fun m ->
          m "session_store: load error from %s: %s"
            path (Printexc.to_string exn));
-       (match load_file backup with
-        | sessions ->
-          Logs.warn (fun m ->
-            m "session_store: recovered from backup %s" backup);
-          sessions
-        | exception backup_exn ->
-          Logs.warn (fun m ->
-            m "session_store: backup load error from %s: %s"
-              backup (Printexc.to_string backup_exn));
-          SessionMap.empty))
+       if backup_is_stale ~primary:path ~backup then (
+         Logs.warn (fun m ->
+           m "session_store: refusing stale backup %s because it predates unreadable primary %s"
+             backup path);
+         SessionMap.empty)
+       else
+         (match load_file backup with
+          | sessions ->
+            Logs.warn (fun m ->
+              m "session_store: recovered from backup %s" backup);
+            sessions
+          | exception backup_exn ->
+            Logs.warn (fun m ->
+              m "session_store: backup load error from %s: %s"
+                backup (Printexc.to_string backup_exn));
+            SessionMap.empty))
 
 (** Create a session store, loading persisted sessions from disk. *)
 let create () =
@@ -308,6 +352,15 @@ let add t ~(thread_id : Discord_types.channel_id) session =
   match persist_or_rollback (fun () -> t.sessions <- prior) (fun () -> save t) with
   | Ok () -> ()
   | Error err -> failwith err
+
+let replace_sessions_with ?(rollback=(fun () -> ())) t sessions =
+  let prior = t.sessions in
+  t.sessions <- sessions;
+  persist_or_rollback
+    (fun () ->
+      t.sessions <- prior;
+      rollback ())
+    (fun () -> save t)
 
 (** Remove a session and persist to disk. *)
 let remove t ~(thread_id : Discord_types.channel_id) =

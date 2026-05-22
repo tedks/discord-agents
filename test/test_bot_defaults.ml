@@ -39,6 +39,7 @@ let with_test_bot f =
       let settings : Discord_agents.Runtime_settings.t = {
         default_agent = Discord_agents.Config.Claude;
         rescue_agent = None;
+        policy_sync_pending = false;
       } in
       let config : Discord_agents.Config.t = {
         Discord_agents.Config.default with
@@ -172,6 +173,11 @@ let test_set_default_agent_defers_busy_control_session () =
     | Ok rotation ->
       Alcotest.(check int) "reset count" 0 rotation.reset_count;
       Alcotest.(check int) "busy count" 1 rotation.busy_count;
+      Alcotest.(check bool) "policy sync completed"
+        false bot.settings.policy_sync_pending;
+      let persisted = Discord_agents.Runtime_settings.load () in
+      Alcotest.(check bool) "persisted policy sync completed"
+        false persisted.policy_sync_pending;
       (match rotation.current_busy_kind with
        | Some kind ->
          Alcotest.(check string) "current busy kind"
@@ -399,13 +405,23 @@ let test_reconcile_preserves_idle_session_override () =
 
 let test_reconcile_rotates_idle_session_to_default_agent () =
   with_test_bot (fun bot ->
-    bot.settings.default_agent <- Discord_agents.Config.Codex;
+    (match Discord_agents.Runtime_settings.set_top_level_policy bot.settings
+             ~default_agent:Discord_agents.Config.Codex
+             ~rescue_agent:None
+             ~policy_sync_pending:true with
+     | Error err -> Alcotest.failf "set_top_level_policy failed: %s" err
+     | Ok () -> ());
     let session = make_session Discord_agents.Config.Claude in
     let original_session_id = session.session_id in
     Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
     Discord_agents.Bot.reconcile_persisted_pending_agent_changes bot;
     let saved = find_control_session bot in
     Alcotest.(check string) "agent rotated" "codex" (kind_string saved.agent_kind);
+    Alcotest.(check bool) "policy sync cleared"
+      false bot.settings.policy_sync_pending;
+    let persisted = Discord_agents.Runtime_settings.load () in
+    Alcotest.(check bool) "persisted policy sync cleared"
+      false persisted.policy_sync_pending;
     Alcotest.(check bool) "fresh session id allocated"
       true (saved.session_id <> original_session_id))
 
@@ -606,11 +622,48 @@ let test_set_rescue_agent_rotates_idle_control_session_under_pressure () =
     | Error err -> Alcotest.failf "set_rescue_agent failed: %s" err
     | Ok rotation ->
       Alcotest.(check int) "idle reset count" 1 rotation.reset_count;
+      Alcotest.(check bool) "policy sync completed"
+        false bot.settings.policy_sync_pending;
+      let persisted = Discord_agents.Runtime_settings.load () in
+      Alcotest.(check bool) "persisted policy sync completed"
+        false persisted.policy_sync_pending;
       let saved = find_control_session bot in
       Alcotest.(check string) "agent rotated to rescue"
         "codex" (kind_string saved.agent_kind);
       Alcotest.(check bool) "fresh session id allocated"
         true (saved.session_id <> original_session_id))
+
+let test_set_default_agent_rolls_back_pending_rotation_when_session_save_fails () =
+  with_test_bot (fun bot ->
+    let session = make_session ~processing:true Discord_agents.Config.Claude in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    let sessions_path = Discord_agents.Session_store.sessions_file () in
+    Sys.remove sessions_path;
+    Unix.mkdir sessions_path 0o700;
+    match Discord_agents.Bot.set_default_agent bot
+            ~current_channel_id:(Some "control")
+            Discord_agents.Config.Codex with
+    | Ok _ ->
+      Alcotest.fail "set_default_agent unexpectedly succeeded"
+    | Error _ ->
+      Alcotest.(check string) "staged default agent persisted"
+        "codex" (kind_string bot.settings.default_agent);
+      Alcotest.(check bool) "policy sync left pending"
+        true bot.settings.policy_sync_pending;
+      let persisted = Discord_agents.Runtime_settings.load () in
+      Alcotest.(check string) "persisted default agent"
+        "codex"
+        (Discord_agents.Config.string_of_agent_kind persisted.default_agent);
+      Alcotest.(check bool) "persisted policy sync pending"
+        true persisted.policy_sync_pending;
+      let saved = find_control_session bot in
+      Alcotest.(check string) "session agent rolled back"
+        "claude" (kind_string saved.agent_kind);
+      Alcotest.(check (option string)) "pending change rolled back"
+        None
+        (Option.map
+           (fun pending -> kind_string pending.Discord_agents.Session_store.kind)
+           saved.pending_agent_change))
 
 let test_set_rescue_agent_preserves_idle_session_override_under_pressure () =
   with_test_bot (fun bot ->
@@ -818,6 +871,8 @@ let () =
     ("default agent", [
       Alcotest.test_case "busy control session defers default rotation" `Quick
         test_set_default_agent_defers_busy_control_session;
+      Alcotest.test_case "default rotation rollback restores session state on save failure" `Quick
+        test_set_default_agent_rolls_back_pending_rotation_when_session_save_fails;
       Alcotest.test_case "explicit session override survives default rotation" `Quick
         test_set_default_agent_preserves_explicit_session_override;
       Alcotest.test_case "completed default rotation gets cleared" `Quick
