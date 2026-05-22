@@ -16,6 +16,10 @@ let create () = { channels = ChannelMap.empty; category_id = None }
 let category_id t = t.category_id
 let set_category_id t id = t.category_id <- id
 
+(** Record or update a known project channel mapping. *)
+let add t ~project_name ~channel_id =
+  t.channels <- ChannelMap.add project_name channel_id t.channels
+
 (** Find a project's channel ID. *)
 let find t ~project_name =
   ChannelMap.find_opt project_name t.channels

@@ -665,6 +665,111 @@ let test_set_default_agent_rolls_back_pending_rotation_when_session_save_fails (
            (fun pending -> kind_string pending.Discord_agents.Session_store.kind)
            saved.pending_agent_change))
 
+let test_align_rolls_back_in_memory_mutations_when_replacement_raises () =
+  with_test_bot (fun bot ->
+    let busy = make_session ~processing:true Discord_agents.Config.Claude in
+    let idle =
+      make_session ~project_name:"proj" ~thread_id:"project-thread"
+        Discord_agents.Config.Claude
+    in
+    Discord_agents.Channel_manager.add
+      bot.project_state.channels
+      ~project_name:"proj"
+      ~channel_id:"project-thread";
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" busy;
+    Discord_agents.Session_store.add
+      bot.sessions ~thread_id:"project-thread" idle;
+    let saw_busy_pending_before_failure = ref false in
+    let replacement_session _t (session : Discord_agents.Session_store.session)
+        ~agent_kind:_ ~session_override_kind:_ =
+      if String.equal session.thread_id "project-thread" then
+        (saw_busy_pending_before_failure :=
+           Option.is_some busy.pending_agent_change;
+        failwith "simulated replacement failure"
+        )
+      else
+        session
+    in
+    match Discord_agents.Bot.align_persistent_sessions_to_agent
+            ~replacement_session
+            bot ~current_channel_id:(Some "control")
+            ~new_agent:Discord_agents.Config.Codex with
+    | Ok _ ->
+      Alcotest.fail "align_persistent_sessions_to_agent unexpectedly succeeded"
+    | Error _ ->
+      Alcotest.(check bool) "busy mutation happened before failure"
+        true !saw_busy_pending_before_failure;
+      let saved_busy = find_control_session bot in
+      Alcotest.(check string) "busy session agent unchanged"
+        "claude" (kind_string saved_busy.agent_kind);
+      Alcotest.(check (option string)) "busy pending rolled back"
+        None
+        (Option.map
+           (fun pending -> kind_string pending.Discord_agents.Session_store.kind)
+           saved_busy.pending_agent_change);
+      match Discord_agents.Session_store.find_opt bot.sessions
+              ~thread_id:"project-thread" with
+      | None -> Alcotest.fail "expected project-thread session"
+      | Some saved_idle ->
+        Alcotest.(check string) "idle session unchanged"
+          "claude" (kind_string saved_idle.agent_kind))
+
+let test_align_reraises_fatal_replacement_exception () =
+  with_test_bot (fun bot ->
+    let session = make_session Discord_agents.Config.Claude in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    let replacement_session _t (_session : Discord_agents.Session_store.session)
+        ~agent_kind:_ ~session_override_kind:_ =
+      assert false
+    in
+    try
+      ignore (Discord_agents.Bot.align_persistent_sessions_to_agent
+        ~replacement_session
+        bot ~current_channel_id:(Some "control")
+        ~new_agent:Discord_agents.Config.Codex);
+      Alcotest.fail "expected Assert_failure"
+    with
+    | Assert_failure _ -> ())
+
+let test_align_rolls_back_cleared_pending_rotation_when_replacement_raises () =
+  with_test_bot (fun bot ->
+    let pending = Discord_agents.Session_store.{
+      kind = Discord_agents.Config.Codex;
+      origin = Default_rotation;
+    } in
+    let control =
+      make_session ~pending_agent_change:pending Discord_agents.Config.Codex
+    in
+    let idle =
+      make_session ~project_name:"proj" ~thread_id:"project-thread"
+        Discord_agents.Config.Claude
+    in
+    Discord_agents.Channel_manager.add
+      bot.project_state.channels
+      ~project_name:"proj"
+      ~channel_id:"project-thread";
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" control;
+    Discord_agents.Session_store.add
+      bot.sessions ~thread_id:"project-thread" idle;
+    let replacement_session _t (session : Discord_agents.Session_store.session)
+        ~agent_kind:_ ~session_override_kind:_ =
+      if String.equal session.thread_id "project-thread" then
+        failwith "simulated replacement failure"
+      else
+        session
+    in
+    match Discord_agents.Bot.align_persistent_sessions_to_agent
+            ~replacement_session
+            bot ~current_channel_id:None
+            ~new_agent:Discord_agents.Config.Codex with
+    | Ok _ ->
+      Alcotest.fail "align_persistent_sessions_to_agent unexpectedly succeeded"
+    | Error _ ->
+      let saved = find_control_session bot in
+      expect_pending saved
+        ~kind:Discord_agents.Config.Codex
+        ~origin:Discord_agents.Session_store.Default_rotation)
+
 let test_set_rescue_agent_preserves_idle_session_override_under_pressure () =
   with_test_bot (fun bot ->
     set_disk_warning_mode ();
@@ -873,6 +978,12 @@ let () =
         test_set_default_agent_defers_busy_control_session;
       Alcotest.test_case "default rotation rollback restores session state on save failure" `Quick
         test_set_default_agent_rolls_back_pending_rotation_when_session_save_fails;
+      Alcotest.test_case "alignment rollback restores in-memory mutations on replacement failure" `Quick
+        test_align_rolls_back_in_memory_mutations_when_replacement_raises;
+      Alcotest.test_case "alignment rollback restores cleared pending rotation on replacement failure" `Quick
+        test_align_rolls_back_cleared_pending_rotation_when_replacement_raises;
+      Alcotest.test_case "alignment reraises fatal replacement exceptions" `Quick
+        test_align_reraises_fatal_replacement_exception;
       Alcotest.test_case "explicit session override survives default rotation" `Quick
         test_set_default_agent_preserves_explicit_session_override;
       Alcotest.test_case "completed default rotation gets cleared" `Quick

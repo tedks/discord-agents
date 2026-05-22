@@ -109,6 +109,18 @@ let rescue_agent_notice t =
   | None ->
     None
 
+let reraise_if_fatal_policy_exception exn =
+  match exn with
+  | Eio.Cancel.Cancelled _ -> raise exn
+  | Out_of_memory
+  | Stack_overflow
+  | Sys.Break
+  | Assert_failure _
+  | Match_failure _
+  | Invalid_argument _ ->
+    raise exn
+  | _ -> ()
+
 let refresh_disk_state () =
   ignore (Disk_health.preflight_state_mutation ())
 
@@ -531,7 +543,9 @@ let replacement_session_for_agent t (session : Session_store.session)
   } in
   replacement
 
-let align_persistent_sessions_to_agent t ~current_channel_id ~new_agent =
+let align_persistent_sessions_to_agent
+    ?(replacement_session=replacement_session_for_agent)
+    t ~current_channel_id ~new_agent =
   let store : Session_store.t = t.sessions in
   let session_entries = Session_store.bindings store in
   let current_override_kind = ref None in
@@ -562,63 +576,77 @@ let align_persistent_sessions_to_agent t ~current_channel_id ~new_agent =
       changed := true
     end
   in
-  List.iter (fun (thread_id, (session : Session_store.session)) ->
-    if is_persistent_session t ~thread_id session then begin
-      if (Config.equal_agent_kind session.agent_kind new_agent
-          || Option.is_some session.session_override_kind)
-      then
-        (match session.pending_agent_change with
-         | Some { origin = Session_store.Default_rotation; _ } ->
-           set_pending_agent_change session None
-         | _ -> ());
-      if Option.is_none session.session_override_kind
-         && not (Config.equal_agent_kind session.agent_kind new_agent)
-      then if session.processing || not (Queue.is_empty session.pending_queue) then begin
-        match session.pending_agent_change with
-        | Some { origin = Session_store.Session_override; kind } ->
-          (match current_channel_id with
-           | Some current_channel_id when thread_id = current_channel_id ->
-             current_override_kind := Some kind
-           | _ -> ())
-        | _ ->
-          let target = pending_default_rotation new_agent in
-          set_pending_agent_change session (Some target);
-          (match current_channel_id with
-           | Some current_channel_id when thread_id = current_channel_id ->
-             current_busy_kind := Some session.agent_kind
-           | _ -> ());
-          incr busy_count
-      end else begin
-        let replacement =
-          replacement_session_for_agent t session
-            ~agent_kind:new_agent ~session_override_kind:None
-        in
-        new_sessions :=
-          Session_store.SessionMap.add thread_id replacement !new_sessions;
-        scroll_states_to_clear := thread_id :: !scroll_states_to_clear;
-        changed := true;
-        incr reset_count
-      end
-    end
-  ) session_entries;
-  let rotation = {
-    reset_count = !reset_count;
-    busy_count = !busy_count;
-    current_busy_kind = !current_busy_kind;
-    current_override_kind = !current_override_kind;
-  } in
-  if not !changed then
-    Ok rotation
-  else
-    match Session_store.replace_sessions_with
-            ~rollback store !new_sessions with
-    | Error err ->
+  let prepared =
+    try
+      List.iter (fun (thread_id, (session : Session_store.session)) ->
+        if is_persistent_session t ~thread_id session then begin
+          if (Config.equal_agent_kind session.agent_kind new_agent
+              || Option.is_some session.session_override_kind)
+          then
+            (match session.pending_agent_change with
+             | Some { origin = Session_store.Default_rotation; _ } ->
+               set_pending_agent_change session None
+             | _ -> ());
+          if Option.is_none session.session_override_kind
+             && not (Config.equal_agent_kind session.agent_kind new_agent)
+          then if session.processing || not (Queue.is_empty session.pending_queue) then begin
+            match session.pending_agent_change with
+            | Some { origin = Session_store.Session_override; kind } ->
+              (match current_channel_id with
+               | Some current_channel_id when thread_id = current_channel_id ->
+                 current_override_kind := Some kind
+               | _ -> ())
+            | _ ->
+              let target = pending_default_rotation new_agent in
+              set_pending_agent_change session (Some target);
+              (match current_channel_id with
+               | Some current_channel_id when thread_id = current_channel_id ->
+                 current_busy_kind := Some session.agent_kind
+               | _ -> ());
+              incr busy_count
+          end else begin
+            let replacement =
+              replacement_session t session
+                ~agent_kind:new_agent ~session_override_kind:None
+            in
+            new_sessions :=
+              Session_store.SessionMap.add thread_id replacement !new_sessions;
+            scroll_states_to_clear := thread_id :: !scroll_states_to_clear;
+            changed := true;
+            incr reset_count
+          end
+        end
+      ) session_entries;
+      Ok ()
+    with exn ->
+      reraise_if_fatal_policy_exception exn;
+      rollback ();
       Error (Printf.sprintf
-        "failed to persist top-level session policy for `%s`: %s"
-        (Config.string_of_agent_kind new_agent) err)
-    | Ok () ->
-      List.iter (Hashtbl.remove t.scroll_states) !scroll_states_to_clear;
+        "failed to prepare top-level session policy for `%s`: %s"
+        (Config.string_of_agent_kind new_agent)
+        (Printexc.to_string exn))
+  in
+  match prepared with
+  | Error _ as err -> err
+  | Ok () ->
+    let rotation = {
+      reset_count = !reset_count;
+      busy_count = !busy_count;
+      current_busy_kind = !current_busy_kind;
+      current_override_kind = !current_override_kind;
+    } in
+    if not !changed then
       Ok rotation
+    else
+      match Session_store.replace_sessions_with
+              ~rollback store !new_sessions with
+      | Error err ->
+        Error (Printf.sprintf
+          "failed to persist top-level session policy for `%s`: %s"
+          (Config.string_of_agent_kind new_agent) err)
+      | Ok () ->
+        List.iter (Hashtbl.remove t.scroll_states) !scroll_states_to_clear;
+        Ok rotation
 
 let clear_policy_sync_pending t =
   if policy_sync_pending t then
