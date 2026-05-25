@@ -201,6 +201,9 @@ let handle_health (bot : Bot.t) =
      `String (Config.string_of_agent_kind effective_top_level_agent));
     ("top_level_policy_sync_pending",
      `Bool (Bot.policy_sync_pending bot));
+    ("top_level_policy_sync_state",
+     `String (Bot.string_of_top_level_policy_sync_state
+       (Bot.top_level_policy_sync_state_from_snapshot bot disk)));
     ("disk_rescue_active",
      `Bool (Bot.rescue_mode_active_from_snapshot bot.settings disk));
     ("sessions", `Int (Session_store.count bot.sessions));
@@ -656,6 +659,9 @@ let handle_default_agent (bot : Bot.t) params =
          (Bot.effective_top_level_agent_from_snapshot bot.settings disk)));
       ("top_level_policy_sync_pending",
        `Bool (Bot.policy_sync_pending bot));
+      ("top_level_policy_sync_state",
+       `String (Bot.string_of_top_level_policy_sync_state
+         (Bot.top_level_policy_sync_state_from_snapshot bot disk)));
       ("disk_rescue_active",
        `Bool (Bot.rescue_mode_active_from_snapshot bot.settings disk));
     ] @
@@ -667,13 +673,19 @@ let handle_default_agent (bot : Bot.t) params =
     (match Bot.set_default_agent bot kind with
      | Error err -> error_response err
      | Ok rotation ->
+       let disk = Disk_health.snapshot () in
        ok_response ([
          ("agent", `String (Config.string_of_agent_kind kind));
          ("effective_top_level_agent",
-          `String (Config.string_of_agent_kind (Bot.effective_top_level_agent bot)));
+          `String (Config.string_of_agent_kind
+            (Bot.effective_top_level_agent_from_snapshot bot.settings disk)));
          ("top_level_policy_sync_pending",
           `Bool (Bot.policy_sync_pending bot));
-         ("disk_rescue_active", `Bool (Bot.rescue_mode_active bot));
+         ("top_level_policy_sync_state",
+          `String (Bot.string_of_top_level_policy_sync_state
+            (Bot.top_level_policy_sync_state_from_snapshot bot disk)));
+         ("disk_rescue_active",
+          `Bool (Bot.rescue_mode_active_from_snapshot bot.settings disk));
          ("reset_count", `Int rotation.Bot.reset_count);
          ("busy_count", `Int rotation.Bot.busy_count);
        ] @
@@ -699,12 +711,18 @@ let handle_rescue_agent (bot : Bot.t) params =
   in
   match requested with
   | None ->
+    let disk = Disk_health.snapshot () in
     ok_response ([
       ("effective_top_level_agent",
-       `String (Config.string_of_agent_kind (Bot.effective_top_level_agent bot)));
+       `String (Config.string_of_agent_kind
+         (Bot.effective_top_level_agent_from_snapshot bot.settings disk)));
       ("top_level_policy_sync_pending",
        `Bool (Bot.policy_sync_pending bot));
-      ("disk_rescue_active", `Bool (Bot.rescue_mode_active bot));
+      ("top_level_policy_sync_state",
+       `String (Bot.string_of_top_level_policy_sync_state
+         (Bot.top_level_policy_sync_state_from_snapshot bot disk)));
+      ("disk_rescue_active",
+       `Bool (Bot.rescue_mode_active_from_snapshot bot.settings disk));
     ] @
     match bot.settings.rescue_agent with
     | Some kind ->
@@ -714,16 +732,22 @@ let handle_rescue_agent (bot : Bot.t) params =
     (match Bot.set_rescue_agent bot kind with
      | Error err -> error_response err
      | Ok rotation ->
+       let disk = Disk_health.snapshot () in
        ok_response [
          ("agent",
           match kind with
           | Some kind -> `String (Config.string_of_agent_kind kind)
           | None -> `Null);
          ("effective_top_level_agent",
-          `String (Config.string_of_agent_kind (Bot.effective_top_level_agent bot)));
+          `String (Config.string_of_agent_kind
+            (Bot.effective_top_level_agent_from_snapshot bot.settings disk)));
          ("top_level_policy_sync_pending",
           `Bool (Bot.policy_sync_pending bot));
-         ("disk_rescue_active", `Bool (Bot.rescue_mode_active bot));
+         ("top_level_policy_sync_state",
+          `String (Bot.string_of_top_level_policy_sync_state
+            (Bot.top_level_policy_sync_state_from_snapshot bot disk)));
+         ("disk_rescue_active",
+          `Bool (Bot.rescue_mode_active_from_snapshot bot.settings disk));
          ("reset_count", `Int rotation.Bot.reset_count);
          ("busy_count", `Int rotation.Bot.busy_count);
        ])

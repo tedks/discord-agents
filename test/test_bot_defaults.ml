@@ -68,6 +68,7 @@ let with_test_bot f =
         wrap_width = Discord_agents.Agent_process.desktop_width;
         refreshing = false;
         output_lines = Discord_agents.Agent_process.default_output_lines;
+        policy_sync_clear_last_warning = None;
         scroll_states = Hashtbl.create 8;
       } in
       Fun.protect
@@ -75,6 +76,9 @@ let with_test_bot f =
         (fun () -> f bot))
 
 let kind_string = Discord_agents.Config.string_of_agent_kind
+let policy_sync_state_string bot =
+  Discord_agents.Bot.top_level_policy_sync_state bot
+  |> Discord_agents.Bot.string_of_top_level_policy_sync_state
 
 let set_disk_warning_mode () =
   Discord_agents.Disk_health.For_testing.set_probe_available_bytes
@@ -580,6 +584,110 @@ let test_best_effort_sync_observes_project_workdir_pressure () =
         Alcotest.(check bool) "fresh session id allocated"
           true (saved.session_id <> original_session_id)))
 
+let test_policy_sync_state_is_marker_clear_pending_after_converged_rotation () =
+  with_test_bot (fun bot ->
+    bot.settings.default_agent <- Discord_agents.Config.Codex;
+    bot.settings.policy_sync_pending <- true;
+    let session = make_session Discord_agents.Config.Codex in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    Alcotest.(check string) "policy sync state"
+      "marker-clear-pending" (policy_sync_state_string bot))
+
+let test_policy_sync_state_is_rotation_pending_for_deferred_default_rotation () =
+  with_test_bot (fun bot ->
+    bot.settings.default_agent <- Discord_agents.Config.Codex;
+    bot.settings.policy_sync_pending <- true;
+    let pending = Discord_agents.Session_store.{
+      kind = Discord_agents.Config.Codex;
+      origin = Default_rotation;
+    } in
+    let session =
+      make_session ~processing:true ~pending_agent_change:pending
+        Discord_agents.Config.Claude
+    in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    Alcotest.(check string) "policy sync state"
+      "rotation-pending" (policy_sync_state_string bot))
+
+let test_policy_sync_state_is_rotation_pending_after_marker_cleared () =
+  with_test_bot (fun bot ->
+    bot.settings.default_agent <- Discord_agents.Config.Codex;
+    let pending = Discord_agents.Session_store.{
+      kind = Discord_agents.Config.Codex;
+      origin = Default_rotation;
+    } in
+    let session =
+      make_session ~processing:true ~pending_agent_change:pending
+        Discord_agents.Config.Claude
+    in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    Alcotest.(check string) "policy sync state"
+      "rotation-pending" (policy_sync_state_string bot))
+
+let test_policy_sync_clear_warning_is_suppressed_for_repeat_state_and_error () =
+  with_test_bot (fun bot ->
+    bot.settings.default_agent <- Discord_agents.Config.Codex;
+    bot.settings.policy_sync_pending <- true;
+    let session = make_session Discord_agents.Config.Codex in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    Alcotest.(check bool) "first warning allowed"
+      true
+      (Discord_agents.Bot.should_log_policy_sync_clear_failure bot "disk full");
+    Alcotest.(check bool) "repeat warning suppressed"
+      false
+      (Discord_agents.Bot.should_log_policy_sync_clear_failure bot "disk full"))
+
+let test_policy_sync_clear_warning_logs_again_after_error_or_state_change () =
+  with_test_bot (fun bot ->
+    bot.settings.default_agent <- Discord_agents.Config.Codex;
+    bot.settings.policy_sync_pending <- true;
+    let converged = make_session Discord_agents.Config.Codex in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" converged;
+    ignore (Discord_agents.Bot.should_log_policy_sync_clear_failure bot "disk full");
+    Alcotest.(check bool) "different error re-logs"
+      true
+      (Discord_agents.Bot.should_log_policy_sync_clear_failure bot "io timeout");
+    let pending = Discord_agents.Session_store.{
+      kind = Discord_agents.Config.Codex;
+      origin = Default_rotation;
+    } in
+    let deferred =
+      make_session ~processing:true ~pending_agent_change:pending
+        Discord_agents.Config.Claude
+    in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" deferred;
+    Alcotest.(check string) "policy sync state changed"
+      "rotation-pending" (policy_sync_state_string bot);
+    Alcotest.(check bool) "state change re-logs"
+      true
+      (Discord_agents.Bot.should_log_policy_sync_clear_failure bot "io timeout"))
+
+let test_policy_sync_clear_success_rearms_warning () =
+  with_test_bot (fun bot ->
+    bot.settings.default_agent <- Discord_agents.Config.Codex;
+    bot.settings.policy_sync_pending <- true;
+    let session = make_session Discord_agents.Config.Codex in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    ignore (Discord_agents.Bot.should_log_policy_sync_clear_failure bot "disk full");
+    Discord_agents.Bot.note_policy_sync_clear_success bot;
+    Alcotest.(check bool) "warning re-armed after success"
+      true
+      (Discord_agents.Bot.should_log_policy_sync_clear_failure bot "disk full"))
+
+let test_policy_sync_state_ignores_nonpersistent_sessions () =
+  with_test_bot (fun bot ->
+    bot.settings.default_agent <- Discord_agents.Config.Codex;
+    bot.settings.policy_sync_pending <- true;
+    let control = make_session Discord_agents.Config.Codex in
+    let ephemeral =
+      make_session ~project_name:"thread" ~thread_id:"thread-1"
+        Discord_agents.Config.Claude
+    in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" control;
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"thread-1" ephemeral;
+    Alcotest.(check string) "policy sync state"
+      "marker-clear-pending" (policy_sync_state_string bot))
+
 let test_reconcile_applies_persisted_pending_default_rotation () =
   with_test_bot (fun bot ->
     bot.settings.default_agent <- Discord_agents.Config.Codex;
@@ -1000,6 +1108,20 @@ let () =
         test_finalize_pending_default_rotation_uses_current_policy_after_pressure_clears;
       Alcotest.test_case "default rotation rechecks active rescue policy" `Quick
         test_finalize_pending_default_rotation_uses_current_rescue_policy;
+      Alcotest.test_case "policy sync state marks converged uncleared marker as marker-clear-pending" `Quick
+        test_policy_sync_state_is_marker_clear_pending_after_converged_rotation;
+      Alcotest.test_case "policy sync state marks deferred default rotation as rotation-pending" `Quick
+        test_policy_sync_state_is_rotation_pending_for_deferred_default_rotation;
+      Alcotest.test_case "policy sync state stays rotation-pending after marker clears with busy rotation" `Quick
+        test_policy_sync_state_is_rotation_pending_after_marker_cleared;
+      Alcotest.test_case "policy sync clear warnings suppress repeated identical state+error pairs" `Quick
+        test_policy_sync_clear_warning_is_suppressed_for_repeat_state_and_error;
+      Alcotest.test_case "policy sync clear warnings re-log after error or state changes" `Quick
+        test_policy_sync_clear_warning_logs_again_after_error_or_state_change;
+      Alcotest.test_case "policy sync clear success re-arms warning logging" `Quick
+        test_policy_sync_clear_success_rearms_warning;
+      Alcotest.test_case "policy sync state ignores nonpersistent sessions" `Quick
+        test_policy_sync_state_ignores_nonpersistent_sessions;
       Alcotest.test_case "reconcile preserves idle session override" `Quick
         test_reconcile_preserves_idle_session_override;
       Alcotest.test_case "reconcile rotates idle session to default" `Quick
