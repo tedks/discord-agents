@@ -175,7 +175,7 @@ let session_converged_to_top_level_policy expected_agent
   | _, Some { origin = Session_store.Session_override; _ } ->
     true
   | None, Some { origin = Session_store.Default_rotation; _ } ->
-    false
+    Config.equal_agent_kind session.agent_kind expected_agent
   | None, None ->
     Config.equal_agent_kind session.agent_kind expected_agent
 
@@ -205,10 +205,7 @@ let top_level_policy_sync_state_from_snapshot t disk =
 let note_policy_sync_clear_success t =
   t.policy_sync_clear_last_warning <- None
 
-let should_log_policy_sync_clear_failure t err =
-  let state =
-    string_of_top_level_policy_sync_state (top_level_policy_sync_state t)
-  in
+let should_log_policy_sync_clear_failure t ~state err =
   let warning = Some (state, err) in
   if t.policy_sync_clear_last_warning = warning then
     false
@@ -908,10 +905,13 @@ let reconcile_persisted_pending_agent_changes t =
     (match clear_policy_sync_pending t with
      | Ok () -> ()
      | Error err ->
-       if should_log_policy_sync_clear_failure t err then
+       let state =
+         string_of_top_level_policy_sync_state (top_level_policy_sync_state t)
+       in
+       if should_log_policy_sync_clear_failure t ~state err then
          Logs.warn (fun m ->
-           m "bot: failed to clear top-level policy sync marker after reconcile: %s"
-             err))
+           m "bot: failed to clear top-level policy sync marker after reconcile (state=%s): %s"
+             state err))
   | Error err ->
     Logs.warn (fun m ->
       m "bot: failed to reconcile top-level default agent sessions: %s" err)
@@ -2171,10 +2171,13 @@ let sync_top_level_agent_policy t =
     (match clear_policy_sync_pending t with
      | Ok () -> ()
      | Error err ->
-       if should_log_policy_sync_clear_failure t err then
+       let state =
+         string_of_top_level_policy_sync_state (top_level_policy_sync_state t)
+       in
+       if should_log_policy_sync_clear_failure t ~state err then
          Logs.warn (fun m ->
-           m "bot: failed to clear top-level policy sync marker after runtime sync: %s"
-             err));
+           m "bot: failed to clear top-level policy sync marker after runtime sync (state=%s): %s"
+             state err));
     Ok rotation
 
 let sync_top_level_agent_policy_best_effort t =
