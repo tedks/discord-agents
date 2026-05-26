@@ -68,6 +68,10 @@ type t = {
   mutable refreshing : bool;
   mutable output_lines : int;
   mutable policy_sync_clear_last_warning : (string * string) option;
+  mutable gateway_supervisor_restarts : int;
+  mutable control_api_restarts : int;
+  mutable last_gateway_supervisor_error : string option;
+  mutable last_control_api_error : string option;
   scroll_states : (Discord_types.channel_id, scroll_state) Hashtbl.t;
 }
 
@@ -288,7 +292,13 @@ let child_pid_tracked t pid =
   Mutex.unlock mu;
   result
 
-let ppid_of_proc_stat_line line =
+type proc_stat_info = {
+  ppid : int;
+  pgrp : int;
+  start_ticks : int64;
+}
+
+let proc_stat_fields line =
   match String.rindex_opt line ')' with
   | None -> None
   | Some close_idx ->
@@ -296,41 +306,101 @@ let ppid_of_proc_stat_line line =
     if rest_start >= String.length line then
       None
     else
-      let rest =
+      Some (
         String.sub line rest_start (String.length line - rest_start)
         |> String.trim
-      in
-      match String.split_on_char ' ' rest |> List.filter ((<>) "") with
-      | _state :: ppid :: _ -> int_of_string_opt ppid
-      | _ -> None
+        |> String.split_on_char ' '
+        |> List.filter ((<>) ""))
+
+let proc_stat_info_of_line line =
+  match proc_stat_fields line with
+  | Some fields ->
+    (match List.nth_opt fields 1, List.nth_opt fields 2, List.nth_opt fields 19 with
+     | Some ppid, Some pgrp, Some start_ticks ->
+       (match int_of_string_opt ppid,
+              int_of_string_opt pgrp,
+              Int64.of_string_opt start_ticks with
+        | Some ppid, Some pgrp, Some start_ticks -> Some { ppid; pgrp; start_ticks }
+        | _ -> None)
+     | _ -> None)
+  | None -> None
+
+let ppid_of_proc_stat_line line =
+  Option.map (fun info -> info.ppid) (proc_stat_info_of_line line)
+
+type proc_stat_lookup =
+  | Proc_stat_missing
+  | Proc_stat_unknown
+  | Proc_stat_found of proc_stat_info
+
+let proc_stat_of_pid pid =
+  let stat_path = Printf.sprintf "/proc/%d/stat" pid in
+  if not (Sys.file_exists stat_path) then
+    Proc_stat_missing
+  else
+    match
+      try
+        let ic = open_in stat_path in
+        Fun.protect
+          ~finally:(fun () -> close_in_noerr ic)
+          (fun () -> Some (input_line ic))
+      with _ -> None
+    with
+    | None -> Proc_stat_unknown
+    | Some stat ->
+      (match proc_stat_info_of_line stat with
+       | Some info -> Proc_stat_found info
+       | None -> Proc_stat_unknown)
+
+let rec child_process_identity_of_pid ?(attempts=5) ?(sleep=Unix.sleepf) pid =
+  match proc_stat_of_pid pid with
+  | Proc_stat_found info ->
+    Some Session_store.{ pid; start_ticks = info.start_ticks }
+  | Proc_stat_missing
+  | Proc_stat_unknown when attempts > 1 ->
+    sleep 0.01;
+    child_process_identity_of_pid ~attempts:(attempts - 1) ~sleep pid
+  | Proc_stat_missing
+  | Proc_stat_unknown ->
+    None
 
 type pid_ownership =
+  | Tracked_process_group
   | Direct_child
+  | Reused_pid
   | Not_direct_child
   | Unknown_child_ownership
 
 let procfs_available () =
   try Sys.is_directory "/proc" with Sys_error _ -> false
 
-let pid_ownership ?(tracked_child=false) pid =
-  let stat_path = Printf.sprintf "/proc/%d/stat" pid in
-  if not (Sys.file_exists stat_path) then
+let pid_ownership ?expected_start_ticks ?(tracked_child=false) pid =
+  match proc_stat_of_pid pid with
+  | Proc_stat_missing ->
     (* Non-Linux hosts do not expose /proc. Falling back is safe only
        for PIDs still tracked from our own spawn path: a direct child
        PID cannot be reused by another process until it is reaped, and
        reaping unregisters it from the tracked set. *)
     if tracked_child && not (procfs_available ()) then Direct_child
     else Not_direct_child
-  else
-    match
-      try Some (Resource.read_file stat_path) with _ -> None
-    with
-    | None -> Unknown_child_ownership
-    | Some stat ->
-      match ppid_of_proc_stat_line stat with
-      | Some ppid ->
-        if ppid = Unix.getpid () then Direct_child else Not_direct_child
-      | None -> Unknown_child_ownership
+  | Proc_stat_unknown -> Unknown_child_ownership
+  | Proc_stat_found info ->
+    (match expected_start_ticks with
+     | Some expected when expected <> info.start_ticks -> Reused_pid
+     | Some _
+     | None ->
+       if info.pgrp = pid then
+         Tracked_process_group
+       else if info.ppid = Unix.getpid () then
+         Direct_child
+       else
+         Not_direct_child)
+
+let active_child_process (session : Session_store.session) =
+  match session.active_run with
+  | Some { child_process = Some child; _ } -> Some child
+  | Some { child_process = None; _ }
+  | None -> None
 
 let drop_queued_messages ?(mark_failed=true) ?(async_marking=false) t
     (session : Session_store.session) ~reason =
@@ -363,43 +433,166 @@ let drop_queued_messages ?(mark_failed=true) ?(async_marking=false) t
         !dropped session.project_name reason);
   !dropped
 
+let log_unknown_child_ownership action pid =
+  Logs.warn (fun m ->
+    m "bot: skipping %s for pid %d; could not verify ownership" action pid)
+
+let signal_tracked_process ownership pid signal =
+  match ownership with
+  | Tracked_process_group -> Unix.kill (-pid) signal
+  | Direct_child -> Unix.kill pid signal
+  | Reused_pid
+  | Not_direct_child
+  | Unknown_child_ownership ->
+    invalid_arg "signal_tracked_process"
+
+let request_tracked_child_stop t ~reason ~pid ~expected_start_ticks =
+  let signalled = Eio_unix.run_in_systhread (fun () ->
+    match pid_ownership ?expected_start_ticks
+            ~tracked_child:(child_pid_tracked t pid) pid with
+    | Tracked_process_group
+    | Direct_child as ownership ->
+      (try
+         signal_tracked_process ownership pid Sys.sigterm;
+         true
+       with Unix.Unix_error _ -> false)
+    | Reused_pid ->
+      Logs.warn (fun m ->
+        m "bot: skipping %s SIGTERM for pid %d; pid was reused"
+          reason pid);
+      false
+    | Not_direct_child -> false
+    | Unknown_child_ownership ->
+      log_unknown_child_ownership (reason ^ " SIGTERM") pid;
+      false)
+  in
+  if signalled then
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
+      Eio_unix.run_in_systhread (fun () ->
+        match pid_ownership ?expected_start_ticks
+                ~tracked_child:(child_pid_tracked t pid) pid with
+        | Tracked_process_group
+        | Direct_child as ownership ->
+          (try
+             signal_tracked_process ownership pid 0;
+             signal_tracked_process ownership pid Sys.sigkill
+           with Unix.Unix_error _ -> ())
+        | Reused_pid ->
+          Logs.warn (fun m ->
+            m "bot: skipping %s SIGKILL for pid %d; pid was reused"
+              reason pid)
+        | Not_direct_child -> ()
+        | Unknown_child_ownership ->
+          log_unknown_child_ownership (reason ^ " SIGKILL") pid));
+  signalled
+
+let compare_child_process_identity
+    (a : Session_store.child_process_identity)
+    (b : Session_store.child_process_identity) =
+  match Int.compare a.pid b.pid with
+  | 0 -> Int64.compare a.start_ticks b.start_ticks
+  | n -> n
+
+let reap_tracked_child_processes_blocking t ~reason children =
+  let children = List.sort_uniq compare_child_process_identity children in
+  let signalled = Eio_unix.run_in_systhread (fun () ->
+    List.filter (fun (child : Session_store.child_process_identity) ->
+      match pid_ownership ~expected_start_ticks:child.start_ticks
+              ~tracked_child:(child_pid_tracked t child.pid) child.pid with
+      | Tracked_process_group
+      | Direct_child as ownership ->
+        (try
+           signal_tracked_process ownership child.pid Sys.sigterm;
+           true
+         with Unix.Unix_error _ -> false)
+      | Reused_pid ->
+        Logs.warn (fun m ->
+          m "bot: skipping %s SIGTERM for pid %d; pid was reused"
+            reason child.pid);
+        false
+      | Not_direct_child -> false
+      | Unknown_child_ownership ->
+        log_unknown_child_ownership (reason ^ " SIGTERM") child.pid;
+        false)
+      children)
+  in
+  if signalled <> [] then begin
+    Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
+    Eio_unix.run_in_systhread (fun () ->
+      List.iter (fun (child : Session_store.child_process_identity) ->
+        match pid_ownership ~expected_start_ticks:child.start_ticks
+                ~tracked_child:(child_pid_tracked t child.pid) child.pid with
+        | Tracked_process_group
+        | Direct_child as ownership ->
+          (try
+             signal_tracked_process ownership child.pid 0;
+             signal_tracked_process ownership child.pid Sys.sigkill
+           with Unix.Unix_error _ -> ())
+        | Reused_pid ->
+          Logs.warn (fun m ->
+            m "bot: skipping %s SIGKILL for pid %d; pid was reused"
+              reason child.pid)
+        | Not_direct_child -> ()
+        | Unknown_child_ownership ->
+          log_unknown_child_ownership (reason ^ " SIGKILL") child.pid)
+        signalled)
+  end;
+  List.length signalled
+
+let reap_tracked_child_pids_blocking t ~reason pids =
+  let pids = List.sort_uniq Int.compare pids in
+  let signalled = Eio_unix.run_in_systhread (fun () ->
+    List.filter (fun pid ->
+      match pid_ownership ~tracked_child:(child_pid_tracked t pid) pid with
+      | Tracked_process_group
+      | Direct_child as ownership ->
+        (try
+           signal_tracked_process ownership pid Sys.sigterm;
+           true
+         with Unix.Unix_error _ -> false)
+      | Reused_pid ->
+        Logs.warn (fun m ->
+          m "bot: skipping %s SIGTERM for pid %d; pid was reused" reason pid);
+        false
+      | Not_direct_child -> false
+      | Unknown_child_ownership ->
+        log_unknown_child_ownership (reason ^ " SIGTERM") pid;
+        false)
+      pids)
+  in
+  if signalled <> [] then begin
+    Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
+    Eio_unix.run_in_systhread (fun () ->
+      List.iter (fun pid ->
+        match pid_ownership ~tracked_child:(child_pid_tracked t pid) pid with
+        | Tracked_process_group
+        | Direct_child as ownership ->
+          (try
+             signal_tracked_process ownership pid 0;
+             signal_tracked_process ownership pid Sys.sigkill
+           with Unix.Unix_error _ -> ())
+        | Reused_pid ->
+          Logs.warn (fun m ->
+            m "bot: skipping %s SIGKILL for pid %d; pid was reused" reason pid)
+        | Not_direct_child -> ()
+        | Unknown_child_ownership ->
+          log_unknown_child_ownership (reason ^ " SIGKILL") pid)
+        signalled)
+  end;
+  List.length signalled
+
 let request_session_process_stop t (session : Session_store.session) =
   match session.child_pid with
   | None -> false
   | Some pid ->
-    let signalled = Eio_unix.run_in_systhread (fun () ->
-      match pid_ownership ~tracked_child:(child_pid_tracked t pid) pid with
-      | Direct_child ->
-        (try
-           Unix.kill pid Sys.sigterm;
-           true
-         with Unix.Unix_error _ -> false)
-      | Not_direct_child -> false
-      | Unknown_child_ownership ->
-        Logs.warn (fun m ->
-          m "bot: skipping stop signal for pid %d; could not verify ownership"
-            pid);
-        false)
+    let expected_start_ticks =
+      match active_child_process session with
+      | Some child when child.pid = pid -> Some child.start_ticks
+      | Some _
+      | None -> None
     in
-    if signalled then
-      Eio.Fiber.fork ~sw:t.sw (fun () ->
-        Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
-        match session.child_pid with
-        | Some live_pid when live_pid = pid ->
-          Eio_unix.run_in_systhread (fun () ->
-            match pid_ownership ~tracked_child:(child_pid_tracked t pid) pid with
-            | Direct_child ->
-              (try
-                 Unix.kill pid 0;
-                 Unix.kill pid Sys.sigkill
-               with Unix.Unix_error _ -> ())
-            | Not_direct_child -> ()
-            | Unknown_child_ownership ->
-              Logs.warn (fun m ->
-                m "bot: skipping forced stop for pid %d; could not verify ownership"
-                  pid))
-        | _ -> ());
-    signalled
+    request_tracked_child_stop t ~reason:"session stop" ~pid ~expected_start_ticks
 
 let remove_session_now t (session : Session_store.session) =
   try
@@ -858,6 +1051,60 @@ let maybe_apply_pending_session_agent_change t (session : Session_store.session)
             err)
     end
 
+let forget_active_run t (session : Session_store.session) ~context =
+  match Session_store.set_active_run t.sessions session None with
+  | Ok () ->
+    true
+  | Error err ->
+    Logs.warn (fun m ->
+      m "bot: failed to clear %s active run for %s: %s"
+        context session.thread_id err);
+    false
+
+let mark_active_run_failed t (session : Session_store.session)
+    ~(message_id : Discord_types.message_id) =
+  ignore (Discord_rest.delete_own_reaction t.rest
+    ~channel_id:session.thread_id ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
+  ignore (Discord_rest.create_reaction t.rest
+    ~channel_id:session.thread_id ~message_id ~emoji:"\xE2\x9D\x8C" ())
+
+let reconcile_interrupted_active_runs ?(mark_failed=mark_active_run_failed) t =
+  Session_store.bindings t.sessions
+  |> List.iter (fun (_thread_id, (session : Session_store.session)) ->
+    match session.active_run with
+    | None -> ()
+    | Some active_run ->
+      (match active_run.child_process with
+       | Some child ->
+         ignore (reap_tracked_child_processes_blocking t
+           ~reason:"startup cleanup" [child])
+       | None -> ());
+      mark_failed t session ~message_id:active_run.message_id;
+      if forget_active_run t session ~context:"startup" then
+        Logs.info (fun m ->
+          m "bot: reconciled interrupted active run for %s"
+            session.thread_id))
+
+let persist_completed_run ?(save=Session_store.save) t
+    (session : Session_store.session) ~had_initial_prompt =
+  let prior_message_count = session.message_count in
+  let prior_initial_prompt = session.initial_prompt in
+  let prior_active_run = session.active_run in
+  if had_initial_prompt then
+    session.initial_prompt <- None;
+  session.message_count <- session.message_count + 1;
+  session.active_run <- None;
+  match
+    try Ok (save t.sessions)
+    with exn -> Error exn
+  with
+  | Ok () -> Ok ()
+  | Error exn ->
+    session.message_count <- prior_message_count;
+    session.initial_prompt <- prior_initial_prompt;
+    session.active_run <- prior_active_run;
+    Error (Printexc.to_string exn)
+
 let finalize_session_run ?(notify_stopped=true) t
     (session : Session_store.session) =
   session.processing <- false;
@@ -916,6 +1163,19 @@ let reconcile_persisted_pending_agent_changes t =
     Logs.warn (fun m ->
       m "bot: failed to reconcile top-level default agent sessions: %s" err)
 
+let child_processes_for_restart t =
+  let sleep = Eio.Time.sleep (Eio.Stdenv.clock t.env) in
+  Session_store.bindings t.sessions
+  |> List.filter_map (fun (_thread_id, (session : Session_store.session)) ->
+    match session.child_pid with
+    | Some pid ->
+      (match active_child_process session with
+       | Some child when child.pid = pid -> Some child
+       | Some _
+       | None -> child_process_identity_of_pid ~sleep pid)
+    | None -> None)
+  |> List.sort_uniq compare_child_process_identity
+
 (** Trigger a graceful restart: drain → reap → build → spawn.
     Callable from command handler or signal handler.
     [notify] is called with status messages (may be a no-op for signal-triggered restarts). *)
@@ -957,37 +1217,26 @@ let trigger_restart t ~notify =
       List.iter (fun (_tid, (s : Session_store.session)) ->
         ignore (drop_queued_messages t s ~reason:"restart")
       ) (Session_store.bindings t.sessions);
-      (* Phase 2: Reap child processes.
-         Split SIGTERM and SIGKILL into separate systhread calls with
-         Eio.Time.sleep between to avoid blocking the systhread pool. *)
-      let pids = get_child_pids t in
-      if not (Pid_set.is_empty pids) then begin
-        notify (Printf.sprintf "Terminating %d child process(es)..." (Pid_set.cardinal pids));
-        Eio_unix.run_in_systhread (fun () ->
-          Pid_set.iter (fun pid ->
-            match pid_ownership ~tracked_child:true pid with
-            | Direct_child ->
-              (try Unix.kill pid Sys.sigterm
-               with Unix.Unix_error _ -> ())
-            | Not_direct_child -> ()
-            | Unknown_child_ownership ->
-              Logs.warn (fun m ->
-                m "bot: skipping restart SIGTERM for pid %d; could not verify ownership"
-                  pid)
-          ) pids);
-        Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
-        Eio_unix.run_in_systhread (fun () ->
-          Pid_set.iter (fun pid ->
-            match pid_ownership ~tracked_child:true pid with
-            | Direct_child ->
-              (try Unix.kill pid 0; Unix.kill pid Sys.sigkill
-               with Unix.Unix_error _ -> ())
-            | Not_direct_child -> ()
-            | Unknown_child_ownership ->
-              Logs.warn (fun m ->
-                m "bot: skipping restart SIGKILL for pid %d; could not verify ownership"
-                  pid)
-          ) pids)
+      (* Phase 2: Reap child processes. *)
+      let children = child_processes_for_restart t in
+      let fallback_pids =
+        if procfs_available () then []
+        else
+          let has_identity pid =
+            List.exists
+              (fun (child : Session_store.child_process_identity) ->
+                 child.pid = pid)
+              children
+          in
+          get_child_pids t
+          |> Pid_set.elements
+          |> List.filter (fun pid -> not (has_identity pid))
+      in
+      let child_count = List.length children + List.length fallback_pids in
+      if child_count > 0 then begin
+        notify (Printf.sprintf "Terminating %d child process(es)..." child_count);
+        ignore (reap_tracked_child_processes_blocking t ~reason:"restart" children);
+        ignore (reap_tracked_child_pids_blocking t ~reason:"restart" fallback_pids)
       end;
       (* Phase 3: Build and restart *)
       notify "Building...";
@@ -1977,111 +2226,157 @@ let resolve_channel_context t ~(channel_id : Discord_types.channel_id)
 let rec process_session_message t session
     (msg : Discord_types.message) channel_info =
   let child_pid = ref None in
+  let checkpoint_failure = ref None in
+  let active_run = Session_store.{
+    message_id = msg.id;
+    child_process = None;
+  } in
   Fun.protect ~finally:(fun () ->
     Option.iter (unregister_child_pid t session) !child_pid
   ) (fun () ->
     let channel_id = msg.channel_id in
     let message_id = msg.id in
-    ignore (Discord_rest.create_reaction t.rest ~channel_id
-      ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
-    Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
-      ~project_name:session.Session_store.project_name (channels t);
-    let author_name = msg.author.username in
-    let (channel_name, channel_type) =
-      resolve_channel_context t ~channel_id ~session ?channel_info () in
-    let on_pid pid =
-      child_pid := Some pid;
-      register_child_pid t session pid;
-      if session.stop_requested then
-        ignore (request_session_process_stop t session);
-      Logs.info (fun m -> m "bot: registered child pid %d" pid) in
-    (* Forward-compat: [session.initial_prompt] is no longer set by any
-       current caller (control_api now posts the prompt visibly and
-       feeds it to handle_thread_message directly — see
-       control_api.handle_start_session). The prepend stays so a
-       sessions.json persisted before that change still gets the
-       intended preface on its first message after a bot restart.
-       Removable once we're sure no on-disk session still carries
-       a non-None [initial_prompt]. *)
-    let had_initial_prompt = Option.is_some session.initial_prompt in
-    let prompt = match session.initial_prompt with
-      | Some ctx ->
-        Printf.sprintf "<session-context>\n%s\n</session-context>\n\n%s"
-          ctx msg.content
-      | None -> msg.content
-    in
-    let on_scroll_content chunks lines_used =
-      (* Cap stored content at ~100KB to prevent memory bloat.
-         The cap is a budget for take_fitting_prefix (which is
-         fence-aware: ``` costs 6); for fence-free text this
-         matches raw bytes within ±a single chunk. Tail-recursive
-         to avoid stack growth on highly fragmented output. *)
-      let rec take_bytes budget acc = function
-        | [] -> List.rev acc
-        | _ when budget <= 0 -> List.rev acc
-        | c :: rest ->
-          let len = String.length c in
-          if len >= budget then
-            List.rev (
-              String.sub c 0
-                (Agent_process.take_fitting_prefix
-                   ~max_chars:budget c)
-              :: acc)
-          else
-            take_bytes (budget - len - 1) (c :: acc) rest
+    match Session_store.set_active_run t.sessions session (Some active_run) with
+    | Error err ->
+      Logs.warn (fun m ->
+        m "bot: failed to persist active run checkpoint for %s: %s"
+          session.thread_id err);
+      ignore (Discord_rest.create_reaction t.rest ~channel_id
+        ~message_id ~emoji:"\xE2\x9D\x8C" ());
+      ignore (Discord_rest.create_message t.rest
+        ~channel_id
+        ~content:"Run aborted because the bot could not persist its restart checkpoint for this session." ())
+    | Ok () ->
+      ignore (Discord_rest.create_reaction t.rest ~channel_id
+        ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
+      Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
+        ~project_name:session.Session_store.project_name (channels t);
+      let author_name = msg.author.username in
+      let (channel_name, channel_type) =
+        resolve_channel_context t ~channel_id ~session ?channel_info () in
+      let on_pid pid =
+        child_pid := Some pid;
+        register_child_pid t session pid;
+        let sleep = Eio.Time.sleep (Eio.Stdenv.clock t.env) in
+        (match child_process_identity_of_pid ~sleep pid with
+         | Some child_process ->
+           (match Session_store.set_active_run t.sessions session
+                    (Some { active_run with child_process = Some child_process }) with
+            | Ok () -> ()
+            | Error err ->
+              checkpoint_failure := Some err;
+              ignore (request_tracked_child_stop t
+                ~reason:"checkpoint failure"
+                ~pid
+                ~expected_start_ticks:(Some child_process.start_ticks));
+              Logs.warn (fun m ->
+                m "bot: failed to persist child identity for %s: %s"
+                  session.thread_id err))
+         | None -> ());
+        if session.stop_requested then
+          ignore (request_session_process_stop t session);
+        Logs.info (fun m -> m "bot: registered child pid %d" pid) in
+      (* Forward-compat: [session.initial_prompt] is no longer set by any
+         current caller (control_api now posts the prompt visibly and
+         feeds it to handle_thread_message directly — see
+         control_api.handle_start_session). The prepend stays so a
+         sessions.json persisted before that change still gets the
+         intended preface on its first message after a bot restart.
+         Removable once we're sure no on-disk session still carries
+         a non-None [initial_prompt]. *)
+      let had_initial_prompt = Option.is_some session.initial_prompt in
+      let prompt = match session.initial_prompt with
+        | Some ctx ->
+          Printf.sprintf "<session-context>\n%s\n</session-context>\n\n%s"
+            ctx msg.content
+        | None -> msg.content
       in
-      let capped = take_bytes 100_000 [] chunks in
-      let block = { lines = Array.of_list capped;
-                    output_lines_used = lines_used;
-                    next_line = lines_used } in
-      let state = match Hashtbl.find_opt t.scroll_states channel_id with
-        | Some s -> s
-        | None -> { blocks = []; current_block = 1 } in
-      (* Push new block to front (most recent first), cap at 20 *)
-      let blocks = block :: (if List.length state.blocks >= 20
-        then List.filteri (fun i _ -> i < 19) state.blocks
-        else state.blocks) in
-      state.blocks <- blocks;
-      state.current_block <- 1;
-      Hashtbl.replace t.scroll_states channel_id state in
-    let on_session_id sid =
-      try
-        Session_store.set_session_id t.sessions session
-          ~session_id:sid
-      with exn ->
-        Logs.warn (fun m ->
-          m "bot: failed to persist session id for %s: %s"
-            session.thread_id (Printexc.to_string exn))
-    in
-    let result = Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
+      let on_scroll_content chunks lines_used =
+        (* Cap stored content at ~100KB to prevent memory bloat.
+           The cap is a budget for take_fitting_prefix (which is
+           fence-aware: ``` costs 6); for fence-free text this
+           matches raw bytes within ±a single chunk. Tail-recursive
+           to avoid stack growth on highly fragmented output. *)
+        let rec take_bytes budget acc = function
+          | [] -> List.rev acc
+          | _ when budget <= 0 -> List.rev acc
+          | c :: rest ->
+            let len = String.length c in
+            if len >= budget then
+              List.rev (
+                String.sub c 0
+                  (Agent_process.take_fitting_prefix
+                     ~max_chars:budget c)
+                :: acc)
+            else
+              take_bytes (budget - len - 1) (c :: acc) rest
+        in
+        let capped = take_bytes 100_000 [] chunks in
+        let block = { lines = Array.of_list capped;
+                      output_lines_used = lines_used;
+                      next_line = lines_used } in
+        let state = match Hashtbl.find_opt t.scroll_states channel_id with
+          | Some s -> s
+          | None -> { blocks = []; current_block = 1 } in
+        (* Push new block to front (most recent first), cap at 20 *)
+        let blocks = block :: (if List.length state.blocks >= 20
+          then List.filteri (fun i _ -> i < 19) state.blocks
+          else state.blocks) in
+        state.blocks <- blocks;
+        state.current_block <- 1;
+        Hashtbl.replace t.scroll_states channel_id state in
+      let on_session_id sid =
+        try
+          Session_store.set_session_id t.sessions session
+            ~session_id:sid
+        with exn ->
+          Logs.warn (fun m ->
+            m "bot: failed to persist session id for %s: %s"
+              session.thread_id (Printexc.to_string exn))
+      in
+      let result =
+        try
+          Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
             ~session ~channel_id ~prompt
             ~attachments:msg.attachments
             ~author_name ~channel_name ~channel_type
             ~wrap_width:t.wrap_width
             ~output_lines:t.output_lines
-            ~on_scroll_content ~on_pid ~on_session_id () in
-    ignore (Discord_rest.delete_own_reaction t.rest ~channel_id
-      ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
-    (match result with
-    | Ok () ->
-      ignore (Discord_rest.create_reaction t.rest ~channel_id
-        ~message_id ~emoji:"\xE2\x9C\x85" ());
-      let prior_message_count = session.message_count in
-      let prior_initial_prompt = session.initial_prompt in
-      if had_initial_prompt then
-        session.initial_prompt <- None;
-      session.message_count <- session.message_count + 1;
-      (try
-         Session_store.save t.sessions
-       with exn ->
-         session.message_count <- prior_message_count;
-         session.initial_prompt <- prior_initial_prompt;
+            ~on_scroll_content ~on_pid ~on_session_id ()
+        with exn ->
+          Logs.warn (fun m ->
+            m "bot: agent runner raised for %s: %s"
+              session.thread_id (Printexc.to_string exn));
+          Error (Printexc.to_string exn)
+      in
+      ignore (Discord_rest.delete_own_reaction t.rest ~channel_id
+        ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
+      (match !checkpoint_failure with
+       | Some err ->
+         ignore (forget_active_run t session ~context:"checkpoint failure");
+         ignore (Discord_rest.create_reaction t.rest ~channel_id
+           ~message_id ~emoji:"\xE2\x9D\x8C" ());
+         ignore (Discord_rest.create_message t.rest
+           ~channel_id
+           ~content:"Run aborted because the bot could not persist restart state for the spawned agent process. Try again after resolving disk or filesystem issues." ());
          Logs.warn (fun m ->
-           m "bot: failed to persist message completion for %s: %s"
-             session.thread_id (Printexc.to_string exn)))
-    | Error _ ->
-      ignore (Discord_rest.create_reaction t.rest ~channel_id
-        ~message_id ~emoji:"\xE2\x9D\x8C" ())));
+           m "bot: aborted run for %s after checkpoint failure: %s"
+             session.thread_id err)
+       | None ->
+         match result with
+         | Ok () ->
+           ignore (Discord_rest.create_reaction t.rest ~channel_id
+             ~message_id ~emoji:"\xE2\x9C\x85" ());
+           (match persist_completed_run t session ~had_initial_prompt with
+            | Ok () -> ()
+            | Error err ->
+              Logs.warn (fun m ->
+                m "bot: failed to persist message completion for %s: %s"
+                  session.thread_id err))
+         | Error _ ->
+           ignore (forget_active_run t session ~context:"failed run");
+           ignore (Discord_rest.create_reaction t.rest ~channel_id
+             ~message_id ~emoji:"\xE2\x9D\x8C" ())));
   (* Drain the queue: process next pending message if any *)
   if session.stop_requested then
     ()
@@ -2363,7 +2658,12 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
                refreshing = false;
                output_lines = Agent_process.default_output_lines;
                policy_sync_clear_last_warning = None;
+               gateway_supervisor_restarts = 0;
+               control_api_restarts = 0;
+               last_gateway_supervisor_error = None;
+               last_control_api_error = None;
                scroll_states = Hashtbl.create 64 } in
+  reconcile_interrupted_active_runs bot;
   reconcile_persisted_stop_requests bot;
   reconcile_persisted_pending_agent_changes bot;
   bot.gateway.handler <- (fun event ->
@@ -2425,6 +2725,53 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
     | Discord_gateway.Disconnected reason ->
       Logs.warn (fun m -> m "bot: disconnected: %s" reason));
   bot
+
+let exn_with_backtrace exn =
+  let bt = Printexc.get_backtrace () |> String.trim in
+  if bt = "" then
+    Printexc.to_string exn
+  else
+    Printf.sprintf "%s\n%s" (Printexc.to_string exn) bt
+
+let supervise_bot_component t ~label ~note_restart run_once =
+  let clock = Eio.Stdenv.clock t.env in
+  let rec loop () =
+    if t.gateway.shutdown then
+      ()
+    else
+      match
+        try Ok (run_once ())
+        with exn -> Error exn
+      with
+      | Ok () when t.gateway.shutdown -> ()
+      | Ok () ->
+        let err = Printf.sprintf "%s loop exited without shutdown" label in
+        note_restart err;
+        Logs.warn (fun m -> m "bot: %s" err);
+        Eio.Time.sleep clock 1.0;
+        loop ()
+      | Error _exn when t.gateway.shutdown -> ()
+      | Error exn ->
+        reraise_if_fatal_policy_exception exn;
+        let err = exn_with_backtrace exn in
+        note_restart err;
+        Logs.warn (fun m -> m "bot: %s supervisor restarting after error: %s" label err);
+        Eio.Time.sleep clock 1.0;
+        loop ()
+  in
+  loop ()
+
+let run_gateway_supervised ~(env : Eio_unix.Stdenv.base) t =
+  supervise_bot_component t ~label:"gateway" ~note_restart:(fun err ->
+    t.gateway_supervisor_restarts <- t.gateway_supervisor_restarts + 1;
+    t.last_gateway_supervisor_error <- Some err)
+    (fun () ->
+      Eio.Switch.run (fun gateway_sw ->
+        Logs.info (fun m -> m "bot: discovered %d projects" (List.length t.project_state.projects));
+        List.iter (fun (p : Project.t) ->
+          Logs.info (fun m -> m "  - %s (%s)" p.name p.path)
+        ) t.project_state.projects;
+        Discord_gateway.connect ~sw:gateway_sw ~env t.gateway))
 
 let run ~sw:_ ~(env : Eio_unix.Stdenv.base) bot =
   Logs.info (fun m -> m "bot: discovered %d projects" (List.length bot.project_state.projects));

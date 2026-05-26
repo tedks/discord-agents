@@ -154,8 +154,24 @@ let handle_health (bot : Bot.t) =
     ("gateway_resuming", `Bool bot.gateway.resuming);
     ("gateway_sequence",
      match bot.gateway.sequence with Some s -> `Int s | None -> `Null);
+    ("gateway_supervisor_restarts", `Int bot.gateway_supervisor_restarts);
+    ("control_api_restarts", `Int bot.control_api_restarts);
   ] in
   let optional_gateway_fields =
+    (match bot.last_gateway_supervisor_error with
+     | Some err ->
+       [("last_gateway_supervisor_error",
+         `String (Resource.truncate_utf8 ~max_bytes:1000
+           (Resource.single_line err)))]
+     | None -> [])
+    @
+    (match bot.last_control_api_error with
+     | Some err ->
+       [("last_control_api_error",
+         `String (Resource.truncate_utf8 ~max_bytes:1000
+           (Resource.single_line err)))]
+     | None -> [])
+    @
     (match bot.gateway.last_error with
      | Some err ->
        [("last_gateway_error",

@@ -140,6 +140,45 @@ let () =
     run_test ~sw ~env config test_channel
   else begin
     let bot = Discord_agents.Bot.create ~sw ~env config in
+    let exn_with_backtrace exn =
+      let bt = Printexc.get_backtrace () |> String.trim in
+      if bt = "" then
+        Printexc.to_string exn
+      else
+        Printf.sprintf "%s\n%s" (Printexc.to_string exn) bt
+    in
+    let run_control_api_supervised () =
+      let clock = Eio.Stdenv.clock env in
+      let rec loop () =
+        if bot.gateway.shutdown then
+          ()
+        else
+          match
+            try Ok (Eio.Switch.run (fun control_sw ->
+              Discord_agents.Control_api.start ~bot ~sw:control_sw ~env))
+            with exn -> Error exn
+          with
+          | Ok () when bot.gateway.shutdown -> ()
+          | Ok () ->
+            let err = "control_api loop exited without shutdown" in
+            bot.control_api_restarts <- bot.control_api_restarts + 1;
+            bot.last_control_api_error <- Some err;
+            Logs.warn (fun m -> m "bot: %s" err);
+            Eio.Time.sleep clock 1.0;
+            loop ()
+          | Error _exn when bot.gateway.shutdown -> ()
+          | Error exn ->
+            Discord_agents.Bot.reraise_if_fatal_policy_exception exn;
+            let err = exn_with_backtrace exn in
+            bot.control_api_restarts <- bot.control_api_restarts + 1;
+            bot.last_control_api_error <- Some err;
+            Logs.warn (fun m ->
+              m "bot: control_api supervisor restarting after error: %s" err);
+            Eio.Time.sleep clock 1.0;
+            loop ()
+      in
+      loop ()
+    in
     (* Shutdown via pipe: signal handler writes a byte, fiber reads it.
        No Eio I/O in the signal handler — just a raw Unix write. *)
     let shutdown_r, shutdown_w = Unix.pipe ~cloexec:true () in
@@ -188,7 +227,6 @@ let () =
       in
       loop ());
     (* Start control API server on Unix domain socket *)
-    Eio.Fiber.fork ~sw (fun () ->
-      Discord_agents.Control_api.start ~bot ~sw ~env);
-    Discord_agents.Bot.run ~sw ~env bot
+    Eio.Fiber.fork ~sw run_control_api_supervised;
+    Discord_agents.Bot.run_gateway_supervised ~env bot
   end

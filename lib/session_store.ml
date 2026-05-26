@@ -20,6 +20,16 @@ type pending_agent_change = {
   origin : pending_agent_origin;
 }
 
+type child_process_identity = {
+  pid : int;
+  start_ticks : int64;
+}
+
+type active_run = {
+  message_id : Discord_types.message_id;
+  child_process : child_process_identity option;
+}
+
 let string_of_pending_agent_origin = function
   | Default_rotation -> "default_rotation"
   | Session_override -> "session_override"
@@ -68,6 +78,7 @@ type session = {
   pending_queue : pending_message Queue.t;
   mutable pending_agent_change : pending_agent_change option;
   mutable initial_prompt : string option;  (* One-shot context for the first message *)
+  mutable active_run : active_run option;  (* Persisted in-flight restart checkpoint *)
   mutable child_pid : int option;  (* Runtime-only current agent subprocess *)
   mutable stop_requested : bool;  (* Persisted stop latch for active sessions *)
 }
@@ -86,6 +97,9 @@ let lock_file () = sessions_file () ^ ".lock"
 (** Serialize sessions to JSON. *)
 let sessions_to_json sessions =
   let entries = SessionMap.bindings sessions in
+  let json_of_int64 n =
+    `Intlit (Int64.to_string n)
+  in
   `List (List.map (fun (_tid, s) ->
     `Assoc ([
       ("project_name", `String s.project_name);
@@ -110,6 +124,15 @@ let sessions_to_json sessions =
              ("pending_agent_origin",
               `String (string_of_pending_agent_origin pending.origin)) ]
          | None -> [])
+      @ (match s.active_run with
+         | Some active_run ->
+           [("active_message_id", `String active_run.message_id)]
+           @ (match active_run.child_process with
+              | Some child ->
+                [("active_child_pid", `Int child.pid);
+                 ("active_child_start_ticks", json_of_int64 child.start_ticks)]
+              | None -> [])
+         | None -> [])
       @ (if s.stop_requested then
            [("stop_requested", `Bool true)]
          else [])
@@ -121,6 +144,11 @@ let sessions_to_json sessions =
 (** Deserialize sessions from JSON. *)
 let sessions_of_json json =
   let open Yojson.Safe.Util in
+  let int64_of_json = function
+    | `Int n -> Some (Int64.of_int n)
+    | `Intlit s | `String s -> Int64.of_string_opt s
+    | _ -> None
+  in
   let entries = to_list json |> List.map (fun j ->
     let thread_id = j |> member "thread_id" |> to_string in
     let agent_kind = (match Config.agent_kind_of_string
@@ -143,7 +171,19 @@ let sessions_of_json json =
              pending_agent_origin_of_json (j |> member "pending_agent_origin")
            in
            Some { kind; origin }
-         | Error _ -> None)
+        | Error _ -> None)
+      | _ -> None
+    in
+    let active_run =
+      match j |> member "active_message_id" with
+      | `String message_id ->
+        let child_process =
+          match j |> member "active_child_pid",
+                int64_of_json (j |> member "active_child_start_ticks") with
+          | `Int pid, Some start_ticks -> Some { pid; start_ticks }
+          | _ -> None
+        in
+        Some { message_id; child_process }
       | _ -> None
     in
     let session = {
@@ -166,6 +206,7 @@ let sessions_of_json json =
       pending_queue = Queue.create ();
       pending_agent_change;
       initial_prompt = j |> member "initial_prompt" |> to_string_option;
+      active_run;
       child_pid = None;
       stop_requested =
         (match j |> member "stop_requested" with
@@ -326,6 +367,7 @@ let make_session ~project_name ~working_dir ~agent_kind ~session_id
     ?(message_count = 0)
     ?(session_override_kind = None)
     ?(pending_agent_change = None)
+    ?(active_run = None)
     ?session_id_confirmed () =
   let session_id_confirmed = match session_id_confirmed with
     | Some b -> b
@@ -335,7 +377,7 @@ let make_session ~project_name ~working_dir ~agent_kind ~session_id
     session_id_confirmed; thread_id; system_prompt;
     message_count; processing = false;
     pending_queue = Queue.create (); pending_agent_change; initial_prompt;
-    child_pid = None; stop_requested = false }
+    active_run; child_pid = None; stop_requested = false }
 
 let persist_or_rollback rollback f =
   try
@@ -460,6 +502,17 @@ let set_stop_requested t session stop_requested =
     session.stop_requested <- stop_requested;
     persist_or_rollback
       (fun () -> session.stop_requested <- prior)
+      (fun () -> save t)
+  end
+
+let set_active_run t session active_run =
+  let prior = session.active_run in
+  if prior = active_run then
+    Ok ()
+  else begin
+    session.active_run <- active_run;
+    persist_or_rollback
+      (fun () -> session.active_run <- prior)
       (fun () -> save t)
   end
 
