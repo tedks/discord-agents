@@ -1247,6 +1247,16 @@ let test_reap_tracked_process_group_leader () =
         match Discord_agents.Bot.child_process_identity_of_pid pid with
         | None -> Alcotest.fail "expected live process-group leader identity"
         | Some child ->
+          let deadline = Unix.gettimeofday () +. 3.0 in
+          let rec wait_for_tracked_process_group () =
+            match Discord_agents.Bot.pid_ownership ~expected_start_ticks:child.start_ticks pid with
+            | Discord_agents.Bot.Tracked_process_group -> ()
+            | _ when Unix.gettimeofday () < deadline ->
+              Eio.Time.sleep (Eio.Stdenv.clock bot.env) 0.01;
+              wait_for_tracked_process_group ()
+            | _ -> Alcotest.fail "expected tracked process-group ownership"
+          in
+          wait_for_tracked_process_group ();
           Alcotest.(check int) "reap count" 1
             (Discord_agents.Bot.reap_tracked_child_processes_blocking bot
                ~reason:"test" [child]);

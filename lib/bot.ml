@@ -1164,7 +1164,6 @@ let reconcile_persisted_pending_agent_changes t =
       m "bot: failed to reconcile top-level default agent sessions: %s" err)
 
 let child_processes_for_restart t =
-  let sleep = Eio.Time.sleep (Eio.Stdenv.clock t.env) in
   Session_store.bindings t.sessions
   |> List.filter_map (fun (_thread_id, (session : Session_store.session)) ->
     match session.child_pid with
@@ -1172,7 +1171,8 @@ let child_processes_for_restart t =
       (match active_child_process session with
        | Some child when child.pid = pid -> Some child
        | Some _
-       | None -> child_process_identity_of_pid ~sleep pid)
+       | None -> Eio_unix.run_in_systhread (fun () ->
+           child_process_identity_of_pid pid))
     | None -> None)
   |> List.sort_uniq compare_child_process_identity
 
@@ -2257,8 +2257,8 @@ let rec process_session_message t session
       let on_pid pid =
         child_pid := Some pid;
         register_child_pid t session pid;
-        let sleep = Eio.Time.sleep (Eio.Stdenv.clock t.env) in
-        (match child_process_identity_of_pid ~sleep pid with
+        (match Eio_unix.run_in_systhread (fun () ->
+           child_process_identity_of_pid pid) with
          | Some child_process ->
            (match Session_store.set_active_run t.sessions session
                     (Some { active_run with child_process = Some child_process }) with
@@ -2272,7 +2272,10 @@ let rec process_session_message t session
               Logs.warn (fun m ->
                 m "bot: failed to persist child identity for %s: %s"
                   session.thread_id err))
-         | None -> ());
+         | None ->
+           Logs.warn (fun m ->
+             m "bot: could not capture child identity for %s; restart cleanup is degraded for this run"
+               session.thread_id));
         if session.stop_requested then
           ignore (request_session_process_stop t session);
         Logs.info (fun m -> m "bot: registered child pid %d" pid) in
@@ -2358,18 +2361,23 @@ let rec process_session_message t session
            ~message_id ~emoji:"\xE2\x9D\x8C" ());
          ignore (Discord_rest.create_message t.rest
            ~channel_id
-           ~content:"Run aborted because the bot could not persist restart state for the spawned agent process. Try again after resolving disk or filesystem issues." ());
+           ~content:"Run aborted because the bot could not persist or confirm restart state for the spawned agent process. The agent may have exited before it could be tracked, or the bot may have hit a storage error. Try again; if it keeps happening, check bot logs and disk health." ());
          Logs.warn (fun m ->
            m "bot: aborted run for %s after checkpoint failure: %s"
              session.thread_id err)
        | None ->
          match result with
          | Ok () ->
-           ignore (Discord_rest.create_reaction t.rest ~channel_id
-             ~message_id ~emoji:"\xE2\x9C\x85" ());
            (match persist_completed_run t session ~had_initial_prompt with
-            | Ok () -> ()
+            | Ok () ->
+              ignore (Discord_rest.create_reaction t.rest ~channel_id
+                ~message_id ~emoji:"\xE2\x9C\x85" ())
             | Error err ->
+              ignore (Discord_rest.create_reaction t.rest ~channel_id
+                ~message_id ~emoji:"\xE2\x9D\x8C" ());
+              ignore (Discord_rest.create_message t.rest
+                ~channel_id
+                ~content:"Run completed, but the bot could not persist completion state. If the bot restarts before persistence succeeds, this run will be reconciled as interrupted." ());
               Logs.warn (fun m ->
                 m "bot: failed to persist message completion for %s: %s"
                   session.thread_id err))
