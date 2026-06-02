@@ -1236,6 +1236,121 @@ let test_persist_completed_run_rolls_back_active_run_on_save_failure () =
       Alcotest.(check bool) "active run restored"
         true (session.active_run = active_run))
 
+let eyes_emoji = "\xF0\x9F\x91\x80"
+let check_emoji = "\xE2\x9C\x85"
+let x_emoji = "\xE2\x9D\x8C"
+
+type process_effect =
+  | Reaction_added of string
+  | Reaction_removed of string
+  | Message_sent of string
+
+let process_effect_pp fmt = function
+  | Reaction_added emoji ->
+    Format.fprintf fmt "Reaction_added(%S)" emoji
+  | Reaction_removed emoji ->
+    Format.fprintf fmt "Reaction_removed(%S)" emoji
+  | Message_sent content ->
+    Format.fprintf fmt "Message_sent(%S)" content
+
+let process_effect_equal a b =
+  match a, b with
+  | Reaction_added a, Reaction_added b -> String.equal a b
+  | Reaction_removed a, Reaction_removed b -> String.equal a b
+  | Message_sent a, Message_sent b -> String.equal a b
+  | _ -> false
+
+let process_effect = Alcotest.testable process_effect_pp process_effect_equal
+
+let record_process_hooks ?capture_child_process ?run_agent ?persist_completed_run effects =
+  let base = Discord_agents.Bot.default_process_message_hooks in
+  let capture_child_process =
+    Option.value capture_child_process ~default:base.capture_child_process
+  in
+  let run_agent =
+    Option.value run_agent ~default:base.run_agent
+  in
+  let persist_completed_run =
+    Option.value persist_completed_run ~default:base.persist_completed_run
+  in
+  { base with
+    capture_child_process;
+    run_agent;
+    persist_completed_run;
+    create_reaction =
+      (fun _rest ~channel_id:_ ~message_id:_ ~emoji ->
+         effects := Reaction_added emoji :: !effects);
+    delete_own_reaction =
+      (fun _rest ~channel_id:_ ~message_id:_ ~emoji ->
+         effects := Reaction_removed emoji :: !effects);
+    create_message =
+      (fun _rest ~channel_id:_ ~content ->
+         effects := Message_sent content :: !effects);
+  }
+
+let test_process_session_message_keeps_success_when_child_identity_is_missing () =
+  with_test_bot (fun bot ->
+    let session = make_session Discord_agents.Config.Claude in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    let effects = ref [] in
+    let hooks = record_process_hooks effects
+      ~capture_child_process:(fun _pid -> None)
+      ~run_agent:(fun ~sw:_ ~env:_ ~rest:_ ~session:_ ~channel_id:_ ~prompt:_
+                     ~attachments:_ ~author_name:_ ~channel_name:_ ~channel_type:_
+                     ~wrap_width:_ ~output_lines:_ ~on_scroll_content:_
+                     ~on_pid ~on_session_id:_ () ->
+        on_pid 424242;
+        Ok ())
+    in
+    Discord_agents.Bot.process_session_message_with_hooks hooks bot session
+      (make_message "hello") None;
+    Alcotest.(check (list process_effect)) "effects"
+      [ Reaction_added eyes_emoji;
+        Reaction_removed eyes_emoji;
+        Reaction_added check_emoji ]
+      (List.rev !effects);
+    Alcotest.(check bool) "active run cleared in memory"
+      true (Option.is_none session.active_run);
+    Alcotest.(check (option int)) "child pid cleared after cleanup"
+      None session.child_pid;
+    let reloaded = Discord_agents.Session_store.create () in
+    match Discord_agents.Session_store.find_opt reloaded ~thread_id:"control" with
+    | Some saved ->
+      Alcotest.(check bool) "active run cleared on disk"
+        true (Option.is_none saved.active_run)
+    | None -> Alcotest.fail "expected reloaded session")
+
+let test_process_session_message_keeps_run_replayable_on_completion_persist_failure () =
+  with_test_bot (fun bot ->
+    let session = make_session Discord_agents.Config.Claude in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    let effects = ref [] in
+    let hooks = record_process_hooks effects
+      ~persist_completed_run:(fun _bot _session ~had_initial_prompt:_ ->
+        Error "disk full")
+      ~run_agent:(fun ~sw:_ ~env:_ ~rest:_ ~session:_ ~channel_id:_ ~prompt:_
+                     ~attachments:_ ~author_name:_ ~channel_name:_ ~channel_type:_
+                     ~wrap_width:_ ~output_lines:_ ~on_scroll_content:_
+                     ~on_pid:_ ~on_session_id:_ () ->
+        Ok ())
+    in
+    Discord_agents.Bot.process_session_message_with_hooks hooks bot session
+      (make_message "hello") None;
+    Alcotest.(check (list process_effect)) "effects"
+      [ Reaction_added eyes_emoji;
+        Reaction_removed eyes_emoji;
+        Reaction_added x_emoji;
+        Message_sent "Run completed, but the bot could not persist completion state. If the bot restarts before persistence succeeds, this run will be reconciled as interrupted." ]
+      (List.rev !effects);
+    Alcotest.(check bool) "active run remains in memory"
+      true (Option.is_some session.active_run);
+    let reloaded = Discord_agents.Session_store.create () in
+    match Discord_agents.Session_store.find_opt reloaded ~thread_id:"control" with
+    | Some saved ->
+      Alcotest.(check bool) "active run remains on disk"
+        true (Option.is_some saved.active_run)
+    | None -> Alcotest.fail "expected reloaded session")
+
 let test_reap_tracked_process_group_leader () =
   with_test_bot (fun bot ->
     let pid = Unix.create_process "/usr/bin/setsid"
@@ -1393,6 +1508,10 @@ let () =
         test_reconcile_interrupted_active_runs_clears_checkpoint;
       Alcotest.test_case "completed run rollback restores active checkpoint" `Quick
         test_persist_completed_run_rolls_back_active_run_on_save_failure;
+      Alcotest.test_case "process message succeeds when child identity is unavailable" `Quick
+        test_process_session_message_keeps_success_when_child_identity_is_missing;
+      Alcotest.test_case "process message keeps run replayable on completion persist failure" `Quick
+        test_process_session_message_keeps_run_replayable_on_completion_persist_failure;
       Alcotest.test_case "reap tracked process-group leader" `Quick
         test_reap_tracked_process_group_leader;
       Alcotest.test_case "busy stop signals tracked child" `Quick
