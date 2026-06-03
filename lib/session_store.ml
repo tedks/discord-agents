@@ -29,6 +29,17 @@ let pending_agent_origin_of_string = function
   | "session_override" -> Some Session_override
   | _ -> None
 
+let pending_agent_origin_of_json = function
+  | `String origin ->
+    (match pending_agent_origin_of_string origin with
+     | Some origin -> origin
+     | None ->
+       Logs.warn (fun m ->
+         m "session_store: unknown pending_agent_origin %S, defaulting to default_rotation"
+           origin);
+       Default_rotation)
+  | _ -> Default_rotation
+
 type session = {
   project_name : string;
   working_dir : string;
@@ -124,12 +135,9 @@ let sessions_of_json json =
           (match Config.agent_kind_of_string s with
            | Ok kind ->
              let origin =
-               match j |> member "pending_agent_origin" with
-               | `String origin ->
-                 pending_agent_origin_of_string origin
-               | _ -> Some Default_rotation
+               pending_agent_origin_of_json (j |> member "pending_agent_origin")
              in
-             Option.map (fun origin -> { kind; origin }) origin
+             Some { kind; origin }
            | Error _ -> None)
         | _ -> None
       in
