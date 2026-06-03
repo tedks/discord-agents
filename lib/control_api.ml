@@ -516,6 +516,11 @@ let handle_stop_session (bot : Bot.t) params =
   let params = match params with Some p -> p | None ->
     failwith "missing params" in
   let thread_id = params |> member "thread_id" |> to_string in
+  let dropped_text dropped_count =
+    if dropped_count = 0 then ""
+    else Printf.sprintf " Dropped %d queued message%s."
+      dropped_count (if dropped_count = 1 then "" else "s")
+  in
   match Bot.stop_session bot ~thread_id with
   | Bot.Session_not_found ->
     error_response "Session not found."
@@ -526,7 +531,8 @@ let handle_stop_session (bot : Bot.t) params =
       ("thread_id", `String thread_id);
       ("dropped_count", `Int dropped_count);
       ("message",
-       `String (Printf.sprintf "Stopped session for %s." project_name));
+       `String (Printf.sprintf "Stopped session for %s.%s"
+                  project_name (dropped_text dropped_count)));
     ]
   | Bot.Session_stopping { project_name; had_running_process; dropped_count } ->
     let message =
@@ -538,6 +544,7 @@ let handle_stop_session (bot : Bot.t) params =
           "Stopping session for %s. The active session will stop as soon as its current turn or agent startup finishes."
           project_name
     in
+    let message = message ^ dropped_text dropped_count in
     ok_response [
       ("state", `String "stopping");
       ("project_name", `String project_name);

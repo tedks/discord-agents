@@ -293,17 +293,7 @@ def handle_tool_call(name, arguments):
         result = control_request("stop_session", arguments)
         if "error" in result:
             return result["error"]
-        message = result.get("message", "Stop requested.")
-        state = result.get("state", "")
-        details = []
-        if state == "stopping" and result.get("had_running_process"):
-            details.append("terminating the active agent process")
-        dropped = result.get("dropped_count", 0)
-        if dropped:
-            details.append(f"dropped {dropped} queued message{'s' if dropped != 1 else ''}")
-        if details:
-            return message + " (" + "; ".join(details) + ")."
-        return message
+        return result.get("message", "Stop requested.")
 
     elif name == "list_claude_sessions":
         result = control_request("list_claude_sessions", arguments)

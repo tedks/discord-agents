@@ -69,7 +69,7 @@ type session = {
   mutable pending_agent_change : pending_agent_change option;
   mutable initial_prompt : string option;  (* One-shot context for the first message *)
   mutable child_pid : int option;  (* Runtime-only current agent subprocess *)
-  mutable stop_requested : bool;  (* Runtime-only stop latch for active sessions *)
+  mutable stop_requested : bool;  (* Persisted stop latch for active sessions *)
 }
 
 type t = {

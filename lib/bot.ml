@@ -139,8 +139,7 @@ let register_child_pid t (session : Session_store.session) pid =
   let (pids, mu) = t.child_pids in
   Mutex.lock mu;
   pids := Pid_set.add pid !pids;
-  session.child_pid <- Some pid
-  ;
+  session.child_pid <- Some pid;
   Mutex.unlock mu
 
 let unregister_child_pid t (session : Session_store.session) pid =
@@ -155,6 +154,13 @@ let get_child_pids t =
   let (pids, mu) = t.child_pids in
   Mutex.lock mu;
   let result = !pids in
+  Mutex.unlock mu;
+  result
+
+let child_pid_tracked t pid =
+  let (pids, mu) = t.child_pids in
+  Mutex.lock mu;
+  let result = Pid_set.mem pid !pids in
   Mutex.unlock mu;
   result
 
@@ -179,10 +185,18 @@ type pid_ownership =
   | Not_direct_child
   | Unknown_child_ownership
 
-let pid_ownership pid =
+let procfs_available () =
+  try Sys.is_directory "/proc" with Sys_error _ -> false
+
+let pid_ownership ?(tracked_child=false) pid =
   let stat_path = Printf.sprintf "/proc/%d/stat" pid in
   if not (Sys.file_exists stat_path) then
-    Not_direct_child
+    (* Non-Linux hosts do not expose /proc. Falling back is safe only
+       for PIDs still tracked from our own spawn path: a direct child
+       PID cannot be reused by another process until it is reaped, and
+       reaping unregisters it from the tracked set. *)
+    if tracked_child && not (procfs_available ()) then Direct_child
+    else Not_direct_child
   else
     match
       try Some (Resource.read_file stat_path) with _ -> None
@@ -230,7 +244,7 @@ let request_session_process_stop t (session : Session_store.session) =
   | None -> false
   | Some pid ->
     let signalled = Eio_unix.run_in_systhread (fun () ->
-      match pid_ownership pid with
+      match pid_ownership ~tracked_child:(child_pid_tracked t pid) pid with
       | Direct_child ->
         (try
            Unix.kill pid Sys.sigterm;
@@ -249,7 +263,7 @@ let request_session_process_stop t (session : Session_store.session) =
         match session.child_pid with
         | Some live_pid when live_pid = pid ->
           Eio_unix.run_in_systhread (fun () ->
-            match pid_ownership pid with
+            match pid_ownership ~tracked_child:(child_pid_tracked t pid) pid with
             | Direct_child ->
               (try
                  Unix.kill pid 0;
@@ -707,7 +721,7 @@ let trigger_restart t ~notify =
         notify (Printf.sprintf "Terminating %d child process(es)..." (Pid_set.cardinal pids));
         Eio_unix.run_in_systhread (fun () ->
           Pid_set.iter (fun pid ->
-            match pid_ownership pid with
+            match pid_ownership ~tracked_child:true pid with
             | Direct_child ->
               (try Unix.kill pid Sys.sigterm
                with Unix.Unix_error _ -> ())
@@ -720,7 +734,7 @@ let trigger_restart t ~notify =
         Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
         Eio_unix.run_in_systhread (fun () ->
           Pid_set.iter (fun pid ->
-            match pid_ownership pid with
+            match pid_ownership ~tracked_child:true pid with
             | Direct_child ->
               (try Unix.kill pid 0; Unix.kill pid Sys.sigkill
                with Unix.Unix_error _ -> ())
