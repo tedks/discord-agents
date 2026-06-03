@@ -80,6 +80,23 @@ let test_load_uses_backup_when_primary_corrupt () =
     Alcotest.(check bool) "stop_requested recovered from backup"
       true recovered.Discord_agents.Session_store.stop_requested)
 
+let test_load_uses_backup_when_primary_has_wrong_shape () =
+  with_tmp_home (fun home ->
+    let store = Discord_agents.Session_store.create () in
+    let session = make_session () in
+    Discord_agents.Session_store.add store ~thread_id:"control" session;
+    (match Discord_agents.Session_store.set_stop_requested store session true with
+     | Ok () -> ()
+     | Error err -> Alcotest.failf "set_stop_requested failed: %s" err);
+    let primary = sessions_path home in
+    let oc = open_out primary in
+    output_string oc "{}";
+    close_out oc;
+    let reloaded = Discord_agents.Session_store.create () in
+    let recovered = find_control_session reloaded in
+    Alcotest.(check bool) "structural error recovered from backup"
+      true recovered.Discord_agents.Session_store.stop_requested)
+
 let test_load_uses_backup_when_primary_missing () =
   with_tmp_home (fun home ->
     let store = Discord_agents.Session_store.create () in
@@ -123,6 +140,8 @@ let () =
         test_save_updates_backup;
       Alcotest.test_case "load uses backup when primary corrupt" `Quick
         test_load_uses_backup_when_primary_corrupt;
+      Alcotest.test_case "load uses backup when primary has wrong shape" `Quick
+        test_load_uses_backup_when_primary_has_wrong_shape;
       Alcotest.test_case "load uses backup when primary missing" `Quick
         test_load_uses_backup_when_primary_missing;
       Alcotest.test_case "visible but unconfirmed primary still updates backup" `Quick
