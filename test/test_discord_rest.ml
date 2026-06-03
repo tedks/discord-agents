@@ -198,6 +198,18 @@ let test_response_clears_rest_health () =
   Alcotest.(check bool) "500 does not clear"
     false (Discord_agents.Discord_rest.response_clears_rest_health 500)
 
+let test_read_body_reports_truncation () =
+  let chunk =
+    String.make (Discord_agents.Discord_rest.max_body_size + 8192) 'x'
+  in
+  let body = Cohttp_eio.Body.of_string chunk in
+  let (body_str, truncated) =
+    Discord_agents.Discord_rest.read_body_with_truncation body
+  in
+  Alcotest.(check bool) "truncated" true truncated;
+  Alcotest.(check bool) "not full body"
+    true (String.length body_str < String.length chunk)
+
 let () =
   Alcotest.run "discord_rest" [
     ("discord_rest", [
@@ -223,5 +235,7 @@ let () =
         test_rate_limit_state_preserves_backoff_window;
       Alcotest.test_case "response_clears_rest_health only for 2xx" `Quick
         test_response_clears_rest_health;
+      Alcotest.test_case "read_body reports truncation" `Quick
+        test_read_body_reports_truncation;
     ]);
   ]

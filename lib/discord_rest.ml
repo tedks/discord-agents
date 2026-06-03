@@ -305,9 +305,12 @@ let sleep_with_jitter t delay =
     Eio.Time.Mono.sleep t.clock (delay +. jitter)
   end
 
-let wait_for_transport_backoff t =
+let rec wait_for_transport_backoff t =
   let delay = transport_retry_delay_s t in
-  sleep_with_jitter t delay
+  if delay > 0.0 then begin
+    sleep_with_jitter t delay;
+    wait_for_transport_backoff t
+  end
 
 let response_clears_rest_health code =
   code >= 200 && code < 300
@@ -349,7 +352,7 @@ let make_headers t =
     Capped at 10MB to prevent OOM from unexpected large responses. *)
 let max_body_size = 10 * 1024 * 1024
 
-let read_body (body : Cohttp_eio.Body.t) =
+let read_body_with_truncation (body : Cohttp_eio.Body.t) =
   let buf = Buffer.create 4096 in
   let chunk = Cstruct.create 4096 in
   let truncated = ref false in
@@ -363,9 +366,12 @@ let read_body (body : Cohttp_eio.Body.t) =
       end;
       (* Always drain to EOF so the connection stays clean for reuse *)
       loop ()
-    | exception End_of_file -> Buffer.contents buf
+    | exception End_of_file -> (Buffer.contents buf, !truncated)
   in
   loop ()
+
+let read_body body =
+  fst (read_body_with_truncation body)
 
 (** Truncate a byte string near [max_len] for log output. Preserves
     UTF-8 validity without verifying it: if the input is valid UTF-8,
@@ -809,8 +815,11 @@ let download_url t ~url () =
       let status = Http.Response.status resp in
       let code = Http.Status.to_int status in
       let resp_headers = Http.Response.headers resp in
-      let body_str = read_body body in
-      if code >= 200 && code < 300 then Ok body_str
+      let (body_str, truncated) = read_body_with_truncation body in
+      if truncated then
+        Error (Printf.sprintf "download_url %s: response exceeded %d bytes"
+          url max_body_size)
+      else if code >= 200 && code < 300 then Ok body_str
       else if code >= 500 && code < 600 && attempt < max_transient_attempts then begin
         let delay =
           Option.value (retry_after_seconds ~headers:resp_headers body_str)
