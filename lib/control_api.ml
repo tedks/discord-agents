@@ -571,8 +571,10 @@ let start ~(bot : Bot.t) ~sw ~(env : Eio_unix.Stdenv.base) =
   let addr = `Unix path in
   let socket = Eio.Net.listen ~sw ~backlog:64 ~reuse_addr:true net addr in
   Logs.info (fun m -> m "control_api: listening on %s" path);
+  let min_accept_retry_delay = 0.1 in
+  let max_accept_retry_delay = 5.0 in
   (* Accept loop — each connection handled in its own fiber *)
-  let rec accept_loop () =
+  let rec accept_loop retry_delay =
     match
       try Ok (Eio.Net.accept ~sw socket)
       with exn ->
@@ -583,11 +585,11 @@ let start ~(bot : Bot.t) ~sw ~(env : Eio_unix.Stdenv.base) =
       Eio.Fiber.fork ~sw (fun () ->
         Fun.protect ~finally:(fun () -> Eio.Flow.close flow) (fun () ->
           handle_connection bot flow));
-      accept_loop ()
+      accept_loop min_accept_retry_delay
     | Error exn ->
-      Logs.warn (fun m -> m "control_api: accept failed: %s"
-        (Printexc.to_string exn));
-      Eio.Time.sleep clock 0.1;
-      accept_loop ()
+      Logs.warn (fun m -> m "control_api: accept failed: %s; retrying in %.1fs"
+        (Printexc.to_string exn) retry_delay);
+      Eio.Time.sleep clock retry_delay;
+      accept_loop (min max_accept_retry_delay (retry_delay *. 2.0))
   in
-  accept_loop ()
+  accept_loop min_accept_retry_delay

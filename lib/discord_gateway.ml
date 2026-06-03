@@ -33,6 +33,7 @@ type t = {
   mutable heartbeat_gen : int;  (* generation counter: daemon stops when it mismatches *)
   mutable resuming : bool;
   mutable shutdown : bool;
+  mutable disconnected_notified : bool;
   mutable last_error : string option;
   mutable last_payload_summary : string option;
   mutable handler : handler;
@@ -49,6 +50,7 @@ let create ~token ~intents ~handler =
     heartbeat_gen = 0;
     resuming = false;
     shutdown = false;
+    disconnected_notified = false;
     last_error = None;
     last_payload_summary = None;
     handler }
@@ -64,6 +66,16 @@ let raise_if_cancelled exn =
   match exn with
   | Eio.Cancel.Cancelled _ -> raise exn
   | _ -> ()
+
+let notify_disconnected t reason =
+  if not t.disconnected_notified then begin
+    t.disconnected_notified <- true;
+    try t.handler (Disconnected reason)
+    with exn ->
+      raise_if_cancelled exn;
+      Logs.warn (fun m -> m "gateway: disconnected handler error: %s"
+        (Printexc.to_string exn))
+  end
 
 (** Send a JSON payload over the WebSocket. *)
 let send_json t json =
@@ -271,7 +283,7 @@ let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
   | Reconnect ->
     Logs.warn (fun m -> m "gateway: server requested reconnect");
     (match t.ws with Some ws -> Websocket.send_close ws | None -> ());
-    t.handler (Disconnected "reconnect requested")
+    notify_disconnected t "reconnect requested"
   | Invalid_session ->
     let resumable = try Yojson.Safe.Util.to_bool d with _ -> false in
     Logs.warn (fun m -> m "gateway: invalid session (resumable=%b)" resumable);
@@ -281,7 +293,7 @@ let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
       t.resuming <- false
     end;
     (match t.ws with Some ws -> Websocket.send_close ws | None -> ());
-    t.handler (Disconnected "invalid session")
+    notify_disconnected t "invalid session"
   | _ ->
     Logs.debug (fun m -> m "gateway: unhandled opcode")
 
@@ -323,6 +335,7 @@ let connect ~sw ~(env : Eio_unix.Stdenv.base) t =
       connect_loop ()
     | Ok ws ->
       t.ws <- Some ws;
+      t.disconnected_notified <- false;
       backoff := 5.0;  (* Reset backoff on successful connect *)
       Logs.info (fun m -> m "gateway: WebSocket connected");
       (* Cancel any stale heartbeat daemon from previous connection *)
@@ -351,7 +364,7 @@ let connect ~sw ~(env : Eio_unix.Stdenv.base) t =
           recv_loop ()
         | { opcode = Close; _ } ->
           Logs.info (fun m -> m "gateway: received close frame");
-          t.handler (Disconnected "close frame")
+          notify_disconnected t "close frame"
         | { opcode = _; _ } ->
           recv_loop ()
         | exception exn ->
@@ -359,7 +372,7 @@ let connect ~sw ~(env : Eio_unix.Stdenv.base) t =
           let err = exn_with_backtrace exn in
           t.last_error <- Some err;
           Logs.warn (fun m -> m "gateway: recv error: %s" err);
-          t.handler (Disconnected ("recv error: " ^ Printexc.to_string exn))
+          notify_disconnected t ("recv error: " ^ Printexc.to_string exn)
       in
       recv_loop ();
       Websocket.close ws;
