@@ -33,6 +33,10 @@ type session = {
   project_name : string;
   working_dir : string;
   agent_kind : Config.agent_kind;
+  (* Persisted top-level session pin set via [!session-agent]. When
+     present, default-agent rotations must leave this session on the
+     recorded agent kind. *)
+  mutable session_override_kind : Config.agent_kind option;
   (* Mutable because Codex and Gemini assign their session ids
      server-side: the pre-generated UUID is overwritten once the
      first event arrives (Codex's [thread.started] / Gemini's
@@ -79,6 +83,11 @@ let sessions_to_json sessions =
       ("message_count", `Int s.message_count);
     ] @ (match s.system_prompt with
          | Some sp -> [("system_prompt", `String sp)]
+         | None -> [])
+      @ (match s.session_override_kind with
+         | Some kind ->
+           [("session_override_kind",
+             `String (Config.string_of_agent_kind kind))]
          | None -> [])
       @ (match s.pending_agent_change with
          | Some pending ->
@@ -128,6 +137,13 @@ let sessions_of_json json =
         project_name = j |> member "project_name" |> to_string;
         working_dir = j |> member "working_dir" |> to_string;
         agent_kind;
+        session_override_kind =
+          (match j |> member "session_override_kind" with
+           | `String s ->
+             (match Config.agent_kind_of_string s with
+              | Ok kind -> Some kind
+              | Error _ -> None)
+           | _ -> None);
         session_id = j |> member "session_id" |> to_string;
         session_id_confirmed;
         thread_id;
@@ -177,13 +193,14 @@ let create () =
 let make_session ~project_name ~working_dir ~agent_kind ~session_id
     ~thread_id ~system_prompt ~initial_prompt
     ?(message_count = 0)
+    ?(session_override_kind = None)
     ?(pending_agent_change = None)
     ?session_id_confirmed () =
   let session_id_confirmed = match session_id_confirmed with
     | Some b -> b
     | None -> Config.caller_pinned_session_id agent_kind
   in
-  { project_name; working_dir; agent_kind; session_id;
+  { project_name; working_dir; agent_kind; session_override_kind; session_id;
     session_id_confirmed; thread_id; system_prompt;
     message_count; processing = false;
     pending_queue = Queue.create (); pending_agent_change; initial_prompt }

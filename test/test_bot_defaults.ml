@@ -74,11 +74,13 @@ let with_test_bot f =
 
 let kind_string = Discord_agents.Config.string_of_agent_kind
 
-let make_session ?(processing=false) ?pending_agent_change agent_kind =
+let make_session ?(processing=false) ?session_override_kind
+    ?pending_agent_change agent_kind =
   let session = Discord_agents.Session_store.make_session
     ~project_name:"control"
     ~working_dir:"/tmp/project"
     ~agent_kind
+    ?session_override_kind
     ~session_id:"session-1"
     ~thread_id:"control"
     ~system_prompt:(Some "prompt")
@@ -199,6 +201,34 @@ let test_apply_pending_session_override_when_idle () =
     Discord_agents.Bot.maybe_apply_pending_session_agent_change bot session;
     let saved = find_control_session bot in
     Alcotest.(check string) "agent switched" "gemini" (kind_string saved.agent_kind);
+    Alcotest.(check (option string)) "session override persisted"
+      (Some "gemini")
+      (Option.map kind_string saved.session_override_kind);
+    Alcotest.(check bool) "fresh session id allocated"
+      true (saved.session_id <> original_session_id);
+    Alcotest.(check (option string)) "pending cleared"
+      None
+      (Option.map
+         (fun pending -> kind_string pending.Discord_agents.Session_store.kind)
+         saved.pending_agent_change))
+
+let test_apply_pending_same_kind_session_override_starts_fresh_session () =
+  with_test_bot (fun bot ->
+    let pending = Discord_agents.Session_store.{
+      kind = Discord_agents.Config.Codex;
+      origin = Session_override;
+    } in
+    let session =
+      make_session ~pending_agent_change:pending Discord_agents.Config.Codex
+    in
+    let original_session_id = session.session_id in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    Discord_agents.Bot.maybe_apply_pending_session_agent_change bot session;
+    let saved = find_control_session bot in
+    Alcotest.(check string) "agent unchanged" "codex" (kind_string saved.agent_kind);
+    Alcotest.(check (option string)) "session override persisted"
+      (Some "codex")
+      (Option.map kind_string saved.session_override_kind);
     Alcotest.(check bool) "fresh session id allocated"
       true (saved.session_id <> original_session_id);
     Alcotest.(check (option string)) "pending cleared"
@@ -242,6 +272,26 @@ let test_apply_pending_busy_session_leaves_pending_intact () =
     expect_pending saved
       ~kind:Discord_agents.Config.Gemini
       ~origin:Discord_agents.Session_store.Session_override)
+
+let test_reconcile_preserves_idle_session_override () =
+  with_test_bot (fun bot ->
+    bot.settings.default_agent <- Discord_agents.Config.Codex;
+    let session =
+      make_session
+        ~session_override_kind:(Some Discord_agents.Config.Gemini)
+        Discord_agents.Config.Gemini
+    in
+    let original_session_id = session.session_id in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    Discord_agents.Bot.reconcile_persisted_pending_agent_changes bot;
+    let saved = find_control_session bot in
+    Alcotest.(check string) "override agent preserved"
+      "gemini" (kind_string saved.agent_kind);
+    Alcotest.(check (option string)) "override still marked"
+      (Some "gemini")
+      (Option.map kind_string saved.session_override_kind);
+    Alcotest.(check string) "session id unchanged"
+      original_session_id saved.session_id)
 
 let test_reconcile_rotates_idle_session_to_default_agent () =
   with_test_bot (fun bot ->
@@ -288,8 +338,12 @@ let () =
         test_apply_pending_session_override_when_idle;
       Alcotest.test_case "same-kind pending clears" `Quick
         test_apply_pending_same_kind_clears_pending;
+      Alcotest.test_case "same-kind session override starts fresh session" `Quick
+        test_apply_pending_same_kind_session_override_starts_fresh_session;
       Alcotest.test_case "busy pending change stays pending" `Quick
         test_apply_pending_busy_session_leaves_pending_intact;
+      Alcotest.test_case "reconcile preserves idle session override" `Quick
+        test_reconcile_preserves_idle_session_override;
       Alcotest.test_case "reconcile rotates idle session to default" `Quick
         test_reconcile_rotates_idle_session_to_default_agent;
       Alcotest.test_case "reconcile applies persisted default rotation" `Quick

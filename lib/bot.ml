@@ -97,11 +97,13 @@ type persistent_rotation = {
   current_override_kind : Config.agent_kind option;
 }
 
-let fresh_session_like (session : Session_store.session) ~agent_kind =
+let fresh_session_like (session : Session_store.session)
+    ~agent_kind ~session_override_kind =
   Session_store.make_session
     ~project_name:session.project_name
     ~working_dir:session.working_dir
     ~agent_kind
+    ~session_override_kind
     ~session_id:(Resource.generate_uuid ())
     ~thread_id:session.thread_id
     ~system_prompt:session.system_prompt
@@ -255,9 +257,10 @@ let refreshed_system_prompt t (session : Session_store.session) =
        | None -> session.system_prompt)
     | None -> session.system_prompt
 
-let replace_session_agent t (session : Session_store.session) ~agent_kind =
+let replace_session_agent t (session : Session_store.session)
+    ~agent_kind ~session_override_kind =
   let replacement = {
-    (fresh_session_like session ~agent_kind) with
+    (fresh_session_like session ~agent_kind ~session_override_kind) with
     system_prompt = refreshed_system_prompt t session;
   } in
   try
@@ -270,7 +273,8 @@ let replace_session_agent t (session : Session_store.session) ~agent_kind =
 let align_persistent_sessions_to_default t ~current_channel_id ~new_agent =
   let clear_redundant_default_rotation thread_id (session : Session_store.session) =
     if is_persistent_channel t ~channel_id:thread_id
-       && Config.equal_agent_kind session.agent_kind new_agent
+       && (Config.equal_agent_kind session.agent_kind new_agent
+           || Option.is_some session.session_override_kind)
     then
       match session.pending_agent_change with
       | Some { origin = Session_store.Default_rotation; _ } ->
@@ -287,10 +291,18 @@ let align_persistent_sessions_to_default t ~current_channel_id ~new_agent =
     Session_store.bindings t.sessions
     |> List.filter (fun (thread_id, (session : Session_store.session)) ->
       is_persistent_channel t ~channel_id:thread_id
+      && Option.is_none session.session_override_kind
       && not (Config.equal_agent_kind session.agent_kind new_agent))
   in
   let current_busy_kind = ref None in
-  let current_override_kind = ref None in
+  let current_override_kind =
+    match current_channel_id with
+    | Some current_channel_id ->
+      (match Session_store.find_opt t.sessions ~thread_id:current_channel_id with
+       | Some session -> ref session.session_override_kind
+       | None -> ref None)
+    | None -> ref None
+  in
   let reset_count = ref 0 in
   let busy_count = ref 0 in
   let rec clear_redundant = function
@@ -336,7 +348,8 @@ let align_persistent_sessions_to_default t ~current_channel_id ~new_agent =
             incr busy_count;
             align rest
       end else
-        match replace_session_agent t session ~agent_kind:new_agent with
+        match replace_session_agent t session ~agent_kind:new_agent
+                ~session_override_kind:None with
         | Error err ->
           Error (Printf.sprintf
             "failed to start a fresh %s session for channel %s: %s"
@@ -366,7 +379,18 @@ let maybe_apply_pending_session_agent_change t (session : Session_store.session)
   match session.pending_agent_change with
   | None -> ()
   | Some pending ->
-    if Config.equal_agent_kind session.agent_kind pending.kind then
+    if pending.origin = Session_store.Default_rotation
+       && Option.is_some session.session_override_kind
+    then
+      (match Session_store.set_pending_agent_change t.sessions session None with
+       | Ok () -> ()
+       | Error err ->
+         Logs.warn (fun m ->
+           m "bot: failed to clear stale default-agent rotation for override %s: %s"
+             session.thread_id err))
+    else if Config.equal_agent_kind session.agent_kind pending.kind
+            && pending.origin = Session_store.Default_rotation
+    then
       (match Session_store.set_pending_agent_change t.sessions session None with
        | Ok () -> ()
        | Error err ->
@@ -375,7 +399,14 @@ let maybe_apply_pending_session_agent_change t (session : Session_store.session)
              session.thread_id err))
     else if not session.processing
             && Queue.is_empty session.pending_queue then begin
-      match replace_session_agent t session ~agent_kind:pending.kind with
+      let session_override_kind =
+        match pending.origin with
+        | Session_store.Session_override -> Some pending.kind
+        | Session_store.Default_rotation -> None
+      in
+      match replace_session_agent t session
+              ~agent_kind:pending.kind
+              ~session_override_kind with
       | Ok () ->
          Logs.info (fun m ->
            m "bot: switched channel %s to %s after pending agent change"
@@ -637,9 +668,10 @@ let resolve_resume_target t ~raw_working_dir ~kind_label ~fallback_channel =
 
 (** Create a fresh persistent channel session with an explicit agent kind. *)
 let create_persistent_channel_session t ~channel_id ~project_name ~working_dir
-    ~system_prompt ~agent_kind =
+    ~system_prompt ~agent_kind ~session_override_kind =
   let session = Session_store.make_session
     ~project_name ~working_dir ~agent_kind
+    ~session_override_kind
     ~session_id:(Resource.generate_uuid ())
     ~thread_id:channel_id
     ~system_prompt ~initial_prompt:None () in
@@ -653,7 +685,7 @@ let create_explicit_channel_session t ~channel_id ~agent_kind =
     create_persistent_channel_session t ~channel_id
       ~project_name:"control" ~working_dir:(Sys.getcwd ())
       ~system_prompt:(Some (control_system_prompt (projects t)))
-      ~agent_kind;
+      ~agent_kind ~session_override_kind:(Some agent_kind);
     true
   end else
     match Channel_manager.project_for_channel (channels t) ~channel_id with
@@ -670,7 +702,7 @@ let create_explicit_channel_session t ~channel_id ~agent_kind =
         create_persistent_channel_session t ~channel_id
           ~project_name:p.name ~working_dir
           ~system_prompt:(Some (project_system_prompt p))
-          ~agent_kind;
+          ~agent_kind ~session_override_kind:(Some agent_kind);
         true
 
 (** Handle a parsed command. *)
@@ -929,11 +961,14 @@ let handle_command t msg cmd =
     (match Session_store.find_opt t.sessions ~thread_id:channel_id with
      | Some session ->
        (match session.pending_agent_change with
-        | Some pending when not (Config.equal_agent_kind pending.kind session.agent_kind) ->
+       | Some pending when not (Config.equal_agent_kind pending.kind session.agent_kind) ->
           reply (Printf.sprintf
             "Session agent: `%s` (will start a fresh `%s` session after queued work finishes)."
             (Config.string_of_agent_kind session.agent_kind)
             (Config.string_of_agent_kind pending.kind))
+        | _ when Option.is_some session.session_override_kind ->
+          reply (Printf.sprintf "Session agent: `%s` (session override)."
+            (Config.string_of_agent_kind session.agent_kind))
         | _ ->
           reply (Printf.sprintf "Session agent: `%s`."
             (Config.string_of_agent_kind session.agent_kind)))
@@ -947,7 +982,8 @@ let handle_command t msg cmd =
     let kind_str = Config.string_of_agent_kind kind in
     (match Session_store.find_opt t.sessions ~thread_id:channel_id with
      | Some session when Config.equal_agent_kind session.agent_kind kind
-                         && Option.is_none session.pending_agent_change ->
+                         && Option.is_none session.pending_agent_change
+                         && session.session_override_kind = Some kind ->
        reply (Printf.sprintf "Session agent is already `%s`." kind_str)
      | Some session when session.processing || not (Queue.is_empty session.pending_queue) ->
        (match Session_store.set_pending_agent_change t.sessions session
@@ -959,7 +995,8 @@ let handle_command t msg cmd =
         | Error err ->
           reply (Printf.sprintf "Failed to persist session agent change: %s" err))
      | Some session ->
-       (match replace_session_agent t session ~agent_kind:kind with
+       (match replace_session_agent t session ~agent_kind:kind
+                ~session_override_kind:(Some kind) with
         | Ok () ->
           reply (Printf.sprintf "Started a fresh `%s` session for this channel."
             kind_str)
@@ -1425,7 +1462,8 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
   | Some _ -> ()
   | None ->
     create_persistent_channel_session t ~channel_id ~project_name
-      ~working_dir ~system_prompt ~agent_kind:(default_agent t);
+      ~working_dir ~system_prompt ~agent_kind:(default_agent t)
+      ~session_override_kind:None;
     Logs.info (fun m -> m "bot: auto-created session for %s" project_name)
 
 let handle_command_safely t msg cmd =
