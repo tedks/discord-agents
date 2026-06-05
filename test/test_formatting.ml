@@ -1791,6 +1791,43 @@ let test_truncate_utf8_drops_2byte_lead_at_cut () =
   Alcotest.(check string) "incomplete 2-byte lead dropped"
     "x" out
 
+let test_context_header_truncates_utf8_boundary () =
+  let session : Discord_agents.Session_store.session = {
+    project_name = String.make 99 'p' ^ "\xC3\xA9tail";
+    working_dir = "/tmp/project";
+    agent_kind = Discord_agents.Config.Claude;
+    session_id = "sid";
+    session_id_confirmed = true;
+    thread_id = "thread";
+    system_prompt = None;
+    message_count = 0;
+    processing = false;
+    pending_queue = Queue.create ();
+    initial_prompt = None;
+  } in
+  let header =
+    Discord_agents.Agent_runner.build_context_header
+      ~session ~author_name:"author" ~channel_name:"channel"
+      ~channel_type:"thread"
+  in
+  Alcotest.(check bool) "truncated project stays valid"
+    true
+    (String.starts_with
+      ~prefix:("[Discord context: project=" ^ String.make 99 'p' ^ ",")
+      header)
+
+let test_prompt_preview_truncates_utf8_boundary () =
+  let prompt = String.make 79 'q' ^ "\xC3\xA9tail" in
+  Alcotest.(check string) "prompt preview boundary"
+    (String.make 79 'q' ^ "...")
+    (Discord_agents.Agent_runner.prompt_preview prompt)
+
+let test_control_thread_name_truncates_utf8_boundary () =
+  let s = String.make 79 't' ^ "\xC3\xA9tail" in
+  Alcotest.(check string) "control name boundary"
+    (String.make 79 't')
+    (Discord_agents.Resource.truncate_utf8 ~max_bytes:80 s)
+
 let truncate_utf8_tests = [
   Alcotest.test_case "preserves \\n in multi-line input" `Quick
     test_truncate_utf8_preserves_newlines;
@@ -1810,6 +1847,12 @@ let truncate_utf8_tests = [
     test_truncate_utf8_keeps_complete_codepoint_at_cut;
   Alcotest.test_case "incomplete 2-byte lead dropped at cut" `Quick
     test_truncate_utf8_drops_2byte_lead_at_cut;
+  Alcotest.test_case "context header truncates UTF-8 boundary" `Quick
+    test_context_header_truncates_utf8_boundary;
+  Alcotest.test_case "prompt preview truncates UTF-8 boundary" `Quick
+    test_prompt_preview_truncates_utf8_boundary;
+  Alcotest.test_case "control thread name truncates UTF-8 boundary" `Quick
+    test_control_thread_name_truncates_utf8_boundary;
 ]
 
 (* ── sanitize_utf8 ─────────────────────────────────────────────────── *)

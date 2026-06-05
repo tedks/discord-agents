@@ -3,20 +3,476 @@
     Assumptions:
     - Bot token auth only
     - No file uploads yet (will add for agent output sharing)
-    - Simple rate limiting: sleep on 429 Retry-After, then retry once *)
+    - Transient transport failures are retried only for operations we can
+      safely repeat (idempotent calls, or create_message with Discord
+      nonce dedupe). *)
 
 open Discord_types
 
 let api_base = "https://discord.com/api/v10"
 
+type backoff_source =
+  | Transport_backoff
+  | Rest_backoff
+
 type t = {
   token : string;
-  client : Cohttp_eio.Client.t;
+  call : http_call;
   sw : Eio.Switch.t;
-  clock : float Eio.Time.clock_ty Eio.Resource.t;
+  clock : Eio.Time.Mono.ty Eio.Resource.t;
+  rest_state : health_state;
 }
 
+and http_call =
+  sw:Eio.Switch.t ->
+  headers:Http.Header.t ->
+  ?body:Cohttp_eio.Body.t ->
+  Http.Method.t ->
+  Uri.t ->
+  Http.Response.t * Cohttp_eio.Body.t
+
+and health_state = {
+  mutable last_error : string option;
+  mutable consecutive_failures : int;
+  mutable last_transport_error : string option;
+  mutable consecutive_transport_failures : int;
+  mutable rest_backoff_until : Mtime.t option;
+  mutable transport_backoff_until : Mtime.t option;
+}
+
+type retry_mode =
+  | No_retry
+  | Retry_transient of int
+
+type transport_error_kind =
+  | Hostname_resolution
+  | Timeout
+  | Connection
+  | Tls
+  | Other_transport
+
+let max_rate_limit_retries = 1
+let max_transient_attempts = 4
+let base_transport_backoff_s = 0.5
+let max_transport_backoff_s = 8.0
+let max_retry_after_s = 300.0
+let max_backoff_jitter_s = 0.25
+let max_recorded_failures = 32
+let default_retry_mode = Retry_transient max_transient_attempts
+let light_retry_mode = Retry_transient 2
+
+let raise_if_cancelled exn =
+  match exn with
+  | Eio.Cancel.Cancelled _
+  | Out_of_memory
+  | Stack_overflow
+  | Sys.Break -> raise exn
+  | _ -> ()
+
+let string_contains s needle =
+  let s_len = String.length s in
+  let needle_len = String.length needle in
+  let rec loop i =
+    if i + needle_len > s_len then false
+    else if String.sub s i needle_len = needle then true
+    else loop (i + 1)
+  in
+  needle_len = 0 || loop 0
+
+let classify_transport_error_message msg =
+  let msg = String.lowercase_ascii msg in
+  if string_contains msg "failed to resolve hostname"
+     || string_contains msg "name resolution"
+     || string_contains msg "getaddrinfo"
+     || string_contains msg "no address associated with hostname"
+  then Hostname_resolution
+  else if string_contains msg "timed out"
+          || string_contains msg "timeout"
+          || string_contains msg "etimedout"
+  then Timeout
+  else if string_contains msg "tls"
+          || string_contains msg "ssl"
+          || string_contains msg "certificate"
+  then Tls
+  else if string_contains msg "connection reset"
+          || string_contains msg "broken pipe"
+          || string_contains msg "connection refused"
+          || string_contains msg "connection aborted"
+          || string_contains msg "network is unreachable"
+          || string_contains msg "host is unreachable"
+          || string_contains msg "epipe"
+          || string_contains msg "enetdown"
+          || string_contains msg "enetreset"
+          || string_contains msg "enetunreach"
+          || string_contains msg "ehostdown"
+          || string_contains msg "ehostunreach"
+          || string_contains msg "enotconn"
+          || string_contains msg "end_of_file"
+          || string_contains msg "econn"
+  then Connection
+  else Other_transport
+
+let string_of_transport_error_kind = function
+  | Hostname_resolution -> "hostname_resolution"
+  | Timeout -> "timeout"
+  | Connection -> "connection"
+  | Tls -> "tls"
+  | Other_transport -> "other_transport"
+
+let transport_backoff_seconds failure_count =
+  let exponent = max 0 (failure_count - 1) in
+  min max_transport_backoff_s
+    (base_transport_backoff_s *. (2. ** float_of_int exponent))
+
+let finite_float f =
+  match classify_float f with
+  | FP_nan | FP_infinite -> false
+  | FP_normal | FP_subnormal | FP_zero -> true
+
+let clamp_retry_after_seconds delay =
+  if finite_float delay then Some (min max_retry_after_s (max 0.0 delay))
+  else None
+
+let backoff_candidate_until ~now ~delay =
+  let delay =
+    match clamp_retry_after_seconds delay with
+    | Some delay -> delay
+    | None -> 0.0
+  in
+  let delay_ns =
+    Int64.of_float (max 0.0 delay *. 1e9)
+  in
+  let delay = Mtime.Span.of_uint64_ns delay_ns in
+  let candidate =
+    match Mtime.add_span now delay with
+    | Some ts -> ts
+    | None -> Mtime.max_stamp
+  in
+  candidate
+
+let next_backoff_until ~now ~current_until ~delay =
+  let candidate = backoff_candidate_until ~now ~delay in
+  match current_until with
+  | Some current when Mtime.is_later current ~than:candidate -> current
+  | _ -> candidate
+
+let create_health_state () =
+  {
+    last_error = None;
+    consecutive_failures = 0;
+    last_transport_error = None;
+    consecutive_transport_failures = 0;
+    rest_backoff_until = None;
+    transport_backoff_until = None;
+  }
+
+let retry_delay_until_s ~now = function
+  | None -> 0.0
+  | Some until when Mtime.compare now until >= 0 -> 0.0
+  | Some until ->
+    Int64.to_float (Mtime.Span.to_uint64_ns (Mtime.span now until)) /. 1e9
+
+let health_retry_delay_s ~now state =
+  max
+    (retry_delay_until_s ~now state.rest_backoff_until)
+    (retry_delay_until_s ~now state.transport_backoff_until)
+
+let health_degraded state =
+  state.consecutive_failures > 0
+
+let health_last_error state =
+  state.last_error
+
+let health_consecutive_failures state =
+  state.consecutive_failures
+
+let health_transport_degraded state =
+  state.consecutive_transport_failures > 0
+
+let health_last_transport_error state =
+  state.last_transport_error
+
+let health_consecutive_transport_failures state =
+  state.consecutive_transport_failures
+
+let effective_backoff_delay_s ~now state =
+  health_retry_delay_s ~now state
+
+let active_rest_backoff ~now state =
+  match state.rest_backoff_until with
+  | Some until when Mtime.compare now until < 0 -> true
+  | _ -> false
+
+let set_backoff_deadline current_until ~now ~delay =
+  Some (next_backoff_until ~now ~current_until ~delay)
+
+let set_backoff state ~now ~source ~delay =
+  match source with
+  | Rest_backoff ->
+    state.rest_backoff_until <-
+      set_backoff_deadline state.rest_backoff_until ~now ~delay
+  | Transport_backoff ->
+    state.transport_backoff_until <-
+      set_backoff_deadline state.transport_backoff_until ~now ~delay
+
+let note_failure_state ?(source = Rest_backoff) state ~now ~summary ~delay =
+  let failures =
+    min max_recorded_failures (state.consecutive_failures + 1)
+  in
+  state.last_error <- Some summary;
+  state.consecutive_failures <- failures;
+  set_backoff state ~now ~source ~delay;
+  effective_backoff_delay_s ~now state
+
+let note_failure_without_backoff_state state ~now ~summary =
+  let failures =
+    min max_recorded_failures (state.consecutive_failures + 1)
+  in
+  state.last_error <- Some summary;
+  state.consecutive_failures <- failures;
+  effective_backoff_delay_s ~now state
+
+let note_transport_failure_state state ~now ~summary ~delay =
+  let failures =
+    min max_recorded_failures (state.consecutive_failures + 1)
+  in
+  if not (active_rest_backoff ~now state) then
+    state.last_error <- Some summary;
+  state.consecutive_failures <- failures;
+  set_backoff state ~now ~source:Transport_backoff ~delay;
+  let delay = effective_backoff_delay_s ~now state in
+  state.last_transport_error <- Some summary;
+  state.consecutive_transport_failures <-
+    min max_recorded_failures (state.consecutive_transport_failures + 1);
+  delay
+
+let note_transport_failure_without_backoff_state state ~now ~summary =
+  let delay =
+    if active_rest_backoff ~now state then begin
+      state.consecutive_failures <-
+        min max_recorded_failures (state.consecutive_failures + 1);
+      effective_backoff_delay_s ~now state
+    end else
+      note_failure_without_backoff_state state ~now ~summary
+  in
+  state.last_transport_error <- Some summary;
+  state.consecutive_transport_failures <-
+    min max_recorded_failures (state.consecutive_transport_failures + 1);
+  delay
+
+let note_rate_limit_state state ~now ~summary ~delay =
+  state.last_error <- Some summary;
+  state.consecutive_failures <-
+    min max_recorded_failures (state.consecutive_failures + 1);
+  set_backoff state ~now ~source:Rest_backoff ~delay;
+  effective_backoff_delay_s ~now state
+
+let note_recovery_state state ~now =
+  let failures = state.consecutive_failures in
+  let active_rest_backoff = active_rest_backoff ~now state in
+  if not active_rest_backoff then begin
+    state.last_error <- None;
+    state.consecutive_failures <- 0;
+    state.rest_backoff_until <- None
+  end;
+  failures
+
+let note_transport_response_state state =
+  let failures = state.consecutive_transport_failures in
+  state.last_transport_error <- None;
+  state.consecutive_transport_failures <- 0;
+  state.transport_backoff_until <- None;
+  failures
+
+(* REST state closures must stay effect-free: no sleeps, logging, I/O, or
+   other Eio operations inside them. In the current single-domain Eio model,
+   that keeps each update atomic with respect to fiber scheduling without
+   pulling in systhreads/Mutex. *)
+let with_rest_state t f =
+  f t.rest_state
+
+let now_s t =
+  Eio.Time.Mono.now t.clock
+
+let transport_retry_delay_s t =
+  let now = now_s t in
+  with_rest_state t (fun state ->
+    health_retry_delay_s ~now state)
+
+let transport_degraded t =
+  with_rest_state t (fun state ->
+    health_transport_degraded state)
+
+let last_transport_error t =
+  with_rest_state t (fun state ->
+    health_last_transport_error state)
+
+let consecutive_transport_failures t =
+  with_rest_state t (fun state ->
+    health_consecutive_transport_failures state)
+
+let rest_retry_delay_s = transport_retry_delay_s
+let rest_degraded t =
+  with_rest_state t (fun state ->
+    health_degraded state)
+let last_rest_error t =
+  with_rest_state t (fun state ->
+    health_last_error state)
+let consecutive_rest_failures t =
+  with_rest_state t (fun state ->
+    health_consecutive_failures state)
+
+let note_rest_recovery t =
+  let now = now_s t in
+  let (failures, recovered) =
+    with_rest_state t (fun state ->
+      let failures = note_recovery_state state ~now in
+      (failures, not (health_degraded state)))
+  in
+  if failures > 0 && recovered then
+    Logs.info (fun m -> m "REST recovered after %d failure(s)"
+      failures)
+
+let note_transport_response t =
+  let failures =
+    with_rest_state t (fun state ->
+      note_transport_response_state state)
+  in
+  if failures > 0 then
+    Logs.info (fun m -> m "REST transport recovered after %d failure(s)"
+      failures)
+
+let retryable_transport_kind = function
+  | Hostname_resolution | Timeout | Connection | Tls -> true
+  | Other_transport -> false
+
+let transport_failure_summary ~host exn =
+  let raw = Printexc.to_string exn in
+  let kind = classify_transport_error_message raw in
+  let summary =
+    Printf.sprintf "host=%s kind=%s error=%s"
+      host (string_of_transport_error_kind kind) raw
+  in
+  (kind, summary)
+
+let parse_retry_after_seconds raw =
+  match float_of_string_opt (String.trim raw) with
+  | Some delay -> clamp_retry_after_seconds delay
+  | None -> None
+
+let retry_after_seconds_from_headers headers =
+  match Http.Header.get headers "retry-after" with
+  | Some raw -> parse_retry_after_seconds raw
+  | None -> None
+
+let retry_after_seconds_from_body body_str =
+  try
+    let json = Yojson.Safe.from_string body_str in
+    match Yojson.Safe.Util.member "retry_after" json with
+    | `Float f -> clamp_retry_after_seconds f
+    | `Int i -> clamp_retry_after_seconds (float_of_int i)
+    | _ -> None
+  with _ -> None
+
+let retry_after_seconds ?headers body_str =
+  match headers with
+  | Some headers ->
+    (match retry_after_seconds_from_headers headers with
+     | Some _ as delay -> delay
+     | None -> retry_after_seconds_from_body body_str)
+  | None -> retry_after_seconds_from_body body_str
+
+let note_transport_failure t ~host exn =
+  let (kind, summary) = transport_failure_summary ~host exn in
+  let now = now_s t in
+  if retryable_transport_kind kind then begin
+    let delay =
+      with_rest_state t (fun state ->
+        let delay =
+          transport_backoff_seconds (state.consecutive_failures + 1)
+        in
+        note_transport_failure_state state
+          ~now ~summary ~delay)
+    in
+    (summary, Some delay)
+  end else begin
+    ignore (with_rest_state t (fun state ->
+      note_transport_failure_without_backoff_state state
+        ~now ~summary));
+    (summary, None)
+  end
+
+let body_for_health_summary ?(max_len = 500) body =
+  if String.length body <= max_len then body
+  else Resource.truncate_utf8 ~max_bytes:max_len body ^ "... (truncated)"
+
+let note_http_failure t ~host ~code ~body ?retry_after () =
+  let body = body_for_health_summary body in
+  let summary =
+    Printf.sprintf "host=%s kind=http_%d error=%s"
+      host code body
+  in
+  let now = now_s t in
+  let delay =
+    with_rest_state t (fun state ->
+      let delay =
+        Option.value retry_after
+          ~default:(transport_backoff_seconds (state.consecutive_failures + 1))
+      in
+      note_failure_state state
+        ~now ~summary ~delay)
+  in
+  (summary, delay)
+
+let note_http_client_failure t ~host ~code ~body =
+  let body = body_for_health_summary body in
+  let summary =
+    Printf.sprintf "host=%s kind=http_%d error=%s"
+      host code body
+  in
+  let now = now_s t in
+  let delay =
+    with_rest_state t (fun state ->
+      note_failure_without_backoff_state state
+        ~now ~summary)
+  in
+  (summary, delay)
+
+let note_rate_limit t ~host ~retry_after ~body =
+  let body = body_for_health_summary body in
+  let summary =
+    Printf.sprintf "host=%s kind=http_429 error=%s"
+      host body
+  in
+  let now = now_s t in
+  let delay =
+    with_rest_state t (fun state ->
+      note_rate_limit_state state
+        ~now ~summary ~delay:retry_after)
+  in
+  (summary, delay)
+
+let sleep_with_jitter t delay =
+  if delay > 0.0 then begin
+    let jitter = Random.float (min max_backoff_jitter_s delay) in
+    Eio.Time.Mono.sleep t.clock (delay +. jitter)
+  end
+
+let rec wait_for_transport_backoff t =
+  let delay = transport_retry_delay_s t in
+  if delay > 0.0 then begin
+    sleep_with_jitter t delay;
+    wait_for_transport_backoff t
+  end
+
+let response_clears_rest_health code =
+  (code >= 200 && code < 300) || code = 404
+
+let response_marks_rest_failure code =
+  code >= 400 && code < 500 && code <> 404 && code <> 429
+
 let create ~sw ~(env : Eio_unix.Stdenv.base) ~token =
+  Random.self_init ();
   Mirage_crypto_rng_unix.use_default ();
   let authenticator =
     match Ca_certs.authenticator () with
@@ -37,8 +493,12 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) ~token =
   in
   let net = Eio.Stdenv.net env in
   let client = Cohttp_eio.Client.make ~https:(Some https) net in
-  let clock = Eio.Stdenv.clock env in
-  { token; client; sw; clock }
+  let clock = Eio.Stdenv.mono_clock env in
+  let call ~sw ~headers ?body meth uri =
+    Cohttp_eio.Client.call client ~sw ~headers ?body meth uri
+  in
+  { token; call; sw; clock;
+    rest_state = create_health_state (); }
 
 let make_headers t =
   Http.Header.of_list [
@@ -51,7 +511,7 @@ let make_headers t =
     Capped at 10MB to prevent OOM from unexpected large responses. *)
 let max_body_size = 10 * 1024 * 1024
 
-let read_body (body : Cohttp_eio.Body.t) =
+let read_body_with_truncation (body : Cohttp_eio.Body.t) =
   let buf = Buffer.create 4096 in
   let chunk = Cstruct.create 4096 in
   let truncated = ref false in
@@ -65,9 +525,12 @@ let read_body (body : Cohttp_eio.Body.t) =
       end;
       (* Always drain to EOF so the connection stays clean for reuse *)
       loop ()
-    | exception End_of_file -> Buffer.contents buf
+    | exception End_of_file -> (Buffer.contents buf, !truncated)
   in
   loop ()
+
+let read_body body =
+  fst (read_body_with_truncation body)
 
 (** Truncate a byte string near [max_len] for log output. Preserves
     UTF-8 validity without verifying it: if the input is valid UTF-8,
@@ -105,19 +568,48 @@ let body_snippet ?(max_len = 150) s =
   if String.length s <= max_len then s
   else truncate_for_log ~max_len s
 
+let message_nonce () =
+  Resource.random_hex 12
+
+let create_message_body ~content ?reply_to ~nonce () =
+  `Assoc ([
+    ("content", `String content);
+    ("nonce", `String nonce);
+    ("enforce_nonce", `Bool true);
+  ] @ match reply_to with
+    | Some msg_id ->
+      [("message_reference", `Assoc [("message_id", `String msg_id)])]
+    | None -> [])
+
+let decode_json_body body_str =
+  if String.length body_str = 0 then Ok `Null
+  else
+    try Ok (Yojson.Safe.from_string body_str)
+    with exn -> Error (Printexc.to_string exn)
+
 (** Low-level HTTP request. Returns parsed JSON or error string.
     On 429 (rate limited), sleeps Retry-After seconds and retries once.
-    Non-2xx responses are logged centrally so callers that [ignore] the
-    Result still surface failures. 404s log at debug level (expected for
-    typing/reactions on deleted channels); other errors log at warn. *)
-let request t ~meth ~path ?body () =
+    This 429 retry happens even for [No_retry], because Discord explicitly
+    told us when to resume and ignoring that would convert a transient
+    throttling response into an avoidable hard failure.
+    Retryable operations also back off and retry on transient transport
+    failures or 5xx responses. Non-2xx responses are logged centrally so
+    callers that [ignore] the Result still surface failures. 404s log at
+    debug level (expected for typing/reactions on deleted channels); other
+    errors log at warn. *)
+let request ?(retry_mode = No_retry) t ~meth ~path ?body () =
   let uri = Uri.of_string (api_base ^ path) in
+  let host = Uri.host uri |> Option.value ~default:"discord.com" in
+  let retry_limit = match retry_mode with
+    | No_retry -> 1
+    | Retry_transient n -> max 1 n
+  in
   let headers = make_headers t in
   let body_str = Option.map (fun j -> Yojson.Safe.to_string j) body in
   let meth_str = Http.Method.to_string meth in
   let do_call () =
     let cohttp_body = Option.map Cohttp_eio.Body.of_string body_str in
-    Cohttp_eio.Client.call t.client ~sw:t.sw ~headers ?body:cohttp_body meth uri
+    t.call ~sw:t.sw ~headers ?body:cohttp_body meth uri
   in
   let log_non_2xx code body =
     let body = truncate_for_log body in
@@ -145,13 +637,16 @@ let request t ~meth ~path ?body () =
           meth_str path (truncate_for_log b))
       ) body_str
   in
-  let handle_response (resp, resp_body) =
-    let status = Http.Response.status resp in
-    let code = Http.Status.to_int status in
-    let body_str = read_body resp_body in
+  let handle_response code body_str =
     if code >= 200 && code < 300 then begin
-      if String.length body_str = 0 then Ok `Null
-      else Ok (Yojson.Safe.from_string body_str)
+      match decode_json_body body_str with
+      | Ok json -> Ok json
+      | Error exn_raw ->
+        Logs.warn (fun m ->
+          m "REST %s %s: response parse error: %s"
+            meth_str path (truncate_for_log exn_raw));
+        Error (Printf.sprintf "discord REST %s %s: response parse error %s"
+          meth_str path (body_snippet exn_raw))
     end else begin
       (* Log the full body (up to truncate_for_log's cap) centrally for
          operator debugging, and include a short body snippet in the
@@ -163,31 +658,88 @@ let request t ~meth ~path ?body () =
         meth_str path code (body_snippet body_str))
     end
   in
-  try
-    let (resp, resp_body) = do_call () in
-    let status = Http.Response.status resp in
-    let code = Http.Status.to_int status in
-    if code = 429 then begin
+  let rec loop attempt rate_limit_retries =
+    wait_for_transport_backoff t;
+    try
+      let (resp, resp_body) = do_call () in
+      let status = Http.Response.status resp in
+      let code = Http.Status.to_int status in
+      let headers = Http.Response.headers resp in
       let body_str = read_body resp_body in
-      let retry_after =
-        try
-          let json = Yojson.Safe.from_string body_str in
-          Yojson.Safe.Util.(json |> member "retry_after" |> to_float)
-        with _ -> 5.0
+      if code = 429 && rate_limit_retries < max_rate_limit_retries then begin
+        note_transport_response t;
+        let retry_after =
+          Option.value (retry_after_seconds ~headers body_str) ~default:5.0
+        in
+        let (_summary, delay) =
+          note_rate_limit t ~host ~retry_after ~body:body_str
+        in
+        Logs.warn (fun m ->
+          m "REST %s %s: rate limited, retrying after %.1fs"
+            meth_str path delay);
+        loop attempt (rate_limit_retries + 1)
+      end else if code = 429 then begin
+        note_transport_response t;
+        let retry_after =
+          Option.value (retry_after_seconds ~headers body_str) ~default:5.0
+        in
+        ignore (note_rate_limit t ~host ~retry_after ~body:body_str);
+        handle_response code body_str
+      end else if code >= 500 && code < 600 then begin
+        note_transport_response t;
+        let retry_after = retry_after_seconds ~headers body_str in
+        let (_summary, default_delay) =
+          note_http_failure t ~host ~code ~body:body_str ?retry_after ()
+        in
+        if attempt < retry_limit then begin
+          log_non_2xx code body_str;
+          Logs.warn (fun m ->
+            m "REST %s %s: HTTP %d on attempt %d/%d, retrying in %.1fs"
+              meth_str path code attempt retry_limit default_delay);
+          loop (attempt + 1) rate_limit_retries
+        end else
+          handle_response code body_str
+      end else if response_marks_rest_failure code then begin
+        note_transport_response t;
+        ignore (note_http_client_failure t ~host ~code ~body:body_str);
+        handle_response code body_str
+      end else if response_clears_rest_health code then begin
+        note_transport_response t;
+        note_rest_recovery t;
+        handle_response code body_str
+      end else begin
+        note_transport_response t;
+        handle_response code body_str
+      end
+    with exn ->
+      raise_if_cancelled exn;
+      let (summary, delay_opt) = note_transport_failure t ~host exn in
+      let can_retry =
+        match delay_opt with
+        | Some _ -> attempt < retry_limit
+        | None -> false
       in
-      Logs.warn (fun m -> m "REST: rate limited on %s, retrying after %.1fs" path retry_after);
-      Eio.Time.sleep t.clock retry_after;
-      handle_response (do_call ())
-    end else
-      handle_response (resp, resp_body)
-  with exn ->
-    (* Full detail in the central log; short snippet in the Error so
-       callers that surface it to users/API retain a useful hint. *)
-    let exn_raw = Printexc.to_string exn in
-    Logs.warn (fun m -> m "REST %s %s: exception %s" meth_str path
-      (truncate_for_log exn_raw));
-    Error (Printf.sprintf "discord REST %s %s: exception %s"
-      meth_str path (body_snippet exn_raw))
+      if can_retry then begin
+        let delay = Option.get delay_opt in
+        Logs.warn (fun m ->
+          m "REST %s %s: transport failure on attempt %d/%d, retrying in %.1fs (%s)"
+            meth_str path attempt retry_limit delay
+            (truncate_for_log summary));
+        loop (attempt + 1) rate_limit_retries
+      end else begin
+        Logs.warn (fun m -> m "REST %s %s: exception %s"
+          meth_str path (truncate_for_log summary));
+        let suffix =
+          if attempt > 1 then
+            Printf.sprintf " after %d attempts" attempt
+          else
+            ""
+        in
+        Error (Printf.sprintf "discord REST %s %s: exception%s %s"
+          meth_str path suffix (body_snippet summary))
+      end
+  in
+  loop 1 0
 
 (** Plan the chunks for a [create_message] call. Pure function, separated
     from I/O so it can be unit-tested. Content fitting in a single Discord
@@ -226,13 +778,12 @@ let create_message t ~(channel_id : Discord_types.channel_id) ~content
      [Resource.sanitize_utf8] for the full rationale. *)
   let content = Resource.sanitize_utf8 content in
   let post_one (chunk, chunk_reply_to) =
-    let body = `Assoc ([
-      ("content", `String chunk);
-    ] @ match chunk_reply_to with
-      | Some msg_id -> [("message_reference", `Assoc [("message_id", `String msg_id)])]
-      | None -> [])
+    let nonce = message_nonce () in
+    let body =
+      create_message_body ~content:chunk ?reply_to:chunk_reply_to
+        ~nonce ()
     in
-    match request t ~meth:`POST
+    match request ~retry_mode:default_retry_mode t ~meth:`POST
       ~path:(Printf.sprintf "/channels/%s/messages" channel_id) ~body () with
     | Ok json ->
       (try Ok (message_of_yojson json)
@@ -265,7 +816,7 @@ let edit_message t ~(channel_id : Discord_types.channel_id)
     ~(message_id : Discord_types.message_id) ~content () =
   let content = Resource.sanitize_utf8 content in
   let body = `Assoc [("content", `String content)] in
-  match request t ~meth:`PATCH
+  match request ~retry_mode:default_retry_mode t ~meth:`PATCH
     ~path:(Printf.sprintf "/channels/%s/messages/%s" channel_id message_id)
     ~body () with
   | Ok json ->
@@ -275,7 +826,7 @@ let edit_message t ~(channel_id : Discord_types.channel_id)
 
 (** Send a typing indicator. *)
 let send_typing t ~(channel_id : Discord_types.channel_id) () =
-  match request t ~meth:`POST
+  match request ~retry_mode:light_retry_mode t ~meth:`POST
     ~path:(Printf.sprintf "/channels/%s/typing" channel_id) () with
   | Ok _ -> Ok ()
   | Error e -> Error e
@@ -297,7 +848,8 @@ let create_channel t ~(guild_id : Discord_types.guild_id) ~name ?(channel_type=0
 
 (** Get all channels in a guild. *)
 let get_guild_channels t ~(guild_id : Discord_types.guild_id) () =
-  match request t ~meth:`GET ~path:(Printf.sprintf "/guilds/%s/channels" guild_id) () with
+  match request ~retry_mode:default_retry_mode t ~meth:`GET
+    ~path:(Printf.sprintf "/guilds/%s/channels" guild_id) () with
   | Ok json ->
     (try Ok (Yojson.Safe.Util.to_list json |> List.map channel_of_yojson)
      with exn -> Error (Printf.sprintf "get_guild_channels: parse error: %s" (Printexc.to_string exn)))
@@ -316,7 +868,8 @@ let modify_channel_position t ~(guild_id : Discord_types.guild_id)
     ("id", `String channel_id);
     ("position", `Int position);
   ]] in
-  match request t ~meth:`PATCH ~path:(Printf.sprintf "/guilds/%s/channels" guild_id) ~body () with
+  match request ~retry_mode:default_retry_mode t ~meth:`PATCH
+    ~path:(Printf.sprintf "/guilds/%s/channels" guild_id) ~body () with
   | Ok _ -> Ok ()
   | Error e -> Error e
 
@@ -331,7 +884,8 @@ let batch_modify_channel_positions t ~(guild_id : Discord_types.guild_id)
       ("position", `Int position);
     ]
   ) positions) in
-  match request t ~meth:`PATCH ~path:(Printf.sprintf "/guilds/%s/channels" guild_id) ~body () with
+  match request ~retry_mode:default_retry_mode t ~meth:`PATCH
+    ~path:(Printf.sprintf "/guilds/%s/channels" guild_id) ~body () with
   | Ok _ -> Ok ()
   | Error e -> Error e
 
@@ -367,7 +921,7 @@ let create_thread_no_message t ~(channel_id : Discord_types.channel_id) ~name ()
 
 (** Fetch messages from a channel. *)
 let get_messages t ~(channel_id : Discord_types.channel_id) ?(limit=20) () =
-  match request t ~meth:`GET
+  match request ~retry_mode:default_retry_mode t ~meth:`GET
     ~path:(Printf.sprintf "/channels/%s/messages?limit=%d" channel_id limit) () with
   | Ok json ->
     (try
@@ -380,7 +934,7 @@ let get_messages t ~(channel_id : Discord_types.channel_id) ?(limit=20) () =
 let create_reaction t ~(channel_id : Discord_types.channel_id)
     ~(message_id : Discord_types.message_id) ~emoji () =
   let encoded_emoji = Uri.pct_encode emoji in
-  match request t ~meth:`PUT
+  match request ~retry_mode:default_retry_mode t ~meth:`PUT
     ~path:(Printf.sprintf "/channels/%s/messages/%s/reactions/%s/@me"
       channel_id message_id encoded_emoji) () with
   | Ok _ -> Ok ()
@@ -399,7 +953,7 @@ let delete_own_reaction t ~(channel_id : Discord_types.channel_id)
 (** Modify a channel/thread's properties (currently: name only). *)
 let modify_channel t ~(channel_id : Discord_types.channel_id) ~name () =
   let body = `Assoc [("name", `String name)] in
-  match request t ~meth:`PATCH
+  match request ~retry_mode:default_retry_mode t ~meth:`PATCH
     ~path:(Printf.sprintf "/channels/%s" channel_id) ~body () with
   | Ok json ->
     (try Ok (channel_of_yojson json)
@@ -408,7 +962,8 @@ let modify_channel t ~(channel_id : Discord_types.channel_id) ~name () =
 
 (** Get a single channel by ID (works for threads too — returns parent_id). *)
 let get_channel t ~(channel_id : Discord_types.channel_id) () =
-  match request t ~meth:`GET ~path:(Printf.sprintf "/channels/%s" channel_id) () with
+  match request ~retry_mode:default_retry_mode t ~meth:`GET
+    ~path:(Printf.sprintf "/channels/%s" channel_id) () with
   | Ok json ->
     (try Ok (channel_of_yojson json)
      with exn -> Error (Printf.sprintf "get_channel: parse error: %s" (Printexc.to_string exn)))
@@ -418,23 +973,54 @@ let get_channel t ~(channel_id : Discord_types.channel_id) () =
     Returns the raw bytes on success. *)
 let download_url t ~url () =
   let uri = Uri.of_string url in
+  let host = Uri.host uri |> Option.value ~default:"<unknown>" in
   let headers = Http.Header.of_list [
     ("User-Agent", "DiscordBot (discord-agents/0.1.0, OCaml)");
   ] in
-  try
-    let (resp, body) =
-      Cohttp_eio.Client.call t.client ~sw:t.sw ~headers `GET uri in
-    let status = Http.Response.status resp in
-    let code = Http.Status.to_int status in
-    let body_str = read_body body in
-    if code >= 200 && code < 300 then Ok body_str
-    else Error (Printf.sprintf "download_url %s: HTTP %d" url code)
-  with exn ->
-    Error (Printf.sprintf "download_url %s: %s" url (Printexc.to_string exn))
+  let rec loop attempt =
+    try
+      let (resp, body) =
+        t.call ~sw:t.sw ~headers `GET uri in
+      let status = Http.Response.status resp in
+      let code = Http.Status.to_int status in
+      let resp_headers = Http.Response.headers resp in
+      let (body_str, truncated) = read_body_with_truncation body in
+      if truncated then
+        Error (Printf.sprintf "download_url %s: response exceeded %d bytes"
+          url max_body_size)
+      else if code >= 200 && code < 300 then Ok body_str
+      else if code >= 500 && code < 600 && attempt < max_transient_attempts then begin
+        let delay =
+          Option.value (retry_after_seconds ~headers:resp_headers body_str)
+            ~default:(transport_backoff_seconds attempt)
+        in
+        Logs.warn (fun m ->
+          m "download_url %s: HTTP %d on attempt %d/%d, retrying in %.1fs"
+            url code attempt max_transient_attempts delay);
+        sleep_with_jitter t delay;
+        loop (attempt + 1)
+      end else
+        Error (Printf.sprintf "download_url %s: HTTP %d" url code)
+    with exn ->
+      raise_if_cancelled exn;
+      let (kind, summary) = transport_failure_summary ~host exn in
+      let delay = transport_backoff_seconds attempt in
+      if retryable_transport_kind kind && attempt < max_transient_attempts then begin
+        Logs.warn (fun m ->
+          m "download_url %s: transport failure on attempt %d/%d, retrying in %.1fs (%s)"
+            url attempt max_transient_attempts delay
+            (truncate_for_log summary));
+        sleep_with_jitter t delay;
+        loop (attempt + 1)
+      end else
+        Error (Printf.sprintf "download_url %s: %s" url summary)
+  in
+  loop 1
 
 (** Get the gateway URL for WebSocket connection. *)
 let get_gateway t =
-  match request t ~meth:`GET ~path:"/gateway/bot" () with
+  match request ~retry_mode:default_retry_mode t ~meth:`GET
+    ~path:"/gateway/bot" () with
   | Ok json ->
     (try
        let url = Yojson.Safe.Util.(json |> member "url" |> to_string) in

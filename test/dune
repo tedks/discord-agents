@@ -1,3 +1,4 @@
 (tests
- (names test_formatting test_project test_agent_contracts)
- (libraries discord_agents alcotest str unix))
+ (names test_formatting test_project test_agent_contracts test_discord_rest)
+ (libraries discord_agents alcotest str unix yojson eio_main cohttp-eio uri
+  mirage-crypto-rng.unix))
