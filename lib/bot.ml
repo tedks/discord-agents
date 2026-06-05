@@ -2223,7 +2223,97 @@ let resolve_channel_context t ~(channel_id : Discord_types.channel_id)
     path in [fork_initial_prompt_run] can reuse it without going
     back through the queue check (which would cause it to queue itself
     behind the very flag we set to close the gateway race). *)
-let rec process_session_message t session
+type process_message_hooks = {
+  set_active_run :
+    Session_store.t ->
+    Session_store.session ->
+    Session_store.active_run option ->
+    (unit, string) result;
+  set_session_id :
+    Session_store.t ->
+    Session_store.session ->
+    session_id:string ->
+    unit;
+  capture_child_process :
+    int -> Session_store.child_process_identity option;
+  run_agent :
+    sw:Eio.Switch.t ->
+    env:Eio_unix.Stdenv.base ->
+    rest:Discord_rest.t ->
+    session:Session_store.session ->
+    channel_id:Discord_types.channel_id ->
+    prompt:string ->
+    attachments:Discord_types.attachment list ->
+    author_name:string ->
+    channel_name:string ->
+    channel_type:string ->
+    wrap_width:int ->
+    output_lines:int ->
+    on_scroll_content:(string list -> int -> unit) ->
+    on_pid:(int -> unit) ->
+    on_session_id:(string -> unit) ->
+    unit ->
+    (unit, string) result;
+  create_reaction :
+    Discord_rest.t ->
+    channel_id:Discord_types.channel_id ->
+    message_id:Discord_types.message_id ->
+    emoji:string ->
+    unit;
+  delete_own_reaction :
+    Discord_rest.t ->
+    channel_id:Discord_types.channel_id ->
+    message_id:Discord_types.message_id ->
+    emoji:string ->
+    unit;
+  create_message :
+    Discord_rest.t ->
+    channel_id:Discord_types.channel_id ->
+    content:string ->
+    unit;
+  persist_completed_run :
+    t ->
+    Session_store.session ->
+    had_initial_prompt:bool ->
+    (unit, string) result;
+}
+
+let default_process_message_hooks = {
+  set_active_run = Session_store.set_active_run;
+  set_session_id =
+    (fun sessions session ~session_id ->
+       Session_store.set_session_id sessions session ~session_id);
+  capture_child_process =
+    (fun pid ->
+       Eio_unix.run_in_systhread (fun () ->
+         child_process_identity_of_pid pid));
+  run_agent =
+    (fun ~sw ~env ~rest ~session ~channel_id ~prompt ~attachments
+         ~author_name ~channel_name ~channel_type
+         ~wrap_width ~output_lines
+         ~on_scroll_content ~on_pid ~on_session_id () ->
+       Agent_runner.run ~sw ~env ~rest ~session ~channel_id ~prompt
+         ~attachments ~author_name ~channel_name ~channel_type
+         ~wrap_width ~output_lines
+         ~on_scroll_content ~on_pid ~on_session_id ());
+  create_reaction =
+    (fun rest ~channel_id ~message_id ~emoji ->
+       ignore (Discord_rest.create_reaction rest
+         ~channel_id ~message_id ~emoji ()));
+  delete_own_reaction =
+    (fun rest ~channel_id ~message_id ~emoji ->
+       ignore (Discord_rest.delete_own_reaction rest
+         ~channel_id ~message_id ~emoji ()));
+  create_message =
+    (fun rest ~channel_id ~content ->
+       ignore (Discord_rest.create_message rest
+         ~channel_id ~content ()));
+  persist_completed_run =
+    (fun t session ~had_initial_prompt ->
+       persist_completed_run t session ~had_initial_prompt);
+}
+
+let rec process_session_message_with_hooks hooks t session
     (msg : Discord_types.message) channel_info =
   let child_pid = ref None in
   let checkpoint_failure = ref None in
@@ -2236,19 +2326,19 @@ let rec process_session_message t session
   ) (fun () ->
     let channel_id = msg.channel_id in
     let message_id = msg.id in
-    match Session_store.set_active_run t.sessions session (Some active_run) with
+    match hooks.set_active_run t.sessions session (Some active_run) with
     | Error err ->
       Logs.warn (fun m ->
         m "bot: failed to persist active run checkpoint for %s: %s"
           session.thread_id err);
-      ignore (Discord_rest.create_reaction t.rest ~channel_id
-        ~message_id ~emoji:"\xE2\x9D\x8C" ());
-      ignore (Discord_rest.create_message t.rest
+      hooks.create_reaction t.rest ~channel_id
+        ~message_id ~emoji:"\xE2\x9D\x8C";
+      hooks.create_message t.rest
         ~channel_id
-        ~content:"Run aborted because the bot could not persist its restart checkpoint for this session." ())
+        ~content:"Run aborted because the bot could not persist its restart checkpoint for this session."
     | Ok () ->
-      ignore (Discord_rest.create_reaction t.rest ~channel_id
-        ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
+      hooks.create_reaction t.rest ~channel_id
+        ~message_id ~emoji:"\xF0\x9F\x91\x80";
       Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
         ~project_name:session.Session_store.project_name (channels t);
       let author_name = msg.author.username in
@@ -2257,10 +2347,9 @@ let rec process_session_message t session
       let on_pid pid =
         child_pid := Some pid;
         register_child_pid t session pid;
-        (match Eio_unix.run_in_systhread (fun () ->
-           child_process_identity_of_pid pid) with
+        (match hooks.capture_child_process pid with
          | Some child_process ->
-           (match Session_store.set_active_run t.sessions session
+           (match hooks.set_active_run t.sessions session
                     (Some { active_run with child_process = Some child_process }) with
             | Ok () -> ()
             | Error err ->
@@ -2330,7 +2419,7 @@ let rec process_session_message t session
         Hashtbl.replace t.scroll_states channel_id state in
       let on_session_id sid =
         try
-          Session_store.set_session_id t.sessions session
+          hooks.set_session_id t.sessions session
             ~session_id:sid
         with exn ->
           Logs.warn (fun m ->
@@ -2339,7 +2428,7 @@ let rec process_session_message t session
       in
       let result =
         try
-          Agent_runner.run ~sw:t.sw ~env:t.env ~rest:t.rest
+          hooks.run_agent ~sw:t.sw ~env:t.env ~rest:t.rest
             ~session ~channel_id ~prompt
             ~attachments:msg.attachments
             ~author_name ~channel_name ~channel_type
@@ -2352,39 +2441,39 @@ let rec process_session_message t session
               session.thread_id (Printexc.to_string exn));
           Error (Printexc.to_string exn)
       in
-      ignore (Discord_rest.delete_own_reaction t.rest ~channel_id
-        ~message_id ~emoji:"\xF0\x9F\x91\x80" ());
+      hooks.delete_own_reaction t.rest ~channel_id
+        ~message_id ~emoji:"\xF0\x9F\x91\x80";
       (match !checkpoint_failure with
        | Some err ->
          ignore (forget_active_run t session ~context:"checkpoint failure");
-         ignore (Discord_rest.create_reaction t.rest ~channel_id
-           ~message_id ~emoji:"\xE2\x9D\x8C" ());
-         ignore (Discord_rest.create_message t.rest
+         hooks.create_reaction t.rest ~channel_id
+           ~message_id ~emoji:"\xE2\x9D\x8C";
+         hooks.create_message t.rest
            ~channel_id
-           ~content:"Run aborted because the bot could not persist or confirm restart state for the spawned agent process. The agent may have exited before it could be tracked, or the bot may have hit a storage error. Try again; if it keeps happening, check bot logs and disk health." ());
+           ~content:"Run aborted because the bot could not persist or confirm restart state for the spawned agent process. The agent may have exited before it could be tracked, or the bot may have hit a storage error. Try again; if it keeps happening, check bot logs and disk health.";
          Logs.warn (fun m ->
            m "bot: aborted run for %s after checkpoint failure: %s"
              session.thread_id err)
        | None ->
          match result with
          | Ok () ->
-           (match persist_completed_run t session ~had_initial_prompt with
+           (match hooks.persist_completed_run t session ~had_initial_prompt with
             | Ok () ->
-              ignore (Discord_rest.create_reaction t.rest ~channel_id
-                ~message_id ~emoji:"\xE2\x9C\x85" ())
+              hooks.create_reaction t.rest ~channel_id
+                ~message_id ~emoji:"\xE2\x9C\x85"
             | Error err ->
-              ignore (Discord_rest.create_reaction t.rest ~channel_id
-                ~message_id ~emoji:"\xE2\x9D\x8C" ());
-              ignore (Discord_rest.create_message t.rest
+              hooks.create_reaction t.rest ~channel_id
+                ~message_id ~emoji:"\xE2\x9D\x8C";
+              hooks.create_message t.rest
                 ~channel_id
-                ~content:"Run completed, but the bot could not persist completion state. If the bot restarts before persistence succeeds, this run will be reconciled as interrupted." ());
+                ~content:"Run completed, but the bot could not persist completion state. If the bot restarts before persistence succeeds, this run will be reconciled as interrupted.";
               Logs.warn (fun m ->
                 m "bot: failed to persist message completion for %s: %s"
                   session.thread_id err))
          | Error _ ->
            ignore (forget_active_run t session ~context:"failed run");
-           ignore (Discord_rest.create_reaction t.rest ~channel_id
-             ~message_id ~emoji:"\xE2\x9D\x8C" ())));
+           hooks.create_reaction t.rest ~channel_id
+             ~message_id ~emoji:"\xE2\x9D\x8C"));
   (* Drain the queue: process next pending message if any *)
   if session.stop_requested then
     ()
@@ -2393,10 +2482,16 @@ let rec process_session_message t session
     | None -> ()
     | Some pending ->
       (* Remove hourglass, will get eyes when processing starts *)
-      ignore (Discord_rest.delete_own_reaction t.rest
+      hooks.delete_own_reaction t.rest
         ~channel_id:pending.msg.channel_id
-        ~message_id:pending.msg.id ~emoji:"\xE2\x8F\xB3" ());
-      process_session_message t session pending.msg pending.channel_info
+        ~message_id:pending.msg.id ~emoji:"\xE2\x8F\xB3";
+      process_session_message_with_hooks hooks t session
+        pending.msg pending.channel_info
+
+let process_session_message t session
+    (msg : Discord_types.message) channel_info =
+  process_session_message_with_hooks default_process_message_hooks
+    t session msg channel_info
 
 let handle_thread_message t msg ?channel_info () =
   if t.draining then
