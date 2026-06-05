@@ -36,8 +36,8 @@ and health_state = {
   mutable consecutive_failures : int;
   mutable last_transport_error : string option;
   mutable consecutive_transport_failures : int;
-  mutable backoff_until : Mtime.t option;
-  mutable backoff_source : backoff_source option;
+  mutable rest_backoff_until : Mtime.t option;
+  mutable transport_backoff_until : Mtime.t option;
 }
 
 type retry_mode =
@@ -126,7 +126,7 @@ let clamp_retry_after_seconds delay =
   if finite_float delay then Some (min max_retry_after_s (max 0.0 delay))
   else None
 
-let next_backoff_until ~now ~current_until ~delay =
+let backoff_candidate_until ~now ~delay =
   let delay =
     match clamp_retry_after_seconds delay with
     | Some delay -> delay
@@ -141,6 +141,10 @@ let next_backoff_until ~now ~current_until ~delay =
     | Some ts -> ts
     | None -> Mtime.max_stamp
   in
+  candidate
+
+let next_backoff_until ~now ~current_until ~delay =
+  let candidate = backoff_candidate_until ~now ~delay in
   match current_until with
   | Some current when Mtime.is_later current ~than:candidate -> current
   | _ -> candidate
@@ -151,16 +155,20 @@ let create_health_state () =
     consecutive_failures = 0;
     last_transport_error = None;
     consecutive_transport_failures = 0;
-    backoff_until = None;
-    backoff_source = None;
+    rest_backoff_until = None;
+    transport_backoff_until = None;
   }
 
-let health_retry_delay_s ~now state =
-  match state.backoff_until with
+let retry_delay_until_s ~now = function
   | None -> 0.0
   | Some until when Mtime.compare now until >= 0 -> 0.0
   | Some until ->
     Int64.to_float (Mtime.Span.to_uint64_ns (Mtime.span now until)) /. 1e9
+
+let health_retry_delay_s ~now state =
+  max
+    (retry_delay_until_s ~now state.rest_backoff_until)
+    (retry_delay_until_s ~now state.transport_backoff_until)
 
 let health_degraded state =
   state.consecutive_failures > 0
@@ -184,13 +192,21 @@ let effective_backoff_delay_s ~now state =
   health_retry_delay_s ~now state
 
 let active_rest_backoff ~now state =
-  match state.backoff_source, state.backoff_until with
-  | Some Rest_backoff, Some until when Mtime.compare now until < 0 -> true
+  match state.rest_backoff_until with
+  | Some until when Mtime.compare now until < 0 -> true
   | _ -> false
 
-let clear_backoff state =
-  state.backoff_until <- None;
-  state.backoff_source <- None
+let set_backoff_deadline current_until ~now ~delay =
+  Some (next_backoff_until ~now ~current_until ~delay)
+
+let set_backoff state ~now ~source ~delay =
+  match source with
+  | Rest_backoff ->
+    state.rest_backoff_until <-
+      set_backoff_deadline state.rest_backoff_until ~now ~delay
+  | Transport_backoff ->
+    state.transport_backoff_until <-
+      set_backoff_deadline state.transport_backoff_until ~now ~delay
 
 let note_failure_state ?(source = Rest_backoff) state ~now ~summary ~delay =
   let failures =
@@ -198,9 +214,7 @@ let note_failure_state ?(source = Rest_backoff) state ~now ~summary ~delay =
   in
   state.last_error <- Some summary;
   state.consecutive_failures <- failures;
-  state.backoff_until <-
-    Some (next_backoff_until ~now ~current_until:state.backoff_until ~delay);
-  state.backoff_source <- Some source;
+  set_backoff state ~now ~source ~delay;
   effective_backoff_delay_s ~now state
 
 let note_failure_without_backoff_state state ~now ~summary =
@@ -212,9 +226,14 @@ let note_failure_without_backoff_state state ~now ~summary =
   effective_backoff_delay_s ~now state
 
 let note_transport_failure_state state ~now ~summary ~delay =
-  let delay =
-    note_failure_state ~source:Transport_backoff state ~now ~summary ~delay
+  let failures =
+    min max_recorded_failures (state.consecutive_failures + 1)
   in
+  if not (active_rest_backoff ~now state) then
+    state.last_error <- Some summary;
+  state.consecutive_failures <- failures;
+  set_backoff state ~now ~source:Transport_backoff ~delay;
+  let delay = effective_backoff_delay_s ~now state in
   state.last_transport_error <- Some summary;
   state.consecutive_transport_failures <-
     min max_recorded_failures (state.consecutive_transport_failures + 1);
@@ -231,9 +250,7 @@ let note_rate_limit_state state ~now ~summary ~delay =
   state.last_error <- Some summary;
   state.consecutive_failures <-
     min max_recorded_failures (state.consecutive_failures + 1);
-  state.backoff_until <-
-    Some (next_backoff_until ~now ~current_until:state.backoff_until ~delay);
-  state.backoff_source <- Some Rest_backoff;
+  set_backoff state ~now ~source:Rest_backoff ~delay;
   effective_backoff_delay_s ~now state
 
 let note_recovery_state state ~now =
@@ -242,18 +259,15 @@ let note_recovery_state state ~now =
   if not active_rest_backoff then begin
     state.last_error <- None;
     state.consecutive_failures <- 0;
-    clear_backoff state
+    state.rest_backoff_until <- None
   end;
-  state.last_transport_error <- None;
-  state.consecutive_transport_failures <- 0;
   failures
 
 let note_transport_response_state state =
   let failures = state.consecutive_transport_failures in
   state.last_transport_error <- None;
   state.consecutive_transport_failures <- 0;
-  if state.backoff_source = Some Transport_backoff then
-    clear_backoff state;
+  state.transport_backoff_until <- None;
   failures
 
 (* REST state closures must stay effect-free: no sleeps, logging, I/O, or
@@ -296,11 +310,12 @@ let consecutive_rest_failures t =
 
 let note_rest_recovery t =
   let now = now_s t in
-  let failures =
+  let (failures, recovered) =
     with_rest_state t (fun state ->
-      note_recovery_state state ~now)
+      let failures = note_recovery_state state ~now in
+      (failures, not (health_degraded state)))
   in
-  if failures > 0 then
+  if failures > 0 && recovered then
     Logs.info (fun m -> m "REST recovered after %d failure(s)"
       failures)
 

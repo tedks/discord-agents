@@ -251,6 +251,56 @@ let test_rest_backoff_survives_unrelated_recovery () =
   Alcotest.(check (float 1e-9)) "expired deadline cleared"
     0.0 (Rest.health_retry_delay_s ~now:(ts 16.0) state)
 
+let test_rest_backoff_survives_transport_shadowing () =
+  let ts seconds = Mtime.of_uint64_ns (Int64.of_float (seconds *. 1e9)) in
+  let state = Rest.create_health_state () in
+  let _ =
+    Rest.note_rate_limit_state state
+      ~now:(ts 10.0) ~summary:"429" ~delay:5.0
+  in
+  let delay =
+    Rest.note_transport_failure_state state
+      ~now:(ts 11.0) ~summary:"timeout" ~delay:8.0
+  in
+  Alcotest.(check (float 1e-9)) "transport extends combined deadline"
+    8.0 delay;
+  let transport_failures = Rest.note_transport_response_state state in
+  Alcotest.(check int) "transport response reports failure"
+    1 transport_failures;
+  Alcotest.(check bool) "transport cleared"
+    false (Rest.health_transport_degraded state);
+  Alcotest.(check bool) "rest backoff still degraded"
+    true (Rest.health_degraded state);
+  Alcotest.(check (option string)) "rest error preserved"
+    (Some "429") (Rest.health_last_error state);
+  Alcotest.(check (float 1e-9)) "transport clear exposes rest deadline"
+    4.0 (Rest.health_retry_delay_s ~now:(ts 11.0) state)
+
+let test_transport_backoff_survives_rest_shadowing () =
+  let ts seconds = Mtime.of_uint64_ns (Int64.of_float (seconds *. 1e9)) in
+  let state = Rest.create_health_state () in
+  let _ =
+    Rest.note_transport_failure_state state
+      ~now:(ts 10.0) ~summary:"timeout" ~delay:8.0
+  in
+  let delay =
+    Rest.note_failure_state state
+      ~now:(ts 11.0) ~summary:"500" ~delay:4.0
+  in
+  Alcotest.(check (float 1e-9)) "transport remains combined deadline"
+    7.0 delay;
+  let transport_failures = Rest.note_transport_response_state state in
+  Alcotest.(check int) "transport response reports failure"
+    1 transport_failures;
+  Alcotest.(check bool) "transport cleared"
+    false (Rest.health_transport_degraded state);
+  Alcotest.(check bool) "rest backoff remains degraded"
+    true (Rest.health_degraded state);
+  Alcotest.(check (option string)) "rest error preserved"
+    (Some "500") (Rest.health_last_error state);
+  Alcotest.(check (float 1e-9)) "rest deadline remains after transport clear"
+    4.0 (Rest.health_retry_delay_s ~now:(ts 11.0) state)
+
 let test_transport_health_clears_separately () =
   let ts seconds = Mtime.of_uint64_ns (Int64.of_float (seconds *. 1e9)) in
   let state = Rest.create_health_state () in
@@ -406,6 +456,10 @@ let () =
         test_rate_limit_state_preserves_backoff_window;
       Alcotest.test_case "rest backoff survives unrelated recovery" `Quick
         test_rest_backoff_survives_unrelated_recovery;
+      Alcotest.test_case "rest backoff survives transport shadowing" `Quick
+        test_rest_backoff_survives_transport_shadowing;
+      Alcotest.test_case "transport backoff survives rest shadowing" `Quick
+        test_transport_backoff_survives_rest_shadowing;
       Alcotest.test_case "transport health clears separately" `Quick
         test_transport_health_clears_separately;
       Alcotest.test_case "client failure records without backoff" `Quick
