@@ -50,6 +50,18 @@ let find_control_session store =
   | Some session -> session
   | None -> Alcotest.fail "expected persisted control session"
 
+let expect_active_run session ~message_id ~pid ~start_ticks =
+  match session.Discord_agents.Session_store.active_run with
+  | Some active_run ->
+    Alcotest.(check string) "active message id" message_id active_run.message_id;
+    (match active_run.child_process with
+     | Some child ->
+       Alcotest.(check int) "child pid" pid child.pid;
+       Alcotest.(check int64) "child start ticks" start_ticks child.start_ticks
+     | None -> Alcotest.fail "expected persisted child process identity")
+  | None ->
+    Alcotest.fail "expected persisted active run"
+
 let test_save_updates_backup () =
   with_tmp_home (fun home ->
     let store = Discord_agents.Session_store.create () in
@@ -183,6 +195,26 @@ let test_load_ignores_stale_backup_when_primary_is_newer_and_corrupt () =
       (Option.is_none
          (Discord_agents.Session_store.find_opt reloaded ~thread_id:"control")))
 
+let test_active_run_roundtrips_through_backup () =
+  with_tmp_home (fun home ->
+    let store = Discord_agents.Session_store.create () in
+    let session = make_session () in
+    Discord_agents.Session_store.add store ~thread_id:"control" session;
+    let active_run = Some Discord_agents.Session_store.{
+      message_id = "message-42";
+      child_process = Some { pid = 4242; start_ticks = 123456789L };
+    } in
+    (match Discord_agents.Session_store.set_active_run store session active_run with
+     | Ok () -> ()
+     | Error err -> Alcotest.failf "set_active_run failed: %s" err);
+    Sys.remove (sessions_path home);
+    let reloaded = Discord_agents.Session_store.create () in
+    let recovered = find_control_session reloaded in
+    expect_active_run recovered
+      ~message_id:"message-42"
+      ~pid:4242
+      ~start_ticks:123456789L)
+
 let test_save_refuses_read_only_preflight () =
   with_tmp_home (fun home ->
     let store = Discord_agents.Session_store.create () in
@@ -228,6 +260,8 @@ let () =
         test_save_marks_primary_newer_when_backup_update_fails;
       Alcotest.test_case "load ignores stale backup when primary is newer and corrupt" `Quick
         test_load_ignores_stale_backup_when_primary_is_newer_and_corrupt;
+      Alcotest.test_case "active run roundtrips through backup" `Quick
+        test_active_run_roundtrips_through_backup;
       Alcotest.test_case "save refuses read-only preflight" `Quick
         test_save_refuses_read_only_preflight;
     ]);

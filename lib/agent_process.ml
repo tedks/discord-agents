@@ -1470,6 +1470,7 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
       setup_gemini_mcp ~working_dir;
       gemini_args ~session_id ~session_id_confirmed ~prompt
   in
+  let args = ["setsid"; "--wait"] @ args in
   let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in
   let stderr_r, stderr_w = Eio.Process.pipe ~sw mgr in
   let proc = Eio.Process.spawn ~sw mgr ~cwd

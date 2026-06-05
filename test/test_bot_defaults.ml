@@ -69,6 +69,10 @@ let with_test_bot f =
         refreshing = false;
         output_lines = Discord_agents.Agent_process.default_output_lines;
         policy_sync_clear_last_warning = None;
+        gateway_supervisor_restarts = 0;
+        control_api_restarts = 0;
+        last_gateway_supervisor_error = None;
+        last_control_api_error = None;
         scroll_states = Hashtbl.create 8;
       } in
       Fun.protect
@@ -138,6 +142,27 @@ let make_message ?(message_id="message-1") ?(channel_id="control") content =
     attachments = [];
     referenced_message = None;
   }
+
+let wait_for_process_exit pid =
+  let deadline = Unix.gettimeofday () +. 5.0 in
+  let rec loop () =
+    match Unix.waitpid [Unix.WNOHANG] pid with
+    | 0, _ when Unix.gettimeofday () < deadline ->
+      Unix.sleepf 0.05;
+      loop ()
+    | 0, _ -> false
+    | _ -> true
+    | exception Unix.Unix_error (Unix.ECHILD, _, _) -> true
+  in
+  loop ()
+
+let cleanup_child pid =
+  (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
+  ignore (try Some (Unix.waitpid [Unix.WNOHANG] pid) with Unix.Unix_error _ -> None)
+
+let cleanup_process_group_leader pid =
+  (try Unix.kill (-pid) Sys.sigkill with Unix.Unix_error _ -> ());
+  cleanup_child pid
 
 let expect_pending session ~kind ~origin =
   match session.Discord_agents.Session_store.pending_agent_change with
@@ -1150,6 +1175,119 @@ let test_reconcile_persisted_stop_requests_removes_session () =
       (Option.is_none
          (Discord_agents.Session_store.find_opt bot.sessions ~thread_id:"control")))
 
+let test_supervise_bot_component_reraises_fatal_exception () =
+  with_test_bot (fun bot ->
+    Alcotest.check_raises "fatal exception reraised"
+      (Invalid_argument "boom")
+      (fun () ->
+        Discord_agents.Bot.supervise_bot_component bot
+          ~label:"test"
+          ~note_restart:(fun _ -> ())
+          (fun () -> invalid_arg "boom")))
+
+let test_proc_stat_info_of_line_parses_start_ticks () =
+  let line = "12345 (codex exec (worker 1)) S 6789 12345 12345 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 123456789 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0" in
+  match Discord_agents.Bot.proc_stat_info_of_line line with
+  | Some info ->
+    Alcotest.(check int) "parsed ppid" 6789 info.ppid;
+    Alcotest.(check int64) "parsed start ticks" 123456789L info.start_ticks
+  | None ->
+    Alcotest.fail "expected proc_stat_info_of_line to parse start ticks"
+
+let test_reconcile_interrupted_active_runs_clears_checkpoint () =
+  with_test_bot (fun bot ->
+    let session = make_session Discord_agents.Config.Claude in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    let active_run = Some Discord_agents.Session_store.{
+      message_id = "message-1";
+      child_process = None;
+    } in
+    (match Discord_agents.Session_store.set_active_run bot.sessions session active_run with
+     | Ok () -> ()
+     | Error err -> Alcotest.failf "set_active_run failed: %s" err);
+    Discord_agents.Bot.reconcile_interrupted_active_runs
+      ~mark_failed:(fun _t _session ~message_id:_ -> ()) bot;
+    Alcotest.(check bool) "active run cleared in memory"
+      true (Option.is_none session.active_run);
+    let reloaded = Discord_agents.Session_store.create () in
+    match Discord_agents.Session_store.find_opt reloaded ~thread_id:"control" with
+    | Some saved ->
+      Alcotest.(check bool) "active run cleared on disk"
+        true (Option.is_none saved.active_run)
+    | None -> Alcotest.fail "expected reloaded session")
+
+let test_persist_completed_run_rolls_back_active_run_on_save_failure () =
+  with_test_bot (fun bot ->
+    let session = make_session Discord_agents.Config.Claude in
+    session.initial_prompt <- Some "preface";
+    session.message_count <- 7;
+    let active_run = Some Discord_agents.Session_store.{
+      message_id = "message-1";
+      child_process = None;
+    } in
+    session.active_run <- active_run;
+    let failing_save _store = failwith "disk full" in
+    match Discord_agents.Bot.persist_completed_run ~save:failing_save bot session ~had_initial_prompt:true with
+    | Ok () -> Alcotest.fail "expected persist_completed_run to fail"
+    | Error _ ->
+      Alcotest.(check int) "message_count rolled back" 7 session.message_count;
+      Alcotest.(check (option string)) "initial_prompt rolled back"
+        (Some "preface") session.initial_prompt;
+      Alcotest.(check bool) "active run restored"
+        true (session.active_run = active_run))
+
+let test_reap_tracked_process_group_leader () =
+  with_test_bot (fun bot ->
+    let pid = Unix.create_process "/usr/bin/setsid"
+      [| "/usr/bin/setsid"; "--wait"; "/bin/sleep"; "30" |]
+      Unix.stdin Unix.stdout Unix.stderr in
+    Fun.protect
+      ~finally:(fun () -> cleanup_process_group_leader pid)
+      (fun () ->
+        match Discord_agents.Bot.child_process_identity_of_pid pid with
+        | None -> Alcotest.fail "expected live process-group leader identity"
+        | Some child ->
+          let deadline = Unix.gettimeofday () +. 3.0 in
+          let rec wait_for_tracked_process_group () =
+            match Discord_agents.Bot.pid_ownership ~expected_start_ticks:child.start_ticks pid with
+            | Discord_agents.Bot.Tracked_process_group -> ()
+            | _ when Unix.gettimeofday () < deadline ->
+              Eio.Time.sleep (Eio.Stdenv.clock bot.env) 0.01;
+              wait_for_tracked_process_group ()
+            | _ -> Alcotest.fail "expected tracked process-group ownership"
+          in
+          wait_for_tracked_process_group ();
+          Alcotest.(check int) "reap count" 1
+            (Discord_agents.Bot.reap_tracked_child_processes_blocking bot
+               ~reason:"test" [child]);
+          Alcotest.(check bool) "process group exited"
+            true (wait_for_process_exit pid)))
+
+let test_stop_busy_session_signals_tracked_child () =
+  with_test_bot (fun bot ->
+    let session = make_session ~processing:true Discord_agents.Config.Claude in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    let pid = Unix.create_process "/bin/sleep" [| "/bin/sleep"; "30" |]
+      Unix.stdin Unix.stdout Unix.stderr in
+    Fun.protect
+      ~finally:(fun () -> cleanup_child pid)
+      (fun () ->
+        match Discord_agents.Bot.child_process_identity_of_pid pid with
+        | None -> Alcotest.fail "expected live child identity"
+        | Some child ->
+          session.child_pid <- Some pid;
+          session.active_run <- Some Discord_agents.Session_store.{
+            message_id = "message-1";
+            child_process = Some child;
+          };
+          match Discord_agents.Bot.stop_session bot ~thread_id:"control" with
+          | Discord_agents.Bot.Session_stopping stop ->
+            Alcotest.(check bool) "had running process" true stop.had_running_process;
+            Alcotest.(check bool) "stop requested latched" true session.stop_requested;
+            Alcotest.(check bool) "child exited after signal"
+              true (wait_for_process_exit pid)
+          | _ -> Alcotest.fail "expected busy session to stop tracked child"))
+
 let () =
   Alcotest.run "bot_defaults" [
     ("default agent", [
@@ -1247,6 +1385,18 @@ let () =
         test_finalize_session_run_removes_stopped_session;
       Alcotest.test_case "proc stat parser handles spaces and parens" `Quick
         test_ppid_of_proc_stat_line_handles_spaces_and_parens;
+      Alcotest.test_case "supervisor reraises fatal exceptions" `Quick
+        test_supervise_bot_component_reraises_fatal_exception;
+      Alcotest.test_case "proc stat parser captures start ticks" `Quick
+        test_proc_stat_info_of_line_parses_start_ticks;
+      Alcotest.test_case "startup reconcile clears interrupted active run checkpoint" `Quick
+        test_reconcile_interrupted_active_runs_clears_checkpoint;
+      Alcotest.test_case "completed run rollback restores active checkpoint" `Quick
+        test_persist_completed_run_rolls_back_active_run_on_save_failure;
+      Alcotest.test_case "reap tracked process-group leader" `Quick
+        test_reap_tracked_process_group_leader;
+      Alcotest.test_case "busy stop signals tracked child" `Quick
+        test_stop_busy_session_signals_tracked_child;
       Alcotest.test_case "stop_requested roundtrips through disk" `Quick
         test_stop_requested_roundtrips_through_disk;
       Alcotest.test_case "startup reconcile removes persisted stopping sessions" `Quick
