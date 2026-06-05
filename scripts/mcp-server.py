@@ -131,6 +131,20 @@ TOOLS = [
         }
     },
     {
+        "name": "stop_session",
+        "description": "Stop an active bot session by Discord thread ID. Idle sessions stop immediately; busy sessions terminate the active agent run and then clean up the session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "thread_id": {
+                    "type": "string",
+                    "description": "Discord thread ID of the session to stop"
+                }
+            },
+            "required": ["thread_id"]
+        }
+    },
+    {
         "name": "list_claude_sessions",
         "description": "List recent Claude Code sessions running on this machine (last 24h). Useful for finding sessions to resume.",
         "inputSchema": {
@@ -274,6 +288,12 @@ def handle_tool_call(name, arguments):
         lines = [f"- **{s['project_name']}** / {s['agent_kind']} — {s['message_count']} messages (thread: <#{s['thread_id']}>)"
                  for s in sessions]
         return "\n".join(lines)
+
+    elif name == "stop_session":
+        result = control_request("stop_session", arguments)
+        if "error" in result:
+            return result["error"]
+        return result.get("message", "Stop requested.")
 
     elif name == "list_claude_sessions":
         result = control_request("list_claude_sessions", arguments)

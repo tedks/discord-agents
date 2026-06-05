@@ -149,7 +149,7 @@ Gemini tool names (`run_shell_command`, `read_file`, `write_file`, `replace`, `s
 
 ## MCP configuration
 
-The bot exposes MCP tools (start_session, list_sessions, etc.) via `scripts/mcp-server.py`. All three agents now pick it up — each through a different mechanism:
+The bot exposes MCP tools (`start_session`, `stop_session`, `list_sessions`, etc.) via `scripts/mcp-server.py`. All three agents now pick it up — each through a different mechanism:
 
 - **Claude** — `--mcp-config <path>` flag; we write the config to `~/.config/discord-agents/mcp-generated.json`.
 - **Codex** — TOML overrides via `-c key=value` per invocation: `mcp_servers.discord_agents.command="python3"` and `mcp_servers.discord_agents.args=["..."]`. Doesn't touch the user's `~/.codex/config.toml`.
