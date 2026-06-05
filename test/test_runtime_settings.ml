@@ -122,6 +122,25 @@ let test_save_reaps_stale_atomic_write_temps () =
       Alcotest.(check bool) "stale temp removed"
         false (Sys.file_exists (stale_temp_path home)))
 
+let test_save_refuses_read_only_preflight () =
+  with_tmp_home (fun home ->
+    let settings = Discord_agents.Runtime_settings.load () in
+    settings.default_agent <- Discord_agents.Config.Codex;
+    let write_attempted = ref false in
+    let write_file _path _content =
+      write_attempted := true;
+      failwith "write should not be attempted"
+    in
+    match Discord_agents.Runtime_settings.save_with
+            ~preflight_write:(fun _ -> Error "disk is read-only")
+            ~write_file settings with
+    | Ok () -> Alcotest.fail "save_with unexpectedly succeeded"
+    | Error err ->
+      Alcotest.(check string) "preflight error" "disk is read-only" err;
+      Alcotest.(check bool) "write skipped" false !write_attempted;
+      Alcotest.(check bool) "primary absent"
+        false (Sys.file_exists (settings_path home)))
+
 let test_xdg_config_home_without_home () =
   let xdg_root = make_tmp_dir "discord_agents_xdg_" in
   Fun.protect
@@ -179,6 +198,8 @@ let () =
         test_save_with_visible_but_unconfirmed_primary_updates_backup;
       Alcotest.test_case "save reaps stale atomic write temps" `Quick
         test_save_reaps_stale_atomic_write_temps;
+      Alcotest.test_case "save refuses read-only preflight" `Quick
+        test_save_refuses_read_only_preflight;
       Alcotest.test_case "xdg config home without home" `Quick
         test_xdg_config_home_without_home;
       Alcotest.test_case "xdg falls back to existing legacy home" `Quick

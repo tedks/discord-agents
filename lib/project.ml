@@ -265,3 +265,52 @@ let create_worktree project ~branch_name =
   | Unix.WEXITED 0 -> Ok worktree_path
   | _ -> Error (Printf.sprintf "failed to create worktree %s: %s"
     branch_name (Buffer.contents output))
+
+let run_git_capture project args =
+  let cmd =
+    "git -C "
+    ^ Filename.quote project.path
+    ^ " "
+    ^ String.concat " " (List.map Filename.quote args)
+    ^ " 2>&1"
+  in
+  let ic = Unix.open_process_in cmd in
+  let output = Buffer.create 256 in
+  (try
+     while true do
+       Buffer.add_string output (input_line ic);
+       Buffer.add_char output '\n'
+     done
+   with End_of_file -> ());
+  match Unix.close_process_in ic with
+  | Unix.WEXITED 0 -> Ok ()
+  | _ -> Error (Buffer.contents output)
+
+let remove_worktree project ~branch_name ~worktree_path =
+  let path_existed = Sys.file_exists worktree_path in
+  let worktree_result =
+    match run_git_capture project ["worktree"; "remove"; "--force"; worktree_path] with
+    | Ok () -> Ok ()
+    | Error err ->
+      (match run_git_capture project ["worktree"; "prune"] with
+       | Ok () when not path_existed -> Ok ()
+       | Ok () -> Error err
+       | Error prune_err ->
+         Error (Printf.sprintf "%s; git worktree prune failed: %s"
+           err prune_err))
+  in
+  let branch_result =
+    run_git_capture project ["branch"; "-D"; branch_name]
+  in
+  match worktree_result, branch_result with
+  | Ok (), Ok () -> Ok ()
+  | Error worktree_err, Ok () ->
+    Error (Printf.sprintf "failed to remove worktree %s: %s"
+      worktree_path worktree_err)
+  | Ok (), Error branch_err ->
+    Error (Printf.sprintf "failed to delete branch %s: %s"
+      branch_name branch_err)
+  | Error worktree_err, Error branch_err ->
+    Error (Printf.sprintf
+      "failed to remove worktree %s: %s; failed to delete branch %s: %s"
+      worktree_path worktree_err branch_name branch_err)

@@ -105,11 +105,15 @@ let load () =
 
 let save config =
   let path = config_path () in
-  Resource.ensure_parent_dir path;
-  let json = yojson_of_t config in
-  (* Write with restricted permissions — file contains discord token *)
-  let fd = Unix.openfile path [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o600 in
-  let oc = Unix.out_channel_of_descr fd in
-  output_string oc (Yojson.Safe.pretty_to_string json);
-  output_char oc '\n';
-  close_out oc
+  match Disk_health.preflight_write path with
+  | Error err -> failwith err
+  | Ok () ->
+    let json = yojson_of_t config in
+    try
+      Resource.with_flock (path ^ ".lock") (fun () ->
+        Resource.cleanup_atomic_write_temps path;
+        Resource.write_file_atomic path (Yojson.Safe.pretty_to_string json));
+      Disk_health.note_write_success path
+    with exn ->
+      Disk_health.note_write_failure path exn;
+      raise exn

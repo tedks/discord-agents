@@ -1,6 +1,7 @@
 (** Discord Agents — top-level library module. *)
 
 module Resource = Resource
+module Disk_health = Disk_health
 module Config = Config
 module Runtime_settings = Runtime_settings
 module Project = Project

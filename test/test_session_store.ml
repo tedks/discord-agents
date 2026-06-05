@@ -133,6 +133,34 @@ let test_save_with_visible_but_unconfirmed_primary_updates_backup () =
     Alcotest.(check bool) "backup captured updated stop_requested"
       true recovered.Discord_agents.Session_store.stop_requested)
 
+let test_save_refuses_read_only_preflight () =
+  with_tmp_home (fun home ->
+    let store = Discord_agents.Session_store.create () in
+    let session = make_session () in
+    store.Discord_agents.Session_store.sessions <-
+      Discord_agents.Session_store.SessionMap.add
+        "control" session store.sessions;
+    let write_attempted = ref false in
+    let write_file _path _content =
+      write_attempted := true;
+      failwith "write should not be attempted"
+    in
+    (match
+       try
+         Discord_agents.Session_store.save_with
+           ~preflight_write:(fun _ -> Error "disk is read-only")
+           ~write_file store;
+         None
+       with Failure msg -> Some msg
+     with
+     | Some err ->
+       Alcotest.(check string) "preflight error" "disk is read-only" err
+     | None ->
+       Alcotest.fail "save_with unexpectedly succeeded");
+    Alcotest.(check bool) "write skipped" false !write_attempted;
+    Alcotest.(check bool) "primary absent"
+      false (Sys.file_exists (sessions_path home)))
+
 let () =
   Alcotest.run "session_store" [
     ("persistence", [
@@ -146,5 +174,7 @@ let () =
         test_load_uses_backup_when_primary_missing;
       Alcotest.test_case "visible but unconfirmed primary still updates backup" `Quick
         test_save_with_visible_but_unconfirmed_primary_updates_backup;
+      Alcotest.test_case "save refuses read-only preflight" `Quick
+        test_save_refuses_read_only_preflight;
     ]);
   ]

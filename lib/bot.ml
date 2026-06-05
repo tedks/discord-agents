@@ -74,6 +74,7 @@ type t = {
 let projects t = t.project_state.projects
 let channels t = t.project_state.channels
 let default_agent t = t.settings.default_agent
+let new_session_block_message () = Disk_health.new_session_block_message ()
 let pending_default_rotation kind =
   Session_store.{ kind; origin = Default_rotation }
 let pending_session_override kind =
@@ -948,6 +949,58 @@ let create_explicit_channel_session t ~channel_id ~agent_kind =
           ~agent_kind ~session_override_kind:(Some agent_kind);
         true
 
+let cleanup_orphan_thread t ~thread_id ~context =
+  match Discord_rest.delete_channel t.rest ~channel_id:thread_id () with
+  | Ok _ -> ()
+  | Error err ->
+    Logs.warn (fun m ->
+      m "bot: failed to clean up orphan thread %s after %s: %s"
+        thread_id context err)
+
+let cleanup_orphan_worktree ~project ~branch_info ~working_dir ~context =
+  match branch_info with
+  | None -> ()
+  | Some branch_name ->
+    (match Project.remove_worktree project ~branch_name
+             ~worktree_path:working_dir with
+     | Ok () -> ()
+     | Error err ->
+       Logs.warn (fun m ->
+         m "bot: failed to clean up orphan worktree %s after %s: %s"
+           working_dir context err))
+
+let remove_persisted_session_for_cleanup t ~thread_id ~context =
+  match Session_store.find_opt t.sessions ~thread_id with
+  | None -> true
+  | Some _ ->
+    try
+      Session_store.remove t.sessions ~thread_id;
+      true
+    with exn ->
+      Logs.warn (fun m ->
+        m "bot: failed to remove persisted session %s during %s cleanup: %s"
+          thread_id context (Printexc.to_string exn));
+      false
+
+let cleanup_start_artifacts t ~project ~branch_info ~working_dir
+    ~thread_id ~session_persisted ~context =
+  let session_removed =
+    (not session_persisted)
+    || remove_persisted_session_for_cleanup t ~thread_id ~context
+  in
+  if session_removed then begin
+    cleanup_orphan_thread t ~thread_id ~context;
+    cleanup_orphan_worktree ~project ~branch_info ~working_dir ~context
+  end
+
+let cleanup_thread_session_artifacts t ~thread_id ~session_persisted ~context =
+  let session_removed =
+    (not session_persisted)
+    || remove_persisted_session_for_cleanup t ~thread_id ~context
+  in
+  if session_removed then
+    cleanup_orphan_thread t ~thread_id ~context
+
 (** Handle a parsed command. *)
 let handle_command t msg cmd =
   let channel_id = msg.Discord_types.channel_id in
@@ -984,9 +1037,13 @@ let handle_command t msg cmd =
         ~resume_hint:"!resume <session_id_prefix>" entries))
   | Command.Start_agent { project; kind } ->
     let kind = Option.value kind ~default:(default_agent t) in
-    let proj = Command.find_project_fuzzy (projects t) project in
-    (match proj with
+    (match new_session_block_message () with
+     | Some msg ->
+       reply msg
      | None ->
+       let proj = Command.find_project_fuzzy (projects t) project in
+       match proj with
+       | None ->
        let q = String.lowercase_ascii project in
        let suggestions = List.filter (fun (p : Project.t) ->
          let name = String.lowercase_ascii p.name in
@@ -1005,7 +1062,7 @@ let handle_command t msg cmd =
         | _ -> reply (Printf.sprintf "No unique match for `%s`. Did you mean:\n%s" project_safe
             (String.concat "\n" (List.map (fun (p : Project.t) ->
               Printf.sprintf "- `!start %s`" p.name) suggestions))))
-     | Some p ->
+       | Some p ->
        let kind_str = Config.string_of_agent_kind kind in
        let branch_name = Printf.sprintf "agent/%s-%s"
          kind_str (String.sub (Resource.generate_uuid ()) 0 8) in
@@ -1028,20 +1085,33 @@ let handle_command t msg cmd =
          match Discord_rest.create_thread_no_message t.rest
                  ~channel_id:thread_parent
                  ~name:(Printf.sprintf "%s / %s" kind_str p.name) () with
-         | Error e -> reply (Printf.sprintf "Failed to create thread: %s" e)
+         | Error e ->
+           cleanup_orphan_worktree ~project:p ~branch_info ~working_dir
+             ~context:"thread creation failure";
+           reply (Printf.sprintf "Failed to create thread: %s" e)
          | Ok thread_ch ->
            let session = Session_store.make_session
              ~project_name:p.name ~working_dir ~agent_kind:kind
              ~session_id:(Resource.generate_uuid ())
              ~thread_id:thread_ch.Discord_types.id
              ~system_prompt:None ~initial_prompt:None () in
-           Session_store.add t.sessions ~thread_id:thread_ch.id session;
-           let branch_str = match branch_info with
-             | Some b -> Printf.sprintf "\nBranch: `%s`" b | None -> "" in
-           ignore (Discord_rest.create_message t.rest ~channel_id:thread_ch.id
-             ~content:(Printf.sprintf
-               "**%s** session started for **%s**%s\nWorking in: `%s`\nSend a message to interact."
-               kind_str p.name branch_str working_dir) ())
+           let session_persisted = ref false in
+           (try
+              Session_store.add t.sessions ~thread_id:thread_ch.id session;
+              session_persisted := true;
+              let branch_str = match branch_info with
+                | Some b -> Printf.sprintf "\nBranch: `%s`" b | None -> "" in
+              ignore (Discord_rest.create_message t.rest ~channel_id:thread_ch.id
+                ~content:(Printf.sprintf
+                  "**%s** session started for **%s**%s\nWorking in: `%s`\nSend a message to interact."
+                  kind_str p.name branch_str working_dir) ())
+            with exn ->
+              cleanup_start_artifacts t ~project:p ~branch_info ~working_dir
+                ~thread_id:thread_ch.id
+                ~session_persisted:!session_persisted
+                ~context:"session startup failure";
+              reply (Printf.sprintf "Failed to persist session: %s"
+                (Printexc.to_string exn)))
        end)
   | Command.List_codex_sessions ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
@@ -1065,6 +1135,10 @@ let handle_command t msg cmd =
         ~resume_hint:"!resume gemini <session_id_prefix>" entries))
   | Command.Resume_session { session_id; kind } ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
+      match new_session_block_message () with
+      | Some msg ->
+        reply msg
+      | None ->
       (* Locate the session in the requested store, or try the
          current default first if [kind] is unspecified. *)
       let try_claude () =
@@ -1134,11 +1208,20 @@ let handle_command t msg cmd =
             ~message_count:1
             ~thread_id:thread_ch.Discord_types.id
             ~system_prompt:None ~initial_prompt:None () in
-          Session_store.add t.sessions ~thread_id:thread_ch.id session;
-          ignore (Discord_rest.create_message t.rest ~channel_id:thread_ch.id
-            ~content:(Printf.sprintf
-              "**Resumed** %s session `%s`\nWorking in: `%s`\nSend a message to continue."
-              kind_title sid_short working_dir) ())))
+          let session_persisted = ref false in
+          (try
+             Session_store.add t.sessions ~thread_id:thread_ch.id session;
+             session_persisted := true;
+             ignore (Discord_rest.create_message t.rest ~channel_id:thread_ch.id
+               ~content:(Printf.sprintf
+                 "**Resumed** %s session `%s`\nWorking in: `%s`\nSend a message to continue."
+                 kind_title sid_short working_dir) ())
+           with exn ->
+             cleanup_thread_session_artifacts t ~thread_id:thread_ch.id
+               ~session_persisted:!session_persisted
+               ~context:"resume startup failure";
+             reply (Printf.sprintf "Failed to persist resumed session: %s"
+               (Printexc.to_string exn)))))
   | Command.Stop_session { thread_id } ->
     (match stop_session t ~thread_id with
      | Session_not_found ->
@@ -1276,11 +1359,16 @@ let handle_command t msg cmd =
           reply (Printf.sprintf
             "Failed to start a fresh `%s` session for this channel: %s"
             kind_str err))
-     | None when create_explicit_channel_session t ~channel_id ~agent_kind:kind ->
-       reply (Printf.sprintf "Started a fresh `%s` session for this channel."
-         kind_str)
      | None ->
-       reply "No session exists in this channel. Use `!start` or `!resume`.")
+       (match new_session_block_message () with
+        | Some msg ->
+          reply msg
+        | None when create_explicit_channel_session t ~channel_id ~agent_kind:kind ->
+          reply (Printf.sprintf "Started a fresh `%s` session for this channel."
+            kind_str)
+        | None ->
+          reply "No session exists in this channel. Use `!start` or `!resume`."
+       ))
   | Command.Cleanup_channels ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       match Channel_manager.cleanup ~rest:t.rest
@@ -1329,6 +1417,7 @@ let handle_command t msg cmd =
   | Command.Status ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       let status_lines = Eio_unix.run_in_systhread (fun () ->
+        ignore (Disk_health.preflight_state_mutation ());
         let pid = Unix.getpid () in
         let uptime_sec = int_of_float (Unix.gettimeofday () -. t.started_at) in
         let hours = uptime_sec / 3600 in
@@ -1407,6 +1496,7 @@ let handle_command t msg cmd =
           Printf.sprintf "**%s** (pid %d, up %s)" (Build_info.version_string ()) pid uptime_str;
           Printf.sprintf "Default agent: %s"
             (Config.string_of_agent_kind (default_agent t));
+          Disk_health.status_summary ();
           Printf.sprintf "Sessions: %d (%d processing)"
             (Session_store.count t.sessions)
             (List.length (List.filter (fun (_, (s : Session_store.session)) ->
@@ -1738,12 +1828,20 @@ let fork_initial_prompt_run t ~session ~msg =
     Creates a persistent session using the current default agent. *)
 let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prompt =
   match Session_store.find_opt t.sessions ~thread_id:channel_id with
-  | Some _ -> ()
+  | Some _ -> Ok ()
   | None ->
-    create_persistent_channel_session t ~channel_id ~project_name
-      ~working_dir ~system_prompt ~agent_kind:(default_agent t)
-      ~session_override_kind:None;
-    Logs.info (fun m -> m "bot: auto-created session for %s" project_name)
+    match new_session_block_message () with
+    | Some msg -> Error msg
+    | None ->
+      (try
+         create_persistent_channel_session t ~channel_id ~project_name
+           ~working_dir ~system_prompt ~agent_kind:(default_agent t)
+           ~session_override_kind:None;
+         Logs.info (fun m -> m "bot: auto-created session for %s" project_name);
+         Ok ()
+       with exn ->
+         Error (Printf.sprintf "Failed to persist session: %s"
+           (Printexc.to_string exn)))
 
 let handle_command_safely t msg cmd =
   try
@@ -1787,10 +1885,13 @@ let handle_message t (msg : Discord_types.message) =
     let project_for_channel =
       Channel_manager.project_for_channel (channels t) ~channel_id:msg.channel_id in
     if is_control then begin
-      ensure_channel_session t ~channel_id:msg.channel_id
-        ~project_name:"control" ~working_dir:(Sys.getcwd ())
-        ~system_prompt:(Some (control_system_prompt (projects t)));
-      handle_thread_message t msg ()
+      match ensure_channel_session t ~channel_id:msg.channel_id
+              ~project_name:"control" ~working_dir:(Sys.getcwd ())
+              ~system_prompt:(Some (control_system_prompt (projects t))) with
+      | Ok () -> handle_thread_message t msg ()
+      | Error err ->
+        ignore (Discord_rest.create_message t.rest
+          ~channel_id:msg.channel_id ~content:err ())
     end else match project_for_channel with
     | Some proj_name ->
       (* Message in a project channel — persistent session (like control channel).
@@ -1799,81 +1900,97 @@ let handle_message t (msg : Discord_types.message) =
       (match proj with
        | Some p ->
          let wd = match working_dir_of_project p with Ok d -> d | Error _ -> p.path in
-         ensure_channel_session t ~channel_id:msg.channel_id
-           ~project_name:p.name ~working_dir:wd
-           ~system_prompt:(Some (project_system_prompt p));
-         Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
-           ~project_name:p.name (channels t);
-         handle_thread_message t msg ()
+         (match ensure_channel_session t ~channel_id:msg.channel_id
+                  ~project_name:p.name ~working_dir:wd
+                  ~system_prompt:(Some (project_system_prompt p)) with
+          | Ok () ->
+            Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
+              ~project_name:p.name (channels t);
+            handle_thread_message t msg ()
+          | Error err ->
+            ignore (Discord_rest.create_message t.rest
+              ~channel_id:msg.channel_id ~content:err ()))
        | None -> ())
     | None ->
       (* Check if this is a thread under a project channel.
          Since the control API creates sessions directly in bot memory,
          no disk reload is needed — sessions are always authoritative. *)
-      (match Session_store.find_opt t.sessions ~thread_id:msg.channel_id with
-       | Some _ -> handle_thread_message t msg ()
-       | None ->
-         (* Look up the channel to find its parent *)
-         (match Discord_rest.get_channel t.rest ~channel_id:msg.channel_id () with
-          | Ok ch ->
-            let parent_project = match ch.Discord_types.parent_id with
-              | Some pid -> Channel_manager.project_for_channel (channels t) ~channel_id:pid
-              | None -> None
-            in
-            (match parent_project with
-             | Some proj_name ->
-               (* Thread under a project channel with no session —
-                  auto-create one (e.g. manually created in Discord).
+      match Session_store.find_opt t.sessions ~thread_id:msg.channel_id with
+      | Some _ -> handle_thread_message t msg ()
+      | None ->
+        (* Look up the channel to find its parent *)
+        (match Discord_rest.get_channel t.rest ~channel_id:msg.channel_id () with
+         | Ok ch ->
+           let parent_project =
+             match ch.Discord_types.parent_id with
+             | Some pid ->
+               Channel_manager.project_for_channel (channels t) ~channel_id:pid
+             | None -> None
+           in
+           (match parent_project with
+            | Some proj_name ->
+              (* Thread under a project channel with no session —
+                 auto-create one (e.g. manually created in Discord).
 
-                  Race-safety: defer the auto-create by 2s and re-
-                  check the session store, in case
-                  [control_api.handle_start_session] is in the middle
-                  of an HTTP roundtrip to create a session for this
-                  thread. Without the wait, a user typing into a
-                  freshly-bot-created thread would race the
-                  start_session HTTP and get a default-worktree
-                  session here instead of the agent-specific
-                  worktree the MCP caller asked for. The cost is a
-                  one-time 2s delay for messages in manually-
-                  created threads (rare in this bot's usage). *)
-               let proj = List.find_opt (fun (p : Project.t) ->
-                 p.name = proj_name) (projects t) in
-               (match proj with
-                | Some p ->
-                  let wd = match working_dir_of_project p with
-                    | Ok d -> d | Error _ -> p.path in
-                  Eio.Fiber.fork ~sw:t.sw (fun () ->
-                    Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
-                    (* If the bot started draining during the wait,
-                       don't start fresh work — the restart's drain
-                       phase may have already moved on past its
-                       processing-flag wait, and a session born now
-                       could orphan its child at handoff timeout. *)
-                    if t.draining then
-                      ignore (Discord_rest.create_message t.rest
-                        ~channel_id:msg.channel_id
-                        ~content:"Bot is restarting. Try again \
-                                  shortly." ())
-                    else
-                      match Session_store.find_opt t.sessions
-                              ~thread_id:msg.channel_id with
-                      | Some _ ->
-                        (* start_session won the race; route normally
-                           (handle_thread_message queues if processing). *)
-                        handle_thread_message t msg ~channel_info:ch ()
-                      | None ->
-                        ensure_channel_session t ~channel_id:msg.channel_id
-                          ~project_name:p.name ~working_dir:wd
-                          ~system_prompt:None;
-                        handle_thread_message t msg ~channel_info:ch ())
-                | None -> handle_thread_message t msg ())
-             | None -> handle_thread_message t msg ())
-          | Error e ->
-            Logs.warn (fun m -> m "bot: channel lookup failed for %s: %s"
-              msg.channel_id e);
-            ignore (Discord_rest.create_message t.rest
-              ~channel_id:msg.channel_id
-              ~content:"Could not set up a session for this thread (channel lookup failed). Try again or use `!start`." ())))
+                 Race-safety: defer the auto-create by 2s and re-
+                 check the session store, in case
+                 [control_api.handle_start_session] is in the middle
+                 of an HTTP roundtrip to create a session for this
+                 thread. Without the wait, a user typing into a
+                 freshly-bot-created thread would race the
+                 start_session HTTP and get a default-worktree
+                 session here instead of the agent-specific
+                 worktree the MCP caller asked for. The cost is a
+                 one-time 2s delay for messages in manually-
+                 created threads (rare in this bot's usage). *)
+              let proj =
+                List.find_opt (fun (p : Project.t) -> p.name = proj_name)
+                  (projects t)
+              in
+              (match proj with
+               | Some p ->
+                 let wd =
+                   match working_dir_of_project p with
+                   | Ok d -> d
+                   | Error _ -> p.path
+                 in
+                 Eio.Fiber.fork ~sw:t.sw (fun () ->
+                   Eio.Time.sleep (Eio.Stdenv.clock t.env) 2.0;
+                   (* If the bot started draining during the wait,
+                      don't start fresh work — the restart's drain
+                      phase may have already moved on past its
+                      processing-flag wait, and a session born now
+                      could orphan its child at handoff timeout. *)
+                   if t.draining then
+                     ignore (Discord_rest.create_message t.rest
+                       ~channel_id:msg.channel_id
+                       ~content:"Bot is restarting. Try again \
+                                 shortly." ())
+                   else
+                     match Session_store.find_opt t.sessions
+                             ~thread_id:msg.channel_id with
+                     | Some _ ->
+                       (* start_session won the race; route normally
+                          (handle_thread_message queues if processing). *)
+                       handle_thread_message t msg ~channel_info:ch ()
+                     | None ->
+                       (match ensure_channel_session t
+                                ~channel_id:msg.channel_id
+                                ~project_name:p.name ~working_dir:wd
+                                ~system_prompt:None with
+                        | Ok () ->
+                          handle_thread_message t msg ~channel_info:ch ()
+                        | Error err ->
+                          ignore (Discord_rest.create_message t.rest
+                            ~channel_id:msg.channel_id ~content:err ())))
+               | None -> handle_thread_message t msg ())
+            | None -> handle_thread_message t msg ())
+         | Error e ->
+           Logs.warn (fun m -> m "bot: channel lookup failed for %s: %s"
+             msg.channel_id e);
+           ignore (Discord_rest.create_message t.rest
+             ~channel_id:msg.channel_id
+             ~content:"Could not set up a session for this thread (channel lookup failed). Try again or use `!start`." ()))
   end
 
 let create ~sw ~(env : Eio_unix.Stdenv.base) config =
