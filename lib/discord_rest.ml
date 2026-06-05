@@ -13,15 +13,25 @@ let api_base = "https://discord.com/api/v10"
 
 type t = {
   token : string;
-  client : Cohttp_eio.Client.t;
+  call : http_call;
   sw : Eio.Switch.t;
   clock : Eio.Time.Mono.ty Eio.Resource.t;
   rest_state : health_state;
 }
 
+and http_call =
+  sw:Eio.Switch.t ->
+  headers:Http.Header.t ->
+  ?body:Cohttp_eio.Body.t ->
+  Http.Method.t ->
+  Uri.t ->
+  Http.Response.t * Cohttp_eio.Body.t
+
 and health_state = {
   mutable last_error : string option;
   mutable consecutive_failures : int;
+  mutable last_transport_error : string option;
+  mutable consecutive_transport_failures : int;
   mutable backoff_until : Mtime.t option;
 }
 
@@ -40,6 +50,7 @@ let max_rate_limit_retries = 1
 let max_transient_attempts = 4
 let base_transport_backoff_s = 0.5
 let max_transport_backoff_s = 8.0
+let max_retry_after_s = 300.0
 let max_backoff_jitter_s = 0.25
 let max_recorded_failures = 32
 let default_retry_mode = Retry_transient max_transient_attempts
@@ -101,7 +112,21 @@ let transport_backoff_seconds failure_count =
   min max_transport_backoff_s
     (base_transport_backoff_s *. (2. ** float_of_int exponent))
 
+let finite_float f =
+  match classify_float f with
+  | FP_nan | FP_infinite -> false
+  | FP_normal | FP_subnormal | FP_zero -> true
+
+let clamp_retry_after_seconds delay =
+  if finite_float delay then Some (min max_retry_after_s (max 0.0 delay))
+  else None
+
 let next_backoff_until ~now ~current_until ~delay =
+  let delay =
+    match clamp_retry_after_seconds delay with
+    | Some delay -> delay
+    | None -> 0.0
+  in
   let delay_ns =
     Int64.of_float (max 0.0 delay *. 1e9)
   in
@@ -119,6 +144,8 @@ let create_health_state () =
   {
     last_error = None;
     consecutive_failures = 0;
+    last_transport_error = None;
+    consecutive_transport_failures = 0;
     backoff_until = None;
   }
 
@@ -138,6 +165,15 @@ let health_last_error state =
 let health_consecutive_failures state =
   state.consecutive_failures
 
+let health_transport_degraded state =
+  state.consecutive_transport_failures > 0
+
+let health_last_transport_error state =
+  state.last_transport_error
+
+let health_consecutive_transport_failures state =
+  state.consecutive_transport_failures
+
 let effective_backoff_delay_s ~now state =
   health_retry_delay_s ~now state
 
@@ -151,6 +187,28 @@ let note_failure_state state ~now ~summary ~delay =
     Some (next_backoff_until ~now ~current_until:state.backoff_until ~delay);
   effective_backoff_delay_s ~now state
 
+let note_failure_without_backoff_state state ~now ~summary =
+  let failures =
+    min max_recorded_failures (state.consecutive_failures + 1)
+  in
+  state.last_error <- Some summary;
+  state.consecutive_failures <- failures;
+  effective_backoff_delay_s ~now state
+
+let note_transport_failure_state state ~now ~summary ~delay =
+  let delay = note_failure_state state ~now ~summary ~delay in
+  state.last_transport_error <- Some summary;
+  state.consecutive_transport_failures <-
+    min max_recorded_failures (state.consecutive_transport_failures + 1);
+  delay
+
+let note_transport_failure_without_backoff_state state ~now ~summary =
+  let delay = note_failure_without_backoff_state state ~now ~summary in
+  state.last_transport_error <- Some summary;
+  state.consecutive_transport_failures <-
+    min max_recorded_failures (state.consecutive_transport_failures + 1);
+  delay
+
 let note_rate_limit_state state ~now ~summary ~delay =
   state.last_error <- Some summary;
   state.consecutive_failures <-
@@ -163,7 +221,15 @@ let note_recovery_state state =
   let failures = state.consecutive_failures in
   state.last_error <- None;
   state.consecutive_failures <- 0;
+  state.last_transport_error <- None;
+  state.consecutive_transport_failures <- 0;
   state.backoff_until <- None;
+  failures
+
+let note_transport_response_state state =
+  let failures = state.consecutive_transport_failures in
+  state.last_transport_error <- None;
+  state.consecutive_transport_failures <- 0;
   failures
 
 (* REST state closures must stay effect-free: no sleeps, logging, I/O, or
@@ -183,25 +249,40 @@ let transport_retry_delay_s t =
 
 let transport_degraded t =
   with_rest_state t (fun state ->
-    health_degraded state)
+    health_transport_degraded state)
 
 let last_transport_error t =
   with_rest_state t (fun state ->
-    health_last_error state)
+    health_last_transport_error state)
 
 let consecutive_transport_failures t =
   with_rest_state t (fun state ->
-    health_consecutive_failures state)
+    health_consecutive_transport_failures state)
 
 let rest_retry_delay_s = transport_retry_delay_s
-let rest_degraded = transport_degraded
-let last_rest_error = last_transport_error
-let consecutive_rest_failures = consecutive_transport_failures
+let rest_degraded t =
+  with_rest_state t (fun state ->
+    health_degraded state)
+let last_rest_error t =
+  with_rest_state t (fun state ->
+    health_last_error state)
+let consecutive_rest_failures t =
+  with_rest_state t (fun state ->
+    health_consecutive_failures state)
 
-let note_transport_recovery t =
+let note_rest_recovery t =
   let failures =
     with_rest_state t (fun state ->
       note_recovery_state state)
+  in
+  if failures > 0 then
+    Logs.info (fun m -> m "REST recovered after %d failure(s)"
+      failures)
+
+let note_transport_response t =
+  let failures =
+    with_rest_state t (fun state ->
+      note_transport_response_state state)
   in
   if failures > 0 then
     Logs.info (fun m -> m "REST transport recovered after %d failure(s)"
@@ -222,7 +303,7 @@ let transport_failure_summary ~host exn =
 
 let parse_retry_after_seconds raw =
   match float_of_string_opt (String.trim raw) with
-  | Some delay -> Some (max 0.0 delay)
+  | Some delay -> clamp_retry_after_seconds delay
   | None -> None
 
 let retry_after_seconds_from_headers headers =
@@ -234,8 +315,8 @@ let retry_after_seconds_from_body body_str =
   try
     let json = Yojson.Safe.from_string body_str in
     match Yojson.Safe.Util.member "retry_after" json with
-    | `Float f -> Some (max 0.0 f)
-    | `Int i -> Some (max 0.0 (float_of_int i))
+    | `Float f -> clamp_retry_after_seconds f
+    | `Int i -> clamp_retry_after_seconds (float_of_int i)
     | _ -> None
   with _ -> None
 
@@ -250,16 +331,22 @@ let retry_after_seconds ?headers body_str =
 let note_transport_failure t ~host exn =
   let (kind, summary) = transport_failure_summary ~host exn in
   let now = now_s t in
-  let delay =
-    with_rest_state t (fun state ->
-      let delay =
-        transport_backoff_seconds (state.consecutive_failures + 1)
-      in
-      note_failure_state state
-        ~now ~summary ~delay)
-  in
-  if retryable_transport_kind kind then (summary, Some delay)
-  else (summary, None)
+  if retryable_transport_kind kind then begin
+    let delay =
+      with_rest_state t (fun state ->
+        let delay =
+          transport_backoff_seconds (state.consecutive_failures + 1)
+        in
+        note_transport_failure_state state
+          ~now ~summary ~delay)
+    in
+    (summary, Some delay)
+  end else begin
+    ignore (with_rest_state t (fun state ->
+      note_transport_failure_without_backoff_state state
+        ~now ~summary));
+    (summary, None)
+  end
 
 let note_http_failure t ~host ~code ~body ?retry_after () =
   let body =
@@ -279,6 +366,23 @@ let note_http_failure t ~host ~code ~body ?retry_after () =
       in
       note_failure_state state
         ~now ~summary ~delay)
+  in
+  (summary, delay)
+
+let note_http_client_failure t ~host ~code ~body =
+  let body =
+    if String.length body <= 500 then body
+    else String.sub body 0 500 ^ "... (truncated)"
+  in
+  let summary =
+    Printf.sprintf "host=%s kind=http_%d error=%s"
+      host code body
+  in
+  let now = now_s t in
+  let delay =
+    with_rest_state t (fun state ->
+      note_failure_without_backoff_state state
+        ~now ~summary)
   in
   (summary, delay)
 
@@ -313,7 +417,10 @@ let rec wait_for_transport_backoff t =
   end
 
 let response_clears_rest_health code =
-  code >= 200 && code < 300
+  (code >= 200 && code < 300) || code = 404
+
+let response_marks_rest_failure code =
+  code >= 400 && code < 500 && code <> 404 && code <> 429
 
 let create ~sw ~(env : Eio_unix.Stdenv.base) ~token =
   Random.self_init ();
@@ -338,7 +445,10 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) ~token =
   let net = Eio.Stdenv.net env in
   let client = Cohttp_eio.Client.make ~https:(Some https) net in
   let clock = Eio.Stdenv.mono_clock env in
-  { token; client; sw; clock;
+  let call ~sw ~headers ?body meth uri =
+    Cohttp_eio.Client.call client ~sw ~headers ?body meth uri
+  in
+  { token; call; sw; clock;
     rest_state = create_health_state (); }
 
 let make_headers t =
@@ -450,7 +560,7 @@ let request ?(retry_mode = No_retry) t ~meth ~path ?body () =
   let meth_str = Http.Method.to_string meth in
   let do_call () =
     let cohttp_body = Option.map Cohttp_eio.Body.of_string body_str in
-    Cohttp_eio.Client.call t.client ~sw:t.sw ~headers ?body:cohttp_body meth uri
+    t.call ~sw:t.sw ~headers ?body:cohttp_body meth uri
   in
   let log_non_2xx code body =
     let body = truncate_for_log body in
@@ -508,6 +618,7 @@ let request ?(retry_mode = No_retry) t ~meth ~path ?body () =
       let headers = Http.Response.headers resp in
       let body_str = read_body resp_body in
       if code = 429 && rate_limit_retries < max_rate_limit_retries then begin
+        note_transport_response t;
         let retry_after =
           Option.value (retry_after_seconds ~headers body_str) ~default:5.0
         in
@@ -519,12 +630,14 @@ let request ?(retry_mode = No_retry) t ~meth ~path ?body () =
             meth_str path delay);
         loop attempt (rate_limit_retries + 1)
       end else if code = 429 then begin
+        note_transport_response t;
         let retry_after =
           Option.value (retry_after_seconds ~headers body_str) ~default:5.0
         in
         ignore (note_rate_limit t ~host ~retry_after ~body:body_str);
         handle_response code body_str
       end else if code >= 500 && code < 600 then begin
+        note_transport_response t;
         let retry_after = retry_after_seconds ~headers body_str in
         let (_summary, default_delay) =
           note_http_failure t ~host ~code ~body:body_str ?retry_after ()
@@ -537,11 +650,17 @@ let request ?(retry_mode = No_retry) t ~meth ~path ?body () =
           loop (attempt + 1) rate_limit_retries
         end else
           handle_response code body_str
+      end else if response_marks_rest_failure code then begin
+        note_transport_response t;
+        ignore (note_http_client_failure t ~host ~code ~body:body_str);
+        handle_response code body_str
       end else if response_clears_rest_health code then begin
-        note_transport_recovery t;
+        note_rest_recovery t;
         handle_response code body_str
-      end else
+      end else begin
+        note_transport_response t;
         handle_response code body_str
+      end
     with exn ->
       raise_if_cancelled exn;
       let (summary, delay_opt) = note_transport_failure t ~host exn in
@@ -811,7 +930,7 @@ let download_url t ~url () =
   let rec loop attempt =
     try
       let (resp, body) =
-        Cohttp_eio.Client.call t.client ~sw:t.sw ~headers `GET uri in
+        t.call ~sw:t.sw ~headers `GET uri in
       let status = Http.Response.status resp in
       let code = Http.Status.to_int status in
       let resp_headers = Http.Response.headers resp in
