@@ -18,6 +18,9 @@ val category_id : t -> string option
 (** Set the category ID. Used during initial setup. *)
 val set_category_id : t -> string option -> unit
 
+(** Record or update a known project-channel mapping. *)
+val add : t -> project_name:string -> channel_id:string -> unit
+
 (** Find a project's channel ID by project name. *)
 val find : t -> project_name:string -> string option
 

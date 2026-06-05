@@ -75,6 +75,11 @@ let test_load_uses_backup_when_primary_corrupt () =
     let oc = open_out primary in
     output_string oc "{ definitely not json";
     close_out oc;
+    let backup_stat = Unix.stat (backup_path home) in
+    Unix.utimes
+      primary
+      backup_stat.Unix.st_atime
+      backup_stat.Unix.st_mtime;
     let reloaded = Discord_agents.Session_store.create () in
     let recovered = find_control_session reloaded in
     Alcotest.(check bool) "stop_requested recovered from backup"
@@ -133,6 +138,51 @@ let test_save_with_visible_but_unconfirmed_primary_updates_backup () =
     Alcotest.(check bool) "backup captured updated stop_requested"
       true recovered.Discord_agents.Session_store.stop_requested)
 
+let test_save_marks_primary_newer_when_backup_update_fails () =
+  with_tmp_home (fun home ->
+    let store = Discord_agents.Session_store.create () in
+    let session = make_session () in
+    Discord_agents.Session_store.add store ~thread_id:"control" session;
+    session.stop_requested <- true;
+    let write_file path content =
+      if String.equal path (backup_path home) then
+        failwith "backup write failed"
+      else
+        Discord_agents.Resource.write_file_atomic path content
+    in
+    Discord_agents.Session_store.save_with ~write_file store;
+    let primary_stat = Unix.stat (sessions_path home) in
+    let backup_stat = Unix.stat (backup_path home) in
+    Alcotest.(check bool) "primary stamped newer than stale backup"
+      true (primary_stat.Unix.st_mtime > backup_stat.Unix.st_mtime))
+
+let test_load_ignores_stale_backup_when_primary_is_newer_and_corrupt () =
+  with_tmp_home (fun home ->
+    let store = Discord_agents.Session_store.create () in
+    let session = make_session () in
+    Discord_agents.Session_store.add store ~thread_id:"control" session;
+    session.stop_requested <- true;
+    let write_file path content =
+      if String.equal path (backup_path home) then
+        failwith "backup write failed"
+      else
+        Discord_agents.Resource.write_file_atomic path content
+    in
+    Discord_agents.Session_store.save_with ~write_file store;
+    let oc = open_out (sessions_path home) in
+    output_string oc "{ definitely not json";
+    close_out oc;
+    let backup_stat = Unix.stat (backup_path home) in
+    Unix.utimes
+      (sessions_path home)
+      backup_stat.Unix.st_atime
+      (backup_stat.Unix.st_mtime +. 10.0);
+    let reloaded = Discord_agents.Session_store.create () in
+    Alcotest.(check bool) "stale backup ignored"
+      true
+      (Option.is_none
+         (Discord_agents.Session_store.find_opt reloaded ~thread_id:"control")))
+
 let test_save_refuses_read_only_preflight () =
   with_tmp_home (fun home ->
     let store = Discord_agents.Session_store.create () in
@@ -174,6 +224,10 @@ let () =
         test_load_uses_backup_when_primary_missing;
       Alcotest.test_case "visible but unconfirmed primary still updates backup" `Quick
         test_save_with_visible_but_unconfirmed_primary_updates_backup;
+      Alcotest.test_case "failed backup leaves primary newer" `Quick
+        test_save_marks_primary_newer_when_backup_update_fails;
+      Alcotest.test_case "load ignores stale backup when primary is newer and corrupt" `Quick
+        test_load_ignores_stale_backup_when_primary_is_newer_and_corrupt;
       Alcotest.test_case "save refuses read-only preflight" `Quick
         test_save_refuses_read_only_preflight;
     ]);

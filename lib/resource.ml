@@ -79,6 +79,28 @@ let read_file path =
     really_input ic s 0 n;
     Bytes.to_string s)
 
+let file_mtime_opt path =
+  try Some (Unix.stat path).Unix.st_mtime
+  with _ -> None
+
+let next_write_epoch paths =
+  let baseline = Unix.gettimeofday () in
+  let latest =
+    List.fold_left (fun acc path ->
+      match file_mtime_opt path with
+      | Some mtime -> max acc mtime
+      | None -> acc) baseline paths
+  in
+  latest +. 1.0
+
+let stamp_file_mtime path mtime =
+  let atime =
+    match Unix.stat path with
+    | stat -> stat.Unix.st_atime
+    | exception _ -> mtime
+  in
+  Unix.utimes path atime mtime
+
 exception Durable_write_visible_but_unconfirmed of string * exn
 
 (** Retry fsync across EINTR so signals do not turn a completed write
