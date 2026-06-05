@@ -102,10 +102,8 @@ let rescue_agent_notice t =
     Some (Printf.sprintf
       "Disk pressure is active, so new top-level sessions currently use rescue agent `%s`."
       (Config.string_of_agent_kind kind))
-  | Some kind ->
-    Some (Printf.sprintf
-      "Rescue agent: `%s` (inactive until disk pressure)."
-      (Config.string_of_agent_kind kind))
+  | Some _ ->
+    Some "Inactive until disk pressure."
   | None ->
     None
 
@@ -122,6 +120,19 @@ let is_project_channel t ~(channel_id : Discord_types.channel_id) =
 
 let is_persistent_channel t ~(channel_id : Discord_types.channel_id) =
   is_control_channel t ~channel_id || is_project_channel t ~channel_id
+
+let refresh_session_disk_state (session : Session_store.session) =
+  ignore (Disk_health.preflight_write session.working_dir)
+
+let refresh_persistent_session_disk_state t =
+  Session_store.bindings t.sessions
+  |> List.iter (fun (thread_id, (session : Session_store.session)) ->
+    if is_persistent_channel t ~channel_id:thread_id then
+      refresh_session_disk_state session)
+
+let refresh_top_level_disk_state t =
+  refresh_disk_state ();
+  refresh_persistent_session_disk_state t
 
 type persistent_rotation = {
   reset_count : int;
@@ -594,7 +605,7 @@ let align_persistent_sessions_to_agent t ~current_channel_id ~new_agent =
   | Ok () -> align stale_sessions
 
 let set_default_agent t ?(current_channel_id=None) kind =
-  refresh_disk_state ();
+  refresh_top_level_disk_state t;
   match Runtime_settings.set_default_agent t.settings kind with
   | Error err ->
     Error (Printf.sprintf "Failed to persist the default agent setting: %s" err)
@@ -608,7 +619,7 @@ let set_default_agent t ?(current_channel_id=None) kind =
          (Config.string_of_agent_kind kind) err))
 
 let set_rescue_agent t ?(current_channel_id=None) kind =
-  refresh_disk_state ();
+  refresh_top_level_disk_state t;
   match Runtime_settings.set_rescue_agent t.settings kind with
   | Error err ->
     Error (Printf.sprintf "Failed to persist the rescue agent setting: %s" err)
@@ -642,6 +653,7 @@ let maybe_apply_pending_session_agent_change t (session : Session_store.session)
            kind is only the scheduling-time target and can become stale when
            disk pressure changes before a busy session finishes. *)
         refresh_disk_state ();
+        refresh_session_disk_state session;
         effective_top_level_agent t
     in
     if pending.origin = Session_store.Default_rotation
@@ -731,7 +743,7 @@ let reconcile_persisted_stop_requests t =
             session.thread_id err))
 
 let reconcile_persisted_pending_agent_changes t =
-  refresh_disk_state ();
+  refresh_top_level_disk_state t;
   Session_store.bindings t.sessions
   |> List.iter (fun (_thread_id, (session : Session_store.session)) ->
     maybe_apply_pending_session_agent_change t session);
@@ -1367,7 +1379,7 @@ let handle_command t msg cmd =
                  (if other_busy = 1 then "" else "s")
            in
            Printf.sprintf
-             " This channel is still running `%s`; it will reset to the new default after its queued work finishes.%s"
+             " This channel is still running `%s`; it will follow the effective top-level agent after its queued work finishes.%s"
              (Config.string_of_agent_kind current_kind) others
          | None, None ->
            if rotation.busy_count = 0 then ""
@@ -1391,7 +1403,6 @@ let handle_command t msg cmd =
        let base = Printf.sprintf "Rescue agent: `%s`."
          (Config.string_of_agent_kind kind) in
        reply (match rescue_agent_notice t with
-         | Some notice when rescue_mode_active t -> base ^ " " ^ notice
          | Some notice -> base ^ " " ^ notice
          | None -> base)
      | None ->
@@ -1548,6 +1559,7 @@ let handle_command t msg cmd =
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       let status_lines = Eio_unix.run_in_systhread (fun () ->
         ignore (Disk_health.preflight_state_mutation ());
+        refresh_persistent_session_disk_state t;
         let pid = Unix.getpid () in
         let uptime_sec = int_of_float (Unix.gettimeofday () -. t.started_at) in
         let hours = uptime_sec / 3600 in
@@ -1989,6 +2001,13 @@ let sync_top_level_agent_policy t =
     ~current_channel_id:None
     ~new_agent:(effective_top_level_agent t)
 
+let sync_top_level_agent_policy_best_effort t =
+  match sync_top_level_agent_policy t with
+  | Ok _ -> ()
+  | Error err ->
+    Logs.warn (fun m ->
+      m "bot: top-level policy sync skipped during message routing: %s" err)
+
 let handle_command_safely t msg cmd =
   try
     handle_command t msg cmd
@@ -2031,42 +2050,34 @@ let handle_message t (msg : Discord_types.message) =
     let project_for_channel =
       Channel_manager.project_for_channel (channels t) ~channel_id:msg.channel_id in
     if is_control then begin
-      match sync_top_level_agent_policy t with
-      | Error err ->
-        ignore (Discord_rest.create_message t.rest
-          ~channel_id:msg.channel_id ~content:err ())
-      | Ok _ ->
-        (match ensure_channel_session t ~channel_id:msg.channel_id
-                ~project_name:"control" ~working_dir:(Sys.getcwd ())
-                ~system_prompt:(Some (control_system_prompt (projects t))) with
-        | Ok () -> handle_thread_message t msg ()
-        | Error err ->
-          ignore (Discord_rest.create_message t.rest
-            ~channel_id:msg.channel_id ~content:err ()))
-    end else match project_for_channel with
-    | Some proj_name ->
-      (match sync_top_level_agent_policy t with
+      sync_top_level_agent_policy_best_effort t;
+      (match ensure_channel_session t ~channel_id:msg.channel_id
+              ~project_name:"control" ~working_dir:(Sys.getcwd ())
+              ~system_prompt:(Some (control_system_prompt (projects t))) with
+       | Ok () -> handle_thread_message t msg ()
        | Error err ->
          ignore (Discord_rest.create_message t.rest
-           ~channel_id:msg.channel_id ~content:err ())
-       | Ok _ ->
-         (* Message in a project channel — persistent session (like control channel).
-            The project Claude can create threads via MCP tools when needed. *)
-         let proj = List.find_opt (fun (p : Project.t) -> p.name = proj_name) (projects t) in
-         (match proj with
-          | Some p ->
-            let wd = match working_dir_of_project p with Ok d -> d | Error _ -> p.path in
-            (match ensure_channel_session t ~channel_id:msg.channel_id
-                     ~project_name:p.name ~working_dir:wd
-                     ~system_prompt:(Some (project_system_prompt p)) with
-             | Ok () ->
-               Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
-                 ~project_name:p.name (channels t);
-               handle_thread_message t msg ()
-             | Error err ->
-               ignore (Discord_rest.create_message t.rest
-                 ~channel_id:msg.channel_id ~content:err ()))
-          | None -> ()))
+           ~channel_id:msg.channel_id ~content:err ()))
+    end else match project_for_channel with
+    | Some proj_name ->
+      sync_top_level_agent_policy_best_effort t;
+      (* Message in a project channel — persistent session (like control channel).
+         The project Claude can create threads via MCP tools when needed. *)
+      let proj = List.find_opt (fun (p : Project.t) -> p.name = proj_name) (projects t) in
+      (match proj with
+       | Some p ->
+         let wd = match working_dir_of_project p with Ok d -> d | Error _ -> p.path in
+         (match ensure_channel_session t ~channel_id:msg.channel_id
+                  ~project_name:p.name ~working_dir:wd
+                  ~system_prompt:(Some (project_system_prompt p)) with
+          | Ok () ->
+            Channel_manager.bump ~rest:t.rest ~guild_id:t.config.guild_id
+              ~project_name:p.name (channels t);
+            handle_thread_message t msg ()
+          | Error err ->
+            ignore (Discord_rest.create_message t.rest
+              ~channel_id:msg.channel_id ~content:err ()))
+       | None -> ())
     | None ->
       (* Check if this is a thread under a project channel.
          Since the control API creates sessions directly in bot memory,

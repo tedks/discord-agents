@@ -150,7 +150,7 @@ let set_default_agent t agent =
       err
 
 let set_rescue_agent t agent =
-  if t.rescue_agent = agent then
+  if Option.equal Config.equal_agent_kind t.rescue_agent agent then
     Ok ()
   else
     let next = {
