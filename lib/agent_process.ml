@@ -1215,7 +1215,7 @@ let contains_substring text needle =
 (** Claude: write the MCP config to a well-known location and return
     the path for [--mcp-config]. *)
 let claude_mcp_config_path () =
-  let config_dir = Filename.concat (Sys.getenv "HOME") ".config/discord-agents" in
+  let config_dir = Resource.app_config_dir () in
   let config_path = Filename.concat config_dir "mcp-generated.json" in
   write_file_safely ~path:config_path (Lazy.force mcp_json);
   config_path

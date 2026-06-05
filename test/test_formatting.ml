@@ -666,7 +666,11 @@ let cmd_testable =
       | List_claude_sessions -> "List_claude_sessions"
       | List_codex_sessions -> "List_codex_sessions"
       | List_gemini_sessions -> "List_gemini_sessions"
-      | Start_agent { project; _ } -> "Start_agent(" ^ project ^ ")"
+      | Start_agent { project; kind = None } ->
+        "Start_agent(" ^ project ^ ")"
+      | Start_agent { project; kind = Some k } ->
+        Printf.sprintf "Start_agent(%s,%s)"
+          project (Discord_agents.Config.string_of_agent_kind k)
       | Resume_session { session_id; kind = None } ->
         "Resume_session(" ^ session_id ^ ")"
       | Resume_session { session_id; kind = Some k } ->
@@ -674,6 +678,14 @@ let cmd_testable =
           (Discord_agents.Config.string_of_agent_kind k) session_id
       | Stop_session { thread_id } -> "Stop_session(" ^ thread_id ^ ")"
       | Cleanup_channels -> "Cleanup_channels"
+      | Default_agent None -> "Default_agent"
+      | Default_agent (Some k) ->
+        Printf.sprintf "Default_agent(%s)"
+          (Discord_agents.Config.string_of_agent_kind k)
+      | Session_agent None -> "Session_agent"
+      | Session_agent (Some k) ->
+        Printf.sprintf "Session_agent(%s)"
+          (Discord_agents.Config.string_of_agent_kind k)
       | Restart -> "Restart"
       | Refresh -> "Refresh"
       | Rename_thread _ -> "Rename_thread"
@@ -826,8 +838,60 @@ let test_parse_gemini_sessions () =
 let test_parse_start_gemini () =
   Alcotest.(check cmd_testable) "start project gemini"
     (Discord_agents.Command.Start_agent
-       { project = "myproj"; kind = Discord_agents.Config.Gemini })
+       { project = "myproj"; kind = Some Discord_agents.Config.Gemini })
     (Discord_agents.Command.parse "!start myproj gemini")
+
+let test_parse_start_default_agent () =
+  Alcotest.(check cmd_testable) "start project default agent"
+    (Discord_agents.Command.Start_agent
+       { project = "myproj"; kind = None })
+    (Discord_agents.Command.parse "!start myproj")
+
+let test_parse_default_agent_no_arg () =
+  Alcotest.(check cmd_testable) "default-agent no arg"
+    (Discord_agents.Command.Default_agent None)
+    (Discord_agents.Command.parse "!default-agent")
+
+let test_parse_default_agent_set () =
+  Alcotest.(check cmd_testable) "default-agent codex"
+    (Discord_agents.Command.Default_agent
+       (Some Discord_agents.Config.Codex))
+    (Discord_agents.Command.parse "!default-agent codex")
+
+let test_parse_default_agent_underscore_alias () =
+  Alcotest.(check cmd_testable) "default_agent alias"
+    (Discord_agents.Command.Default_agent
+       (Some Discord_agents.Config.Gemini))
+    (Discord_agents.Command.parse "!default_agent gemini")
+
+let test_parse_default_agent_invalid_kind () =
+  match Discord_agents.Command.parse "!default-agent nonesuch" with
+  | Discord_agents.Command.Unknown _ ->
+    Alcotest.(check pass) "invalid default agent is Unknown" () ()
+  | _ -> Alcotest.fail "expected Unknown for invalid default agent kind"
+
+let test_parse_session_agent_no_arg () =
+  Alcotest.(check cmd_testable) "session-agent no arg"
+    (Discord_agents.Command.Session_agent None)
+    (Discord_agents.Command.parse "!session-agent")
+
+let test_parse_session_agent_set () =
+  Alcotest.(check cmd_testable) "session-agent claude"
+    (Discord_agents.Command.Session_agent
+       (Some Discord_agents.Config.Claude))
+    (Discord_agents.Command.parse "!session-agent claude")
+
+let test_parse_session_agent_underscore_alias () =
+  Alcotest.(check cmd_testable) "session_agent alias"
+    (Discord_agents.Command.Session_agent
+       (Some Discord_agents.Config.Codex))
+    (Discord_agents.Command.parse "!session_agent codex")
+
+let test_parse_session_agent_invalid_kind () =
+  match Discord_agents.Command.parse "!session-agent nonesuch" with
+  | Discord_agents.Command.Unknown _ ->
+    Alcotest.(check pass) "invalid session agent is Unknown" () ()
+  | _ -> Alcotest.fail "expected Unknown for invalid session agent kind"
 
 let command_tests = [
   Alcotest.test_case "desktop" `Quick test_parse_desktop;
@@ -853,6 +917,15 @@ let command_tests = [
   Alcotest.test_case "gemini-sessions" `Quick test_parse_gemini_sessions;
   Alcotest.test_case "resume with codex kind" `Quick test_parse_resume_with_codex_kind;
   Alcotest.test_case "start with gemini kind" `Quick test_parse_start_gemini;
+  Alcotest.test_case "start with default agent" `Quick test_parse_start_default_agent;
+  Alcotest.test_case "default-agent no arg" `Quick test_parse_default_agent_no_arg;
+  Alcotest.test_case "default-agent set" `Quick test_parse_default_agent_set;
+  Alcotest.test_case "default_agent alias" `Quick test_parse_default_agent_underscore_alias;
+  Alcotest.test_case "default-agent invalid kind" `Quick test_parse_default_agent_invalid_kind;
+  Alcotest.test_case "session-agent no arg" `Quick test_parse_session_agent_no_arg;
+  Alcotest.test_case "session-agent set" `Quick test_parse_session_agent_set;
+  Alcotest.test_case "session_agent alias" `Quick test_parse_session_agent_underscore_alias;
+  Alcotest.test_case "session-agent invalid kind" `Quick test_parse_session_agent_invalid_kind;
 ]
 
 (* ── tool detail formatting ────────────────────────────────────── *)
@@ -1535,6 +1608,112 @@ let test_make_session_default_claude_confirmed () =
     "Claude default is confirmed (--session-id pins it)"
     true s.session_id_confirmed
 
+let test_pending_agent_kind_roundtrip () =
+  let session = Discord_agents.Session_store.make_session
+    ~project_name:"foo" ~working_dir:"/tmp/foo"
+    ~agent_kind:Discord_agents.Config.Claude
+    ~session_id:"caller-pinned"
+    ~thread_id:"123" ~system_prompt:None ~initial_prompt:None
+    ~session_override_kind:(Some Discord_agents.Config.Gemini)
+    ~pending_agent_change:(Some
+      Discord_agents.Session_store.{
+        kind = Discord_agents.Config.Codex;
+        origin = Session_override;
+      }) ()
+  in
+  let map =
+    Discord_agents.Session_store.SessionMap.empty
+    |> Discord_agents.Session_store.SessionMap.add "123" session
+  in
+  let json = Discord_agents.Session_store.sessions_to_json map in
+  let reparsed = Discord_agents.Session_store.sessions_of_json json in
+  let sessions = Discord_agents.Session_store.SessionMap.bindings reparsed in
+  match sessions with
+  | [(_, s)] ->
+    let pending_kind =
+      Option.map
+        (fun (pending : Discord_agents.Session_store.pending_agent_change) ->
+          Discord_agents.Config.string_of_agent_kind pending.kind)
+        s.pending_agent_change
+    in
+    let pending_origin =
+      Option.map
+        (fun (pending : Discord_agents.Session_store.pending_agent_change) ->
+          match pending.origin with
+          | Discord_agents.Session_store.Default_rotation -> "default_rotation"
+          | Discord_agents.Session_store.Session_override -> "session_override")
+        s.pending_agent_change
+    in
+    Alcotest.(check (option string))
+      "session override kind survives roundtrip"
+      (Some "gemini")
+      (Option.map Discord_agents.Config.string_of_agent_kind
+         s.session_override_kind);
+    Alcotest.(check (option string))
+      "pending agent kind survives roundtrip"
+      (Some "codex") pending_kind;
+    Alcotest.(check (option string))
+      "pending agent origin survives roundtrip"
+      (Some "session_override") pending_origin
+  | _ -> Alcotest.fail "expected exactly one session"
+
+let test_legacy_pending_agent_defaults_to_default_rotation () =
+  let json = Yojson.Safe.from_string {|[
+    {"project_name":"foo","working_dir":"/tmp/foo",
+     "agent_kind":"claude","session_id":"abc","thread_id":"123",
+     "message_count":1,
+     "pending_agent_kind":"codex"}
+  ]|} in
+  let map = Discord_agents.Session_store.sessions_of_json json in
+  let sessions = Discord_agents.Session_store.SessionMap.bindings map in
+  match sessions with
+  | [(_, s)] ->
+    let pending =
+      match s.pending_agent_change with
+      | None -> Alcotest.fail "expected pending agent change"
+      | Some pending -> pending
+    in
+    Alcotest.(check string)
+      "legacy pending kind parsed"
+      "codex"
+      (Discord_agents.Config.string_of_agent_kind pending.kind);
+    Alcotest.(check string)
+      "legacy pending defaults to default rotation"
+      "default_rotation"
+      (match pending.origin with
+       | Discord_agents.Session_store.Default_rotation -> "default_rotation"
+       | Discord_agents.Session_store.Session_override -> "session_override")
+  | _ -> Alcotest.fail "expected exactly one session"
+
+let test_unknown_pending_agent_origin_defaults_to_default_rotation () =
+  let json = Yojson.Safe.from_string {|[
+    {"project_name":"foo","working_dir":"/tmp/foo",
+     "agent_kind":"claude","session_id":"abc","thread_id":"123",
+     "message_count":1,
+     "pending_agent_kind":"codex",
+     "pending_agent_origin":"future_origin"}
+  ]|} in
+  let map = Discord_agents.Session_store.sessions_of_json json in
+  let sessions = Discord_agents.Session_store.SessionMap.bindings map in
+  match sessions with
+  | [(_, s)] ->
+    let pending =
+      match s.pending_agent_change with
+      | None -> Alcotest.fail "expected pending agent change"
+      | Some pending -> pending
+    in
+    Alcotest.(check string)
+      "pending kind survives unknown origin"
+      "codex"
+      (Discord_agents.Config.string_of_agent_kind pending.kind);
+    Alcotest.(check string)
+      "unknown origin defaults to default rotation"
+      "default_rotation"
+      (match pending.origin with
+       | Discord_agents.Session_store.Default_rotation -> "default_rotation"
+       | Discord_agents.Session_store.Session_override -> "session_override")
+  | _ -> Alcotest.fail "expected exactly one session"
+
 let session_store_tests = [
   Alcotest.test_case "legacy Codex session unconfirmed" `Quick
     test_legacy_codex_session_defaults_unconfirmed;
@@ -1552,6 +1731,12 @@ let session_store_tests = [
     test_make_session_default_gemini_unconfirmed;
   Alcotest.test_case "fresh Claude default confirmed" `Quick
     test_make_session_default_claude_confirmed;
+  Alcotest.test_case "pending agent kind roundtrip" `Quick
+    test_pending_agent_kind_roundtrip;
+  Alcotest.test_case "legacy pending agent defaults to default rotation" `Quick
+    test_legacy_pending_agent_defaults_to_default_rotation;
+  Alcotest.test_case "unknown pending origin defaults to default rotation" `Quick
+    test_unknown_pending_agent_origin_defaults_to_default_rotation;
 ]
 
 (* ── Bot.resume_not_found_message + Bot.merge_gemini_settings ───── *)
@@ -1796,6 +1981,7 @@ let test_context_header_truncates_utf8_boundary () =
     project_name = String.make 99 'p' ^ "\xC3\xA9tail";
     working_dir = "/tmp/project";
     agent_kind = Discord_agents.Config.Claude;
+    session_override_kind = None;
     session_id = "sid";
     session_id_confirmed = true;
     thread_id = "thread";
@@ -1803,6 +1989,7 @@ let test_context_header_truncates_utf8_boundary () =
     message_count = 0;
     processing = false;
     pending_queue = Queue.create ();
+    pending_agent_change = None;
     initial_prompt = None;
   } in
   let header =

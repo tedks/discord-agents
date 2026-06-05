@@ -9,6 +9,68 @@ let with_file_out path f =
   let oc = open_out path in
   Fun.protect ~finally:(fun () -> close_out oc) (fun () -> f oc)
 
+(** Environment variable lookup that treats empty values as absent. *)
+let getenv_nonempty name =
+  match Sys.getenv_opt name with
+  | Some "" | None -> None
+  | Some value -> Some value
+
+(** Legacy pre-XDG config directory. *)
+let legacy_home_config_dir () =
+  match getenv_nonempty "HOME" with
+  | Some home -> Some (Filename.concat home ".config/discord-agents")
+  | None -> None
+
+let config_dir_has_state dir =
+  Sys.file_exists dir
+  && List.exists
+       (fun name -> Sys.file_exists (Filename.concat dir name))
+       ["config.json"; "settings.json"; "sessions.json"; "control.sock"]
+
+(** Application config directory, preferring XDG for new installs while
+    preserving pre-XDG HOME-based installs. If XDG_CONFIG_HOME appears
+    later but its app directory has no bot state yet, use the legacy
+    directory when it already exists so settings, sessions, and the
+    control socket remain discoverable. *)
+let app_config_dir () =
+  match getenv_nonempty "XDG_CONFIG_HOME" with
+  | Some xdg_config_home ->
+    let xdg_dir = Filename.concat xdg_config_home "discord-agents" in
+    (match legacy_home_config_dir () with
+     | Some legacy_dir
+       when (not (config_dir_has_state xdg_dir)) && Sys.file_exists legacy_dir ->
+       legacy_dir
+     | _ -> xdg_dir)
+  | None ->
+    match legacy_home_config_dir () with
+    | Some legacy_dir -> legacy_dir
+    | None ->
+      let fallback =
+        Filename.concat (Filename.get_temp_dir_name ())
+          (Printf.sprintf "discord-agents-%d" (Unix.getuid ()))
+      in
+      Logs.warn (fun m ->
+        m "resource: HOME/XDG_CONFIG_HOME unset; using %s" fallback);
+      fallback
+
+(** Ensure the parent directory of [path] exists. *)
+let ensure_parent_dir path =
+  let rec mkdir_p dir =
+    if Sys.file_exists dir then begin
+      if not (Sys.is_directory dir) then
+        failwith (Printf.sprintf "parent is not a directory: %s" dir)
+    end else begin
+      let parent = Filename.dirname dir in
+      if parent <> dir then mkdir_p parent;
+      try Unix.mkdir dir 0o700 with
+      | Unix.Unix_error ((Unix.EEXIST | Unix.EISDIR), _, _) ->
+        if not (Sys.is_directory dir) then
+          failwith (Printf.sprintf "parent is not a directory: %s" dir)
+      | exn -> raise exn
+    end
+  in
+  mkdir_p (Filename.dirname path)
+
 (** Read entire file contents safely. *)
 let read_file path =
   with_file_in path (fun ic ->
@@ -21,6 +83,7 @@ let read_file path =
 let write_file_atomic path content =
   let tmp = path ^ ".tmp" in
   (try
+    ensure_parent_dir path;
     with_file_out tmp (fun oc ->
       output_string oc content;
       output_char oc '\n');
@@ -32,6 +95,7 @@ let write_file_atomic path content =
 (** Execute f while holding an exclusive flock on lock_path.
     Used for cross-process synchronization (bot + MCP server). *)
 let with_flock lock_path f =
+  ensure_parent_dir lock_path;
   let fd = Unix.openfile lock_path [Unix.O_WRONLY; Unix.O_CREAT] 0o600 in
   Fun.protect ~finally:(fun () ->
     (try Unix.lockf fd Unix.F_ULOCK 0 with _ -> ());

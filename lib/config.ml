@@ -19,6 +19,21 @@ let string_of_agent_kind = function
   | Codex -> "codex"
   | Gemini -> "gemini"
 
+let preferred_agent_order preferred =
+  preferred
+  :: List.filter (fun kind -> not (equal_agent_kind kind preferred))
+       [Claude; Codex; Gemini]
+
+let find_with_preferred_agent preferred f =
+  let rec first_found = function
+    | [] -> None
+    | kind :: rest ->
+      match f kind with
+      | Some _ as found -> found
+      | None -> first_found rest
+  in
+  first_found (preferred_agent_order preferred)
+
 (** Whether this agent accepts a caller-supplied session id at startup
     (Claude's [--session-id]) or allocates its own server-side and
     emits it on first run (Codex's [thread.started], Gemini's [init]).
@@ -62,8 +77,7 @@ let default = {
 }
 
 let config_path () =
-  let home = Sys.getenv "HOME" in
-  Filename.concat home ".config/discord-agents/config.json"
+  Filename.concat (Resource.app_config_dir ()) "config.json"
 
 let load_file path =
   let ic = open_in path in
@@ -91,9 +105,7 @@ let load () =
 
 let save config =
   let path = config_path () in
-  let dir = Filename.dirname path in
-  if not (Sys.file_exists dir) then
-    Sys.mkdir dir 0o700;
+  Resource.ensure_parent_dir path;
   let json = yojson_of_t config in
   (* Write with restricted permissions — file contains discord token *)
   let fd = Unix.openfile path [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o600 in

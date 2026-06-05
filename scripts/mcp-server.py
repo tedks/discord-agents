@@ -13,13 +13,40 @@ Protocol: JSON-RPC 2.0 over stdio (MCP standard).
 """
 
 import json
+import os
 import socket
 import sys
+import tempfile
 from pathlib import Path
 
 # --- Configuration ---
 
-CONFIG_DIR = Path.home() / ".config" / "discord-agents"
+def legacy_config_dir():
+    home = os.environ.get("HOME", "")
+    if home:
+        return Path(home) / ".config" / "discord-agents"
+    return None
+
+def config_dir_has_state(config_dir):
+    if not config_dir.exists():
+        return False
+    state_files = ("config.json", "settings.json", "sessions.json", "control.sock")
+    return any((config_dir / name).exists() for name in state_files)
+
+def app_config_dir():
+    xdg = os.environ.get("XDG_CONFIG_HOME", "")
+    if xdg:
+        xdg_dir = Path(xdg) / "discord-agents"
+        legacy_dir = legacy_config_dir()
+        if not config_dir_has_state(xdg_dir) and legacy_dir and legacy_dir.exists():
+            return legacy_dir
+        return xdg_dir
+    legacy_dir = legacy_config_dir()
+    if legacy_dir:
+        return legacy_dir
+    return Path(tempfile.gettempdir()) / f"discord-agents-{os.getuid()}"
+
+CONFIG_DIR = app_config_dir()
 CONTROL_SOCKET = CONFIG_DIR / "control.sock"
 
 # --- Bot control API client ---
@@ -70,8 +97,7 @@ TOOLS = [
                 },
                 "agent": {
                     "type": "string",
-                    "description": "Agent type: claude, codex, or gemini",
-                    "default": "claude",
+                    "description": "Agent type: claude, codex, or gemini. If omitted, uses the bot's current default agent.",
                     "enum": ["claude", "codex", "gemini"]
                 },
                 "thread_name": {
@@ -147,8 +173,22 @@ TOOLS = [
         }
     },
     {
+        "name": "default_agent",
+        "description": "Show or set the default agent used for new top-level sessions. Existing idle top-level sessions reset to a fresh session immediately; busy ones reset after their queued work finishes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "description": "Agent type to make the default. Omit to read the current default.",
+                    "enum": ["claude", "codex", "gemini"]
+                }
+            }
+        }
+    },
+    {
         "name": "resume_session",
-        "description": "Resume an existing Claude, Codex, or Gemini session in a new Discord thread. Use list_claude_sessions / list_codex_sessions / list_gemini_sessions to find a session ID. With kind unspecified, the bot tries Claude → Codex → Gemini.",
+        "description": "Resume an existing Claude, Codex, or Gemini session in a new Discord thread. Use list_claude_sessions / list_codex_sessions / list_gemini_sessions to find a session ID. With kind unspecified, the bot tries the current default agent first, then the others.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -159,7 +199,7 @@ TOOLS = [
                 "kind": {
                     "type": "string",
                     "enum": ["claude", "codex", "gemini"],
-                    "description": "Which session store to search. Omit to try Claude → Codex → Gemini."
+                    "description": "Which session store to search. Omit to try the current default agent first, then the others."
                 }
             },
             "required": ["session_id"]
@@ -304,6 +344,24 @@ def handle_tool_call(name, arguments):
         kind = result.get("agent_kind", "")
         kind_label = f"{kind.capitalize()} " if kind else ""
         return f"Resumed {kind_label}session `{sid}` in <#{tid}>."
+
+    elif name == "default_agent":
+        result = control_request("default_agent", arguments)
+        if "error" in result:
+            return result["error"]
+        agent = result.get("agent", "")
+        if (arguments or {}).get("agent") is None:
+            return f"Default agent: `{agent}`."
+        reset_count = result.get("reset_count", 0)
+        busy_count = result.get("busy_count", 0)
+        parts = [f"Default agent set to `{agent}`."]
+        if reset_count:
+            noun = "session" if reset_count == 1 else "sessions"
+            parts.append(f"Reset {reset_count} idle top-level {noun} immediately.")
+        if busy_count:
+            noun = "session" if busy_count == 1 else "sessions"
+            parts.append(f"{busy_count} busy top-level {noun} will switch after queued work finishes.")
+        return " ".join(parts)
 
     elif name == "restart_bot":
         result = control_request("restart")
