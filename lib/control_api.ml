@@ -16,7 +16,10 @@ let socket_path () =
 
 let raise_if_cancelled exn =
   match exn with
-  | Eio.Cancel.Cancelled _ -> raise exn
+  | Eio.Cancel.Cancelled _
+  | Out_of_memory
+  | Stack_overflow
+  | Sys.Break -> raise exn
   | _ -> ()
 
 let max_request_size = 1_000_000

@@ -164,7 +164,9 @@ let () =
       Logs.info (fun m -> m "shutdown: signal received");
       bot.gateway.shutdown <- true;
       (match bot.gateway.ws with
-       | Some ws -> (try Discord_agents.Websocket.send_close ws with _ -> ())
+       | Some ws ->
+         (try Discord_agents.Websocket.send_close ws with exn ->
+            Discord_agents.Websocket.raise_if_cancelled exn)
        | None -> ());
       Unix.close shutdown_r;
       Unix.close shutdown_w);

@@ -24,6 +24,16 @@ let test_payload_diagnostics_wrong_types () =
   Alcotest.(check string) "wrong-typed payload summary"
     expected (Discord_agents.Discord_gateway.payload_diagnostics payload)
 
+let test_websocket_closed_error_classification () =
+  Alcotest.(check bool) "closed websocket failure"
+    true
+    (Discord_agents.Discord_gateway.websocket_closed_error
+      (Failure "websocket: connection closed"));
+  Alcotest.(check bool) "other failure"
+    false
+    (Discord_agents.Discord_gateway.websocket_closed_error
+      (Failure "connection reset by peer"))
+
 let test_websocket_reader_limit_tracks_payload_limit () =
   Alcotest.(check int) "reader limit matches payload cap"
     Discord_agents.Websocket.max_payload_size
@@ -45,6 +55,14 @@ let websocket_frame_header ~fin ~opcode payload_len =
       Buffer.add_char buf (Char.chr ((payload_len lsr (i * 8)) land 0xff))
     done
   end;
+  Buffer.contents buf
+
+let websocket_frame_header_64 ~fin ~opcode bytes =
+  let b0 = (if fin then 0x80 else 0x00) lor opcode in
+  let buf = Buffer.create 10 in
+  Buffer.add_char buf (Char.chr b0);
+  Buffer.add_char buf (Char.chr 127);
+  List.iter (fun byte -> Buffer.add_char buf (Char.chr byte)) bytes;
   Buffer.contents buf
 
 let websocket_frame ~fin ~opcode payload =
@@ -78,6 +96,16 @@ let test_websocket_rejects_oversized_frame_header () =
   check_failure_contains "oversized frame" "websocket: payload too large"
     (fun () -> ignore (Discord_agents.Websocket.recv_frame ws))
 
+let test_websocket_rejects_oversized_64bit_frame_header () =
+  let ws =
+    websocket_of_input
+      (websocket_frame_header_64 ~fin:true ~opcode:1
+        [0x80; 0x00; 0x00; 0x00; 0x00; 0x00; 0x00; 0x00])
+  in
+  check_failure_contains "oversized 64-bit frame"
+    "websocket: payload too large"
+    (fun () -> ignore (Discord_agents.Websocket.recv_frame ws))
+
 let test_websocket_rejects_fragment_accumulation_overflow () =
   let first_payload =
     String.make Discord_agents.Websocket.max_payload_size 'a'
@@ -100,10 +128,14 @@ let () =
         test_payload_diagnostics_invalid_json;
       Alcotest.test_case "payload diagnostics wrong types" `Quick
         test_payload_diagnostics_wrong_types;
+      Alcotest.test_case "websocket closed error classification" `Quick
+        test_websocket_closed_error_classification;
       Alcotest.test_case "reader limit tracks payload cap" `Quick
         test_websocket_reader_limit_tracks_payload_limit;
       Alcotest.test_case "websocket rejects oversized frame header" `Quick
         test_websocket_rejects_oversized_frame_header;
+      Alcotest.test_case "websocket rejects oversized 64-bit frame header" `Quick
+        test_websocket_rejects_oversized_64bit_frame_header;
       Alcotest.test_case "websocket rejects fragment accumulation overflow" `Quick
         test_websocket_rejects_fragment_accumulation_overflow;
     ]);

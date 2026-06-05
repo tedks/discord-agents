@@ -64,7 +64,10 @@ let default_intents =
 
 let raise_if_cancelled exn =
   match exn with
-  | Eio.Cancel.Cancelled _ -> raise exn
+  | Eio.Cancel.Cancelled _
+  | Out_of_memory
+  | Stack_overflow
+  | Sys.Break -> raise exn
   | _ -> ()
 
 let notify_disconnected t reason =
@@ -76,6 +79,10 @@ let notify_disconnected t reason =
       Logs.warn (fun m -> m "gateway: disconnected handler error: %s"
         (Printexc.to_string exn))
   end
+
+let websocket_closed_error = function
+  | Failure msg when String.equal msg "websocket: connection closed" -> true
+  | _ -> false
 
 (** Send a JSON payload over the WebSocket. *)
 let send_json t json =
@@ -138,7 +145,9 @@ let string_of_gateway_opcode = function
 let payload_summary_of_json ~bytes json =
   let open Yojson.Safe.Util in
   let safe f ~default =
-    try f () with _ -> default
+    try f () with exn ->
+      raise_if_cancelled exn;
+      default
   in
   let op =
     match safe (fun () -> json |> member "op" |> to_int_option) ~default:None with
@@ -250,6 +259,8 @@ let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
           `Stop_daemon
         else if not t.last_heartbeat_acked then begin
           Logs.warn (fun m -> m "gateway: heartbeat not acked, reconnecting");
+          t.last_error <- Some "heartbeat timeout";
+          notify_disconnected t "heartbeat timeout";
           (match t.ws with Some ws -> Websocket.send_close ws | None -> ());
           `Stop_daemon
         end else begin
@@ -369,20 +380,47 @@ let connect ~sw ~(env : Eio_unix.Stdenv.base) t =
           recv_loop ()
         | exception exn ->
           raise_if_cancelled exn;
-          let err = exn_with_backtrace exn in
-          t.last_error <- Some err;
-          Logs.warn (fun m -> m "gateway: recv error: %s" err);
-          notify_disconnected t ("recv error: " ^ Printexc.to_string exn)
+          if (t.disconnected_notified || t.shutdown)
+             && websocket_closed_error exn
+          then
+            ()
+          else begin
+            let err = exn_with_backtrace exn in
+            t.last_error <- Some err;
+            Logs.warn (fun m -> m "gateway: recv error: %s" err);
+            notify_disconnected t ("recv error: " ^ Printexc.to_string exn)
+          end
       in
-      recv_loop ();
-      Websocket.close ws;
-      t.ws <- None;
-      t.heartbeat_gen <- t.heartbeat_gen + 1;
-      if can_resume t then
-        t.resuming <- true;
-      Logs.info (fun m -> m "gateway: reconnecting in %.0fs..." !backoff);
-      Eio.Time.sleep clock !backoff;
-      backoff := min (!backoff *. 1.5) 60.0;
-      connect_loop ())
+      let cleanup_connection () =
+        Fun.protect
+          ~finally:(fun () ->
+            t.ws <- None;
+            t.heartbeat_gen <- t.heartbeat_gen + 1)
+          (fun () -> Websocket.close ws)
+      in
+      let recv_result =
+        try recv_loop (); Ok ()
+        with exn -> Error exn
+      in
+      let cleanup_result =
+        try cleanup_connection (); Ok ()
+        with exn -> Error exn
+      in
+      (match recv_result with
+       | Error exn -> raise exn
+       | Ok () ->
+         (match cleanup_result with
+          | Error exn -> raise_if_cancelled exn
+          | Ok () -> ());
+         if t.shutdown then
+           Logs.info (fun m -> m "gateway: shutdown requested, not reconnecting")
+         else begin
+           if can_resume t then
+             t.resuming <- true;
+           Logs.info (fun m -> m "gateway: reconnecting in %.0fs..." !backoff);
+           Eio.Time.sleep clock !backoff;
+           backoff := min (!backoff *. 1.5) 60.0;
+           connect_loop ()
+         end))
   in
   connect_loop ()
