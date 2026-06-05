@@ -79,6 +79,10 @@ let set_disk_warning_mode () =
   Discord_agents.Disk_health.For_testing.set_probe_available_bytes
     (fun _path -> Discord_agents.Disk_health.For_testing.mib 96)
 
+let set_disk_healthy_mode () =
+  Discord_agents.Disk_health.For_testing.set_probe_available_bytes
+    (fun _path -> Discord_agents.Disk_health.For_testing.mib 512)
+
 let make_session ?(processing=false) ?session_override_kind ?pending_agent_change
     agent_kind =
   let session = Discord_agents.Session_store.make_session
@@ -294,6 +298,61 @@ let test_apply_pending_busy_session_leaves_pending_intact () =
     expect_pending saved
       ~kind:Discord_agents.Config.Gemini
       ~origin:Discord_agents.Session_store.Session_override)
+
+let test_finalize_pending_default_rotation_uses_current_policy_after_pressure_clears () =
+  with_test_bot (fun bot ->
+    bot.settings.rescue_agent <- Some Discord_agents.Config.Codex;
+    set_disk_warning_mode ();
+    ignore (Discord_agents.Disk_health.preflight_state_mutation ());
+    let pending = Discord_agents.Session_store.{
+      kind = Discord_agents.Config.Codex;
+      origin = Default_rotation;
+    } in
+    let session =
+      make_session ~processing:true ~pending_agent_change:pending
+        Discord_agents.Config.Claude
+    in
+    let original_session_id = session.session_id in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    set_disk_healthy_mode ();
+    Discord_agents.Bot.finalize_session_run ~notify_stopped:false bot session;
+    let saved = find_control_session bot in
+    Alcotest.(check string) "agent follows recovered default policy"
+      "claude" (kind_string saved.agent_kind);
+    Alcotest.(check string) "session id unchanged"
+      original_session_id saved.session_id;
+    Alcotest.(check (option string)) "stale pending cleared"
+      None
+      (Option.map
+         (fun pending -> kind_string pending.Discord_agents.Session_store.kind)
+         saved.pending_agent_change))
+
+let test_finalize_pending_default_rotation_uses_current_rescue_policy () =
+  with_test_bot (fun bot ->
+    bot.settings.default_agent <- Discord_agents.Config.Gemini;
+    bot.settings.rescue_agent <- Some Discord_agents.Config.Codex;
+    let pending = Discord_agents.Session_store.{
+      kind = Discord_agents.Config.Gemini;
+      origin = Default_rotation;
+    } in
+    let session =
+      make_session ~processing:true ~pending_agent_change:pending
+        Discord_agents.Config.Claude
+    in
+    let original_session_id = session.session_id in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    set_disk_warning_mode ();
+    Discord_agents.Bot.finalize_session_run ~notify_stopped:false bot session;
+    let saved = find_control_session bot in
+    Alcotest.(check string) "agent follows current rescue policy"
+      "codex" (kind_string saved.agent_kind);
+    Alcotest.(check bool) "fresh session id allocated"
+      true (saved.session_id <> original_session_id);
+    Alcotest.(check (option string)) "pending cleared"
+      None
+      (Option.map
+         (fun pending -> kind_string pending.Discord_agents.Session_store.kind)
+         saved.pending_agent_change))
 
 let test_reconcile_preserves_idle_session_override () =
   with_test_bot (fun bot ->
@@ -572,6 +631,10 @@ let () =
         test_apply_pending_same_kind_session_override_pins_existing_session;
       Alcotest.test_case "busy pending change stays pending" `Quick
         test_apply_pending_busy_session_leaves_pending_intact;
+      Alcotest.test_case "default rotation rechecks policy after pressure clears" `Quick
+        test_finalize_pending_default_rotation_uses_current_policy_after_pressure_clears;
+      Alcotest.test_case "default rotation rechecks active rescue policy" `Quick
+        test_finalize_pending_default_rotation_uses_current_rescue_policy;
       Alcotest.test_case "reconcile preserves idle session override" `Quick
         test_reconcile_preserves_idle_session_override;
       Alcotest.test_case "reconcile rotates idle session to default" `Quick

@@ -405,7 +405,7 @@ You have MCP tools available:
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume
 - list_gemini_sessions: Find recent Gemini CLI sessions to resume
-- resume_session: Resume an existing session (pass kind=claude, kind=codex, or kind=gemini to disambiguate; default tries the current default agent first)
+- resume_session: Resume an existing session (pass kind=claude, kind=codex, or kind=gemini to disambiguate; default tries the current effective top-level agent first)
 - default_agent: Show or set the default agent used for new top-level sessions
 - rescue_agent: Show or set the rescue agent automatically used for new top-level sessions under disk pressure
 - restart_bot: Rebuild and restart the bot
@@ -445,7 +445,7 @@ You have MCP tools available:
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume
 - list_gemini_sessions: Find recent Gemini CLI sessions to resume
-- resume_session: Resume an existing session (pass kind=claude, kind=codex, or kind=gemini to disambiguate; default tries the current default agent first)
+- resume_session: Resume an existing session (pass kind=claude, kind=codex, or kind=gemini to disambiguate; default tries the current effective top-level agent first)
 - default_agent: Show or set the default agent used for new top-level sessions
 - rescue_agent: Show or set the rescue agent automatically used for new top-level sessions under disk pressure
 - rename_thread: Rename a Discord thread
@@ -634,6 +634,16 @@ let maybe_apply_pending_session_agent_change t (session : Session_store.session)
   match session.pending_agent_change with
   | None -> ()
   | Some pending ->
+    let target_kind =
+      match pending.origin with
+      | Session_store.Session_override -> pending.kind
+      | Session_store.Default_rotation ->
+        (* Default rotations follow the live top-level policy. The persisted
+           kind is only the scheduling-time target and can become stale when
+           disk pressure changes before a busy session finishes. *)
+        refresh_disk_state ();
+        effective_top_level_agent t
+    in
     if pending.origin = Session_store.Default_rotation
        && Option.is_some session.session_override_kind
     then
@@ -643,7 +653,7 @@ let maybe_apply_pending_session_agent_change t (session : Session_store.session)
          Logs.warn (fun m ->
            m "bot: failed to clear stale default-agent rotation for override %s: %s"
              session.thread_id err))
-    else if Config.equal_agent_kind session.agent_kind pending.kind
+    else if Config.equal_agent_kind session.agent_kind target_kind
             && pending.origin = Session_store.Default_rotation
     then
       (match Session_store.set_pending_agent_change t.sessions session None with
@@ -674,17 +684,17 @@ let maybe_apply_pending_session_agent_change t (session : Session_store.session)
         | Session_store.Default_rotation -> None
       in
       match replace_session_agent t session
-              ~agent_kind:pending.kind
+              ~agent_kind:target_kind
               ~session_override_kind with
       | Ok () ->
          Logs.info (fun m ->
            m "bot: switched channel %s to %s after pending agent change"
-             session.thread_id (Config.string_of_agent_kind pending.kind))
+             session.thread_id (Config.string_of_agent_kind target_kind))
       | Error err ->
         Logs.warn (fun m ->
           m "bot: failed to switch channel %s to %s: %s"
             session.thread_id
-            (Config.string_of_agent_kind pending.kind)
+            (Config.string_of_agent_kind target_kind)
             err)
     end
 
@@ -721,10 +731,10 @@ let reconcile_persisted_stop_requests t =
             session.thread_id err))
 
 let reconcile_persisted_pending_agent_changes t =
+  refresh_disk_state ();
   Session_store.bindings t.sessions
   |> List.iter (fun (_thread_id, (session : Session_store.session)) ->
     maybe_apply_pending_session_agent_change t session);
-  ignore (Disk_health.preflight_state_mutation ());
   match align_persistent_sessions_to_agent t
           ~current_channel_id:None ~new_agent:(effective_top_level_agent t) with
   | Ok _ -> ()
@@ -1200,8 +1210,8 @@ let handle_command t msg cmd =
       | Some msg ->
         reply msg
       | None ->
-      (* Locate the session in the requested store, or try the
-         current default first if [kind] is unspecified. *)
+      (* Locate the session in the requested store, or try the current
+         effective top-level agent first if [kind] is unspecified. *)
       let try_claude () =
         match Claude_sessions.find_by_prefix session_id with
         | Some (sid, wd) -> Some (Config.Claude, sid, wd)
@@ -1222,8 +1232,8 @@ let handle_command t msg cmd =
         | Config.Codex -> try_codex ()
         | Config.Gemini -> try_gemini ()
       in
-      (* Explicit kind hits exactly one store; otherwise try the
-         current default first, then the remaining stores. *)
+      (* Explicit kind hits exactly one store; otherwise try the current
+         effective top-level agent first, then the remaining stores. *)
       let found = match kind with
         | Some k -> try_kind k
         | None -> Config.find_with_preferred_agent (effective_top_level_agent t) try_kind
@@ -1650,11 +1660,11 @@ let handle_command t msg cmd =
       "`!claude-sessions` — list recent Claude sessions";
       "`!codex-sessions` — list recent Codex sessions";
       "`!gemini-sessions` — list recent Gemini sessions";
-      "`!start <project> [agent]` — start a session (defaults to the current default agent)";
+      "`!start <project> [agent]` — start a session (defaults to the current effective top-level agent)";
       "`!default-agent [agent]` / `!default_agent [agent]` — show or set the default agent (claude|codex|gemini)";
       "`!rescue-agent [agent|off]` / `!rescue_agent [agent|off]` — show or set the rescue agent used under disk pressure";
       "`!session-agent [agent]` / `!session_agent [agent]` — show or set the current channel session agent";
-      "`!resume [agent] <session_id>` — resume a session (no agent = try the current default first)";
+      "`!resume [agent] <session_id>` — resume a session (no agent = try the current effective top-level agent first)";
       "`!stop <thread_id>` — stop a session";
       "`!rename [thread_id] <name>` — rename a thread";
       "`!status` — bot status and running processes";
@@ -1954,7 +1964,7 @@ let fork_initial_prompt_run t ~session ~msg =
       process_session_message t session msg None))
 
 (** Ensure a session exists for a channel (control or project channels).
-    Creates a persistent session using the current default agent. *)
+    Creates a persistent session using the current effective top-level agent. *)
 let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prompt =
   match Session_store.find_opt t.sessions ~thread_id:channel_id with
   | Some _ -> Ok ()

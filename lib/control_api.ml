@@ -541,8 +541,8 @@ let handle_resume_session (bot : Bot.t) params =
            | Ok k -> Some k | Error _ -> None)
       in
       (* Mirror Bot.handle_command's Resume_session dispatch: explicit
-         kind looks up its own store; None tries the current default
-         first, then the remaining stores. *)
+         kind looks up its own store; None tries the current effective
+         top-level agent first, then the remaining stores. *)
       let try_claude () =
         match Claude_sessions.find_by_prefix sid_prefix with
         | Some (sid, wd) -> Some (Config.Claude, sid, wd) | None -> None

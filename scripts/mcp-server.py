@@ -227,7 +227,7 @@ TOOLS = [
                 "kind": {
                     "type": "string",
                     "enum": ["claude", "codex", "gemini"],
-                    "description": "Which session store to search. Omit to try the current default agent first, then the others."
+                    "description": "Which session store to search. Omit to try the current effective top-level agent first, then the others."
                 }
             },
             "required": ["session_id"]
