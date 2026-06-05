@@ -87,9 +87,21 @@ let set_disk_healthy_mode () =
   Discord_agents.Disk_health.For_testing.set_probe_available_bytes
     (fun _path -> Discord_agents.Disk_health.For_testing.mib 512)
 
+let make_project ~name ~path =
+  Discord_agents.Project.{
+    name;
+    path;
+    is_bare = false;
+    remote_url = None;
+  }
+
+let set_projects bot projects =
+  bot.Discord_agents.Bot.project_state <-
+    { bot.Discord_agents.Bot.project_state with projects }
+
 let make_session ?(project_name="control") ?(working_dir="/tmp/project")
     ?(thread_id="control") ?(processing=false) ?session_override_kind
-    ?pending_agent_change agent_kind =
+    ?pending_agent_change ?(system_prompt=Some "prompt") agent_kind =
   let session = Discord_agents.Session_store.make_session
     ~project_name
     ~working_dir
@@ -97,7 +109,7 @@ let make_session ?(project_name="control") ?(working_dir="/tmp/project")
     ?session_override_kind
     ~session_id:"session-1"
     ~thread_id
-    ~system_prompt:(Some "prompt")
+    ~system_prompt
     ~initial_prompt:None
     ()
   in
@@ -142,6 +154,12 @@ let find_control_session bot =
           ~thread_id:"control" with
   | Some session -> session
   | None -> Alcotest.fail "expected a control-channel session"
+
+let find_session bot thread_id =
+  match Discord_agents.Session_store.find_opt bot.Discord_agents.Bot.sessions
+          ~thread_id with
+  | Some session -> session
+  | None -> Alcotest.failf "expected session %s" thread_id
 
 let test_set_default_agent_defers_busy_control_session () =
   with_test_bot (fun bot ->
@@ -461,6 +479,91 @@ let test_reconcile_keeps_rescue_when_persistent_workdir_still_under_pressure () 
         Alcotest.(check string) "session id unchanged"
           original_session_id saved.session_id))
 
+let test_reconcile_rotates_project_session_without_channel_map () =
+  with_test_bot (fun bot ->
+    bot.settings.default_agent <- Discord_agents.Config.Codex;
+    let project_dir = make_tmp_dir "discord_agents_project_session_" in
+    Fun.protect
+      ~finally:(fun () -> rm_rf project_dir)
+      (fun () ->
+        set_projects bot [make_project ~name:"demo" ~path:project_dir];
+        let session =
+          make_session
+            ~project_name:"demo"
+            ~working_dir:project_dir
+            ~thread_id:"project-channel"
+            Discord_agents.Config.Claude
+        in
+        let original_session_id = session.session_id in
+        Discord_agents.Session_store.add bot.sessions
+          ~thread_id:"project-channel" session;
+        Discord_agents.Bot.reconcile_persisted_pending_agent_changes bot;
+        let saved = find_session bot "project-channel" in
+        Alcotest.(check string) "project session rotated"
+          "codex" (kind_string saved.agent_kind);
+        Alcotest.(check bool) "fresh session id allocated"
+          true (saved.session_id <> original_session_id)))
+
+let test_reconcile_does_not_rotate_thread_session_without_channel_map () =
+  with_test_bot (fun bot ->
+    bot.settings.default_agent <- Discord_agents.Config.Codex;
+    let project_dir = make_tmp_dir "discord_agents_thread_session_" in
+    Fun.protect
+      ~finally:(fun () -> rm_rf project_dir)
+      (fun () ->
+        set_projects bot [make_project ~name:"demo" ~path:project_dir];
+        let session =
+          make_session
+            ~project_name:"demo"
+            ~working_dir:project_dir
+            ~thread_id:"thread-1"
+            ~system_prompt:None
+            Discord_agents.Config.Claude
+        in
+        let original_session_id = session.session_id in
+        Discord_agents.Session_store.add bot.sessions
+          ~thread_id:"thread-1" session;
+        Discord_agents.Bot.reconcile_persisted_pending_agent_changes bot;
+        let saved = find_session bot "thread-1" in
+        Alcotest.(check string) "thread session agent preserved"
+          "claude" (kind_string saved.agent_kind);
+        Alcotest.(check string) "session id unchanged"
+          original_session_id saved.session_id))
+
+let test_best_effort_sync_observes_project_workdir_pressure () =
+  with_test_bot (fun bot ->
+    bot.settings.rescue_agent <- Some Discord_agents.Config.Codex;
+    let project_dir = make_tmp_dir "discord_agents_sync_project_pressure_" in
+    Fun.protect
+      ~finally:(fun () -> rm_rf project_dir)
+      (fun () ->
+        set_projects bot [make_project ~name:"demo" ~path:project_dir];
+        Discord_agents.Disk_health.For_testing.set_probe_available_bytes
+          (fun path ->
+             if String.equal path project_dir then
+               Discord_agents.Disk_health.For_testing.mib 96
+             else
+               Discord_agents.Disk_health.For_testing.mib 512);
+        let session =
+          make_session
+            ~project_name:"demo"
+            ~working_dir:project_dir
+            ~thread_id:"project-channel"
+            Discord_agents.Config.Claude
+        in
+        let original_session_id = session.session_id in
+        Discord_agents.Session_store.add bot.sessions
+          ~thread_id:"project-channel" session;
+        Discord_agents.Bot.sync_top_level_agent_policy_best_effort bot;
+        let saved = find_session bot "project-channel" in
+        Alcotest.(check string) "effective policy observes workdir pressure"
+          "codex"
+          (kind_string (Discord_agents.Bot.effective_top_level_agent bot));
+        Alcotest.(check string) "session rotated to rescue"
+          "codex" (kind_string saved.agent_kind);
+        Alcotest.(check bool) "fresh session id allocated"
+          true (saved.session_id <> original_session_id)))
+
 let test_reconcile_applies_persisted_pending_default_rotation () =
   with_test_bot (fun bot ->
     bot.settings.default_agent <- Discord_agents.Config.Codex;
@@ -534,6 +637,27 @@ let test_set_rescue_agent_preserves_idle_session_override_under_pressure () =
         "gemini" (kind_string saved.agent_kind);
       Alcotest.(check string) "session id unchanged"
         original_session_id saved.session_id)
+
+let test_disable_rescue_agent_rotates_idle_session_to_default_under_pressure () =
+  with_test_bot (fun bot ->
+    bot.settings.default_agent <- Discord_agents.Config.Claude;
+    bot.settings.rescue_agent <- Some Discord_agents.Config.Codex;
+    set_disk_warning_mode ();
+    ignore (Discord_agents.Disk_health.preflight_state_mutation ());
+    let session = make_session Discord_agents.Config.Codex in
+    let original_session_id = session.session_id in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    match Discord_agents.Bot.set_rescue_agent bot
+            ~current_channel_id:(Some "control")
+            None with
+    | Error err -> Alcotest.failf "disable rescue agent failed: %s" err
+    | Ok rotation ->
+      Alcotest.(check int) "idle reset count" 1 rotation.reset_count;
+      let saved = find_control_session bot in
+      Alcotest.(check string) "agent rotated to default"
+        "claude" (kind_string saved.agent_kind);
+      Alcotest.(check bool) "fresh session id allocated"
+        true (saved.session_id <> original_session_id))
 
 let test_set_default_agent_under_active_rescue_preserves_rescue_target () =
   with_test_bot (fun bot ->
@@ -720,6 +844,12 @@ let () =
         test_reconcile_clears_stale_rescue_rotation_after_pressure_clears;
       Alcotest.test_case "startup reconcile probes persistent workdir pressure before failback" `Quick
         test_reconcile_keeps_rescue_when_persistent_workdir_still_under_pressure;
+      Alcotest.test_case "startup reconcile rotates project session without channel map" `Quick
+        test_reconcile_rotates_project_session_without_channel_map;
+      Alcotest.test_case "startup reconcile ignores thread session without channel map" `Quick
+        test_reconcile_does_not_rotate_thread_session_without_channel_map;
+      Alcotest.test_case "best-effort sync observes project workdir pressure" `Quick
+        test_best_effort_sync_observes_project_workdir_pressure;
       Alcotest.test_case "reconcile applies persisted default rotation" `Quick
         test_reconcile_applies_persisted_pending_default_rotation;
       Alcotest.test_case "effective top-level agent uses rescue under pressure" `Quick
@@ -728,6 +858,8 @@ let () =
         test_set_rescue_agent_rotates_idle_control_session_under_pressure;
       Alcotest.test_case "set rescue agent preserves idle session override under pressure" `Quick
         test_set_rescue_agent_preserves_idle_session_override_under_pressure;
+      Alcotest.test_case "disable rescue agent rotates idle session to default under pressure" `Quick
+        test_disable_rescue_agent_rotates_idle_session_to_default_under_pressure;
       Alcotest.test_case "set default agent under active rescue preserves rescue target" `Quick
         test_set_default_agent_under_active_rescue_preserves_rescue_target;
       Alcotest.test_case "reconcile rotates idle session to rescue under pressure" `Quick

@@ -889,7 +889,13 @@ let test_parse_rescue_agent_set () =
 let test_parse_rescue_agent_clear () =
   Alcotest.(check cmd_testable) "rescue-agent off"
     (Discord_agents.Command.Rescue_agent (Some None))
-    (Discord_agents.Command.parse "!rescue-agent off")
+    (Discord_agents.Command.parse "!rescue-agent off");
+  Alcotest.(check cmd_testable) "rescue-agent Off"
+    (Discord_agents.Command.Rescue_agent (Some None))
+    (Discord_agents.Command.parse "!rescue-agent Off");
+  Alcotest.(check cmd_testable) "rescue-agent NONE"
+    (Discord_agents.Command.Rescue_agent (Some None))
+    (Discord_agents.Command.parse "!rescue-agent NONE")
 
 let test_parse_rescue_agent_underscore_alias () =
   Alcotest.(check cmd_testable) "rescue_agent alias"

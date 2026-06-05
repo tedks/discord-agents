@@ -102,8 +102,9 @@ let rescue_agent_notice t =
     Some (Printf.sprintf
       "Disk pressure is active, so new top-level sessions currently use rescue agent `%s`."
       (Config.string_of_agent_kind kind))
-  | Some _ ->
-    Some "Inactive until disk pressure."
+  | Some kind ->
+    Some (Printf.sprintf "Rescue agent `%s` is inactive until disk pressure."
+      (Config.string_of_agent_kind kind))
   | None ->
     None
 
@@ -121,13 +122,22 @@ let is_project_channel t ~(channel_id : Discord_types.channel_id) =
 let is_persistent_channel t ~(channel_id : Discord_types.channel_id) =
   is_control_channel t ~channel_id || is_project_channel t ~channel_id
 
+let is_known_project_name t project_name =
+  List.exists (fun (project : Project.t) ->
+    String.equal project.Project.name project_name) (projects t)
+
+let is_persistent_session t ~thread_id (session : Session_store.session) =
+  is_persistent_channel t ~channel_id:thread_id
+  || (Option.is_some session.system_prompt
+      && is_known_project_name t session.project_name)
+
 let refresh_session_disk_state (session : Session_store.session) =
   ignore (Disk_health.preflight_write session.working_dir)
 
 let refresh_persistent_session_disk_state t =
   Session_store.bindings t.sessions
   |> List.iter (fun (thread_id, (session : Session_store.session)) ->
-    if is_persistent_channel t ~channel_id:thread_id then
+    if is_persistent_session t ~thread_id session then
       refresh_session_disk_state session)
 
 let refresh_top_level_disk_state t =
@@ -514,7 +524,7 @@ let replace_session_agent t (session : Session_store.session)
 
 let align_persistent_sessions_to_agent t ~current_channel_id ~new_agent =
   let clear_redundant_default_rotation thread_id (session : Session_store.session) =
-    if is_persistent_channel t ~channel_id:thread_id
+    if is_persistent_session t ~thread_id session
        && (Config.equal_agent_kind session.agent_kind new_agent
            || Option.is_some session.session_override_kind)
     then
@@ -540,7 +550,7 @@ let align_persistent_sessions_to_agent t ~current_channel_id ~new_agent =
   let stale_sessions =
     Session_store.bindings t.sessions
     |> List.filter (fun (thread_id, (session : Session_store.session)) ->
-      is_persistent_channel t ~channel_id:thread_id
+      is_persistent_session t ~thread_id session
       && Option.is_none session.session_override_kind
       && not (Config.equal_agent_kind session.agent_kind new_agent))
   in
@@ -1412,6 +1422,7 @@ let handle_command t msg cmd =
       | Some kind -> Printf.sprintf "`%s`" (Config.string_of_agent_kind kind)
       | None -> "disabled"
     in
+    let rescue_was_active = rescue_mode_active t in
     (match set_rescue_agent t ~current_channel_id:(Some channel_id) requested with
      | Error err -> reply err
      | Ok rotation ->
@@ -1436,7 +1447,7 @@ let handle_command t msg cmd =
            Printf.sprintf
              " Disk pressure is active, so top-level sessions are currently using `%s`."
              (Config.string_of_agent_kind effective)
-         | None when rescue_mode_active t ->
+         | None when rescue_was_active ->
            Printf.sprintf
              " Disk pressure is active, so top-level sessions are currently using the default agent `%s`."
              (Config.string_of_agent_kind effective)
@@ -1996,7 +2007,7 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
            (Printexc.to_string exn)))
 
 let sync_top_level_agent_policy t =
-  ignore (Disk_health.preflight_state_mutation ());
+  refresh_top_level_disk_state t;
   align_persistent_sessions_to_agent t
     ~current_channel_id:None
     ~new_agent:(effective_top_level_agent t)

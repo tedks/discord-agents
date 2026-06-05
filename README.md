@@ -49,7 +49,7 @@ All commands use a `!` prefix:
 |---------|-------------|
 | `!start <project> [agent]` | Start a session with the current effective top-level agent or explicit agent |
 | `!default-agent [agent]` | Show or set the default agent (`claude`, `codex`, `gemini`) |
-| `!rescue-agent [agent|off]` | Show, set, or disable the rescue agent used under disk pressure |
+| `!rescue-agent [agent|off]` | Show, set, or disable the rescue agent used at warning-level disk pressure |
 | `!session-agent [agent]` | Show or set the current channel's session agent |
 | `!start` | Show numbered project list |
 | `!resume [agent] <session_id>` | Resume an existing session |
@@ -66,7 +66,7 @@ All commands use a `!` prefix:
 | `!restart` | Rebuild and restart the bot |
 | `!help` | Command reference |
 
-All channels -- control and project -- have the same capabilities. The agent knows which channel it's in and has context about the associated project. Non-command messages are routed to the channel's current session automatically; new top-level channel sessions start with the current effective top-level agent. Normally that is the default agent, but if you configure a rescue agent and disk pressure is active, the rescue agent takes over automatically unless you set a `!session-agent` override on that session.
+All channels -- control and project -- have the same capabilities. The agent knows which channel it's in and has context about the associated project. Non-command messages are routed to the channel's current session automatically; new top-level channel sessions start with the current effective top-level agent. Normally that is the default agent, but if you configure a rescue agent and warning-level disk pressure is active, the rescue agent takes over automatically unless you set a `!session-agent` override on that session. Read-only disk mode still blocks new stateful session creation until space is freed.
 
 `!default_agent`, `!rescue_agent`, and `!session_agent` are accepted as underscore aliases.
 

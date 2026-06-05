@@ -79,7 +79,7 @@ Commands require a `!` prefix:
 - `codex-sessions` — list recent Codex CLI sessions on this machine
 - `gemini-sessions` — list recent Gemini CLI sessions on this machine
 - `default-agent [agent]` — show or set the default agent for new top-level sessions
-- `rescue-agent [agent|off]` — show, set, or disable the rescue agent used under disk pressure
+- `rescue-agent [agent|off]` — show, set, or disable the rescue agent used at warning-level disk pressure
 - `session-agent [agent]` — show or set the current channel session agent
 - `stop <thread_id>` — stop a session
 - `rename [thread_id] <name>` — rename a thread
@@ -92,7 +92,7 @@ Commands require a `!` prefix:
 - `restart` — rebuild and restart the bot
 - `help` — command reference
 
-Non-command messages in control/project channels are routed to the channel's current session automatically. New top-level sessions start with the current effective top-level agent unless you set a `session-agent` override on that session. Normally that is the default agent; under disk pressure, a configured rescue agent takes over automatically.
+Non-command messages in control/project channels are routed to the channel's current session automatically. New top-level sessions start with the current effective top-level agent unless you set a `session-agent` override on that session. Normally that is the default agent; at warning-level disk pressure, a configured rescue agent takes over automatically. Read-only disk mode still blocks new stateful session creation until space is freed.
 
 ## Key behaviors
 
