@@ -63,6 +63,53 @@ let cleanup_orphan_thread rest ~thread_id ~context =
       m "control_api: failed to clean up orphan thread %s after %s: %s"
         thread_id context err)
 
+let cleanup_orphan_worktree ~project ~branch_info ~working_dir ~context =
+  match branch_info with
+  | None -> ()
+  | Some branch_name ->
+    (match Project.remove_worktree project ~branch_name
+             ~worktree_path:working_dir with
+     | Ok () -> ()
+     | Error err ->
+       Logs.warn (fun m ->
+         m "control_api: failed to clean up orphan worktree %s after %s: %s"
+           working_dir context err))
+
+let remove_persisted_session_for_cleanup (bot : Bot.t) ~thread_id ~context =
+  match Session_store.find_opt bot.sessions ~thread_id with
+  | None -> true
+  | Some _ ->
+    try
+      Session_store.remove bot.sessions ~thread_id;
+      true
+    with exn ->
+      Logs.warn (fun m ->
+        m "control_api: failed to remove persisted session %s during %s cleanup: %s"
+          thread_id context (Printexc.to_string exn));
+      false
+
+let cleanup_start_artifacts (bot : Bot.t) ~project ~branch_info ~working_dir
+    ~thread_id ~session_persisted ~context =
+  let session_removed =
+    (not session_persisted)
+    || remove_persisted_session_for_cleanup bot ~thread_id ~context
+  in
+  if session_removed then begin
+    cleanup_orphan_thread bot.rest ~thread_id ~context;
+    cleanup_orphan_worktree ~project ~branch_info ~working_dir ~context
+  end;
+  session_removed
+
+let cleanup_thread_session_artifacts (bot : Bot.t)
+    ~thread_id ~session_persisted ~context =
+  let session_removed =
+    (not session_persisted)
+    || remove_persisted_session_for_cleanup bot ~thread_id ~context
+  in
+  if session_removed then
+    cleanup_orphan_thread bot.rest ~thread_id ~context;
+  session_removed
+
 (* ── Handlers ──────────────────────────────────────────────────── *)
 
 let handle_health (bot : Bot.t) =
@@ -305,9 +352,11 @@ let handle_start_session (bot : Bot.t) params =
              | Ok wd -> wd, None
              | Error _ -> "", None)
         in
-        if working_dir = "" then
+        if working_dir = "" then begin
+          cleanup_orphan_worktree ~project:p ~branch_info ~working_dir
+            ~context:"working directory resolution failure";
           error_response "No working directory available."
-        else
+        end else
           let thread_display_name = match thread_name with
             | Some n when String.length (String.trim n) > 0 ->
               let n = String.trim n in
@@ -325,12 +374,18 @@ let handle_start_session (bot : Bot.t) params =
               (match bot.config.control_channel_id with
                | Some ctl -> ctl | None -> "")
           in
-          if thread_parent = "" then
+          if thread_parent = "" then begin
+            cleanup_orphan_worktree ~project:p ~branch_info ~working_dir
+              ~context:"thread parent resolution failure";
             error_response "No channel found for thread creation."
+          end
           else
             match Discord_rest.create_thread_no_message bot.rest
                     ~channel_id:thread_parent ~name:thread_display_name () with
-            | Error e -> error_response (Printf.sprintf "Failed to create thread: %s" e)
+            | Error e ->
+              cleanup_orphan_worktree ~project:p ~branch_info ~working_dir
+                ~context:"thread creation failure";
+              error_response (Printf.sprintf "Failed to create thread: %s" e)
             | Ok thread_ch ->
           let session_id = Resource.generate_uuid () in
           let branch_str = match branch_info with
@@ -374,8 +429,10 @@ let handle_start_session (bot : Bot.t) params =
              through the standard [handle_thread_message] flow. *)
           match initial_prompt with
           | None ->
+            let session_persisted = ref false in
             (try
                Session_store.add bot.sessions ~thread_id:thread_ch.id session;
+               session_persisted := true;
                ignore (Discord_rest.create_message bot.rest
                  ~channel_id:thread_ch.id
                  ~content:(Printf.sprintf
@@ -390,14 +447,18 @@ let handle_start_session (bot : Bot.t) params =
                  ("session_id", `String session_id);
                ]
              with exn ->
-               cleanup_orphan_thread bot.rest ~thread_id:thread_ch.id
-                 ~context:"session persistence failure";
+               ignore (cleanup_start_artifacts bot ~project:p ~branch_info ~working_dir
+                 ~thread_id:thread_ch.id
+                 ~session_persisted:!session_persisted
+                 ~context:"session startup failure");
                error_response (Printf.sprintf "Failed to persist session: %s"
                  (Printexc.to_string exn)))
           | Some prompt ->
             session.processing <- true;
+            let session_persisted = ref false in
             (try
                Session_store.add bot.sessions ~thread_id:thread_ch.id session;
+               session_persisted := true;
                ignore (Discord_rest.create_message bot.rest
                  ~channel_id:thread_ch.id
                  ~content:(Printf.sprintf
@@ -414,12 +475,18 @@ let handle_start_session (bot : Bot.t) params =
                  Logs.warn (fun m -> m
                    "control_api: failed to post initial_prompt: %s" e);
                  session.processing <- false;
-                 Session_store.remove bot.sessions
-                   ~thread_id:thread_ch.id;
-                 cleanup_orphan_thread bot.rest ~thread_id:thread_ch.id
-                   ~context:"prompt-post failure";
+                 let cleaned =
+                   cleanup_start_artifacts bot ~project:p ~branch_info
+                     ~working_dir ~thread_id:thread_ch.id
+                     ~session_persisted:true
+                     ~context:"prompt-post failure"
+                 in
+                 let suffix =
+                   if cleaned then ""
+                   else " The session was persisted and could not be rolled back; send a message in the new thread or stop it manually."
+                 in
                  error_response (Printf.sprintf
-                   "Failed to post initial_prompt: %s" e)
+                   "Failed to post initial_prompt: %s%s" e suffix)
                | Ok prompt_msg ->
                  Bot.fork_initial_prompt_run bot
                    ~session ~msg:prompt_msg;
@@ -433,8 +500,10 @@ let handle_start_session (bot : Bot.t) params =
                  ]
              with exn ->
                session.processing <- false;
-               cleanup_orphan_thread bot.rest ~thread_id:thread_ch.id
-                 ~context:"session persistence failure";
+               ignore (cleanup_start_artifacts bot ~project:p ~branch_info ~working_dir
+                 ~thread_id:thread_ch.id
+                 ~session_persisted:!session_persisted
+                 ~context:"session startup failure");
                error_response (Printf.sprintf "Failed to persist session: %s"
                  (Printexc.to_string exn)))
 
@@ -524,8 +593,10 @@ let handle_resume_session (bot : Bot.t) params =
           ~message_count:1
           ~thread_id:thread_ch.Discord_types.id
           ~system_prompt:None ~initial_prompt:None () in
+        let session_persisted = ref false in
         (try
            Session_store.add bot.sessions ~thread_id:thread_ch.id session;
+           session_persisted := true;
            ignore (Discord_rest.create_message bot.rest ~channel_id:thread_ch.id
              ~content:(Printf.sprintf
                "**Resumed** %s session `%s`\nWorking in: `%s`\nSend a message to continue."
@@ -538,8 +609,9 @@ let handle_resume_session (bot : Bot.t) params =
              ("agent_kind", `String kind_label);
            ]
          with exn ->
-           cleanup_orphan_thread bot.rest ~thread_id:thread_ch.id
-             ~context:"resume persistence failure";
+           ignore (cleanup_thread_session_artifacts bot ~thread_id:thread_ch.id
+             ~session_persisted:!session_persisted
+             ~context:"resume startup failure");
            error_response (Printf.sprintf
              "Failed to persist resumed session: %s"
              (Printexc.to_string exn))))

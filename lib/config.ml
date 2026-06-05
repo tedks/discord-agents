@@ -110,7 +110,9 @@ let save config =
   | Ok () ->
     let json = yojson_of_t config in
     try
-      Resource.write_file_atomic path (Yojson.Safe.pretty_to_string json);
+      Resource.with_flock (path ^ ".lock") (fun () ->
+        Resource.cleanup_atomic_write_temps path;
+        Resource.write_file_atomic path (Yojson.Safe.pretty_to_string json));
       Disk_health.note_write_success path
     with exn ->
       Disk_health.note_write_failure path exn;

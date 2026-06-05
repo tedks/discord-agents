@@ -1191,7 +1191,9 @@ let write_file_safely ~path contents =
       m "agent_process: refused write to %s: %s" path err)
   | Ok () ->
     (try
-       Resource.write_file_atomic path contents;
+       Resource.with_flock (path ^ ".lock") (fun () ->
+         Resource.cleanup_atomic_write_temps path;
+         Resource.write_file_atomic path contents);
        Disk_health.note_write_success path
      with exn ->
        Disk_health.note_write_failure path exn;

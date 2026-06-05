@@ -173,6 +173,27 @@ let make_git_repo_with_remote path ~remote_url =
   run (Printf.sprintf "git -C %s remote add origin %s"
     (Filename.quote path) (Filename.quote remote_url))
 
+let make_git_repo_with_commit path =
+  mkdir_p path;
+  let run cmd =
+    let exit_code = Sys.command (Printf.sprintf "%s 2>/dev/null" cmd) in
+    if exit_code <> 0 then
+      Alcotest.failf "setup command failed (%d): %s" exit_code cmd
+  in
+  run (Printf.sprintf "git -C %s init -q --initial-branch=main"
+    (Filename.quote path));
+  run (Printf.sprintf "git -C %s config user.email test@example.invalid"
+    (Filename.quote path));
+  run (Printf.sprintf "git -C %s config user.name 'Discord Agents Test'"
+    (Filename.quote path));
+  let readme = Filename.concat path "README.md" in
+  let oc = open_out readme in
+  output_string oc "test repo\n";
+  close_out oc;
+  run (Printf.sprintf "git -C %s add README.md" (Filename.quote path));
+  run (Printf.sprintf "git -C %s commit -q -m initial"
+    (Filename.quote path))
+
 let test_cluster_preserves_parent_with_remote () =
   (* Real bug from code review: when a clustered repo has a remote URL,
      the old dedup path renamed it to just the remote-basename and dropped
@@ -223,6 +244,59 @@ let test_permission_error_skipped () =
       Alcotest.(check bool) "readable cluster child discovered"
         true (List.mem "cluster/readable" (names_of ps))))
 
+let test_remove_worktree_deletes_worktree_and_branch () =
+  with_tmpdir (fun base ->
+    let repo = Filename.concat base "repo" in
+    make_git_repo_with_commit repo;
+    let project =
+      P.{ name = "repo"; path = repo; is_bare = false; remote_url = None }
+    in
+    let branch_name = "agent/test-cleanup" in
+    match P.create_worktree project ~branch_name with
+    | Error err -> Alcotest.failf "create_worktree failed: %s" err
+    | Ok worktree_path ->
+      Alcotest.(check bool) "worktree exists"
+        true (Sys.file_exists worktree_path);
+      (match P.remove_worktree project ~branch_name ~worktree_path with
+       | Ok () -> ()
+       | Error err -> Alcotest.failf "remove_worktree failed: %s" err);
+      Alcotest.(check bool) "worktree removed"
+        false (Sys.file_exists worktree_path);
+      let branch_exists =
+        Sys.command (Printf.sprintf
+          "git -C %s rev-parse --verify %s >/dev/null 2>&1"
+          (Filename.quote repo) (Filename.quote branch_name)) = 0
+      in
+      Alcotest.(check bool) "branch removed" false branch_exists)
+
+let test_remove_worktree_prunes_missing_worktree_registration () =
+  with_tmpdir (fun base ->
+    let repo = Filename.concat base "repo" in
+    make_git_repo_with_commit repo;
+    let project =
+      P.{ name = "repo"; path = repo; is_bare = false; remote_url = None }
+    in
+    let branch_name = "agent/test-stale-cleanup" in
+    match P.create_worktree project ~branch_name with
+    | Error err -> Alcotest.failf "create_worktree failed: %s" err
+    | Ok worktree_path ->
+      rm_rf worktree_path;
+      (match P.remove_worktree project ~branch_name ~worktree_path with
+       | Ok () -> ()
+       | Error err -> Alcotest.failf "remove_worktree failed: %s" err);
+      let branch_exists =
+        Sys.command (Printf.sprintf
+          "git -C %s rev-parse --verify %s >/dev/null 2>&1"
+          (Filename.quote repo) (Filename.quote branch_name)) = 0
+      in
+      Alcotest.(check bool) "branch removed after prune" false branch_exists;
+      let registered =
+        Sys.command (Printf.sprintf
+          "git -C %s worktree list --porcelain | grep -F %s >/dev/null 2>&1"
+          (Filename.quote repo) (Filename.quote worktree_path)) = 0
+      in
+      Alcotest.(check bool) "stale registration pruned" false registered)
+
 let discovery_tests = [
   Alcotest.test_case "flat repo" `Quick test_flat_repo;
   Alcotest.test_case "bare repo" `Quick test_bare_repo;
@@ -249,4 +323,10 @@ let discovery_tests = [
 let () =
   Alcotest.run "discord_project" [
     "discovery", discovery_tests;
+    "worktrees", [
+      Alcotest.test_case "remove worktree deletes branch" `Quick
+        test_remove_worktree_deletes_worktree_and_branch;
+      Alcotest.test_case "remove missing worktree prunes registration" `Quick
+        test_remove_worktree_prunes_missing_worktree_registration;
+    ];
   ]
