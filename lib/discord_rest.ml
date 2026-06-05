@@ -11,6 +11,10 @@ open Discord_types
 
 let api_base = "https://discord.com/api/v10"
 
+type backoff_source =
+  | Transport_backoff
+  | Rest_backoff
+
 type t = {
   token : string;
   call : http_call;
@@ -33,6 +37,7 @@ and health_state = {
   mutable last_transport_error : string option;
   mutable consecutive_transport_failures : int;
   mutable backoff_until : Mtime.t option;
+  mutable backoff_source : backoff_source option;
 }
 
 type retry_mode =
@@ -147,6 +152,7 @@ let create_health_state () =
     last_transport_error = None;
     consecutive_transport_failures = 0;
     backoff_until = None;
+    backoff_source = None;
   }
 
 let health_retry_delay_s ~now state =
@@ -177,7 +183,16 @@ let health_consecutive_transport_failures state =
 let effective_backoff_delay_s ~now state =
   health_retry_delay_s ~now state
 
-let note_failure_state state ~now ~summary ~delay =
+let active_rest_backoff ~now state =
+  match state.backoff_source, state.backoff_until with
+  | Some Rest_backoff, Some until when Mtime.compare now until < 0 -> true
+  | _ -> false
+
+let clear_backoff state =
+  state.backoff_until <- None;
+  state.backoff_source <- None
+
+let note_failure_state ?(source = Rest_backoff) state ~now ~summary ~delay =
   let failures =
     min max_recorded_failures (state.consecutive_failures + 1)
   in
@@ -185,6 +200,7 @@ let note_failure_state state ~now ~summary ~delay =
   state.consecutive_failures <- failures;
   state.backoff_until <-
     Some (next_backoff_until ~now ~current_until:state.backoff_until ~delay);
+  state.backoff_source <- Some source;
   effective_backoff_delay_s ~now state
 
 let note_failure_without_backoff_state state ~now ~summary =
@@ -196,7 +212,9 @@ let note_failure_without_backoff_state state ~now ~summary =
   effective_backoff_delay_s ~now state
 
 let note_transport_failure_state state ~now ~summary ~delay =
-  let delay = note_failure_state state ~now ~summary ~delay in
+  let delay =
+    note_failure_state ~source:Transport_backoff state ~now ~summary ~delay
+  in
   state.last_transport_error <- Some summary;
   state.consecutive_transport_failures <-
     min max_recorded_failures (state.consecutive_transport_failures + 1);
@@ -215,21 +233,27 @@ let note_rate_limit_state state ~now ~summary ~delay =
     min max_recorded_failures (state.consecutive_failures + 1);
   state.backoff_until <-
     Some (next_backoff_until ~now ~current_until:state.backoff_until ~delay);
+  state.backoff_source <- Some Rest_backoff;
   effective_backoff_delay_s ~now state
 
-let note_recovery_state state =
+let note_recovery_state state ~now =
   let failures = state.consecutive_failures in
-  state.last_error <- None;
-  state.consecutive_failures <- 0;
+  let active_rest_backoff = active_rest_backoff ~now state in
+  if not active_rest_backoff then begin
+    state.last_error <- None;
+    state.consecutive_failures <- 0;
+    clear_backoff state
+  end;
   state.last_transport_error <- None;
   state.consecutive_transport_failures <- 0;
-  state.backoff_until <- None;
   failures
 
 let note_transport_response_state state =
   let failures = state.consecutive_transport_failures in
   state.last_transport_error <- None;
   state.consecutive_transport_failures <- 0;
+  if state.backoff_source = Some Transport_backoff then
+    clear_backoff state;
   failures
 
 (* REST state closures must stay effect-free: no sleeps, logging, I/O, or
@@ -271,9 +295,10 @@ let consecutive_rest_failures t =
     health_consecutive_failures state)
 
 let note_rest_recovery t =
+  let now = now_s t in
   let failures =
     with_rest_state t (fun state ->
-      note_recovery_state state)
+      note_recovery_state state ~now)
   in
   if failures > 0 then
     Logs.info (fun m -> m "REST recovered after %d failure(s)"
@@ -655,6 +680,7 @@ let request ?(retry_mode = No_retry) t ~meth ~path ?body () =
         ignore (note_http_client_failure t ~host ~code ~body:body_str);
         handle_response code body_str
       end else if response_clears_rest_health code then begin
+        note_transport_response t;
         note_rest_recovery t;
         handle_response code body_str
       end else begin
