@@ -4,6 +4,7 @@ module Resource = Resource
 module Disk_health = Disk_health
 module Config = Config
 module Runtime_settings = Runtime_settings
+module Runtime_limits = Runtime_limits
 module Project = Project
 module Agent_process = Agent_process
 module Agent_runner = Agent_runner

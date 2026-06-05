@@ -18,18 +18,17 @@ type backoff_source =
 type t = {
   token : string;
   call : http_call;
-  sw : Eio.Switch.t;
   clock : Eio.Time.Mono.ty Eio.Resource.t;
   rest_state : health_state;
+  api_base : string;
 }
 
 and http_call =
-  sw:Eio.Switch.t ->
   headers:Http.Header.t ->
   ?body:Cohttp_eio.Body.t ->
   Http.Method.t ->
   Uri.t ->
-  Http.Response.t * Cohttp_eio.Body.t
+  Http.Response.t * string * bool
 
 and health_state = {
   mutable last_error : string option;
@@ -471,7 +470,32 @@ let response_clears_rest_health code =
 let response_marks_rest_failure code =
   code >= 400 && code < 500 && code <> 404 && code <> 429
 
-let create ~sw ~(env : Eio_unix.Stdenv.base) ~token =
+(** Read entire body from a cohttp-eio response source.
+    Capped at 10MB to prevent OOM from unexpected large responses. *)
+let max_body_size = 10 * 1024 * 1024
+
+let read_body_with_truncation (body : Cohttp_eio.Body.t) =
+  let buf = Buffer.create 4096 in
+  let chunk = Cstruct.create 4096 in
+  let truncated = ref false in
+  let rec loop () =
+    match Eio.Flow.single_read body chunk with
+    | n ->
+      if not !truncated then begin
+        Buffer.add_string buf (Cstruct.to_string ~off:0 ~len:n chunk);
+        if Buffer.length buf > max_body_size then
+          truncated := true
+      end;
+      (* Always drain to EOF so the connection stays clean for reuse. *)
+      loop ()
+    | exception End_of_file -> (Buffer.contents buf, !truncated)
+  in
+  loop ()
+
+let read_body body =
+  fst (read_body_with_truncation body)
+
+let create_with_api_base ~api_base ~sw:_ ~(env : Eio_unix.Stdenv.base) ~token =
   Random.self_init ();
   Mirage_crypto_rng_unix.use_default ();
   let authenticator =
@@ -494,11 +518,18 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) ~token =
   let net = Eio.Stdenv.net env in
   let client = Cohttp_eio.Client.make ~https:(Some https) net in
   let clock = Eio.Stdenv.mono_clock env in
-  let call ~sw ~headers ?body meth uri =
-    Cohttp_eio.Client.call client ~sw ~headers ?body meth uri
+  let call ~headers ?body meth uri =
+    Eio.Switch.run @@ fun request_sw ->
+    let (resp, resp_body) =
+      Cohttp_eio.Client.call client ~sw:request_sw ~headers ?body meth uri
+    in
+    let (body_str, truncated) = read_body_with_truncation resp_body in
+    (resp, body_str, truncated)
   in
-  { token; call; sw; clock;
-    rest_state = create_health_state (); }
+  { token; call; clock; rest_state = create_health_state (); api_base; }
+
+let create ~sw ~env ~token =
+  create_with_api_base ~api_base ~sw ~env ~token
 
 let make_headers t =
   Http.Header.of_list [
@@ -506,31 +537,6 @@ let make_headers t =
     ("Content-Type", "application/json");
     ("User-Agent", "DiscordBot (discord-agents/0.1.0, OCaml)");
   ]
-
-(** Read entire body from a cohttp-eio response source.
-    Capped at 10MB to prevent OOM from unexpected large responses. *)
-let max_body_size = 10 * 1024 * 1024
-
-let read_body_with_truncation (body : Cohttp_eio.Body.t) =
-  let buf = Buffer.create 4096 in
-  let chunk = Cstruct.create 4096 in
-  let truncated = ref false in
-  let rec loop () =
-    match Eio.Flow.single_read body chunk with
-    | n ->
-      if not !truncated then begin
-        Buffer.add_string buf (Cstruct.to_string ~off:0 ~len:n chunk);
-        if Buffer.length buf > max_body_size then
-          truncated := true
-      end;
-      (* Always drain to EOF so the connection stays clean for reuse *)
-      loop ()
-    | exception End_of_file -> (Buffer.contents buf, !truncated)
-  in
-  loop ()
-
-let read_body body =
-  fst (read_body_with_truncation body)
 
 (** Truncate a byte string near [max_len] for log output. Preserves
     UTF-8 validity without verifying it: if the input is valid UTF-8,
@@ -598,7 +604,7 @@ let decode_json_body body_str =
     debug level (expected for typing/reactions on deleted channels); other
     errors log at warn. *)
 let request ?(retry_mode = No_retry) t ~meth ~path ?body () =
-  let uri = Uri.of_string (api_base ^ path) in
+  let uri = Uri.of_string (t.api_base ^ path) in
   let host = Uri.host uri |> Option.value ~default:"discord.com" in
   let retry_limit = match retry_mode with
     | No_retry -> 1
@@ -609,7 +615,10 @@ let request ?(retry_mode = No_retry) t ~meth ~path ?body () =
   let meth_str = Http.Method.to_string meth in
   let do_call () =
     let cohttp_body = Option.map Cohttp_eio.Body.of_string body_str in
-    t.call ~sw:t.sw ~headers ?body:cohttp_body meth uri
+    let (resp, body_str, _truncated) =
+      t.call ~headers ?body:cohttp_body meth uri
+    in
+    (resp, body_str)
   in
   let log_non_2xx code body =
     let body = truncate_for_log body in
@@ -661,11 +670,10 @@ let request ?(retry_mode = No_retry) t ~meth ~path ?body () =
   let rec loop attempt rate_limit_retries =
     wait_for_transport_backoff t;
     try
-      let (resp, resp_body) = do_call () in
+      let (resp, body_str) = do_call () in
       let status = Http.Response.status resp in
       let code = Http.Status.to_int status in
       let headers = Http.Response.headers resp in
-      let body_str = read_body resp_body in
       if code = 429 && rate_limit_retries < max_rate_limit_retries then begin
         note_transport_response t;
         let retry_after =
@@ -980,11 +988,15 @@ let download_url t ~url () =
   let rec loop attempt =
     try
       let (resp, body) =
-        t.call ~sw:t.sw ~headers `GET uri in
+        let (resp, body_str, truncated) =
+          t.call ~headers `GET uri
+        in
+        (resp, (body_str, truncated))
+      in
       let status = Http.Response.status resp in
       let code = Http.Status.to_int status in
       let resp_headers = Http.Response.headers resp in
-      let (body_str, truncated) = read_body_with_truncation body in
+      let (body_str, truncated) = body in
       if truncated then
         Error (Printf.sprintf "download_url %s: response exceeded %d bytes"
           url max_body_size)

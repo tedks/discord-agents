@@ -4,7 +4,7 @@
  (libraries eio_main cohttp-eio tls-eio ca-certs mirage-crypto-rng.unix base64 yojson logs fmt uri)
  (foreign_stubs
   (language c)
-  (names disk_space_stubs))
+  (names disk_space_stubs rlimit_stubs))
  (preprocess
   (pps ppx_yojson_conv ppx_deriving.show ppx_deriving.eq)))
 

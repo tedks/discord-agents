@@ -117,6 +117,7 @@ let run_test ~sw ~env config test_channel =
 
 let () =
   setup_logging ();
+  Discord_agents.Runtime_limits.bump_nofile ();
   let args = Array.to_list Sys.argv |> List.tl in
   let test_mode = List.mem "--test" args in
   let test_channel =
