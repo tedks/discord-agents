@@ -228,7 +228,10 @@ let handle_start_session (bot : Bot.t) params =
       let thread_display_name = match thread_name with
         | Some n when String.length (String.trim n) > 0 ->
           let n = String.trim n in
-          if String.length n > 80 then String.sub n 0 80 else n
+          if String.length n > 80 then
+            Resource.truncate_utf8 ~max_bytes:80 n
+          else
+            n
         | _ -> Printf.sprintf "%s / %s" kind_str p.name
       in
       let thread_parent =

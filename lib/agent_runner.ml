@@ -56,7 +56,12 @@ let format_tool_status (info : Agent_process.tool_info) =
     prompt injection via user-controlled fields like thread names. *)
 let sanitize_context_value s =
   let max_len = 100 in
-  let s = if String.length s > max_len then String.sub s 0 max_len else s in
+  let s =
+    if String.length s > max_len then
+      Resource.truncate_utf8 ~max_bytes:max_len s
+    else
+      s
+  in
   String.init (String.length s) (fun i ->
     match s.[i] with
     | '\n' | '\r' | '\t' -> ' '
