@@ -10,18 +10,18 @@ let ensure_rng () =
 
 let response ?(headers = Http.Header.of_list []) code body =
   (Http.Response.make ~status:(Http.Status.of_int code) ~headers (),
-   Cohttp_eio.Body.of_string body)
+   body,
+   false)
 
 let with_fake_rest call f =
   ensure_rng ();
   Eio_main.run @@ fun env ->
-  Eio.Switch.run @@ fun sw ->
   let t : Rest.t = {
     token = "test-token";
     call;
-    sw;
     clock = Eio.Stdenv.mono_clock env;
     rest_state = Rest.create_health_state ();
+    api_base = Rest.api_base;
   } in
   f t
 
@@ -406,7 +406,7 @@ let test_read_body_reports_truncation () =
 
 let test_create_message_reuses_nonce_across_5xx_retry () =
   let attempts = ref [] in
-  let call ~sw:_ ~headers:_ ?body meth uri =
+  let call ~headers:_ ?body meth uri =
     attempts := (meth, Uri.path uri, body_json body) :: !attempts;
     match List.length !attempts with
     | 1 ->
@@ -437,7 +437,7 @@ let test_create_message_reuses_nonce_across_5xx_retry () =
 
 let test_create_channel_does_not_retry_5xx () =
   let attempts = ref 0 in
-  let call ~sw:_ ~headers:_ ?body:_ _meth _uri =
+  let call ~headers:_ ?body:_ _meth _uri =
     incr attempts;
     response 500 {|{"message":"server unavailable"}|}
   in
@@ -448,7 +448,7 @@ let test_create_channel_does_not_retry_5xx () =
     Alcotest.(check int) "single non-idempotent attempt" 1 !attempts
 
 let test_401_marks_rest_health_without_transport_backoff () =
-  let call ~sw:_ ~headers:_ ?body:_ _meth _uri =
+  let call ~headers:_ ?body:_ _meth _uri =
     response 401 {|{"message":"bad auth"}|}
   in
   with_fake_rest call @@ fun t ->
@@ -464,6 +464,69 @@ let test_401_marks_rest_health_without_transport_backoff () =
       1 (Rest.consecutive_rest_failures t);
     Alcotest.(check int) "transport failure not recorded"
       0 (Rest.consecutive_transport_failures t)
+
+let count_open_fds () =
+  if Sys.file_exists "/proc/self/fd" then
+    Some (Array.length (Sys.readdir "/proc/self/fd"))
+  else
+    None
+
+let local_server_addr socket =
+  match Eio.Net.listening_addr socket with
+  | `Tcp (_addr, port) -> Printf.sprintf "http://127.0.0.1:%d" port
+  | `Unix path -> Alcotest.failf "unexpected Unix listening socket %s" path
+
+let run_local_json_server env sw f =
+  let net = Eio.Stdenv.net env in
+  let addr = `Tcp (Eio.Net.Ipaddr.V4.loopback, 0) in
+  let socket = Eio.Net.listen ~sw ~backlog:64 ~reuse_addr:true net addr in
+  let stop, stop_resolver = Eio.Promise.create () in
+  let server =
+    Cohttp_eio.Server.make
+      ~callback:(fun _conn _request _body response ->
+        Cohttp_eio.Server.respond
+          ~headers:(Http.Header.of_list [("connection", "close")])
+          ~status:`OK
+          ~body:(Cohttp_eio.Body.of_string "{}")
+          () response)
+      ()
+  in
+  Eio.Fiber.fork ~sw (fun () ->
+    Cohttp_eio.Server.run ~stop ~on_error:raise socket server);
+  Fun.protect
+    ~finally:(fun () -> Eio.Promise.resolve stop_resolver ())
+    (fun () -> f (local_server_addr socket))
+
+let test_requests_close_response_sockets () =
+  match count_open_fds () with
+  | None ->
+    Alcotest.skip ()
+  | Some _ ->
+    Eio_main.run @@ fun env ->
+    Eio.Switch.run @@ fun sw ->
+    run_local_json_server env sw @@ fun api_base ->
+    let rest =
+      Discord_agents.Discord_rest.create_with_api_base
+        ~api_base ~sw ~env ~token:"test-token"
+    in
+    let before =
+      match count_open_fds () with
+      | Some count -> count
+      | None -> Alcotest.fail "lost /proc/self/fd during test"
+    in
+    for _i = 1 to 64 do
+      match Discord_agents.Discord_rest.request rest ~meth:`GET ~path:"/ok" () with
+      | Ok _ -> ()
+      | Error err -> Alcotest.failf "REST request failed: %s" err
+    done;
+    Eio.Time.sleep (Eio.Stdenv.clock env) 0.1;
+    let after =
+      match count_open_fds () with
+      | Some count -> count
+      | None -> Alcotest.fail "lost /proc/self/fd during test"
+    in
+    Alcotest.(check bool) "fd count remains bounded"
+      true (after <= before + 8)
 
 let () =
   Alcotest.run "discord_rest" [
@@ -514,5 +577,7 @@ let () =
         test_create_channel_does_not_retry_5xx;
       Alcotest.test_case "401 marks rest health without transport backoff" `Quick
         test_401_marks_rest_health_without_transport_backoff;
+      Alcotest.test_case "requests close response sockets" `Quick
+        test_requests_close_response_sockets;
     ]);
   ]
