@@ -1981,6 +1981,7 @@ let test_context_header_truncates_utf8_boundary () =
     project_name = String.make 99 'p' ^ "\xC3\xA9tail";
     working_dir = "/tmp/project";
     agent_kind = Discord_agents.Config.Claude;
+    session_override_kind = None;
     session_id = "sid";
     session_id_confirmed = true;
     thread_id = "thread";
@@ -1988,6 +1989,7 @@ let test_context_header_truncates_utf8_boundary () =
     message_count = 0;
     processing = false;
     pending_queue = Queue.create ();
+    pending_agent_change = None;
     initial_prompt = None;
   } in
   let header =
