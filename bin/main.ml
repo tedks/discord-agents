@@ -10,6 +10,7 @@
     --test CHANNEL   Also send a test message to the given channel *)
 
 let setup_logging () =
+  Printexc.record_backtrace true;
   Fmt_tty.setup_std_outputs ();
   Logs.set_reporter (Logs_fmt.reporter ());
   Logs.set_level (Some Logs.Info)
@@ -163,7 +164,9 @@ let () =
       Logs.info (fun m -> m "shutdown: signal received");
       bot.gateway.shutdown <- true;
       (match bot.gateway.ws with
-       | Some ws -> (try Discord_agents.Websocket.send_close ws with _ -> ())
+       | Some ws ->
+         (try Discord_agents.Websocket.send_close ws with exn ->
+            Discord_agents.Websocket.raise_if_cancelled exn)
        | None -> ());
       Unix.close shutdown_r;
       Unix.close shutdown_w);

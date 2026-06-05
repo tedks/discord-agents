@@ -33,6 +33,9 @@ type t = {
   mutable heartbeat_gen : int;  (* generation counter: daemon stops when it mismatches *)
   mutable resuming : bool;
   mutable shutdown : bool;
+  mutable disconnected_notified : bool;
+  mutable last_error : string option;
+  mutable last_payload_summary : string option;
   mutable handler : handler;
 }
 
@@ -47,6 +50,9 @@ let create ~token ~intents ~handler =
     heartbeat_gen = 0;
     resuming = false;
     shutdown = false;
+    disconnected_notified = false;
+    last_error = None;
+    last_payload_summary = None;
     handler }
 
 let default_intents =
@@ -56,12 +62,31 @@ let default_intents =
   lor Intent.direct_messages
   lor Intent.message_content
 
+let raise_if_cancelled exn =
+  match exn with
+  | Eio.Cancel.Cancelled _
+  | Out_of_memory
+  | Stack_overflow
+  | Sys.Break -> raise exn
+  | _ -> ()
+
+let notify_disconnected t reason =
+  if not t.disconnected_notified then begin
+    t.disconnected_notified <- true;
+    try t.handler (Disconnected reason)
+    with exn ->
+      raise_if_cancelled exn;
+      Logs.warn (fun m -> m "gateway: disconnected handler error: %s"
+        (Printexc.to_string exn))
+  end
+
 (** Send a JSON payload over the WebSocket. *)
 let send_json t json =
   match t.ws with
   | Some ws ->
     (try Websocket.send_text ws (Yojson.Safe.to_string json)
      with exn ->
+       raise_if_cancelled exn;
        Logs.warn (fun m -> m "gateway: send_json error: %s" (Printexc.to_string exn)))
   | None -> Logs.warn (fun m -> m "gateway: send_json but no ws connection")
 
@@ -102,6 +127,58 @@ let resume_payload t =
 let can_resume t =
   Option.is_some t.session_id && Option.is_some t.sequence
 
+let string_of_gateway_opcode = function
+  | Dispatch -> "Dispatch"
+  | Heartbeat -> "Heartbeat"
+  | Identify -> "Identify"
+  | Resume -> "Resume"
+  | Reconnect -> "Reconnect"
+  | Invalid_session -> "Invalid_session"
+  | Hello -> "Hello"
+  | Heartbeat_ack -> "Heartbeat_ack"
+  | Unknown_op n -> Printf.sprintf "Unknown_op(%d)" n
+
+let payload_summary_of_json ~bytes json =
+  let open Yojson.Safe.Util in
+  let safe f ~default =
+    try f () with exn ->
+      raise_if_cancelled exn;
+      default
+  in
+  let op =
+    match safe (fun () -> json |> member "op" |> to_int_option) ~default:None with
+    | Some n -> string_of_gateway_opcode (gateway_opcode_of_int n)
+    | None -> "?"
+  in
+  let event_name = safe
+    (fun () -> json |> member "t" |> to_string_option
+      |> Option.value ~default:"UNKNOWN")
+    ~default:"?"
+  in
+  let seq = safe
+    (fun () -> json |> member "s" |> to_int_option
+      |> Option.map string_of_int |> Option.value ~default:"?")
+    ~default:"?"
+  in
+  Printf.sprintf "bytes=%d op=%s event=%s seq=%s"
+    bytes op event_name seq
+
+let payload_diagnostics payload =
+  let bytes = String.length payload in
+  match Yojson.Safe.from_string payload with
+  | exception _ ->
+    Printf.sprintf "bytes=%d invalid_json" bytes
+  | json -> payload_summary_of_json ~bytes json
+
+let exn_with_backtrace exn =
+  let bt = Printexc.get_backtrace () |> String.trim in
+  if bt = "" then
+    Printexc.to_string exn
+  else
+    Printf.sprintf "%s\n%s" (Printexc.to_string exn) bt
+
+let large_payload_warn_threshold = 512 * 1024
+
 (** Parse a gateway payload and dispatch events. *)
 let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
   let open Yojson.Safe.Util in
@@ -125,14 +202,19 @@ let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
           let resume_url = d |> member "resume_gateway_url" |> to_string_option in
           t.resume_gateway_url <- resume_url;
           t.resuming <- false;
+          t.last_error <- None;
+          t.last_payload_summary <- None;
           Logs.info (fun m -> m "gateway: READY as %s (session %s)"
             user.username (Option.value ~default:"?" t.session_id));
           t.handler (Connected user)
         with exn ->
+          raise_if_cancelled exn;
           Logs.warn (fun m -> m "gateway: failed to parse READY: %s"
             (Printexc.to_string exn)))
      | "RESUMED" ->
        t.resuming <- false;
+       t.last_error <- None;
+       t.last_payload_summary <- None;
        Logs.info (fun m -> m "gateway: RESUMED successfully (session %s)"
          (Option.value ~default:"?" t.session_id))
      | "MESSAGE_CREATE" ->
@@ -140,6 +222,7 @@ let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
           let msg = message_of_yojson d in
           t.handler (Message_received msg)
         with exn ->
+          raise_if_cancelled exn;
           Logs.warn (fun m -> m "gateway: failed to parse MESSAGE_CREATE: %s"
             (Printexc.to_string exn)))
      | "THREAD_CREATE" ->
@@ -147,6 +230,7 @@ let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
           let ch = channel_of_yojson d in
           t.handler (Thread_created ch)
         with exn ->
+          raise_if_cancelled exn;
           Logs.warn (fun m -> m "gateway: failed to parse THREAD_CREATE: %s"
             (Printexc.to_string exn)))
      | _ ->
@@ -171,6 +255,8 @@ let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
           `Stop_daemon
         else if not t.last_heartbeat_acked then begin
           Logs.warn (fun m -> m "gateway: heartbeat not acked, reconnecting");
+          t.last_error <- Some "heartbeat timeout";
+          notify_disconnected t "heartbeat timeout";
           (match t.ws with Some ws -> Websocket.send_close ws | None -> ());
           `Stop_daemon
         end else begin
@@ -204,7 +290,7 @@ let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
   | Reconnect ->
     Logs.warn (fun m -> m "gateway: server requested reconnect");
     (match t.ws with Some ws -> Websocket.send_close ws | None -> ());
-    t.handler (Disconnected "reconnect requested")
+    notify_disconnected t "reconnect requested"
   | Invalid_session ->
     let resumable = try Yojson.Safe.Util.to_bool d with _ -> false in
     Logs.warn (fun m -> m "gateway: invalid session (resumable=%b)" resumable);
@@ -214,7 +300,7 @@ let handle_payload t ~sw ~(clock : _ Eio.Time.clock) json =
       t.resuming <- false
     end;
     (match t.ws with Some ws -> Websocket.send_close ws | None -> ());
-    t.handler (Disconnected "invalid session")
+    notify_disconnected t "invalid session"
   | _ ->
     Logs.debug (fun m -> m "gateway: unhandled opcode")
 
@@ -242,16 +328,21 @@ let connect ~sw ~(env : Eio_unix.Stdenv.base) t =
     Logs.info (fun m -> m "gateway: connecting to %s" host);
     (match
       (try Ok (Websocket.connect ~sw ~net ~host ~port:443 ~path:gateway_path)
-       with exn -> Error exn)
+       with exn ->
+         raise_if_cancelled exn;
+         Error exn)
     with
     | Error exn ->
-      Logs.warn (fun m -> m "gateway: connect failed: %s" (Printexc.to_string exn));
+      let err = exn_with_backtrace exn in
+      t.last_error <- Some err;
+      Logs.warn (fun m -> m "gateway: connect failed: %s" err);
       Logs.info (fun m -> m "gateway: retrying in %.0fs..." !backoff);
       Eio.Time.sleep clock !backoff;
       backoff := min (!backoff *. 2.0) 60.0;
       connect_loop ()
     | Ok ws ->
       t.ws <- Some ws;
+      t.disconnected_notified <- false;
       backoff := 5.0;  (* Reset backoff on successful connect *)
       Logs.info (fun m -> m "gateway: WebSocket connected");
       (* Cancel any stale heartbeat daemon from previous connection *)
@@ -261,26 +352,69 @@ let connect ~sw ~(env : Eio_unix.Stdenv.base) t =
         | { Websocket.opcode = Text; payload } ->
           (try
              let json = Yojson.Safe.from_string payload in
+             if String.length payload >= large_payload_warn_threshold then begin
+               let summary =
+                 payload_summary_of_json ~bytes:(String.length payload) json
+               in
+               t.last_payload_summary <- Some summary;
+               Logs.warn (fun m -> m "gateway: large payload received (%s)" summary)
+             end;
              handle_payload t ~sw ~clock json
            with exn ->
-             Logs.warn (fun m -> m "gateway: failed to parse payload: %s"
-               (Printexc.to_string exn)));
+             raise_if_cancelled exn;
+             let summary = payload_diagnostics payload in
+             t.last_payload_summary <- Some summary;
+             let err = exn_with_backtrace exn in
+             t.last_error <- Some err;
+             Logs.warn (fun m -> m "gateway: failed to parse payload (%s): %s"
+               summary err));
           recv_loop ()
         | { opcode = Close; _ } ->
-          Logs.info (fun m -> m "gateway: received close frame")
+          Logs.info (fun m -> m "gateway: received close frame");
+          notify_disconnected t "close frame"
         | { opcode = _; _ } ->
           recv_loop ()
         | exception exn ->
-          Logs.warn (fun m -> m "gateway: recv error: %s" (Printexc.to_string exn))
+          raise_if_cancelled exn;
+          if t.disconnected_notified || t.shutdown then
+            ()
+          else begin
+            let err = exn_with_backtrace exn in
+            t.last_error <- Some err;
+            Logs.warn (fun m -> m "gateway: recv error: %s" err);
+            notify_disconnected t ("recv error: " ^ Printexc.to_string exn)
+          end
       in
-      recv_loop ();
-      t.ws <- None;
-      t.heartbeat_gen <- t.heartbeat_gen + 1;
-      if can_resume t then
-        t.resuming <- true;
-      Logs.info (fun m -> m "gateway: reconnecting in %.0fs..." !backoff);
-      Eio.Time.sleep clock !backoff;
-      backoff := min (!backoff *. 1.5) 60.0;
-      connect_loop ())
+      let cleanup_connection () =
+        Fun.protect
+          ~finally:(fun () ->
+            t.ws <- None;
+            t.heartbeat_gen <- t.heartbeat_gen + 1)
+          (fun () -> Websocket.close ws)
+      in
+      let recv_result =
+        try recv_loop (); Ok ()
+        with exn -> Error exn
+      in
+      let cleanup_result =
+        try cleanup_connection (); Ok ()
+        with exn -> Error exn
+      in
+      (match recv_result with
+       | Error exn -> raise exn
+       | Ok () ->
+         (match cleanup_result with
+          | Error exn -> raise_if_cancelled exn
+          | Ok () -> ());
+         if t.shutdown then
+           Logs.info (fun m -> m "gateway: shutdown requested, not reconnecting")
+         else begin
+           if can_resume t then
+             t.resuming <- true;
+           Logs.info (fun m -> m "gateway: reconnecting in %.0fs..." !backoff);
+           Eio.Time.sleep clock !backoff;
+           backoff := min (!backoff *. 1.5) 60.0;
+           connect_loop ()
+         end))
   in
   connect_loop ()

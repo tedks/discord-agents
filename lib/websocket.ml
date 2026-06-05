@@ -23,8 +23,10 @@ type frame = {
   payload : string;
 }
 
+type closable_flow = [ Eio.Flow.two_way_ty | Eio.Resource.close_ty ]
+
 type t = {
-  flow : Eio.Flow.two_way_ty Eio.Resource.t;
+  flow : closable_flow Eio.Resource.t;
   reader : Eio.Buf_read.t;
   mutable closed : bool;
 }
@@ -46,6 +48,23 @@ let int_of_opcode = function
   | Ping -> 9
   | Pong -> 10
   | Unknown n -> n
+
+let raise_if_cancelled exn =
+  match exn with
+  | Eio.Cancel.Cancelled _
+  | Out_of_memory
+  | Stack_overflow
+  | Sys.Break -> raise exn
+  | _ -> ()
+
+let record_cancelled slot exn =
+  match exn with
+  | Eio.Cancel.Cancelled _
+  | Out_of_memory
+  | Stack_overflow
+  | Sys.Break ->
+    if !slot = None then slot := Some exn
+  | _ -> ()
 
 (** Generate 4 random bytes for WebSocket client masking.
     Uses mirage-crypto-rng (already initialized by discord_rest). *)
@@ -102,8 +121,29 @@ let read_exactly reader n =
 (** Read a WebSocket frame from the connection.
     Handles fragmented incoming messages by accumulating continuation frames.
     Server frames are NOT masked per the spec. *)
-(** Maximum payload size we'll accept (100MB). Prevents OOM from malicious frames. *)
-let max_payload_size = 100 * 1024 * 1024
+(** Discord gateway payloads are typically far smaller than this. Keep the
+    cap comfortably above observed sizes, but low enough that a malicious
+    peer can't force an outsized buffer allocation before we reject. *)
+let max_payload_size = 16 * 1024 * 1024
+
+(** Keep Eio's buffered-reader cap aligned with the explicit frame cap.
+    [Eio.Buf_read.take] raises [Buffer_limit_exceeded] before our own
+    payload-length checks if this is smaller than [max_payload_size]. *)
+let reader_max_size = max_payload_size
+
+let read_64bit_payload_len reader =
+  let len = ref 0 in
+  for _ = 0 to 7 do
+    let byte = Char.code (Eio.Buf_read.any_char reader) in
+    if !len > max_payload_size lsr 8
+       || (!len = max_payload_size lsr 8
+           && byte > (max_payload_size land 0xff))
+    then
+      failwith (Printf.sprintf "websocket: payload too large: >%d bytes"
+        max_payload_size);
+    len := (!len lsl 8) lor byte
+  done;
+  !len
 
 let recv_frame t =
   if t.closed then failwith "websocket: connection closed";
@@ -122,13 +162,7 @@ let recv_frame t =
         let lo = Char.code (Eio.Buf_read.any_char t.reader) in
         (hi lsl 8) lor lo
       end else begin
-        let len = ref 0 in
-        for _ = 0 to 7 do
-          len := (!len lsl 8) lor Char.code (Eio.Buf_read.any_char t.reader)
-        done;
-        if !len > max_payload_size then
-          failwith (Printf.sprintf "websocket: payload too large: %d bytes" !len);
-        !len
+        read_64bit_payload_len t.reader
       end
     in
     if payload_len > max_payload_size then
@@ -149,13 +183,14 @@ let recv_frame t =
       read_fragments ~first_opcode
     | Close ->
       (* Send close reply BEFORE setting closed flag *)
-      (try send_frame t ~opcode:Close "" with _ -> ());
+      (try send_frame t ~opcode:Close "" with exn ->
+         raise_if_cancelled exn);
       t.closed <- true;
       { opcode = Close; payload }
     | _ ->
-      Buffer.add_string acc_buf payload;
-      if Buffer.length acc_buf > max_payload_size then
+      if Buffer.length acc_buf + String.length payload > max_payload_size then
         failwith "websocket: accumulated fragments too large";
+      Buffer.add_string acc_buf payload;
       if fin then
         { opcode = effective_opcode; payload = Buffer.contents acc_buf }
       else
@@ -165,12 +200,28 @@ let recv_frame t =
 
 let send_text t text = send_frame t ~opcode:Text text
 
+let close t =
+  let cancelled = ref None in
+  t.closed <- true;
+  (try Eio.Flow.shutdown t.flow `All with exn ->
+     record_cancelled cancelled exn);
+  (try Eio.Flow.close t.flow with exn ->
+     record_cancelled cancelled exn);
+  match !cancelled with
+  | Some exn -> raise exn
+  | None -> ()
+
 let send_close t =
-  if not t.closed then begin
-    (* Send close frame BEFORE setting flag, otherwise send_frame rejects it *)
-    (try send_frame t ~opcode:Close "" with _ -> ());
-    t.closed <- true
-  end
+  let cancelled = ref None in
+  if not t.closed then
+    (* Send close frame BEFORE setting flag, otherwise send_frame rejects it. *)
+    (try send_frame t ~opcode:Close "" with exn ->
+       record_cancelled cancelled exn);
+  (try close t with exn ->
+     record_cancelled cancelled exn);
+  match !cancelled with
+  | Some exn -> raise exn
+  | None -> ()
 
 (** Perform the WebSocket upgrade handshake over an existing TLS connection. *)
 let handshake t ~host ~path =
@@ -228,8 +279,8 @@ let connect ~sw ~net ~host ~port ~path =
   (* If TLS or handshake fails, close the TCP flow to avoid leaking it *)
   match
     let tls_flow = Tls_eio.client_of_flow tls_config ?host:host_dn tcp_flow in
-    let flow = (tls_flow :> Eio.Flow.two_way_ty Eio.Resource.t) in
-    let reader = Eio.Buf_read.of_flow ~max_size:(1024 * 1024) flow in
+    let flow = (tls_flow :> closable_flow Eio.Resource.t) in
+    let reader = Eio.Buf_read.of_flow ~max_size:reader_max_size flow in
     let t = { flow; reader; closed = false } in
     handshake t ~host ~path;
     t

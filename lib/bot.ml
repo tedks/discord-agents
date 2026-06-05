@@ -298,6 +298,12 @@ let trigger_restart t ~notify =
         notify "Build failed, not restarting."
         (* draining reset by Fun.protect finally *)
       | `Restarting ->
+        t.gateway.shutdown <- true;
+        (match t.gateway.ws with
+         | Some ws ->
+           (try Websocket.send_close ws with exn ->
+              Websocket.raise_if_cancelled exn)
+         | None -> ());
         notify "Build succeeded. New instance starting — shutting down in 30s.";
         (* Wait for new instance to take over, then exit. *)
         Eio.Time.sleep (Eio.Stdenv.clock t.env) 30.0;
