@@ -100,6 +100,13 @@ let classify_transport_error_message msg =
           || string_contains msg "connection aborted"
           || string_contains msg "network is unreachable"
           || string_contains msg "host is unreachable"
+          || string_contains msg "epipe"
+          || string_contains msg "enetdown"
+          || string_contains msg "enetreset"
+          || string_contains msg "enetunreach"
+          || string_contains msg "ehostdown"
+          || string_contains msg "ehostunreach"
+          || string_contains msg "enotconn"
           || string_contains msg "end_of_file"
           || string_contains msg "econn"
   then Connection

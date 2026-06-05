@@ -63,6 +63,18 @@ let test_transport_error_classification () =
   Alcotest.(check string) "connection"
     "connection"
     (classify "Failure(\"connection reset by peer\")");
+  Alcotest.(check string) "network unreachable errno"
+    "connection"
+    (classify (Printexc.to_string
+      (Unix.Unix_error (Unix.ENETUNREACH, "connect", "discord.com"))));
+  Alcotest.(check string) "host unreachable errno"
+    "connection"
+    (classify (Printexc.to_string
+      (Unix.Unix_error (Unix.EHOSTUNREACH, "connect", "discord.com"))));
+  Alcotest.(check string) "broken pipe errno"
+    "connection"
+    (classify (Printexc.to_string
+      (Unix.Unix_error (Unix.EPIPE, "write", "discord.com"))));
   Alcotest.(check string) "other"
     "other_transport"
     (classify "Failure(\"unexpected library wording\")")

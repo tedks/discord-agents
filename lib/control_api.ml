@@ -58,7 +58,7 @@ let handle_health (bot : Bot.t) =
   let optional_error_field key err =
     [
       (key, `String (Resource.truncate_utf8 ~max_bytes:1000
-        (Resource.single_line err)));
+        (Resource.sanitize_utf8 (Resource.single_line err))));
     ]
   in
   let optional_rest_fields =
