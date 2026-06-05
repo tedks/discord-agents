@@ -240,7 +240,14 @@ let note_transport_failure_state state ~now ~summary ~delay =
   delay
 
 let note_transport_failure_without_backoff_state state ~now ~summary =
-  let delay = note_failure_without_backoff_state state ~now ~summary in
+  let delay =
+    if active_rest_backoff ~now state then begin
+      state.consecutive_failures <-
+        min max_recorded_failures (state.consecutive_failures + 1);
+      effective_backoff_delay_s ~now state
+    end else
+      note_failure_without_backoff_state state ~now ~summary
+  in
   state.last_transport_error <- Some summary;
   state.consecutive_transport_failures <-
     min max_recorded_failures (state.consecutive_transport_failures + 1);
@@ -388,11 +395,12 @@ let note_transport_failure t ~host exn =
     (summary, None)
   end
 
+let body_for_health_summary ?(max_len = 500) body =
+  if String.length body <= max_len then body
+  else Resource.truncate_utf8 ~max_bytes:max_len body ^ "... (truncated)"
+
 let note_http_failure t ~host ~code ~body ?retry_after () =
-  let body =
-    if String.length body <= 500 then body
-    else String.sub body 0 500 ^ "... (truncated)"
-  in
+  let body = body_for_health_summary body in
   let summary =
     Printf.sprintf "host=%s kind=http_%d error=%s"
       host code body
@@ -410,10 +418,7 @@ let note_http_failure t ~host ~code ~body ?retry_after () =
   (summary, delay)
 
 let note_http_client_failure t ~host ~code ~body =
-  let body =
-    if String.length body <= 500 then body
-    else String.sub body 0 500 ^ "... (truncated)"
-  in
+  let body = body_for_health_summary body in
   let summary =
     Printf.sprintf "host=%s kind=http_%d error=%s"
       host code body
@@ -427,10 +432,7 @@ let note_http_client_failure t ~host ~code ~body =
   (summary, delay)
 
 let note_rate_limit t ~host ~retry_after ~body =
-  let body =
-    if String.length body <= 500 then body
-    else String.sub body 0 500 ^ "... (truncated)"
-  in
+  let body = body_for_health_summary body in
   let summary =
     Printf.sprintf "host=%s kind=http_429 error=%s"
       host body

@@ -154,6 +154,12 @@ let test_retry_after_rejects_non_finite_values () =
   Alcotest.(check (option (float 1e-9))) "huge exponent rejected"
     None (Rest.parse_retry_after_seconds "1e9999")
 
+let test_body_for_health_summary_preserves_utf8_boundary () =
+  let body = String.make 499 'x' ^ "\xC3\xA9tail" in
+  Alcotest.(check string) "drops incomplete final codepoint"
+    (String.make 499 'x' ^ "... (truncated)")
+    (Rest.body_for_health_summary body)
+
 let test_health_state_failure_and_recovery () =
   let ts seconds = Mtime.of_uint64_ns (Int64.of_float (seconds *. 1e9)) in
   let state = Rest.create_health_state () in
@@ -275,6 +281,24 @@ let test_rest_backoff_survives_transport_shadowing () =
     (Some "429") (Rest.health_last_error state);
   Alcotest.(check (float 1e-9)) "transport clear exposes rest deadline"
     4.0 (Rest.health_retry_delay_s ~now:(ts 11.0) state)
+
+let test_rest_backoff_preserves_error_on_nonretryable_transport () =
+  let ts seconds = Mtime.of_uint64_ns (Int64.of_float (seconds *. 1e9)) in
+  let state = Rest.create_health_state () in
+  let _ =
+    Rest.note_rate_limit_state state
+      ~now:(ts 10.0) ~summary:"429" ~delay:5.0
+  in
+  let delay =
+    Rest.note_transport_failure_without_backoff_state state
+      ~now:(ts 11.0) ~summary:"unexpected"
+  in
+  Alcotest.(check (float 1e-9)) "rest deadline remains active"
+    4.0 delay;
+  Alcotest.(check (option string)) "rest error preserved"
+    (Some "429") (Rest.health_last_error state);
+  Alcotest.(check (option string)) "transport error recorded"
+    (Some "unexpected") (Rest.health_last_transport_error state)
 
 let test_transport_backoff_survives_rest_shadowing () =
   let ts seconds = Mtime.of_uint64_ns (Int64.of_float (seconds *. 1e9)) in
@@ -448,6 +472,8 @@ let () =
         test_retry_after_seconds_prefers_headers;
       Alcotest.test_case "retry_after rejects non-finite values" `Quick
         test_retry_after_rejects_non_finite_values;
+      Alcotest.test_case "health summary truncates on UTF-8 boundary" `Quick
+        test_body_for_health_summary_preserves_utf8_boundary;
       Alcotest.test_case "health state failure and recovery" `Quick
         test_health_state_failure_and_recovery;
       Alcotest.test_case "health state returns effective shared delay" `Quick
@@ -458,6 +484,8 @@ let () =
         test_rest_backoff_survives_unrelated_recovery;
       Alcotest.test_case "rest backoff survives transport shadowing" `Quick
         test_rest_backoff_survives_transport_shadowing;
+      Alcotest.test_case "rest backoff preserves nonretryable transport error" `Quick
+        test_rest_backoff_preserves_error_on_nonretryable_transport;
       Alcotest.test_case "transport backoff survives rest shadowing" `Quick
         test_transport_backoff_survives_rest_shadowing;
       Alcotest.test_case "transport health clears separately" `Quick
