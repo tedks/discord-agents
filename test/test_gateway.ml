@@ -24,16 +24,6 @@ let test_payload_diagnostics_wrong_types () =
   Alcotest.(check string) "wrong-typed payload summary"
     expected (Discord_agents.Discord_gateway.payload_diagnostics payload)
 
-let test_websocket_closed_error_classification () =
-  Alcotest.(check bool) "closed websocket failure"
-    true
-    (Discord_agents.Discord_gateway.websocket_closed_error
-      (Failure "websocket: connection closed"));
-  Alcotest.(check bool) "other failure"
-    false
-    (Discord_agents.Discord_gateway.websocket_closed_error
-      (Failure "connection reset by peer"))
-
 let test_websocket_reader_limit_tracks_payload_limit () =
   Alcotest.(check int) "reader limit matches payload cap"
     Discord_agents.Websocket.max_payload_size
@@ -128,8 +118,6 @@ let () =
         test_payload_diagnostics_invalid_json;
       Alcotest.test_case "payload diagnostics wrong types" `Quick
         test_payload_diagnostics_wrong_types;
-      Alcotest.test_case "websocket closed error classification" `Quick
-        test_websocket_closed_error_classification;
       Alcotest.test_case "reader limit tracks payload cap" `Quick
         test_websocket_reader_limit_tracks_payload_limit;
       Alcotest.test_case "websocket rejects oversized frame header" `Quick

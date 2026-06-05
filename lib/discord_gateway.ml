@@ -80,10 +80,6 @@ let notify_disconnected t reason =
         (Printexc.to_string exn))
   end
 
-let websocket_closed_error = function
-  | Failure msg when String.equal msg "websocket: connection closed" -> true
-  | _ -> false
-
 (** Send a JSON payload over the WebSocket. *)
 let send_json t json =
   match t.ws with
@@ -380,9 +376,7 @@ let connect ~sw ~(env : Eio_unix.Stdenv.base) t =
           recv_loop ()
         | exception exn ->
           raise_if_cancelled exn;
-          if (t.disconnected_notified || t.shutdown)
-             && websocket_closed_error exn
-          then
+          if t.disconnected_notified || t.shutdown then
             ()
           else begin
             let err = exn_with_backtrace exn in
