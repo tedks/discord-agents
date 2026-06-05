@@ -79,18 +79,90 @@ let read_file path =
     really_input ic s 0 n;
     Bytes.to_string s)
 
-(** Write string to file atomically (temp + rename). *)
-let write_file_atomic path content =
-  let tmp = path ^ ".tmp" in
-  (try
-    ensure_parent_dir path;
-    with_file_out tmp (fun oc ->
-      output_string oc content;
-      output_char oc '\n');
-    Unix.rename tmp path
+exception Durable_write_visible_but_unconfirmed of string * exn
+
+(** Retry fsync across EINTR so signals do not turn a completed write
+    into a spurious failure. *)
+let rec fsync fd =
+  try Unix.fsync fd with
+  | Unix.Unix_error (Unix.EINTR, _, _) ->
+    fsync fd
+
+(** Best-effort fsync of a parent directory after a rename. *)
+let fsync_dir path =
+  let fd = Unix.openfile path [Unix.O_RDONLY] 0 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
+    fsync fd)
+
+(** Reap stale temp files from prior crashed writers.
+    Callers must already hold the per-file flock before using this. *)
+let cleanup_atomic_write_temps path =
+  let dir = Filename.dirname path in
+  let prefix = Filename.basename path ^ ".tmp." in
+  match Sys.readdir dir with
+  | exception Sys_error _ -> ()
+  | entries ->
+    Array.iter (fun name ->
+      if String.starts_with ~prefix name then
+        let temp_path = Filename.concat dir name in
+        match Unix.lstat temp_path with
+        | { Unix.st_kind = S_REG; _ } ->
+          (try Unix.unlink temp_path with
+           | Unix.Unix_error (Unix.ENOENT, _, _) -> ()
+           | exn ->
+             Logs.warn (fun m ->
+               m "resource: failed to remove stale temp file %s: %s"
+                 temp_path (Printexc.to_string exn)))
+        | _ -> ()
+        | exception Unix.Unix_error (Unix.ENOENT, _, _) -> ())
+      entries
+
+let rec write_once fd content offset length =
+  try Unix.single_write_substring fd content offset length with
+  | Unix.Unix_error (Unix.EINTR, _, _) ->
+    write_once fd content offset length
+
+let rec write_all fd content offset length =
+  if length > 0 then
+    let wrote = write_once fd content offset length in
+    if wrote <= 0 then
+      failwith "resource: short write"
+    else
+      write_all fd content (offset + wrote) (length - wrote)
+
+(** Write string to file atomically and durably:
+    - write to a temp file in the same directory
+    - fsync the temp file
+    - rename into place
+    - fsync the parent directory so the rename is durable *)
+let write_file_atomic ?(fsync_parent=fsync_dir) path content =
+  ensure_parent_dir path;
+  let dir = Filename.dirname path in
+  let tmp =
+    Filename.temp_file
+      ~temp_dir:dir
+      (Filename.basename path ^ ".tmp.")
+      ""
+  in
+  let renamed = ref false in
+  try
+    let fd = Unix.openfile tmp
+      [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o600 in
+    Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
+      write_all fd content 0 (String.length content);
+      write_all fd "\n" 0 1;
+      fsync fd);
+    Unix.rename tmp path;
+    renamed := true;
+    (try
+       fsync_parent dir
+     with exn ->
+       raise (Durable_write_visible_but_unconfirmed
+         (path, exn)))
   with exn ->
-    (try Sys.remove tmp with _ -> ());
-    raise exn)
+    if not !renamed then
+      (try Sys.remove tmp with _ -> ());
+    raise exn
 
 (** Execute f while holding an exclusive flock on lock_path.
     Used for cross-process synchronization (bot + MCP server). *)

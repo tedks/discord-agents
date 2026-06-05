@@ -11,10 +11,7 @@ let rec rm_rf path =
     Unix.unlink path
 
 let make_tmp_dir prefix =
-  let base = Filename.temp_file prefix "" in
-  Sys.remove base;
-  Unix.mkdir base 0o755;
-  base
+  Filename.temp_dir prefix ""
 
 let restore_env name = function
   | Some value -> Unix.putenv name value

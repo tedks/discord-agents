@@ -80,6 +80,7 @@ type t = {
 let sessions_file () =
   Filename.concat (Resource.app_config_dir ()) "sessions.json"
 
+let backup_file () = sessions_file () ^ ".bak"
 let lock_file () = sessions_file () ^ ".lock"
 
 (** Serialize sessions to JSON. *)
@@ -119,85 +120,133 @@ let sessions_to_json sessions =
 
 (** Deserialize sessions from JSON. *)
 let sessions_of_json json =
-  try
-    let open Yojson.Safe.Util in
-    let entries = to_list json |> List.map (fun j ->
-      let thread_id = j |> member "thread_id" |> to_string in
-      let agent_kind = (match Config.agent_kind_of_string
-        (j |> member "agent_kind" |> to_string) with
-        | Ok k -> k | Error _ -> Config.Claude) in
-      (* For sessions written before session_id_confirmed existed,
-         derive the default from the agent's id origin: caller-pinned
-         agents (Claude) are always confirmed; server-allocated ones
-         (Codex, Gemini) default to false so the next run starts
-         fresh rather than resuming a placeholder. *)
-      let session_id_confirmed = match j |> member "session_id_confirmed" with
-        | `Bool b -> b
-        | _ -> Config.caller_pinned_session_id agent_kind in
-      let pending_agent_change =
-        match j |> member "pending_agent_kind" with
-        | `String s ->
-          (match Config.agent_kind_of_string s with
-           | Ok kind ->
-             let origin =
-               pending_agent_origin_of_json (j |> member "pending_agent_origin")
-             in
-             Some { kind; origin }
-           | Error _ -> None)
-        | _ -> None
-      in
-      let session = {
-        project_name = j |> member "project_name" |> to_string;
-        working_dir = j |> member "working_dir" |> to_string;
-        agent_kind;
-        session_override_kind =
-          (match j |> member "session_override_kind" with
-           | `String s ->
-             (match Config.agent_kind_of_string s with
-              | Ok kind -> Some kind
-              | Error _ -> None)
-           | _ -> None);
-        session_id = j |> member "session_id" |> to_string;
-        session_id_confirmed;
-        thread_id;
-        system_prompt = j |> member "system_prompt" |> to_string_option;
-        message_count = j |> member "message_count" |> to_int;
-        processing = false;
-        pending_queue = Queue.create ();
-        pending_agent_change;
-        initial_prompt = j |> member "initial_prompt" |> to_string_option;
-        child_pid = None;
-        stop_requested =
-          (match j |> member "stop_requested" with
-           | `Bool b -> b
-           | _ -> false);
-      } in
-      (thread_id, session)
-    ) in
-    List.fold_left (fun acc (tid, s) -> SessionMap.add tid s acc)
-      SessionMap.empty entries
-  with exn ->
-    Logs.warn (fun m -> m "session_store: parse error: %s" (Printexc.to_string exn));
-    SessionMap.empty
+  let open Yojson.Safe.Util in
+  let entries = to_list json |> List.map (fun j ->
+    let thread_id = j |> member "thread_id" |> to_string in
+    let agent_kind = (match Config.agent_kind_of_string
+      (j |> member "agent_kind" |> to_string) with
+      | Ok k -> k | Error _ -> Config.Claude) in
+    (* For sessions written before session_id_confirmed existed,
+       derive the default from the agent's id origin: caller-pinned
+       agents (Claude) are always confirmed; server-allocated ones
+       (Codex, Gemini) default to false so the next run starts
+       fresh rather than resuming a placeholder. *)
+    let session_id_confirmed = match j |> member "session_id_confirmed" with
+      | `Bool b -> b
+      | _ -> Config.caller_pinned_session_id agent_kind in
+    let pending_agent_change =
+      match j |> member "pending_agent_kind" with
+      | `String s ->
+        (match Config.agent_kind_of_string s with
+         | Ok kind ->
+           let origin =
+             pending_agent_origin_of_json (j |> member "pending_agent_origin")
+           in
+           Some { kind; origin }
+         | Error _ -> None)
+      | _ -> None
+    in
+    let session = {
+      project_name = j |> member "project_name" |> to_string;
+      working_dir = j |> member "working_dir" |> to_string;
+      agent_kind;
+      session_override_kind =
+        (match j |> member "session_override_kind" with
+         | `String s ->
+           (match Config.agent_kind_of_string s with
+            | Ok kind -> Some kind
+            | Error _ -> None)
+         | _ -> None);
+      session_id = j |> member "session_id" |> to_string;
+      session_id_confirmed;
+      thread_id;
+      system_prompt = j |> member "system_prompt" |> to_string_option;
+      message_count = j |> member "message_count" |> to_int;
+      processing = false;
+      pending_queue = Queue.create ();
+      pending_agent_change;
+      initial_prompt = j |> member "initial_prompt" |> to_string_option;
+      child_pid = None;
+      stop_requested =
+        (match j |> member "stop_requested" with
+         | `Bool b -> b
+         | _ -> false);
+    } in
+    (thread_id, session)
+  ) in
+  List.fold_left (fun acc (tid, s) -> SessionMap.add tid s acc)
+    SessionMap.empty entries
 
 (** Save sessions to disk with file locking. *)
-let save (t : t) =
+let log_visible_but_unconfirmed path exn =
+  Logs.warn (fun m ->
+    m "session_store: write to %s is visible but durability could not be confirmed: %s"
+      path (Printexc.to_string exn))
+
+let save_with ~write_file (t : t) =
   let json = sessions_to_json t.sessions in
   let path = sessions_file () in
+  let backup = backup_file () in
+  let rendered = Yojson.Safe.pretty_to_string json in
+  let primary_warning = ref None in
   Resource.with_flock (lock_file ()) (fun () ->
-    Resource.write_file_atomic path (Yojson.Safe.pretty_to_string json))
+    Resource.cleanup_atomic_write_temps path;
+    Resource.cleanup_atomic_write_temps backup;
+    (try write_file path rendered with
+     | Resource.Durable_write_visible_but_unconfirmed (path, exn) ->
+       primary_warning := Some (path, exn));
+    (try write_file backup rendered with
+     | Resource.Durable_write_visible_but_unconfirmed (path, exn) ->
+       log_visible_but_unconfirmed path exn
+     | exn ->
+       Logs.warn (fun m ->
+         m "session_store: failed to update backup %s: %s"
+           backup (Printexc.to_string exn))));
+  Option.iter (fun (path, exn) ->
+    log_visible_but_unconfirmed path exn) !primary_warning
+
+let save t =
+  save_with ~write_file:(fun path rendered ->
+    Resource.write_file_atomic path rendered) t
+
+let load_file path =
+  let contents = Resource.read_file path in
+  sessions_of_json (Yojson.Safe.from_string contents)
 
 (** Load sessions from disk. *)
 let load_from_disk () =
   let path = sessions_file () in
-  if not (Sys.file_exists path) then SessionMap.empty
-  else
-    try
-      let contents = Resource.read_file path in
-      sessions_of_json (Yojson.Safe.from_string contents)
-    with exn ->
-      Logs.warn (fun m -> m "session_store: load error: %s" (Printexc.to_string exn));
-      SessionMap.empty
+  let backup = backup_file () in
+  match Sys.file_exists path, Sys.file_exists backup with
+  | false, false -> SessionMap.empty
+  | false, true ->
+    (match load_file backup with
+     | sessions ->
+       Logs.warn (fun m ->
+         m "session_store: primary missing; recovered from backup %s" backup);
+       sessions
+     | exception backup_exn ->
+       Logs.warn (fun m ->
+         m "session_store: backup load error from %s: %s"
+           backup (Printexc.to_string backup_exn));
+       SessionMap.empty)
+  | true, _ ->
+    (match load_file path with
+     | sessions -> sessions
+     | exception exn ->
+       Logs.warn (fun m ->
+         m "session_store: load error from %s: %s"
+           path (Printexc.to_string exn));
+       (match load_file backup with
+        | sessions ->
+          Logs.warn (fun m ->
+            m "session_store: recovered from backup %s" backup);
+          sessions
+        | exception backup_exn ->
+          Logs.warn (fun m ->
+            m "session_store: backup load error from %s: %s"
+              backup (Printexc.to_string backup_exn));
+          SessionMap.empty))
 
 (** Create a session store, loading persisted sessions from disk. *)
 let create () =
