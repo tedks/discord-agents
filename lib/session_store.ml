@@ -267,6 +267,35 @@ let set_pending_agent_change t session pending_agent_change =
       (fun () -> save t)
   end
 
+let set_session_override_kind t session session_override_kind =
+  let prior = session.session_override_kind in
+  if prior = session_override_kind then
+    Ok ()
+  else begin
+    session.session_override_kind <- session_override_kind;
+    persist_or_rollback
+      (fun () -> session.session_override_kind <- prior)
+      (fun () -> save t)
+  end
+
+let set_override_and_pending_agent_change t session
+    ~session_override_kind ~pending_agent_change =
+  let prior_override = session.session_override_kind in
+  let prior_pending = session.pending_agent_change in
+  if prior_override = session_override_kind
+     && prior_pending = pending_agent_change
+  then
+    Ok ()
+  else begin
+    session.session_override_kind <- session_override_kind;
+    session.pending_agent_change <- pending_agent_change;
+    persist_or_rollback
+      (fun () ->
+        session.session_override_kind <- prior_override;
+        session.pending_agent_change <- prior_pending)
+      (fun () -> save t)
+  end
+
 (** Update a session's id and mark it confirmed for resume.
     Used when an agent assigns its id server-side (Codex's
     thread.started) so the pre-generated UUID is replaced before the

@@ -47,7 +47,7 @@ All commands use a `!` prefix:
 
 | Command | Description |
 |---------|-------------|
-| `!start <project>` | Start a session with the current default agent |
+| `!start <project> [agent]` | Start a session with the current default agent or explicit agent |
 | `!default-agent [agent]` | Show or set the default agent (`claude`, `codex`, `gemini`) |
 | `!session-agent [agent]` | Show or set the current channel's session agent |
 | `!start` | Show numbered project list |

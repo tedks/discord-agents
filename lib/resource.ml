@@ -15,14 +15,35 @@ let getenv_nonempty name =
   | Some "" | None -> None
   | Some value -> Some value
 
-(** Application config directory, preferring XDG and falling back to a
-    uid-specific temp dir if neither XDG nor HOME is set. *)
+(** Legacy pre-XDG config directory. *)
+let legacy_home_config_dir () =
+  match getenv_nonempty "HOME" with
+  | Some home -> Some (Filename.concat home ".config/discord-agents")
+  | None -> None
+
+let config_dir_has_state dir =
+  Sys.file_exists dir
+  && List.exists
+       (fun name -> Sys.file_exists (Filename.concat dir name))
+       ["config.json"; "settings.json"; "sessions.json"; "control.sock"]
+
+(** Application config directory, preferring XDG for new installs while
+    preserving pre-XDG HOME-based installs. If XDG_CONFIG_HOME appears
+    later but its app directory has no bot state yet, use the legacy
+    directory when it already exists so settings, sessions, and the
+    control socket remain discoverable. *)
 let app_config_dir () =
   match getenv_nonempty "XDG_CONFIG_HOME" with
-  | Some xdg_config_home -> Filename.concat xdg_config_home "discord-agents"
+  | Some xdg_config_home ->
+    let xdg_dir = Filename.concat xdg_config_home "discord-agents" in
+    (match legacy_home_config_dir () with
+     | Some legacy_dir
+       when (not (config_dir_has_state xdg_dir)) && Sys.file_exists legacy_dir ->
+       legacy_dir
+     | _ -> xdg_dir)
   | None ->
-    match getenv_nonempty "HOME" with
-    | Some home -> Filename.concat home ".config/discord-agents"
+    match legacy_home_config_dir () with
+    | Some legacy_dir -> legacy_dir
     | None ->
       let fallback =
         Filename.concat (Filename.get_temp_dir_name ())

@@ -212,7 +212,7 @@ let test_apply_pending_session_override_when_idle () =
          (fun pending -> kind_string pending.Discord_agents.Session_store.kind)
          saved.pending_agent_change))
 
-let test_apply_pending_same_kind_session_override_starts_fresh_session () =
+let test_apply_pending_same_kind_session_override_pins_existing_session () =
   with_test_bot (fun bot ->
     let pending = Discord_agents.Session_store.{
       kind = Discord_agents.Config.Codex;
@@ -229,8 +229,8 @@ let test_apply_pending_same_kind_session_override_starts_fresh_session () =
     Alcotest.(check (option string)) "session override persisted"
       (Some "codex")
       (Option.map kind_string saved.session_override_kind);
-    Alcotest.(check bool) "fresh session id allocated"
-      true (saved.session_id <> original_session_id);
+    Alcotest.(check string) "session id unchanged"
+      original_session_id saved.session_id;
     Alcotest.(check (option string)) "pending cleared"
       None
       (Option.map
@@ -338,8 +338,8 @@ let () =
         test_apply_pending_session_override_when_idle;
       Alcotest.test_case "same-kind pending clears" `Quick
         test_apply_pending_same_kind_clears_pending;
-      Alcotest.test_case "same-kind session override starts fresh session" `Quick
-        test_apply_pending_same_kind_session_override_starts_fresh_session;
+      Alcotest.test_case "same-kind session override pins existing session" `Quick
+        test_apply_pending_same_kind_session_override_pins_existing_session;
       Alcotest.test_case "busy pending change stays pending" `Quick
         test_apply_pending_busy_session_leaves_pending_intact;
       Alcotest.test_case "reconcile preserves idle session override" `Quick

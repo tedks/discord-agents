@@ -21,13 +21,29 @@ from pathlib import Path
 
 # --- Configuration ---
 
-def app_config_dir():
-    xdg = os.environ.get("XDG_CONFIG_HOME", "")
-    if xdg:
-        return Path(xdg) / "discord-agents"
+def legacy_config_dir():
     home = os.environ.get("HOME", "")
     if home:
         return Path(home) / ".config" / "discord-agents"
+    return None
+
+def config_dir_has_state(config_dir):
+    if not config_dir.exists():
+        return False
+    state_files = ("config.json", "settings.json", "sessions.json", "control.sock")
+    return any((config_dir / name).exists() for name in state_files)
+
+def app_config_dir():
+    xdg = os.environ.get("XDG_CONFIG_HOME", "")
+    if xdg:
+        xdg_dir = Path(xdg) / "discord-agents"
+        legacy_dir = legacy_config_dir()
+        if not config_dir_has_state(xdg_dir) and legacy_dir and legacy_dir.exists():
+            return legacy_dir
+        return xdg_dir
+    legacy_dir = legacy_config_dir()
+    if legacy_dir:
+        return legacy_dir
     return Path(tempfile.gettempdir()) / f"discord-agents-{os.getuid()}"
 
 CONFIG_DIR = app_config_dir()
@@ -334,7 +350,7 @@ def handle_tool_call(name, arguments):
         if "error" in result:
             return result["error"]
         agent = result.get("agent", "")
-        if "agent" not in (arguments or {}):
+        if (arguments or {}).get("agent") is None:
             return f"Default agent: `{agent}`."
         reset_count = result.get("reset_count", 0)
         busy_count = result.get("busy_count", 0)

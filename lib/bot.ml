@@ -397,6 +397,20 @@ let maybe_apply_pending_session_agent_change t (session : Session_store.session)
          Logs.warn (fun m ->
            m "bot: failed to clear pending agent change for %s: %s"
              session.thread_id err))
+    else if Config.equal_agent_kind session.agent_kind pending.kind
+            && pending.origin = Session_store.Session_override
+    then
+      (match Session_store.set_override_and_pending_agent_change t.sessions session
+               ~session_override_kind:(Some pending.kind)
+               ~pending_agent_change:None with
+       | Ok () ->
+         Logs.info (fun m ->
+           m "bot: pinned channel %s to existing %s session after pending agent change"
+             session.thread_id (Config.string_of_agent_kind pending.kind))
+       | Error err ->
+         Logs.warn (fun m ->
+           m "bot: failed to pin existing session for %s: %s"
+             session.thread_id err))
     else if not session.processing
             && Queue.is_empty session.pending_queue then begin
       let session_override_kind =
@@ -982,9 +996,18 @@ let handle_command t msg cmd =
     let kind_str = Config.string_of_agent_kind kind in
     (match Session_store.find_opt t.sessions ~thread_id:channel_id with
      | Some session when Config.equal_agent_kind session.agent_kind kind
-                         && Option.is_none session.pending_agent_change
-                         && session.session_override_kind = Some kind ->
-       reply (Printf.sprintf "Session agent is already `%s`." kind_str)
+                         && Option.is_none session.pending_agent_change ->
+       (match session.session_override_kind with
+        | Some override_kind when Config.equal_agent_kind override_kind kind ->
+          reply (Printf.sprintf "Session agent is already `%s`." kind_str)
+        | _ ->
+          (match Session_store.set_session_override_kind t.sessions session
+                   (Some kind) with
+           | Ok () ->
+             reply (Printf.sprintf "Session agent pinned to `%s`." kind_str)
+           | Error err ->
+             reply (Printf.sprintf "Failed to persist session agent pin: %s"
+               err)))
      | Some session when session.processing || not (Queue.is_empty session.pending_queue) ->
        (match Session_store.set_pending_agent_change t.sessions session
                 (Some (pending_session_override kind)) with

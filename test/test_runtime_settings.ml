@@ -96,6 +96,33 @@ let test_xdg_config_home_without_home () =
             (Discord_agents.Config.string_of_agent_kind
                reloaded.default_agent)))
 
+let test_xdg_falls_back_to_existing_legacy_home () =
+  let home = make_tmp_dir "discord_agents_home_" in
+  let xdg_root = make_tmp_dir "discord_agents_xdg_" in
+  Fun.protect
+    ~finally:(fun () ->
+      rm_rf xdg_root;
+      rm_rf home)
+    (fun () ->
+      with_tmp_env ~home ~xdg_config_home:xdg_root (fun () ->
+        let legacy_dir =
+          Filename.concat home ".config/discord-agents"
+        in
+        Unix.mkdir (Filename.concat xdg_root "discord-agents") 0o755;
+        let legacy_settings =
+          Filename.concat legacy_dir "settings.json"
+        in
+        Discord_agents.Resource.write_file_atomic legacy_settings
+          {|{"default_agent":"codex"}|};
+        Alcotest.(check string) "config dir"
+          legacy_dir
+          (Discord_agents.Resource.app_config_dir ());
+        let settings = Discord_agents.Runtime_settings.load () in
+        Alcotest.(check string) "legacy default agent"
+          "codex"
+          (Discord_agents.Config.string_of_agent_kind
+             settings.default_agent)))
+
 let () =
   Alcotest.run "runtime_settings" [
     ("settings", [
@@ -107,5 +134,7 @@ let () =
         test_load_uses_backup_when_primary_corrupt;
       Alcotest.test_case "xdg config home without home" `Quick
         test_xdg_config_home_without_home;
+      Alcotest.test_case "xdg falls back to existing legacy home" `Quick
+        test_xdg_falls_back_to_existing_legacy_home;
     ]);
   ]
