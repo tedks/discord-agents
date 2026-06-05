@@ -117,6 +117,9 @@ let handle_health (bot : Bot.t) =
     Disk_health.preflight_state_mutation ()));
   let uptime = int_of_float (Unix.gettimeofday () -. bot.started_at) in
   let disk = Disk_health.snapshot () in
+  let effective_top_level_agent =
+    Bot.effective_top_level_agent_from_snapshot bot.settings disk
+  in
   let rest_failures = Discord_rest.consecutive_rest_failures bot.rest in
   let transport_failures =
     Discord_rest.consecutive_transport_failures bot.rest
@@ -194,13 +197,22 @@ let handle_health (bot : Bot.t) =
     ("uptime_seconds", `Int uptime);
     ("default_agent",
      `String (Config.string_of_agent_kind bot.settings.default_agent));
+    ("effective_top_level_agent",
+     `String (Config.string_of_agent_kind effective_top_level_agent));
+    ("disk_rescue_active",
+     `Bool (Bot.rescue_mode_active_from_snapshot bot.settings disk));
     ("sessions", `Int (Session_store.count bot.sessions));
     ("projects", `Int (List.length (Bot.projects bot)));
     ("channels", `Int (Channel_manager.count (Bot.channels bot)));
   ] @ rest_fields @ optional_rest_fields
     @ optional_transport_fields
     @ gateway_fields @ optional_gateway_fields
-    @ disk_fields @ optional_disk_fields)
+    @ disk_fields @ optional_disk_fields
+    @
+    match bot.settings.rescue_agent with
+    | Some kind ->
+      [("rescue_agent", `String (Config.string_of_agent_kind kind))]
+    | None -> [])
 
 let handle_list_projects (bot : Bot.t) =
   let projects = List.map (fun (p : Project.t) ->
@@ -304,7 +316,7 @@ let handle_start_session (bot : Bot.t) params =
       let kind_str = match params |> member "agent" |> to_string_option with
         | Some s -> s
         | None ->
-          Config.string_of_agent_kind bot.settings.default_agent
+          Config.string_of_agent_kind (Bot.effective_top_level_agent bot)
       in
       let kind = match Config.agent_kind_of_string kind_str with
         | Ok k -> k | Error _ -> failwith ("unknown agent: " ^ kind_str) in
@@ -529,8 +541,8 @@ let handle_resume_session (bot : Bot.t) params =
            | Ok k -> Some k | Error _ -> None)
       in
       (* Mirror Bot.handle_command's Resume_session dispatch: explicit
-         kind looks up its own store; None tries the current default
-         first, then the remaining stores. *)
+         kind looks up its own store; None tries the current effective
+         top-level agent first, then the remaining stores. *)
       let try_claude () =
         match Claude_sessions.find_by_prefix sid_prefix with
         | Some (sid, wd) -> Some (Config.Claude, sid, wd) | None -> None
@@ -551,7 +563,8 @@ let handle_resume_session (bot : Bot.t) params =
       let found = match kind with
         | Some k -> try_kind k
         | None ->
-          Config.find_with_preferred_agent bot.settings.default_agent try_kind
+          Config.find_with_preferred_agent
+            (Bot.effective_top_level_agent bot) try_kind
       in
       match found with
       | None ->
@@ -618,6 +631,7 @@ let handle_resume_session (bot : Bot.t) params =
 
 let handle_default_agent (bot : Bot.t) params =
   let open Yojson.Safe.Util in
+  ignore (Disk_health.preflight_state_mutation ());
   let requested =
     match params with
     | Some p ->
@@ -631,16 +645,75 @@ let handle_default_agent (bot : Bot.t) params =
   in
   match requested with
   | None ->
-    ok_response [
+    let disk = Disk_health.snapshot () in
+    ok_response ([
       ("agent",
        `String (Config.string_of_agent_kind bot.settings.default_agent));
-    ]
+      ("effective_top_level_agent",
+       `String (Config.string_of_agent_kind
+         (Bot.effective_top_level_agent_from_snapshot bot.settings disk)));
+      ("disk_rescue_active",
+       `Bool (Bot.rescue_mode_active_from_snapshot bot.settings disk));
+    ] @
+    match bot.settings.rescue_agent with
+    | Some kind ->
+      [("rescue_agent", `String (Config.string_of_agent_kind kind))]
+    | None -> [])
   | Some kind ->
     (match Bot.set_default_agent bot kind with
      | Error err -> error_response err
      | Ok rotation ->
-       ok_response [
+       ok_response ([
          ("agent", `String (Config.string_of_agent_kind kind));
+         ("effective_top_level_agent",
+          `String (Config.string_of_agent_kind (Bot.effective_top_level_agent bot)));
+         ("disk_rescue_active", `Bool (Bot.rescue_mode_active bot));
+         ("reset_count", `Int rotation.Bot.reset_count);
+         ("busy_count", `Int rotation.Bot.busy_count);
+       ] @
+       match bot.settings.rescue_agent with
+       | Some rescue ->
+         [("rescue_agent", `String (Config.string_of_agent_kind rescue))]
+       | None -> []))
+
+let handle_rescue_agent (bot : Bot.t) params =
+  let open Yojson.Safe.Util in
+  ignore (Disk_health.preflight_state_mutation ());
+  let requested =
+    match params with
+    | Some p ->
+      (match p |> member "agent" |> to_string_option with
+       | None -> None
+       | Some s when String.equal (String.lowercase_ascii s) "off" -> Some None
+       | Some s ->
+         (match Config.agent_kind_of_string (String.lowercase_ascii s) with
+          | Ok kind -> Some (Some kind)
+          | Error msg -> failwith msg))
+    | None -> None
+  in
+  match requested with
+  | None ->
+    ok_response ([
+      ("effective_top_level_agent",
+       `String (Config.string_of_agent_kind (Bot.effective_top_level_agent bot)));
+      ("disk_rescue_active", `Bool (Bot.rescue_mode_active bot));
+    ] @
+    match bot.settings.rescue_agent with
+    | Some kind ->
+      [("agent", `String (Config.string_of_agent_kind kind))]
+    | None -> [("agent", `Null)])
+  | Some kind ->
+    (match Bot.set_rescue_agent bot kind with
+     | Error err -> error_response err
+     | Ok rotation ->
+       ok_response [
+         ("agent",
+          match kind with
+          | Some kind -> `String (Config.string_of_agent_kind kind)
+          | None -> `Null);
+         ("effective_top_level_agent",
+          `String (Config.string_of_agent_kind (Bot.effective_top_level_agent bot)));
+         ("disk_rescue_active", `Bool (Bot.rescue_mode_active bot));
          ("reset_count", `Int rotation.Bot.reset_count);
          ("busy_count", `Int rotation.Bot.busy_count);
        ])
@@ -745,6 +818,7 @@ let dispatch (bot : Bot.t) method_ params =
     | "resume_session" -> handle_resume_session bot params
     | "stop_session" -> handle_stop_session bot params
     | "default_agent" -> handle_default_agent bot params
+    | "rescue_agent" -> handle_rescue_agent bot params
     | "restart" -> handle_restart bot
     | "rename_thread" -> handle_rename_thread bot params
     | "cleanup_channels" -> handle_cleanup_channels bot

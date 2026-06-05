@@ -682,6 +682,11 @@ let cmd_testable =
       | Default_agent (Some k) ->
         Printf.sprintf "Default_agent(%s)"
           (Discord_agents.Config.string_of_agent_kind k)
+      | Rescue_agent None -> "Rescue_agent"
+      | Rescue_agent (Some None) -> "Rescue_agent(off)"
+      | Rescue_agent (Some (Some k)) ->
+        Printf.sprintf "Rescue_agent(%s)"
+          (Discord_agents.Config.string_of_agent_kind k)
       | Session_agent None -> "Session_agent"
       | Session_agent (Some k) ->
         Printf.sprintf "Session_agent(%s)"
@@ -870,6 +875,40 @@ let test_parse_default_agent_invalid_kind () =
     Alcotest.(check pass) "invalid default agent is Unknown" () ()
   | _ -> Alcotest.fail "expected Unknown for invalid default agent kind"
 
+let test_parse_rescue_agent_no_arg () =
+  Alcotest.(check cmd_testable) "rescue-agent no arg"
+    (Discord_agents.Command.Rescue_agent None)
+    (Discord_agents.Command.parse "!rescue-agent")
+
+let test_parse_rescue_agent_set () =
+  Alcotest.(check cmd_testable) "rescue-agent codex"
+    (Discord_agents.Command.Rescue_agent
+       (Some (Some Discord_agents.Config.Codex)))
+    (Discord_agents.Command.parse "!rescue-agent codex")
+
+let test_parse_rescue_agent_clear () =
+  Alcotest.(check cmd_testable) "rescue-agent off"
+    (Discord_agents.Command.Rescue_agent (Some None))
+    (Discord_agents.Command.parse "!rescue-agent off");
+  Alcotest.(check cmd_testable) "rescue-agent Off"
+    (Discord_agents.Command.Rescue_agent (Some None))
+    (Discord_agents.Command.parse "!rescue-agent Off");
+  Alcotest.(check cmd_testable) "rescue-agent NONE"
+    (Discord_agents.Command.Rescue_agent (Some None))
+    (Discord_agents.Command.parse "!rescue-agent NONE")
+
+let test_parse_rescue_agent_underscore_alias () =
+  Alcotest.(check cmd_testable) "rescue_agent alias"
+    (Discord_agents.Command.Rescue_agent
+       (Some (Some Discord_agents.Config.Gemini)))
+    (Discord_agents.Command.parse "!rescue_agent gemini")
+
+let test_parse_rescue_agent_invalid_kind () =
+  match Discord_agents.Command.parse "!rescue-agent nonesuch" with
+  | Discord_agents.Command.Unknown _ ->
+    Alcotest.(check pass) "invalid rescue agent is Unknown" () ()
+  | _ -> Alcotest.fail "expected Unknown for invalid rescue agent kind"
+
 let test_parse_session_agent_no_arg () =
   Alcotest.(check cmd_testable) "session-agent no arg"
     (Discord_agents.Command.Session_agent None)
@@ -922,6 +961,11 @@ let command_tests = [
   Alcotest.test_case "default-agent set" `Quick test_parse_default_agent_set;
   Alcotest.test_case "default_agent alias" `Quick test_parse_default_agent_underscore_alias;
   Alcotest.test_case "default-agent invalid kind" `Quick test_parse_default_agent_invalid_kind;
+  Alcotest.test_case "rescue-agent no arg" `Quick test_parse_rescue_agent_no_arg;
+  Alcotest.test_case "rescue-agent set" `Quick test_parse_rescue_agent_set;
+  Alcotest.test_case "rescue-agent clear" `Quick test_parse_rescue_agent_clear;
+  Alcotest.test_case "rescue_agent alias" `Quick test_parse_rescue_agent_underscore_alias;
+  Alcotest.test_case "rescue-agent invalid kind" `Quick test_parse_rescue_agent_invalid_kind;
   Alcotest.test_case "session-agent no arg" `Quick test_parse_session_agent_no_arg;
   Alcotest.test_case "session-agent set" `Quick test_parse_session_agent_set;
   Alcotest.test_case "session_agent alias" `Quick test_parse_session_agent_underscore_alias;
@@ -1644,6 +1688,10 @@ let test_pending_agent_kind_roundtrip () =
           | Discord_agents.Session_store.Session_override -> "session_override")
         s.pending_agent_change
     in
+    let session_override_kind =
+      Option.map Discord_agents.Config.string_of_agent_kind
+        s.session_override_kind
+    in
     Alcotest.(check (option string))
       "session override kind survives roundtrip"
       (Some "gemini")
@@ -1654,7 +1702,10 @@ let test_pending_agent_kind_roundtrip () =
       (Some "codex") pending_kind;
     Alcotest.(check (option string))
       "pending agent origin survives roundtrip"
-      (Some "session_override") pending_origin
+      (Some "session_override") pending_origin;
+    Alcotest.(check (option string))
+      "session override survives roundtrip"
+      (Some "gemini") session_override_kind
   | _ -> Alcotest.fail "expected exactly one session"
 
 let test_legacy_pending_agent_defaults_to_default_rotation () =

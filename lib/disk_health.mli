@@ -48,4 +48,5 @@ module For_testing : sig
     available_bytes_of_path:(string -> int64) ->
     string ->
     (unit, string) result
+  val set_probe_available_bytes : (string -> int64) -> unit
 end

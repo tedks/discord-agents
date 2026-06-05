@@ -74,11 +74,42 @@ type t = {
 let projects t = t.project_state.projects
 let channels t = t.project_state.channels
 let default_agent t = t.settings.default_agent
+let rescue_agent t = t.settings.rescue_agent
 let new_session_block_message () = Disk_health.new_session_block_message ()
 let pending_default_rotation kind =
   Session_store.{ kind; origin = Default_rotation }
 let pending_session_override kind =
   Session_store.{ kind; origin = Session_override }
+
+let rescue_mode_active_from_snapshot (settings : Runtime_settings.t) disk =
+  Disk_health.pressure disk && Option.is_some settings.rescue_agent
+
+let effective_top_level_agent_from_snapshot (settings : Runtime_settings.t) disk =
+  match settings.rescue_agent with
+  | Some kind when Disk_health.pressure disk -> kind
+  | _ -> settings.default_agent
+
+let effective_top_level_agent t =
+  effective_top_level_agent_from_snapshot t.settings (Disk_health.snapshot ())
+
+let rescue_mode_active t =
+  rescue_mode_active_from_snapshot t.settings (Disk_health.snapshot ())
+
+let rescue_agent_notice t =
+  let disk = Disk_health.snapshot () in
+  match t.settings.rescue_agent with
+  | Some kind when Disk_health.pressure disk ->
+    Some (Printf.sprintf
+      "Disk pressure is active, so new top-level sessions currently use rescue agent `%s`."
+      (Config.string_of_agent_kind kind))
+  | Some kind ->
+    Some (Printf.sprintf "Rescue agent `%s` is inactive until disk pressure."
+      (Config.string_of_agent_kind kind))
+  | None ->
+    None
+
+let refresh_disk_state () =
+  ignore (Disk_health.preflight_state_mutation ())
 
 let is_control_channel t ~(channel_id : Discord_types.channel_id) =
   match t.config.control_channel_id with
@@ -90,6 +121,28 @@ let is_project_channel t ~(channel_id : Discord_types.channel_id) =
 
 let is_persistent_channel t ~(channel_id : Discord_types.channel_id) =
   is_control_channel t ~channel_id || is_project_channel t ~channel_id
+
+let is_known_project_name t project_name =
+  List.exists (fun (project : Project.t) ->
+    String.equal project.Project.name project_name) (projects t)
+
+let is_persistent_session t ~thread_id (session : Session_store.session) =
+  is_persistent_channel t ~channel_id:thread_id
+  || (Option.is_some session.system_prompt
+      && is_known_project_name t session.project_name)
+
+let refresh_session_disk_state (session : Session_store.session) =
+  ignore (Disk_health.preflight_write session.working_dir)
+
+let refresh_persistent_session_disk_state t =
+  Session_store.bindings t.sessions
+  |> List.iter (fun (thread_id, (session : Session_store.session)) ->
+    if is_persistent_session t ~thread_id session then
+      refresh_session_disk_state session)
+
+let refresh_top_level_disk_state t =
+  refresh_disk_state ();
+  refresh_persistent_session_disk_state t
 
 type persistent_rotation = {
   reset_count : int;
@@ -373,8 +426,9 @@ You have MCP tools available:
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume
 - list_gemini_sessions: Find recent Gemini CLI sessions to resume
-- resume_session: Resume an existing session (pass kind=claude, kind=codex, or kind=gemini to disambiguate; default tries the current default agent first)
+- resume_session: Resume an existing session (pass kind=claude, kind=codex, or kind=gemini to disambiguate; default tries the current effective top-level agent first)
 - default_agent: Show or set the default agent used for new top-level sessions
+- rescue_agent: Show or set the rescue agent automatically used for new top-level sessions under disk pressure
 - restart_bot: Rebuild and restart the bot
 - rename_thread: Rename a Discord thread
 - cleanup_channels: Delete stale Discord channels
@@ -412,8 +466,9 @@ You have MCP tools available:
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume
 - list_gemini_sessions: Find recent Gemini CLI sessions to resume
-- resume_session: Resume an existing session (pass kind=claude, kind=codex, or kind=gemini to disambiguate; default tries the current default agent first)
+- resume_session: Resume an existing session (pass kind=claude, kind=codex, or kind=gemini to disambiguate; default tries the current effective top-level agent first)
 - default_agent: Show or set the default agent used for new top-level sessions
+- rescue_agent: Show or set the rescue agent automatically used for new top-level sessions under disk pressure
 - rename_thread: Rename a Discord thread
 - restart_bot: Rebuild and restart the bot
 - cleanup_channels: Delete stale Discord channels
@@ -467,9 +522,9 @@ let replace_session_agent t (session : Session_store.session)
   with exn ->
     Error (Printexc.to_string exn)
 
-let align_persistent_sessions_to_default t ~current_channel_id ~new_agent =
+let align_persistent_sessions_to_agent t ~current_channel_id ~new_agent =
   let clear_redundant_default_rotation thread_id (session : Session_store.session) =
-    if is_persistent_channel t ~channel_id:thread_id
+    if is_persistent_session t ~thread_id session
        && (Config.equal_agent_kind session.agent_kind new_agent
            || Option.is_some session.session_override_kind)
     then
@@ -484,22 +539,22 @@ let align_persistent_sessions_to_default t ~current_channel_id ~new_agent =
     else
       Ok ()
   in
+  let current_override_kind = ref None in
+  (match current_channel_id with
+   | Some thread_id ->
+     (match Session_store.find_opt t.sessions ~thread_id with
+      | Some session ->
+        current_override_kind := session.session_override_kind
+      | None -> ())
+   | None -> ());
   let stale_sessions =
     Session_store.bindings t.sessions
     |> List.filter (fun (thread_id, (session : Session_store.session)) ->
-      is_persistent_channel t ~channel_id:thread_id
+      is_persistent_session t ~thread_id session
       && Option.is_none session.session_override_kind
       && not (Config.equal_agent_kind session.agent_kind new_agent))
   in
   let current_busy_kind = ref None in
-  let current_override_kind =
-    match current_channel_id with
-    | Some current_channel_id ->
-      (match Session_store.find_opt t.sessions ~thread_id:current_channel_id with
-       | Some session -> ref session.session_override_kind
-       | None -> ref None)
-    | None -> ref None
-  in
   let reset_count = ref 0 in
   let busy_count = ref 0 in
   let rec clear_redundant = function
@@ -545,8 +600,8 @@ let align_persistent_sessions_to_default t ~current_channel_id ~new_agent =
             incr busy_count;
             align rest
       end else
-        match replace_session_agent t session ~agent_kind:new_agent
-                ~session_override_kind:None with
+        match replace_session_agent t session
+                ~agent_kind:new_agent ~session_override_kind:None with
         | Error err ->
           Error (Printf.sprintf
             "failed to start a fresh %s session for channel %s: %s"
@@ -560,22 +615,57 @@ let align_persistent_sessions_to_default t ~current_channel_id ~new_agent =
   | Ok () -> align stale_sessions
 
 let set_default_agent t ?(current_channel_id=None) kind =
+  refresh_top_level_disk_state t;
   match Runtime_settings.set_default_agent t.settings kind with
   | Error err ->
     Error (Printf.sprintf "Failed to persist the default agent setting: %s" err)
   | Ok () ->
-    (match align_persistent_sessions_to_default t
-             ~current_channel_id ~new_agent:kind with
+    (match align_persistent_sessions_to_agent t
+             ~current_channel_id ~new_agent:(effective_top_level_agent t) with
      | Ok rotation -> Ok rotation
      | Error err ->
        Error (Printf.sprintf
          "Default agent is now `%s`, but top-level session rotation was incomplete: %s"
          (Config.string_of_agent_kind kind) err))
 
+let set_rescue_agent t ?(current_channel_id=None) kind =
+  refresh_top_level_disk_state t;
+  match Runtime_settings.set_rescue_agent t.settings kind with
+  | Error err ->
+    Error (Printf.sprintf "Failed to persist the rescue agent setting: %s" err)
+  | Ok () ->
+    let effective = effective_top_level_agent t in
+    let summary =
+      match kind with
+      | Some kind ->
+        Printf.sprintf "Rescue agent is now `%s`"
+          (Config.string_of_agent_kind kind)
+      | None ->
+        "Rescue agent is now disabled"
+    in
+    (match align_persistent_sessions_to_agent t
+             ~current_channel_id ~new_agent:effective with
+     | Ok rotation -> Ok rotation
+     | Error err ->
+       Error (Printf.sprintf
+         "%s, but top-level session rotation was incomplete: %s"
+         summary err))
+
 let maybe_apply_pending_session_agent_change t (session : Session_store.session) =
   match session.pending_agent_change with
   | None -> ()
   | Some pending ->
+    let target_kind =
+      match pending.origin with
+      | Session_store.Session_override -> pending.kind
+      | Session_store.Default_rotation ->
+        (* Default rotations follow the live top-level policy. The persisted
+           kind is only the scheduling-time target and can become stale when
+           disk pressure changes before a busy session finishes. *)
+        refresh_disk_state ();
+        refresh_session_disk_state session;
+        effective_top_level_agent t
+    in
     if pending.origin = Session_store.Default_rotation
        && Option.is_some session.session_override_kind
     then
@@ -585,7 +675,7 @@ let maybe_apply_pending_session_agent_change t (session : Session_store.session)
          Logs.warn (fun m ->
            m "bot: failed to clear stale default-agent rotation for override %s: %s"
              session.thread_id err))
-    else if Config.equal_agent_kind session.agent_kind pending.kind
+    else if Config.equal_agent_kind session.agent_kind target_kind
             && pending.origin = Session_store.Default_rotation
     then
       (match Session_store.set_pending_agent_change t.sessions session None with
@@ -616,17 +706,17 @@ let maybe_apply_pending_session_agent_change t (session : Session_store.session)
         | Session_store.Default_rotation -> None
       in
       match replace_session_agent t session
-              ~agent_kind:pending.kind
+              ~agent_kind:target_kind
               ~session_override_kind with
       | Ok () ->
          Logs.info (fun m ->
            m "bot: switched channel %s to %s after pending agent change"
-             session.thread_id (Config.string_of_agent_kind pending.kind))
+             session.thread_id (Config.string_of_agent_kind target_kind))
       | Error err ->
         Logs.warn (fun m ->
           m "bot: failed to switch channel %s to %s: %s"
             session.thread_id
-            (Config.string_of_agent_kind pending.kind)
+            (Config.string_of_agent_kind target_kind)
             err)
     end
 
@@ -663,11 +753,12 @@ let reconcile_persisted_stop_requests t =
             session.thread_id err))
 
 let reconcile_persisted_pending_agent_changes t =
+  refresh_top_level_disk_state t;
   Session_store.bindings t.sessions
   |> List.iter (fun (_thread_id, (session : Session_store.session)) ->
     maybe_apply_pending_session_agent_change t session);
-  match align_persistent_sessions_to_default t
-          ~current_channel_id:None ~new_agent:(default_agent t) with
+  match align_persistent_sessions_to_agent t
+          ~current_channel_id:None ~new_agent:(effective_top_level_agent t) with
   | Ok _ -> ()
   | Error err ->
     Logs.warn (fun m ->
@@ -929,7 +1020,8 @@ let create_explicit_channel_session t ~channel_id ~agent_kind =
     create_persistent_channel_session t ~channel_id
       ~project_name:"control" ~working_dir:(Sys.getcwd ())
       ~system_prompt:(Some (control_system_prompt (projects t)))
-      ~agent_kind ~session_override_kind:(Some agent_kind);
+      ~agent_kind
+      ~session_override_kind:(Some agent_kind);
     true
   end else
     match Channel_manager.project_for_channel (channels t) ~channel_id with
@@ -946,7 +1038,8 @@ let create_explicit_channel_session t ~channel_id ~agent_kind =
         create_persistent_channel_session t ~channel_id
           ~project_name:p.name ~working_dir
           ~system_prompt:(Some (project_system_prompt p))
-          ~agent_kind ~session_override_kind:(Some agent_kind);
+          ~agent_kind
+          ~session_override_kind:(Some agent_kind);
         true
 
 let cleanup_orphan_thread t ~thread_id ~context =
@@ -1036,11 +1129,11 @@ let handle_command t msg cmd =
       reply (format_session_listing ~label:"Claude"
         ~resume_hint:"!resume <session_id_prefix>" entries))
   | Command.Start_agent { project; kind } ->
-    let kind = Option.value kind ~default:(default_agent t) in
     (match new_session_block_message () with
      | Some msg ->
        reply msg
      | None ->
+       let kind = Option.value kind ~default:(effective_top_level_agent t) in
        let proj = Command.find_project_fuzzy (projects t) project in
        match proj with
        | None ->
@@ -1139,8 +1232,8 @@ let handle_command t msg cmd =
       | Some msg ->
         reply msg
       | None ->
-      (* Locate the session in the requested store, or try the
-         current default first if [kind] is unspecified. *)
+      (* Locate the session in the requested store, or try the current
+         effective top-level agent first if [kind] is unspecified. *)
       let try_claude () =
         match Claude_sessions.find_by_prefix session_id with
         | Some (sid, wd) -> Some (Config.Claude, sid, wd)
@@ -1161,11 +1254,11 @@ let handle_command t msg cmd =
         | Config.Codex -> try_codex ()
         | Config.Gemini -> try_gemini ()
       in
-      (* Explicit kind hits exactly one store; otherwise try the
-         current default first, then the remaining stores. *)
+      (* Explicit kind hits exactly one store; otherwise try the current
+         effective top-level agent first, then the remaining stores. *)
       let found = match kind with
         | Some k -> try_kind k
-        | None -> Config.find_with_preferred_agent (default_agent t) try_kind
+        | None -> Config.find_with_preferred_agent (effective_top_level_agent t) try_kind
       in
       match found with
       | None ->
@@ -1254,8 +1347,12 @@ let handle_command t msg cmd =
      | Session_stop_failed err ->
        reply (Printf.sprintf "Failed to stop session: %s" err))
   | Command.Default_agent None ->
-    reply (Printf.sprintf "Default agent: `%s`."
-      (Config.string_of_agent_kind (default_agent t)))
+    refresh_disk_state ();
+    let base = Printf.sprintf "Default agent: `%s`."
+      (Config.string_of_agent_kind (default_agent t)) in
+    reply (match rescue_agent_notice t with
+      | Some notice -> base ^ " " ^ notice
+      | None -> base)
   | Command.Default_agent (Some kind) ->
     let kind_str = Config.string_of_agent_kind kind in
     (match set_default_agent t ~current_channel_id:(Some channel_id) kind with
@@ -1292,7 +1389,7 @@ let handle_command t msg cmd =
                  (if other_busy = 1 then "" else "s")
            in
            Printf.sprintf
-             " This channel is still running `%s`; it will reset to the new default after its queued work finishes.%s"
+             " This channel is still running `%s`; it will follow the effective top-level agent after its queued work finishes.%s"
              (Config.string_of_agent_kind current_kind) others
          | None, None ->
            if rotation.busy_count = 0 then ""
@@ -1301,17 +1398,72 @@ let handle_command t msg cmd =
                rotation.busy_count
                (if rotation.busy_count = 1 then "" else "s")
       in
-       reply (Printf.sprintf "Default agent set to `%s`.%s%s"
-         kind_str reset_suffix busy_suffix))
+       let rescue_suffix =
+         match rescue_agent_notice t with
+         | Some notice when not (Config.equal_agent_kind (effective_top_level_agent t) kind) ->
+           " " ^ notice
+         | _ -> ""
+       in
+       reply (Printf.sprintf "Default agent set to `%s`.%s%s%s"
+         kind_str reset_suffix busy_suffix rescue_suffix))
+  | Command.Rescue_agent None ->
+    refresh_disk_state ();
+    (match rescue_agent t with
+     | Some kind ->
+       let base = Printf.sprintf "Rescue agent: `%s`."
+         (Config.string_of_agent_kind kind) in
+       reply (match rescue_agent_notice t with
+         | Some notice -> base ^ " " ^ notice
+         | None -> base)
+     | None ->
+       reply "Rescue agent: disabled.")
+  | Command.Rescue_agent (Some requested) ->
+    let requested_label = match requested with
+      | Some kind -> Printf.sprintf "`%s`" (Config.string_of_agent_kind kind)
+      | None -> "disabled"
+    in
+    let rescue_was_active = rescue_mode_active t in
+    (match set_rescue_agent t ~current_channel_id:(Some channel_id) requested with
+     | Error err -> reply err
+     | Ok rotation ->
+       let reset_suffix =
+         if rotation.reset_count = 0 then ""
+         else
+           Printf.sprintf " Reset %d top-level session%s immediately."
+             rotation.reset_count
+             (if rotation.reset_count = 1 then "" else "s")
+       in
+       let busy_suffix =
+         if rotation.busy_count = 0 then ""
+         else
+           Printf.sprintf " %d busy top-level session%s will switch after their queued work finishes."
+             rotation.busy_count
+             (if rotation.busy_count = 1 then "" else "s")
+       in
+       let effective_suffix =
+         let effective = effective_top_level_agent t in
+         match requested with
+         | Some _ when rescue_mode_active t ->
+           Printf.sprintf
+             " Disk pressure is active, so top-level sessions are currently using `%s`."
+             (Config.string_of_agent_kind effective)
+         | None when rescue_was_active ->
+           Printf.sprintf
+             " Disk pressure is active, so top-level sessions are currently using the default agent `%s`."
+             (Config.string_of_agent_kind effective)
+         | _ -> ""
+       in
+       reply (Printf.sprintf "Rescue agent set to %s.%s%s%s"
+         requested_label reset_suffix busy_suffix effective_suffix))
   | Command.Session_agent None ->
     (match Session_store.find_opt t.sessions ~thread_id:channel_id with
      | Some session ->
        (match session.pending_agent_change with
-       | Some pending when not (Config.equal_agent_kind pending.kind session.agent_kind) ->
+        | Some { origin = Session_store.Session_override; kind } ->
           reply (Printf.sprintf
             "Session agent: `%s` (will start a fresh `%s` session after queued work finishes)."
             (Config.string_of_agent_kind session.agent_kind)
-            (Config.string_of_agent_kind pending.kind))
+            (Config.string_of_agent_kind kind))
         | _ when Option.is_some session.session_override_kind ->
           reply (Printf.sprintf "Session agent: `%s` (session override)."
             (Config.string_of_agent_kind session.agent_kind))
@@ -1320,8 +1472,8 @@ let handle_command t msg cmd =
             (Config.string_of_agent_kind session.agent_kind)))
      | None when is_persistent_channel t ~channel_id ->
        reply (Printf.sprintf
-         "No session exists in this channel yet. It will start with default agent `%s`."
-         (Config.string_of_agent_kind (default_agent t)))
+         "No session exists in this channel yet. It will start with top-level agent `%s`."
+         (Config.string_of_agent_kind (effective_top_level_agent t)))
      | None ->
        reply "No session exists in this channel.")
   | Command.Session_agent (Some kind) ->
@@ -1418,6 +1570,7 @@ let handle_command t msg cmd =
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       let status_lines = Eio_unix.run_in_systhread (fun () ->
         ignore (Disk_health.preflight_state_mutation ());
+        refresh_persistent_session_disk_state t;
         let pid = Unix.getpid () in
         let uptime_sec = int_of_float (Unix.gettimeofday () -. t.started_at) in
         let hours = uptime_sec / 3600 in
@@ -1496,6 +1649,14 @@ let handle_command t msg cmd =
           Printf.sprintf "**%s** (pid %d, up %s)" (Build_info.version_string ()) pid uptime_str;
           Printf.sprintf "Default agent: %s"
             (Config.string_of_agent_kind (default_agent t));
+          (match rescue_agent t with
+           | Some kind ->
+             Printf.sprintf "Rescue agent: %s%s"
+               (Config.string_of_agent_kind kind)
+               (if rescue_mode_active t then " (active)" else "")
+           | None -> "Rescue agent: disabled");
+          Printf.sprintf "Effective top-level agent: %s"
+            (Config.string_of_agent_kind (effective_top_level_agent t));
           Disk_health.status_summary ();
           Printf.sprintf "Sessions: %d (%d processing)"
             (Session_store.count t.sessions)
@@ -1522,10 +1683,11 @@ let handle_command t msg cmd =
       "`!claude-sessions` — list recent Claude sessions";
       "`!codex-sessions` — list recent Codex sessions";
       "`!gemini-sessions` — list recent Gemini sessions";
-      "`!start <project> [agent]` — start a session (defaults to the current default agent)";
+      "`!start <project> [agent]` — start a session (defaults to the current effective top-level agent)";
       "`!default-agent [agent]` / `!default_agent [agent]` — show or set the default agent (claude|codex|gemini)";
+      "`!rescue-agent [agent|off]` / `!rescue_agent [agent|off]` — show or set the rescue agent used under disk pressure";
       "`!session-agent [agent]` / `!session_agent [agent]` — show or set the current channel session agent";
-      "`!resume [agent] <session_id>` — resume a session (no agent = try the current default first)";
+      "`!resume [agent] <session_id>` — resume a session (no agent = try the current effective top-level agent first)";
       "`!stop <thread_id>` — stop a session";
       "`!rename [thread_id] <name>` — rename a thread";
       "`!status` — bot status and running processes";
@@ -1825,7 +1987,7 @@ let fork_initial_prompt_run t ~session ~msg =
       process_session_message t session msg None))
 
 (** Ensure a session exists for a channel (control or project channels).
-    Creates a persistent session using the current default agent. *)
+    Creates a persistent session using the current effective top-level agent. *)
 let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prompt =
   match Session_store.find_opt t.sessions ~thread_id:channel_id with
   | Some _ -> Ok ()
@@ -1835,13 +1997,27 @@ let ensure_channel_session t ~channel_id ~project_name ~working_dir ~system_prom
     | None ->
       (try
          create_persistent_channel_session t ~channel_id ~project_name
-           ~working_dir ~system_prompt ~agent_kind:(default_agent t)
+           ~working_dir ~system_prompt
+           ~agent_kind:(effective_top_level_agent t)
            ~session_override_kind:None;
          Logs.info (fun m -> m "bot: auto-created session for %s" project_name);
          Ok ()
        with exn ->
          Error (Printf.sprintf "Failed to persist session: %s"
            (Printexc.to_string exn)))
+
+let sync_top_level_agent_policy t =
+  refresh_top_level_disk_state t;
+  align_persistent_sessions_to_agent t
+    ~current_channel_id:None
+    ~new_agent:(effective_top_level_agent t)
+
+let sync_top_level_agent_policy_best_effort t =
+  match sync_top_level_agent_policy t with
+  | Ok _ -> ()
+  | Error err ->
+    Logs.warn (fun m ->
+      m "bot: top-level policy sync skipped during message routing: %s" err)
 
 let handle_command_safely t msg cmd =
   try
@@ -1885,15 +2061,17 @@ let handle_message t (msg : Discord_types.message) =
     let project_for_channel =
       Channel_manager.project_for_channel (channels t) ~channel_id:msg.channel_id in
     if is_control then begin
-      match ensure_channel_session t ~channel_id:msg.channel_id
+      sync_top_level_agent_policy_best_effort t;
+      (match ensure_channel_session t ~channel_id:msg.channel_id
               ~project_name:"control" ~working_dir:(Sys.getcwd ())
               ~system_prompt:(Some (control_system_prompt (projects t))) with
-      | Ok () -> handle_thread_message t msg ()
-      | Error err ->
-        ignore (Discord_rest.create_message t.rest
-          ~channel_id:msg.channel_id ~content:err ())
+       | Ok () -> handle_thread_message t msg ()
+       | Error err ->
+         ignore (Discord_rest.create_message t.rest
+           ~channel_id:msg.channel_id ~content:err ()))
     end else match project_for_channel with
     | Some proj_name ->
+      sync_top_level_agent_policy_best_effort t;
       (* Message in a project channel — persistent session (like control channel).
          The project Claude can create threads via MCP tools when needed. *)
       let proj = List.find_opt (fun (p : Project.t) -> p.name = proj_name) (projects t) in

@@ -70,15 +70,16 @@ test/test_formatting.ml  — Tests for formatting, wrapping, escaping, command p
 
 Commands require a `!` prefix:
 
-- `start <project> [agent]` — start a session (agent ∈ {claude, codex, gemini}; defaults to the current default agent)
+- `start <project> [agent]` — start a session (agent ∈ {claude, codex, gemini}; defaults to the current effective top-level agent)
 - `start` — show numbered project list
-- `resume [agent] <session_id>` — resume an existing session (agent defaults to none; tries the current default agent first, then the others)
+- `resume [agent] <session_id>` — resume an existing session (agent defaults to none; tries the current effective top-level agent first, then the others)
 - `projects` — list discovered projects with numbers
 - `sessions` — list active bot sessions
 - `claude-sessions` — list recent Claude Code sessions on this machine
 - `codex-sessions` — list recent Codex CLI sessions on this machine
 - `gemini-sessions` — list recent Gemini CLI sessions on this machine
 - `default-agent [agent]` — show or set the default agent for new top-level sessions
+- `rescue-agent [agent|off]` — show, set, or disable the rescue agent used at warning-level disk pressure
 - `session-agent [agent]` — show or set the current channel session agent
 - `stop <thread_id>` — stop a session
 - `rename [thread_id] <name>` — rename a thread
@@ -91,7 +92,7 @@ Commands require a `!` prefix:
 - `restart` — rebuild and restart the bot
 - `help` — command reference
 
-Non-command messages in control/project channels are routed to the channel's current session automatically. New top-level sessions start with the current default agent unless you set a `session-agent` override on that session.
+Non-command messages in control/project channels are routed to the channel's current session automatically. New top-level sessions start with the current effective top-level agent unless you set a `session-agent` override on that session. Normally that is the default agent; at warning-level disk pressure, a configured rescue agent takes over automatically. Read-only disk mode still blocks new stateful session creation until space is freed.
 
 ## Key behaviors
 
@@ -164,7 +165,7 @@ Per-session system prompts (set via `Session_store.session.system_prompt`) tell 
 - **Claude** — `--append-system-prompt <text>` flag (persistent across all turns).
 - **Codex / Gemini** — neither CLI exposes a system-instruction flag, so the bot prepends the prompt as a `<bot-context>...</bot-context>` block to the user's first-turn message. The conversation history carries it forward on subsequent turns. See `Agent_process.compose_session_prompt`.
 
-Today only the control/project channel sessions (created by `ensure_channel_session`) set a system prompt. Those sessions now start with the current default agent rather than being hardcoded to Claude, and the Codex/Gemini paths are wired and tested for that flow.
+Today only the control/project channel sessions (created by `ensure_channel_session`) set a system prompt. Those sessions now start with the current effective top-level agent rather than being hardcoded to Claude, and the Codex/Gemini paths are wired and tested for that flow.
 
 ## Bare repo / worktree setup
 

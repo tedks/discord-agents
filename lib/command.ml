@@ -10,12 +10,12 @@ type t =
   | List_codex_sessions
   | List_gemini_sessions
   | Start_agent of { project : string; kind : Config.agent_kind option }
-  (** [kind = None] means "try the current default agent first, then
-      the remaining agent stores". *)
+  (** [kind = None] means use the current effective top-level agent. *)
   | Resume_session of { session_id : string; kind : Config.agent_kind option }
   | Stop_session of { thread_id : string }
   | Cleanup_channels
   | Default_agent of Config.agent_kind option
+  | Rescue_agent of Config.agent_kind option option
   | Session_agent of Config.agent_kind option
   | Restart
   | Refresh
@@ -65,6 +65,15 @@ let parse content =
     (match Config.agent_kind_of_string (String.lowercase_ascii kind_str) with
      | Ok k -> Default_agent (Some k)
      | Error _ -> Unknown content)
+  | ["rescue-agent"] | ["rescue_agent"] -> Rescue_agent None
+  | ["rescue-agent"; kind_str] | ["rescue_agent"; kind_str] ->
+    let kind_str = String.lowercase_ascii kind_str in
+    if kind_str = "off" || kind_str = "none" then
+      Rescue_agent (Some None)
+    else
+      (match Config.agent_kind_of_string kind_str with
+       | Ok k -> Rescue_agent (Some (Some k))
+       | Error _ -> Unknown content)
   | ["session-agent"] | ["session_agent"] -> Session_agent None
   | ["session-agent"; kind_str] | ["session_agent"; kind_str] ->
     (match Config.agent_kind_of_string (String.lowercase_ascii kind_str) with

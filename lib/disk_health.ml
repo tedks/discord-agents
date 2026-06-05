@@ -55,6 +55,7 @@ let warning_threshold_bytes = mib 128
 let read_only_threshold_bytes = mib 64
 
 let state_mu = Mutex.create ()
+let probe_available_bytes_override = ref None
 
 let state = ref {
   observations = [];
@@ -222,10 +223,20 @@ let is_read_only () =
 
 let reset_for_tests () =
   with_state (fun state ->
+    probe_available_bytes_override := None;
     state := {
       observations = [];
       last_probe_error = None;
     })
+
+let set_probe_available_bytes_for_tests f =
+  with_state (fun _state ->
+    probe_available_bytes_override := Some f)
+
+let probe_available_bytes path =
+  match !probe_available_bytes_override with
+  | Some probe -> probe path
+  | None -> statvfs_available_bytes path
 
 let update_from_available_bytes ?(force = false) ~path available_bytes =
   let mode = mode_of_available_bytes available_bytes in
@@ -275,9 +286,6 @@ let note_probe_failure ~path exn =
           probe_checked_at = Unix.gettimeofday ();
         };
     })
-
-let probe_available_bytes path =
-  statvfs_available_bytes path
 
 let preflight_path_with ~available_bytes_of_path path =
   let requested_path = path in
@@ -464,4 +472,5 @@ module For_testing = struct
   let new_session_block_message = new_session_block_message
   let preflight_path_with = preflight_path_with
   let note_write_success = note_write_success
+  let set_probe_available_bytes = set_probe_available_bytes_for_tests
 end
