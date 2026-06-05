@@ -67,8 +67,14 @@ type t = {
   mutable wrap_width : int;
   mutable refreshing : bool;
   mutable output_lines : int;
+  mutable policy_sync_clear_last_warning : (string * string) option;
   scroll_states : (Discord_types.channel_id, scroll_state) Hashtbl.t;
 }
+
+type top_level_policy_sync_state =
+  | Policy_sync_clean
+  | Policy_sync_rotation_pending
+  | Policy_sync_marker_clear_pending
 
 (** Convenience accessors for the current project state snapshot. *)
 let projects t = t.project_state.projects
@@ -108,6 +114,11 @@ let rescue_agent_notice t =
       (Config.string_of_agent_kind kind))
   | None ->
     None
+
+let string_of_top_level_policy_sync_state = function
+  | Policy_sync_clean -> "clean"
+  | Policy_sync_rotation_pending -> "rotation-pending"
+  | Policy_sync_marker_clear_pending -> "marker-clear-pending"
 
 let reraise_if_fatal_policy_exception exn =
   match exn with
@@ -156,6 +167,52 @@ let refresh_persistent_session_disk_state t =
 let refresh_top_level_disk_state t =
   refresh_disk_state ();
   refresh_persistent_session_disk_state t
+
+let session_converged_to_top_level_policy expected_agent
+    (session : Session_store.session) =
+  match session.session_override_kind, session.pending_agent_change with
+  | Some _, _
+  | _, Some { origin = Session_store.Session_override; _ } ->
+    true
+  | None, Some { origin = Session_store.Default_rotation; _ } ->
+    Config.equal_agent_kind session.agent_kind expected_agent
+  | None, None ->
+    Config.equal_agent_kind session.agent_kind expected_agent
+
+let top_level_policy_state_converged_for_agent t expected_agent =
+  Session_store.bindings t.sessions
+  |> List.for_all (fun (thread_id, (session : Session_store.session)) ->
+    not (is_persistent_channel t ~channel_id:thread_id)
+    || session_converged_to_top_level_policy expected_agent session)
+
+let rec top_level_policy_sync_state t =
+  let expected_agent = effective_top_level_agent t in
+  top_level_policy_sync_state_for_agent t expected_agent
+
+and top_level_policy_sync_state_for_agent t expected_agent =
+  if top_level_policy_state_converged_for_agent t expected_agent then
+    if policy_sync_pending t then
+      Policy_sync_marker_clear_pending
+    else
+      Policy_sync_clean
+  else
+    Policy_sync_rotation_pending
+
+let top_level_policy_sync_state_from_snapshot t disk =
+  let expected_agent = effective_top_level_agent_from_snapshot t.settings disk in
+  top_level_policy_sync_state_for_agent t expected_agent
+
+let note_policy_sync_clear_success t =
+  t.policy_sync_clear_last_warning <- None
+
+let should_log_policy_sync_clear_failure t ~state err =
+  let warning = Some (state, err) in
+  if t.policy_sync_clear_last_warning = warning then
+    false
+  else begin
+    t.policy_sync_clear_last_warning <- warning;
+    true
+  end
 
 type persistent_rotation = {
   reset_count : int;
@@ -650,12 +707,18 @@ let align_persistent_sessions_to_agent
 
 let clear_policy_sync_pending t =
   if policy_sync_pending t then
-    Runtime_settings.set_policy_sync_pending t.settings false
+    match Runtime_settings.set_policy_sync_pending t.settings false with
+    | Ok () ->
+      note_policy_sync_clear_success t;
+      Ok ()
+    | Error _ as err ->
+      err
   else
     Ok ()
 
 let run_top_level_policy_change t ~current_channel_id
     ~default_agent ~rescue_agent ~new_agent ~summary ~policy_label =
+  t.policy_sync_clear_last_warning <- None;
   let policy_changed =
     not (Config.equal_agent_kind t.settings.default_agent default_agent)
     || not (Option.equal Config.equal_agent_kind
@@ -842,9 +905,13 @@ let reconcile_persisted_pending_agent_changes t =
     (match clear_policy_sync_pending t with
      | Ok () -> ()
      | Error err ->
-       Logs.warn (fun m ->
-         m "bot: failed to clear top-level policy sync marker after reconcile: %s"
-           err))
+       let state =
+         string_of_top_level_policy_sync_state (top_level_policy_sync_state t)
+       in
+       if should_log_policy_sync_clear_failure t ~state err then
+         Logs.warn (fun m ->
+           m "bot: failed to clear top-level policy sync marker after reconcile (state=%s): %s"
+             state err))
   | Error err ->
     Logs.warn (fun m ->
       m "bot: failed to reconcile top-level default agent sessions: %s" err)
@@ -1743,7 +1810,8 @@ let handle_command t msg cmd =
           Printf.sprintf "Effective top-level agent: %s"
             (Config.string_of_agent_kind (effective_top_level_agent t));
           Printf.sprintf "Top-level policy sync: %s"
-            (if policy_sync_pending t then "pending" else "clean");
+            (string_of_top_level_policy_sync_state
+              (top_level_policy_sync_state t));
           Disk_health.status_summary ();
           Printf.sprintf "Sessions: %d (%d processing)"
             (Session_store.count t.sessions)
@@ -2103,9 +2171,13 @@ let sync_top_level_agent_policy t =
     (match clear_policy_sync_pending t with
      | Ok () -> ()
      | Error err ->
-       Logs.warn (fun m ->
-         m "bot: failed to clear top-level policy sync marker after runtime sync: %s"
-           err));
+       let state =
+         string_of_top_level_policy_sync_state (top_level_policy_sync_state t)
+       in
+       if should_log_policy_sync_clear_failure t ~state err then
+         Logs.warn (fun m ->
+           m "bot: failed to clear top-level policy sync marker after runtime sync (state=%s): %s"
+             state err));
     Ok rotation
 
 let sync_top_level_agent_policy_best_effort t =
@@ -2290,6 +2362,7 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
                wrap_width = Agent_process.desktop_width;
                refreshing = false;
                output_lines = Agent_process.default_output_lines;
+               policy_sync_clear_last_warning = None;
                scroll_states = Hashtbl.create 64 } in
   reconcile_persisted_stop_requests bot;
   reconcile_persisted_pending_agent_changes bot;
