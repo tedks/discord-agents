@@ -2039,6 +2039,7 @@ let test_context_header_truncates_utf8_boundary () =
     system_prompt = None;
     message_count = 0;
     processing = false;
+    active_run = None;
     child_pid = None;
     stop_requested = false;
     pending_queue = Queue.create ();
