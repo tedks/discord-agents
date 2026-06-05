@@ -80,6 +80,12 @@ let build_context_header ~(session : Session_store.session) ~author_name
     channel_type
     (sanitize_context_value author_name)
 
+let prompt_preview prompt =
+  if String.length prompt > 80 then
+    Resource.truncate_utf8 ~max_bytes:80 prompt ^ "..."
+  else
+    prompt
+
 (** Download attachments to temp files in the working directory.
     Returns a list of (filename, local_path) for successfully downloaded files. *)
 let download_attachments ~rest ~working_dir
@@ -145,9 +151,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
   Logs.info (fun m -> m "agent_runner: running %s for %s: %s"
     (Config.string_of_agent_kind session.Session_store.agent_kind)
     session.project_name
-    (if String.length prompt > 80
-     then String.sub prompt 0 80 ^ "..."
-     else prompt));
+    (prompt_preview prompt));
   let result_buf = Buffer.create 4096 in
   let current_msg_id = ref None in
   let current_msg_buf = Buffer.create 1900 in

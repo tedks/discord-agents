@@ -1816,6 +1816,12 @@ let test_context_header_truncates_utf8_boundary () =
       ~prefix:("[Discord context: project=" ^ String.make 99 'p' ^ ",")
       header)
 
+let test_prompt_preview_truncates_utf8_boundary () =
+  let prompt = String.make 79 'q' ^ "\xC3\xA9tail" in
+  Alcotest.(check string) "prompt preview boundary"
+    (String.make 79 'q' ^ "...")
+    (Discord_agents.Agent_runner.prompt_preview prompt)
+
 let test_control_thread_name_truncates_utf8_boundary () =
   let s = String.make 79 't' ^ "\xC3\xA9tail" in
   Alcotest.(check string) "control name boundary"
@@ -1843,6 +1849,8 @@ let truncate_utf8_tests = [
     test_truncate_utf8_drops_2byte_lead_at_cut;
   Alcotest.test_case "context header truncates UTF-8 boundary" `Quick
     test_context_header_truncates_utf8_boundary;
+  Alcotest.test_case "prompt preview truncates UTF-8 boundary" `Quick
+    test_prompt_preview_truncates_utf8_boundary;
   Alcotest.test_case "control thread name truncates UTF-8 boundary" `Quick
     test_control_thread_name_truncates_utf8_boundary;
 ]
