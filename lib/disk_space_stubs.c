@@ -1,21 +1,35 @@
 #include <caml/alloc.h>
 #include <caml/fail.h>
 #include <caml/memory.h>
+#include <caml/threads.h>
 #include <caml/mlvalues.h>
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/statvfs.h>
 
 CAMLprim value discord_agents_available_bytes(value path_v)
 {
   CAMLparam1(path_v);
+  CAMLlocal1(result);
   struct statvfs st;
-  const char *path = String_val(path_v);
+  char *path = strdup(String_val(path_v));
+  if (path == NULL) {
+    caml_failwith("out of memory");
+  }
 
-  if (statvfs(path, &st) != 0) {
-    caml_failwith(strerror(errno));
+  int rc;
+  int saved_errno;
+  caml_enter_blocking_section();
+  rc = statvfs(path, &st);
+  saved_errno = errno;
+  caml_leave_blocking_section();
+  free(path);
+
+  if (rc != 0) {
+    caml_failwith(strerror(saved_errno));
   }
 
   unsigned __int128 bytes =
@@ -24,5 +38,6 @@ CAMLprim value discord_agents_available_bytes(value path_v)
     bytes = (unsigned __int128) INT64_MAX;
   }
 
-  CAMLreturn(caml_copy_int64((int64_t) bytes));
+  result = caml_copy_int64((int64_t) bytes);
+  CAMLreturn(result);
 }

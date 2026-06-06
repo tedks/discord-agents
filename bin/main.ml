@@ -150,7 +150,7 @@ let () =
     in
     let run_control_api_supervised () =
       let clock = Eio.Stdenv.clock env in
-      let rec loop () =
+      let rec loop retry_delay =
         if bot.gateway.shutdown then
           ()
         else
@@ -165,8 +165,8 @@ let () =
             bot.control_api_restarts <- bot.control_api_restarts + 1;
             bot.last_control_api_error <- Some err;
             Logs.warn (fun m -> m "bot: %s" err);
-            Eio.Time.sleep clock 1.0;
-            loop ()
+            Eio.Time.sleep clock retry_delay;
+            loop (Discord_agents.Bot.supervisor_next_backoff_s retry_delay)
           | Error _exn when bot.gateway.shutdown -> ()
           | Error exn ->
             Discord_agents.Bot.reraise_if_fatal_policy_exception exn;
@@ -175,10 +175,10 @@ let () =
             bot.last_control_api_error <- Some err;
             Logs.warn (fun m ->
               m "bot: control_api supervisor restarting after error: %s" err);
-            Eio.Time.sleep clock 1.0;
-            loop ()
+            Eio.Time.sleep clock retry_delay;
+            loop (Discord_agents.Bot.supervisor_next_backoff_s retry_delay)
       in
-      loop ()
+      loop Discord_agents.Bot.supervisor_initial_backoff_s
     in
     (* Shutdown via pipe: signal handler writes a byte, fiber reads it.
        No Eio I/O in the signal handler — just a raw Unix write. *)

@@ -186,17 +186,45 @@ let write_file_atomic ?(fsync_parent=fsync_dir) path content =
       (try Sys.remove tmp with _ -> ());
     raise exn
 
+let in_process_flock_table_mu = Mutex.create ()
+let in_process_flock_table : (string, Mutex.t) Hashtbl.t = Hashtbl.create 16
+
+let in_process_flock_mutex lock_path =
+  Mutex.lock in_process_flock_table_mu;
+  Fun.protect
+    ~finally:(fun () -> Mutex.unlock in_process_flock_table_mu)
+    (fun () ->
+       match Hashtbl.find_opt in_process_flock_table lock_path with
+       | Some mu -> mu
+       | None ->
+         let mu = Mutex.create () in
+         Hashtbl.add in_process_flock_table lock_path mu;
+         mu)
+
 (** Execute f while holding an exclusive flock on lock_path.
-    Used for cross-process synchronization (bot + MCP server). *)
+    Used for cross-process synchronization (bot + MCP server).
+
+    POSIX record locks are per-process, so the OS lock alone does not
+    serialize two fibers in this bot process. The in-process mutex closes
+    that gap, while [lockf] still coordinates with the MCP helper process.
+    Callers must keep [f] synchronous: doing Eio I/O while holding this
+    stdlib mutex can deadlock the scheduler if another fiber contends on
+    the same lock path. The table is intentionally never pruned; current
+    callers use a bounded set of config/session lock paths. *)
 let with_flock lock_path f =
-  ensure_parent_dir lock_path;
-  let fd = Unix.openfile lock_path [Unix.O_WRONLY; Unix.O_CREAT] 0o600 in
+  let in_process_mu = in_process_flock_mutex lock_path in
+  Mutex.lock in_process_mu;
   Fun.protect ~finally:(fun () ->
-    (try Unix.lockf fd Unix.F_ULOCK 0 with _ -> ());
-    Unix.close fd
+    Mutex.unlock in_process_mu
   ) (fun () ->
-    Unix.lockf fd Unix.F_LOCK 0;
-    f ())
+    ensure_parent_dir lock_path;
+    let fd = Unix.openfile lock_path [Unix.O_WRONLY; Unix.O_CREAT] 0o600 in
+    Fun.protect ~finally:(fun () ->
+      (try Unix.lockf fd Unix.F_ULOCK 0 with _ -> ());
+      Unix.close fd
+    ) (fun () ->
+      Unix.lockf fd Unix.F_LOCK 0;
+      f ()))
 
 (** Generate a random hex string of the given byte length using mirage-crypto-rng. *)
 let random_hex n =

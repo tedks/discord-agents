@@ -69,6 +69,7 @@ let with_test_bot f =
         refreshing = false;
         output_lines = Discord_agents.Agent_process.default_output_lines;
         policy_sync_clear_last_warning = None;
+        last_top_level_disk_refresh_at = 0.0;
         gateway_supervisor_restarts = 0;
         control_api_restarts = 0;
         last_gateway_supervisor_error = None;
@@ -1216,6 +1217,33 @@ let test_reconcile_interrupted_active_runs_clears_checkpoint () =
         true (Option.is_none saved.active_run)
     | None -> Alcotest.fail "expected reloaded session")
 
+let test_reconcile_interrupted_active_runs_reaps_children_in_one_batch () =
+  with_test_bot (fun bot ->
+    let child pid start_ticks = Discord_agents.Session_store.{
+      pid;
+      start_ticks;
+    } in
+    let add_active thread_id pid start_ticks =
+      let session = make_session ~thread_id Discord_agents.Config.Claude in
+      Discord_agents.Session_store.add bot.sessions ~thread_id session;
+      match Discord_agents.Session_store.set_active_run bot.sessions session
+              (Some Discord_agents.Session_store.{
+                message_id = "message-" ^ thread_id;
+                child_process = Some (child pid start_ticks);
+              }) with
+      | Ok () -> ()
+      | Error err -> Alcotest.failf "set_active_run failed: %s" err
+    in
+    add_active "control-1" 101 1001L;
+    add_active "control-2" 202 2002L;
+    let batches = ref [] in
+    Discord_agents.Bot.reconcile_interrupted_active_runs
+      ~mark_failed:(fun _t _session ~message_id:_ -> ())
+      ~reap_children:(fun _t children -> batches := children :: !batches)
+      bot;
+    Alcotest.(check (list int)) "one reap batch with both children"
+      [2] (List.map List.length (List.rev !batches)))
+
 let test_persist_completed_run_rolls_back_active_run_on_save_failure () =
   with_test_bot (fun bot ->
     let session = make_session Discord_agents.Config.Claude in
@@ -1237,7 +1265,6 @@ let test_persist_completed_run_rolls_back_active_run_on_save_failure () =
         true (session.active_run = active_run))
 
 let eyes_emoji = "\xF0\x9F\x91\x80"
-let check_emoji = "\xE2\x9C\x85"
 let x_emoji = "\xE2\x9D\x8C"
 
 type process_effect =
@@ -1262,8 +1289,12 @@ let process_effect_equal a b =
 
 let process_effect = Alcotest.testable process_effect_pp process_effect_equal
 
-let record_process_hooks ?capture_child_process ?run_agent ?persist_completed_run effects =
+let record_process_hooks ?set_session_id ?capture_child_process ?run_agent
+    ?persist_completed_run effects =
   let base = Discord_agents.Bot.default_process_message_hooks in
+  let set_session_id =
+    Option.value set_session_id ~default:base.set_session_id
+  in
   let capture_child_process =
     Option.value capture_child_process ~default:base.capture_child_process
   in
@@ -1274,6 +1305,7 @@ let record_process_hooks ?capture_child_process ?run_agent ?persist_completed_ru
     Option.value persist_completed_run ~default:base.persist_completed_run
   in
   { base with
+    set_session_id;
     capture_child_process;
     run_agent;
     persist_completed_run;
@@ -1288,7 +1320,10 @@ let record_process_hooks ?capture_child_process ?run_agent ?persist_completed_ru
          effects := Message_sent content :: !effects);
   }
 
-let test_process_session_message_keeps_success_when_child_identity_is_missing () =
+let checkpoint_failure_message =
+  "Run aborted because the bot could not persist or confirm restart state for the spawned agent process. The agent may have exited before it could be tracked, or the bot may have hit a storage error. Try again; if it keeps happening, check bot logs and disk health."
+
+let test_process_session_message_aborts_when_child_identity_is_missing () =
   with_test_bot (fun bot ->
     let session = make_session Discord_agents.Config.Claude in
     Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
@@ -1307,7 +1342,8 @@ let test_process_session_message_keeps_success_when_child_identity_is_missing ()
     Alcotest.(check (list process_effect)) "effects"
       [ Reaction_added eyes_emoji;
         Reaction_removed eyes_emoji;
-        Reaction_added check_emoji ]
+        Reaction_added x_emoji;
+        Message_sent checkpoint_failure_message ]
       (List.rev !effects);
     Alcotest.(check bool) "active run cleared in memory"
       true (Option.is_none session.active_run);
@@ -1319,6 +1355,36 @@ let test_process_session_message_keeps_success_when_child_identity_is_missing ()
       Alcotest.(check bool) "active run cleared on disk"
         true (Option.is_none saved.active_run)
     | None -> Alcotest.fail "expected reloaded session")
+
+let test_process_session_message_aborts_on_session_id_persist_failure () =
+  with_test_bot (fun bot ->
+    let session = make_session Discord_agents.Config.Codex in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    let effects = ref [] in
+    let hooks = record_process_hooks effects
+      ~set_session_id:(fun _sessions _session ~session_id:_ ->
+        failwith "disk full")
+      ~run_agent:(fun ~sw:_ ~env:_ ~rest:_ ~session:_ ~channel_id:_ ~prompt:_
+                     ~attachments:_ ~author_name:_ ~channel_name:_ ~channel_type:_
+                     ~wrap_width:_ ~output_lines:_ ~on_scroll_content:_
+                     ~on_pid:_ ~on_session_id () ->
+        on_session_id "real-codex-session-id";
+        Ok ())
+    in
+    Discord_agents.Bot.process_session_message_with_hooks hooks bot session
+      (make_message "hello") None;
+    Alcotest.(check (list process_effect)) "effects"
+      [ Reaction_added eyes_emoji;
+        Reaction_removed eyes_emoji;
+        Reaction_added x_emoji;
+        Message_sent checkpoint_failure_message ]
+      (List.rev !effects);
+    Alcotest.(check string) "placeholder session id preserved"
+      "session-1" session.session_id;
+    Alcotest.(check bool) "session id remains unconfirmed"
+      false session.session_id_confirmed;
+    Alcotest.(check bool) "active run cleared in memory"
+      true (Option.is_none session.active_run))
 
 let test_process_session_message_keeps_run_replayable_on_completion_persist_failure () =
   with_test_bot (fun bot ->
@@ -1506,10 +1572,14 @@ let () =
         test_proc_stat_info_of_line_parses_start_ticks;
       Alcotest.test_case "startup reconcile clears interrupted active run checkpoint" `Quick
         test_reconcile_interrupted_active_runs_clears_checkpoint;
+      Alcotest.test_case "startup reconcile reaps interrupted children in one batch" `Quick
+        test_reconcile_interrupted_active_runs_reaps_children_in_one_batch;
       Alcotest.test_case "completed run rollback restores active checkpoint" `Quick
         test_persist_completed_run_rolls_back_active_run_on_save_failure;
-      Alcotest.test_case "process message succeeds when child identity is unavailable" `Quick
-        test_process_session_message_keeps_success_when_child_identity_is_missing;
+      Alcotest.test_case "process message aborts when child identity is unavailable" `Quick
+        test_process_session_message_aborts_when_child_identity_is_missing;
+      Alcotest.test_case "process message aborts on session id persist failure" `Quick
+        test_process_session_message_aborts_on_session_id_persist_failure;
       Alcotest.test_case "process message keeps run replayable on completion persist failure" `Quick
         test_process_session_message_keeps_run_replayable_on_completion_persist_failure;
       Alcotest.test_case "reap tracked process-group leader" `Quick
