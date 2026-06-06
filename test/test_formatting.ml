@@ -2446,6 +2446,25 @@ let test_setup_gemini_mcp_preserves_user_settings () =
     Alcotest.(check bool) "theme key preserved"
       true (List.mem_assoc "theme" (json |> to_assoc)))
 
+let test_setup_gemini_mcp_fails_closed_on_read_errors () =
+  with_temp_dir (fun dir ->
+    let rc = Sys.command (Printf.sprintf
+      "git init -q -b main %s 2>&1 >/dev/null"
+      (Filename.quote dir)) in
+    Alcotest.(check int) "git init succeeded" 0 rc;
+    let gemini_dir = Filename.concat dir ".gemini" in
+    Unix.mkdir gemini_dir 0o755;
+    let settings_path = Filename.concat gemini_dir "settings.json" in
+    Unix.mkdir settings_path 0o755;
+    let exclude_path = Filename.concat dir ".git/info/exclude" in
+    Sys.remove exclude_path;
+    Unix.mkdir exclude_path 0o755;
+    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir;
+    Alcotest.(check bool) "settings path left untouched"
+      true (Sys.is_directory settings_path);
+    Alcotest.(check bool) "exclude path left untouched"
+      true (Sys.is_directory exclude_path))
+
 let setup_gemini_mcp_e2e_tests = [
   Alcotest.test_case "writes settings in a regular repo" `Quick
     test_setup_gemini_mcp_writes_settings_in_regular_repo;
@@ -2453,6 +2472,8 @@ let setup_gemini_mcp_e2e_tests = [
     test_setup_gemini_mcp_idempotent;
   Alcotest.test_case "preserves user's prior .gemini/settings.json" `Quick
     test_setup_gemini_mcp_preserves_user_settings;
+  Alcotest.test_case "fails closed on config read errors" `Quick
+    test_setup_gemini_mcp_fails_closed_on_read_errors;
 ]
 
 (* ── single_line + format_session_listing newline safety ─────────── *)
@@ -2547,6 +2568,24 @@ let test_exclude_already_lists_gemini_false_positives () =
   Alcotest.(check bool) "empty file"
     false (already "")
 
+let test_merge_gemini_exclude_appends_preserving_existing_content () =
+  let merge = Discord_agents.Agent_process.merge_gemini_exclude in
+  Alcotest.(check string) "empty exclude"
+    ".gemini/\n" (merge None);
+  Alcotest.(check string) "adds newline before appended pattern"
+    "*.tmp\n.gemini/\n" (merge (Some "*.tmp"));
+  Alcotest.(check string) "preserves trailing newline"
+    "*.tmp\n.gemini/\n" (merge (Some "*.tmp\n"))
+
+let test_merge_gemini_exclude_is_idempotent () =
+  let merge = Discord_agents.Agent_process.merge_gemini_exclude in
+  let existing = "*.tmp\n.gemini/\nbuild/\n" in
+  Alcotest.(check string) "already listed unchanged"
+    existing (merge (Some existing));
+  let commented = "# .gemini/ is only documentation\n" in
+  Alcotest.(check string) "comment is not treated as active exclude"
+    (commented ^ ".gemini/\n") (merge (Some commented))
+
 let test_merge_gemini_settings_non_object_falls_back () =
   (* Parseable JSON that isn't an object — list, scalar — would
      round-trip unchanged under naive logic, dropping our MCP entry. *)
@@ -2580,6 +2619,10 @@ let resume_helpers_tests = [
     test_exclude_already_lists_gemini_positive;
   Alcotest.test_case "exclude check rejects comment/negated/subpath" `Quick
     test_exclude_already_lists_gemini_false_positives;
+  Alcotest.test_case "merge_gemini_exclude appends preserving content" `Quick
+    test_merge_gemini_exclude_appends_preserving_existing_content;
+  Alcotest.test_case "merge_gemini_exclude is idempotent" `Quick
+    test_merge_gemini_exclude_is_idempotent;
   Alcotest.test_case "single_line strips \\n \\r \\t" `Quick
     test_single_line_strips_newlines;
   Alcotest.test_case "single_line passthrough" `Quick

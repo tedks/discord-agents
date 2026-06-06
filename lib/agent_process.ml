@@ -1201,15 +1201,35 @@ let write_file_safely ~path contents =
          m "agent_process: failed to write %s: %s"
            path (Printexc.to_string exn)))
 
-let read_file_opt path =
+type read_file_result =
+  | File_missing
+  | File_contents of string
+  | File_read_error of exn
+
+let read_file_result path =
   try
-    let ic = open_in path in
-    Fun.protect ~finally:(fun () -> close_in ic) (fun () ->
-      let n = in_channel_length ic in
-      let s = Bytes.create n in
-      really_input ic s 0 n;
-      Some (Bytes.to_string s))
-  with _ -> None
+    if not (Sys.file_exists path) then
+      File_missing
+    else
+      let ic = open_in path in
+      Fun.protect ~finally:(fun () -> close_in ic) (fun () ->
+        let n = in_channel_length ic in
+        let s = Bytes.create n in
+        really_input ic s 0 n;
+        File_contents (Bytes.to_string s))
+  with exn ->
+    if Sys.file_exists path then File_read_error exn else File_missing
+
+let read_file_opt path =
+  match read_file_result path with
+  | File_contents contents -> Some contents
+  | File_missing
+  | File_read_error _ -> None
+
+let log_file_read_failure ~path exn =
+  Logs.warn (fun m ->
+    m "agent_process: failed to read %s; leaving it unchanged: %s"
+      path (Printexc.to_string exn))
 
 let contains_substring text needle =
   let nlen = String.length needle in
@@ -1304,6 +1324,17 @@ let exclude_already_lists_gemini text =
     let trimmed = String.trim line in
     trimmed = ".gemini/" || trimmed = ".gemini")
 
+let merge_gemini_exclude existing =
+  match existing with
+  | Some text when exclude_already_lists_gemini text -> text
+  | existing ->
+    let text = Option.value existing ~default:"" in
+    let prefix =
+      if text = "" || String.ends_with ~suffix:"\n" text then text
+      else text ^ "\n"
+    in
+    prefix ^ ".gemini/\n"
+
 (** Gemini: drop our entry into [.gemini/settings.json] (merging into
     any pre-existing user config) and ensure [.gemini/] is in the
     repo's [info/exclude]. Both writes are idempotent — re-running
@@ -1320,24 +1351,24 @@ let setup_gemini_mcp ~working_dir =
      if not (Sys.file_exists gemini_dir) then Unix.mkdir gemini_dir 0o755
    with _ -> ());
   let settings_path = Filename.concat gemini_dir "settings.json" in
-  let merged = merge_gemini_settings (read_file_opt settings_path) in
-  write_file_safely ~path:settings_path merged;
+  (match read_file_result settings_path with
+   | File_read_error exn -> log_file_read_failure ~path:settings_path exn
+   | File_missing ->
+     write_file_safely ~path:settings_path
+       (merge_gemini_settings None)
+   | File_contents existing ->
+     write_file_safely ~path:settings_path
+       (merge_gemini_settings (Some existing)));
   match resolve_git_info_exclude ~working_dir with
   | None -> ()
   | Some exclude_path ->
-    match read_file_opt exclude_path with
-    | Some existing when exclude_already_lists_gemini existing -> ()
-    | _ ->
-      try
-        (* exclude_path may live in a directory git hasn't materialized
-           (e.g. a fresh worktree's info/). Create it if missing. *)
-        let info_dir = Filename.dirname exclude_path in
-        (try if not (Sys.file_exists info_dir) then Unix.mkdir info_dir 0o755
-         with _ -> ());
-        let oc = open_out_gen [Open_append; Open_creat] 0o644 exclude_path in
-        Fun.protect ~finally:(fun () -> close_out oc) (fun () ->
-          output_string oc "\n.gemini/\n")
-      with _ -> ()
+    match read_file_result exclude_path with
+    | File_read_error exn -> log_file_read_failure ~path:exclude_path exn
+    | File_contents existing when exclude_already_lists_gemini existing -> ()
+    | File_contents existing ->
+      write_file_safely ~path:exclude_path (merge_gemini_exclude (Some existing))
+    | File_missing ->
+      write_file_safely ~path:exclude_path (merge_gemini_exclude None)
 
 (** Escape a string for embedding inside a TOML double-quoted string.
     Beyond backslash and double-quote (the cases we actually hit with
@@ -1421,6 +1452,31 @@ let gemini_args ~session_id ~session_id_confirmed ~prompt =
   if not session_id_confirmed then base
   else base @ ["--resume"; session_id]
 
+let executable_in_path name =
+  if Filename.is_implicit name then
+    Sys.getenv_opt "PATH"
+    |> Option.value ~default:""
+    |> String.split_on_char ':'
+    |> List.filter_map (fun dir ->
+      let dir = if dir = "" then "." else dir in
+      let path = Filename.concat dir name in
+      if Sys.file_exists path && not (Sys.is_directory path) then Some path
+      else None)
+    |> List.find_opt (fun path ->
+      try Unix.access path [Unix.X_OK]; true
+      with Unix.Unix_error _ -> false)
+  else if Sys.file_exists name && not (Sys.is_directory name) then
+    (try Unix.access name [Unix.X_OK]; Some name with Unix.Unix_error _ -> None)
+  else
+    None
+
+let setsid_command () =
+  match executable_in_path "setsid" with
+  | Some path -> path
+  | None ->
+    failwith
+      "agent_process: required command `setsid` was not found in PATH; install util-linux or start discord-agents with setsid available"
+
 (** Compose the per-turn prompt sent to a non-Claude agent, prepending
     the session's system prompt on the first turn so MCP-aware agents
     know what tools they have. Claude takes [--append-system-prompt]
@@ -1457,6 +1513,9 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
      [--append-system-prompt] flag instead. *)
   let prompt = compose_session_prompt
     ~agent_kind:kind ~system_prompt ~message_count ~user_prompt:prompt in
+  let close_noerr flow =
+    try Eio.Resource.close flow with _ -> ()
+  in
   let args = match kind with
     | Config.Claude ->
       let base = claude_args ~session_id ~message_count ~prompt in
@@ -1470,50 +1529,68 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
       setup_gemini_mcp ~working_dir;
       gemini_args ~session_id ~session_id_confirmed ~prompt
   in
-  let args = ["setsid"; "--wait"] @ args in
+  let args = [setsid_command (); "--wait"] @ args in
   let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in
-  let stderr_r, stderr_w = Eio.Process.pipe ~sw mgr in
-  let proc = Eio.Process.spawn ~sw mgr ~cwd
-    ~stdout:stdout_w ~stderr:stderr_w args in
-  (match on_pid with Some f -> f (Eio.Process.pid proc) | None -> ());
-  (* Close write ends so reads get EOF when process exits *)
-  Eio.Resource.close stdout_w;
-  Eio.Resource.close stderr_w;
-  (* Read stdout and stderr concurrently to avoid deadlock.
-     If the child fills the stderr pipe buffer (~64KB) before stdout
-     hits EOF, the child blocks on write and stdout never closes. *)
-  let stderr_buf = Buffer.create 1024 in
-  Eio.Fiber.both
-    (fun () ->
-      (* Drain stderr in parallel *)
+  try
+    let stderr_r, stderr_w = Eio.Process.pipe ~sw mgr in
+    try
+      let proc = Eio.Process.spawn ~sw mgr ~cwd
+        ~stdout:stdout_w ~stderr:stderr_w args in
+      (* Close write ends so reads get EOF when process exits. Do this before
+         callbacks so callback failures cannot strand pipe writers on [sw]. *)
+      Eio.Resource.close stdout_w;
+      Eio.Resource.close stderr_w;
       (try
-        let sr = Eio.Buf_read.of_flow ~max_size:(64 * 1024) stderr_r in
-        Buffer.add_string stderr_buf (Eio.Buf_read.take_all sr)
-      with End_of_file -> ());
-      Eio.Resource.close stderr_r)
-    (fun () ->
-      (* Read stdout line by line and parse events *)
-      let reader = Eio.Buf_read.of_flow ~max_size:(1024 * 1024) stdout_r in
-      (try
-        while true do
-          let line = Eio.Buf_read.line reader in
-          if String.length line > 0 then begin
-            let events = match kind with
-              | Config.Claude -> parse_stream_json_line line
-              | Config.Codex -> parse_codex_json_line line
-              | Config.Gemini -> parse_gemini_stream_json_line line
-            in
-            List.iter on_event events
-          end
-        done
-      with End_of_file -> ());
-      Eio.Resource.close stdout_r);
-  let stderr_text = Buffer.contents stderr_buf in
-  (* Wait for process to finish *)
-  let status = Eio.Process.await proc in
-  match status with
-  | `Exited 0 -> Ok ()
-  | `Exited code ->
-    Error (Printf.sprintf "agent exited with code %d: %s" code stderr_text)
-  | `Signaled sig_ ->
-    Error (Printf.sprintf "agent killed by signal %d" sig_)
+         (match on_pid with Some f -> f (Eio.Process.pid proc) | None -> ())
+       with exn ->
+         close_noerr stdout_r;
+         close_noerr stderr_r;
+         raise exn);
+      (* Read stdout and stderr concurrently to avoid deadlock.
+         If the child fills the stderr pipe buffer (~64KB) before stdout
+         hits EOF, the child blocks on write and stdout never closes. *)
+      let stderr_buf = Buffer.create 1024 in
+      Eio.Fiber.both
+        (fun () ->
+          (* Drain stderr in parallel *)
+          (try
+             let sr = Eio.Buf_read.of_flow ~max_size:(64 * 1024) stderr_r in
+             Buffer.add_string stderr_buf (Eio.Buf_read.take_all sr)
+           with End_of_file -> ());
+          Eio.Resource.close stderr_r)
+        (fun () ->
+          (* Read stdout line by line and parse events *)
+          let reader = Eio.Buf_read.of_flow ~max_size:(1024 * 1024) stdout_r in
+          (try
+             while true do
+               let line = Eio.Buf_read.line reader in
+               if String.length line > 0 then begin
+                 let events = match kind with
+                   | Config.Claude -> parse_stream_json_line line
+                   | Config.Codex -> parse_codex_json_line line
+                   | Config.Gemini -> parse_gemini_stream_json_line line
+                 in
+                 List.iter on_event events
+               end
+             done
+           with End_of_file -> ());
+          Eio.Resource.close stdout_r);
+      let stderr_text = Buffer.contents stderr_buf in
+      (* Wait for process to finish *)
+      let status = Eio.Process.await proc in
+      match status with
+      | `Exited 0 -> Ok ()
+      | `Exited code ->
+        Error (Printf.sprintf "agent exited with code %d: %s" code stderr_text)
+      | `Signaled sig_ ->
+        Error (Printf.sprintf "agent killed by signal %d" sig_)
+    with exn ->
+      close_noerr stdout_r;
+      close_noerr stdout_w;
+      close_noerr stderr_r;
+      close_noerr stderr_w;
+      raise exn
+  with exn ->
+    close_noerr stdout_r;
+    close_noerr stdout_w;
+    raise exn

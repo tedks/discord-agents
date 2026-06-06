@@ -14,8 +14,8 @@
       a missing gemini shouldn't fail tests for someone who only uses
       codex. The skip notice is printed at suite start so it stays
       visible.
-    - Detected auth failure — that's a user config issue, not a
-      contract drift in the binary.
+    - Detected auth/quota failure — that's a user config/capacity
+      issue, not a contract drift in the binary.
 
     Tests FAIL (not skip) on anything else: non-zero exit with a
     non-auth-looking error, missing event fields, schema drift.
@@ -47,14 +47,16 @@ let contains_substring text needle =
     true
   with Not_found -> false
 
-(** Heuristic union of auth-failure messages across the three
+(** Heuristic union of auth/quota-failure messages across the three
     binaries. Any match short-circuits to a clean skip — auth is
-    user config, not a contract drift. *)
+    user config and quota is external capacity, not a contract drift. *)
 let auth_failure_indicators = [
   "unauthenticated"; "Unauthorized"; "Not authorized";
   "API key"; "api_key"; "401"; "403";
   "log in"; "Please log in"; "login required";
   "Please run"; "authenticate"; "credentials"; "OAuth";
+  "429"; "QUOTA_EXHAUSTED"; "TerminalQuotaError";
+  "exhausted your capacity";
 ]
 
 let looks_like_auth_failure text =

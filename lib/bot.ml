@@ -68,6 +68,7 @@ type t = {
   mutable refreshing : bool;
   mutable output_lines : int;
   mutable policy_sync_clear_last_warning : (string * string) option;
+  mutable last_top_level_disk_refresh_at : float;
   mutable gateway_supervisor_restarts : int;
   mutable control_api_restarts : int;
   mutable last_gateway_supervisor_error : string option;
@@ -162,15 +163,36 @@ let is_persistent_session t ~thread_id (session : Session_store.session) =
 let refresh_session_disk_state (session : Session_store.session) =
   ignore (Disk_health.preflight_write session.working_dir)
 
-let refresh_persistent_session_disk_state t =
+let persistent_session_working_dirs t =
   Session_store.bindings t.sessions
-  |> List.iter (fun (thread_id, (session : Session_store.session)) ->
+  |> List.filter_map (fun (thread_id, (session : Session_store.session)) ->
     if is_persistent_session t ~thread_id session then
-      refresh_session_disk_state session)
+      Some session.working_dir
+    else
+      None)
+  |> List.sort_uniq String.compare
 
-let refresh_top_level_disk_state t =
-  refresh_disk_state ();
-  refresh_persistent_session_disk_state t
+let refresh_persistent_session_disk_state t =
+  persistent_session_working_dirs t
+  |> List.iter (fun working_dir ->
+    ignore (Disk_health.preflight_write working_dir))
+
+let min_top_level_disk_refresh_interval_s = 5.0
+
+let refresh_top_level_disk_state ?(force=false) t =
+  let now = Unix.gettimeofday () in
+  if force
+     || now -. t.last_top_level_disk_refresh_at
+        >= min_top_level_disk_refresh_interval_s
+  then begin
+    let persistent_session_dirs = persistent_session_working_dirs t in
+    t.last_top_level_disk_refresh_at <- now;
+    Eio_unix.run_in_systhread (fun () ->
+      refresh_disk_state ();
+      List.iter
+        (fun working_dir -> ignore (Disk_health.preflight_write working_dir))
+        persistent_session_dirs)
+  end
 
 let session_converged_to_top_level_policy expected_agent
     (session : Session_store.session) =
@@ -948,7 +970,7 @@ let run_top_level_policy_change t ~current_channel_id
          Ok rotation)
 
 let set_default_agent t ?(current_channel_id=None) kind =
-  refresh_top_level_disk_state t;
+  refresh_top_level_disk_state ~force:true t;
   let simulated_settings : Runtime_settings.t = {
     t.settings with default_agent = kind;
   } in
@@ -962,7 +984,7 @@ let set_default_agent t ?(current_channel_id=None) kind =
     ~policy_label:"default-agent"
 
 let set_rescue_agent t ?(current_channel_id=None) kind =
-  refresh_top_level_disk_state t;
+  refresh_top_level_disk_state ~force:true t;
   let simulated_settings : Runtime_settings.t = {
     t.settings with rescue_agent = kind;
   } in
@@ -1068,22 +1090,33 @@ let mark_active_run_failed t (session : Session_store.session)
   ignore (Discord_rest.create_reaction t.rest
     ~channel_id:session.thread_id ~message_id ~emoji:"\xE2\x9D\x8C" ())
 
-let reconcile_interrupted_active_runs ?(mark_failed=mark_active_run_failed) t =
-  Session_store.bindings t.sessions
-  |> List.iter (fun (_thread_id, (session : Session_store.session)) ->
-    match session.active_run with
-    | None -> ()
-    | Some active_run ->
-      (match active_run.child_process with
-       | Some child ->
-         ignore (reap_tracked_child_processes_blocking t
-           ~reason:"startup cleanup" [child])
-       | None -> ());
-      mark_failed t session ~message_id:active_run.message_id;
-      if forget_active_run t session ~context:"startup" then
-        Logs.info (fun m ->
-          m "bot: reconciled interrupted active run for %s"
-            session.thread_id))
+let reconcile_interrupted_active_runs
+    ?(mark_failed=mark_active_run_failed)
+    ?(reap_children=(fun t children ->
+      ignore (reap_tracked_child_processes_blocking t
+        ~reason:"startup cleanup" children)))
+    t =
+  let interrupted =
+    Session_store.bindings t.sessions
+    |> List.filter_map (fun (_thread_id, (session : Session_store.session)) ->
+      match session.active_run with
+      | None -> None
+      | Some active_run -> Some (session, active_run))
+  in
+  let children =
+    interrupted
+    |> List.filter_map (fun (_session, (active_run : Session_store.active_run)) ->
+      active_run.child_process)
+  in
+  if children <> [] then
+    reap_children t children;
+  List.iter (fun ((session : Session_store.session), active_run) ->
+    mark_failed t session ~message_id:active_run.Session_store.message_id;
+    if forget_active_run t session ~context:"startup" then
+      Logs.info (fun m ->
+        m "bot: reconciled interrupted active run for %s"
+          session.thread_id))
+    interrupted
 
 let persist_completed_run ?(save=Session_store.save) t
     (session : Session_store.session) ~had_initial_prompt =
@@ -1138,7 +1171,7 @@ let reconcile_persisted_stop_requests t =
             session.thread_id err))
 
 let reconcile_persisted_pending_agent_changes t =
-  refresh_top_level_disk_state t;
+  refresh_top_level_disk_state ~force:true t;
   Session_store.bindings t.sessions
   |> List.iter (fun (_thread_id, (session : Session_store.session)) ->
     match session.pending_agent_change with
@@ -1213,9 +1246,10 @@ let trigger_restart t ~notify =
         in
         wait ()
       end;
-      (* Clear any remaining queued messages and notify users *)
+      (* Clear any remaining queued messages without spawning best-effort REST
+         reaction updates while the process is trying to shed load. *)
       List.iter (fun (_tid, (s : Session_store.session)) ->
-        ignore (drop_queued_messages t s ~reason:"restart")
+        ignore (drop_queued_messages ~mark_failed:false t s ~reason:"restart")
       ) (Session_store.bindings t.sessions);
       (* Phase 2: Reap child processes. *)
       let children = child_processes_for_restart t in
@@ -2344,6 +2378,16 @@ let rec process_session_message_with_hooks hooks t session
       let author_name = msg.author.username in
       let (channel_name, channel_type) =
         resolve_channel_context t ~channel_id ~session ?channel_info () in
+      let expected_start_ticks_for_pid pid =
+        match active_child_process session with
+        | Some child when child.pid = pid -> Some child.start_ticks
+        | Some _
+        | None -> None
+      in
+      let stop_child_after_checkpoint_failure ~reason pid =
+        ignore (request_tracked_child_stop t ~reason ~pid
+          ~expected_start_ticks:(expected_start_ticks_for_pid pid))
+      in
       let on_pid pid =
         child_pid := Some pid;
         register_child_pid t session pid;
@@ -2362,8 +2406,12 @@ let rec process_session_message_with_hooks hooks t session
                 m "bot: failed to persist child identity for %s: %s"
                   session.thread_id err))
          | None ->
+           let err = "could not capture child process identity" in
+           checkpoint_failure := Some err;
+           stop_child_after_checkpoint_failure
+             ~reason:"checkpoint identity capture failure" pid;
            Logs.warn (fun m ->
-             m "bot: could not capture child identity for %s; restart cleanup is degraded for this run"
+             m "bot: could not capture child identity for %s; aborting run because restart cleanup would be unsafe"
                session.thread_id));
         if session.stop_requested then
           ignore (request_session_process_stop t session);
@@ -2422,9 +2470,15 @@ let rec process_session_message_with_hooks hooks t session
           hooks.set_session_id t.sessions session
             ~session_id:sid
         with exn ->
+          let err = Printexc.to_string exn in
+          checkpoint_failure := Some err;
+          Option.iter
+            (stop_child_after_checkpoint_failure
+               ~reason:"checkpoint session id failure")
+            !child_pid;
           Logs.warn (fun m ->
             m "bot: failed to persist session id for %s: %s"
-              session.thread_id (Printexc.to_string exn))
+              session.thread_id err)
       in
       let result =
         try
@@ -2761,6 +2815,7 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
                refreshing = false;
                output_lines = Agent_process.default_output_lines;
                policy_sync_clear_last_warning = None;
+               last_top_level_disk_refresh_at = 0.0;
                gateway_supervisor_restarts = 0;
                control_api_restarts = 0;
                last_gateway_supervisor_error = None;
@@ -2836,9 +2891,15 @@ let exn_with_backtrace exn =
   else
     Printf.sprintf "%s\n%s" (Printexc.to_string exn) bt
 
+let supervisor_initial_backoff_s = 1.0
+let supervisor_max_backoff_s = 60.0
+
+let supervisor_next_backoff_s delay =
+  min supervisor_max_backoff_s (max supervisor_initial_backoff_s (delay *. 2.0))
+
 let supervise_bot_component t ~label ~note_restart run_once =
   let clock = Eio.Stdenv.clock t.env in
-  let rec loop () =
+  let rec loop retry_delay =
     if t.gateway.shutdown then
       ()
     else
@@ -2851,18 +2912,18 @@ let supervise_bot_component t ~label ~note_restart run_once =
         let err = Printf.sprintf "%s loop exited without shutdown" label in
         note_restart err;
         Logs.warn (fun m -> m "bot: %s" err);
-        Eio.Time.sleep clock 1.0;
-        loop ()
+        Eio.Time.sleep clock retry_delay;
+        loop (supervisor_next_backoff_s retry_delay)
       | Error _exn when t.gateway.shutdown -> ()
       | Error exn ->
         reraise_if_fatal_policy_exception exn;
         let err = exn_with_backtrace exn in
         note_restart err;
         Logs.warn (fun m -> m "bot: %s supervisor restarting after error: %s" label err);
-        Eio.Time.sleep clock 1.0;
-        loop ()
+        Eio.Time.sleep clock retry_delay;
+        loop (supervisor_next_backoff_s retry_delay)
   in
-  loop ()
+  loop supervisor_initial_backoff_s
 
 let run_gateway_supervised ~(env : Eio_unix.Stdenv.base) t =
   supervise_bot_component t ~label:"gateway" ~note_restart:(fun err ->
