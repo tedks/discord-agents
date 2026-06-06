@@ -1,5 +1,7 @@
 (** Behavioral tests for default-agent and session-agent session transitions. *)
 
+module Agent_checkpoint = Discord_agents__Agent_checkpoint
+
 let rec rm_rf path =
   match Unix.lstat path with
   | exception Unix.Unix_error (ENOENT, _, _) -> ()
@@ -1199,10 +1201,10 @@ let test_reconcile_interrupted_active_runs_clears_checkpoint () =
   with_test_bot (fun bot ->
     let session = make_session Discord_agents.Config.Claude in
     Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
-    let active_run = Some Discord_agents.Session_store.{
-      message_id = "message-1";
-      child_process = None;
-    } in
+    let active_run =
+      Some (Agent_checkpoint.erase
+        (Agent_checkpoint.create ~message_id:"message-1"))
+    in
     (match Discord_agents.Session_store.set_active_run bot.sessions session active_run with
      | Ok () -> ()
      | Error err -> Alcotest.failf "set_active_run failed: %s" err);
@@ -1219,18 +1221,23 @@ let test_reconcile_interrupted_active_runs_clears_checkpoint () =
 
 let test_reconcile_interrupted_active_runs_reaps_children_in_one_batch () =
   with_test_bot (fun bot ->
-    let child pid start_ticks = Discord_agents.Session_store.{
-      pid;
-      start_ticks;
-    } in
+    let child pid start_ticks =
+      Agent_checkpoint.child_process_identity ~pid ~start_ticks
+    in
     let add_active thread_id pid start_ticks =
       let session = make_session ~thread_id Discord_agents.Config.Claude in
       Discord_agents.Session_store.add bot.sessions ~thread_id session;
+      let checkpoint =
+        Agent_checkpoint.create
+          ~message_id:("message-" ^ thread_id)
+      in
+      let active_run =
+        Agent_checkpoint.track_child checkpoint
+          (child pid start_ticks)
+        |> Agent_checkpoint.erase
+      in
       match Discord_agents.Session_store.set_active_run bot.sessions session
-              (Some Discord_agents.Session_store.{
-                message_id = "message-" ^ thread_id;
-                child_process = Some (child pid start_ticks);
-              }) with
+              (Some active_run) with
       | Ok () -> ()
       | Error err -> Alcotest.failf "set_active_run failed: %s" err
     in
@@ -1249,10 +1256,10 @@ let test_persist_completed_run_rolls_back_active_run_on_save_failure () =
     let session = make_session Discord_agents.Config.Claude in
     session.initial_prompt <- Some "preface";
     session.message_count <- 7;
-    let active_run = Some Discord_agents.Session_store.{
-      message_id = "message-1";
-      child_process = None;
-    } in
+    let active_run =
+      Some (Agent_checkpoint.erase
+        (Agent_checkpoint.create ~message_id:"message-1"))
+    in
     session.active_run <- active_run;
     let failing_save _store = failwith "disk full" in
     match Discord_agents.Bot.persist_completed_run ~save:failing_save bot session ~had_initial_prompt:true with
@@ -1262,7 +1269,8 @@ let test_persist_completed_run_rolls_back_active_run_on_save_failure () =
       Alcotest.(check (option string)) "initial_prompt rolled back"
         (Some "preface") session.initial_prompt;
       Alcotest.(check bool) "active run restored"
-        true (session.active_run = active_run))
+        true (Agent_checkpoint.equal_any_option
+          session.active_run active_run))
 
 let eyes_emoji = "\xF0\x9F\x91\x80"
 let x_emoji = "\xE2\x9D\x8C"
@@ -1457,10 +1465,12 @@ let test_stop_busy_session_signals_tracked_child () =
         | None -> Alcotest.fail "expected live child identity"
         | Some child ->
           session.child_pid <- Some pid;
-          session.active_run <- Some Discord_agents.Session_store.{
-            message_id = "message-1";
-            child_process = Some child;
-          };
+          let checkpoint =
+            Agent_checkpoint.create ~message_id:"message-1"
+          in
+          session.active_run <- Some (
+            Agent_checkpoint.track_child checkpoint child
+            |> Agent_checkpoint.erase);
           match Discord_agents.Bot.stop_session bot ~thread_id:"control" with
           | Discord_agents.Bot.Session_stopping stop ->
             Alcotest.(check bool) "had running process" true stop.had_running_process;
