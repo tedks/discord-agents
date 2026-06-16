@@ -86,6 +86,7 @@ let utf8_prefix_len_for_table_cell ~max_bytes s =
       let c = Char.code s.[i] in
       let raw_step =
         if c < 0x80 then 1
+        else if c < 0xC0 then 1
         else if c < 0xE0 then 2
         else if c < 0xF0 then 3
         else 4

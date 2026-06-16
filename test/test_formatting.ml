@@ -365,6 +365,45 @@ let test_split_output_keeps_fitting_suffix_together () =
   Alcotest.(check (list string)) "suffix stays in one chunk"
     ["verylongwo"; "rd bye"] chunks
 
+let test_stream_delta_flushes_before_splitting_word () =
+  let len =
+    Discord_agents.Agent_runner.take_stream_delta_chunk_len
+      ~current_len:(Discord_agents.Agent_runner.stream_message_max - 5)
+      "account balance" ~start:0
+  in
+  Alcotest.(check int) "flush before account split" 0 len
+
+let test_stream_delta_splits_long_word_when_fresh () =
+  let text =
+    String.make (Discord_agents.Agent_runner.stream_message_max + 10) 'a'
+  in
+  let len =
+    Discord_agents.Agent_runner.take_stream_delta_chunk_len
+      ~current_len:0 text ~start:0
+  in
+  Alcotest.(check int) "fresh message takes hard budget"
+    Discord_agents.Agent_runner.stream_message_max len
+
+let test_stream_delta_utf8_boundary_after_flush () =
+  let emoji = "\xF0\x9F\x98\x80" in
+  let text = emoji ^ " account" in
+  let len_before_flush =
+    Discord_agents.Agent_runner.take_stream_delta_chunk_len
+      ~current_len:(Discord_agents.Agent_runner.stream_message_max - 1)
+      text ~start:0
+  in
+  Alcotest.(check int) "flush before slicing emoji" 0 len_before_flush;
+  let prefix =
+    String.make (Discord_agents.Agent_runner.stream_message_max - 1) 'a'
+  in
+  let text = prefix ^ emoji ^ " account" in
+  let len_after_flush =
+    Discord_agents.Agent_runner.take_stream_delta_chunk_len
+      ~current_len:0 text ~start:0
+  in
+  Alcotest.(check int) "fresh chunk stops before emoji boundary"
+    (String.length prefix) len_after_flush
+
 (* Regression: !projects output with many entries must be safely chunkable.
    The original bug was that create_message sent a single ~5700-char message
    when 63 projects were discovered, and Discord silently rejected it.
@@ -580,6 +619,12 @@ let split_message_tests = [
     test_split_output_chunks_do_not_split_words;
   Alcotest.test_case "output chunking keeps fitting suffix" `Quick
     test_split_output_keeps_fitting_suffix_together;
+  Alcotest.test_case "stream delta flushes before word split" `Quick
+    test_stream_delta_flushes_before_splitting_word;
+  Alcotest.test_case "stream delta splits long fresh word" `Quick
+    test_stream_delta_splits_long_word_when_fresh;
+  Alcotest.test_case "stream delta preserves UTF-8 boundary" `Quick
+    test_stream_delta_utf8_boundary_after_flush;
   Alcotest.test_case "projects-list regression" `Quick
     test_split_projects_list_shape;
   Alcotest.test_case "plan: short content → single chunk with reply_to" `Quick
