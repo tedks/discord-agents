@@ -17,15 +17,24 @@ echo "experimental-features = nix-command flakes" >> ~/.config/nix/nix.conf
 
 Log out and back in (or restart your shell) for the changes to take effect.
 
-## 2. Install Claude Code
+## 2. Install agent CLIs
 
-discord-agents uses the Claude Code CLI to run agent sessions. Install it:
+discord-agents defaults new top-level sessions to Codex. Install and
+authenticate the Codex CLI:
 
 ```bash
-npm install -g @anthropic-ai/claude-code
+npm install -g @openai/codex
+codex
 ```
 
-Make sure `claude` is on your PATH and you've authenticated (`claude` will prompt on first run).
+Make sure `codex` is on your PATH before starting the bot. Claude and
+Gemini are optional backends; install `claude` or `gemini` if you plan to
+start sessions with those agents or change the default with
+`!default-agent claude` or `!default-agent gemini`.
+
+For Gemini, use a CLI build whose `gemini --help` includes `--skip-trust`;
+the bot passes that flag so headless worktree sessions do not stop for a
+workspace trust prompt.
 
 ## 3. Create a Discord bot
 
@@ -78,7 +87,7 @@ nix develop --command dune exec discord-agents
 The bot will:
 1. Connect to Discord
 2. Create an "Agent Projects" category if it doesn't exist
-3. Scan your `base_dirs` for git repos and create a channel for each
+3. Scan your `base_directories` for git repos and create a channel for each
 4. Set up a control channel with a Codex session
 
 ### Smoke test

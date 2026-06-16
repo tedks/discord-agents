@@ -12,7 +12,14 @@ Only tested on GNU+Linux. Environment managed by Nix. Built with OCaml 5.3.
 
 ## Quickstart
 
+Install and authenticate the Codex CLI first; new top-level sessions default
+to `codex`.
+
 ```bash
+# Agent CLI
+npm install -g @openai/codex
+codex
+
 # Build
 nix develop --command dune build
 

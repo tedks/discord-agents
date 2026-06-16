@@ -131,6 +131,43 @@ let test_reformat_separator_regenerated () =
        true (String.length sep > 10)
    | [] -> Alcotest.fail "no separator row found")
 
+let test_render_padded_table_truncates_utf8_safely () =
+  let input = [
+    "| Icon | Description |";
+    "|---|---|";
+    "| " ^ String.concat "" (List.init 8 (fun _ -> "😀")) ^ " | " ^
+      String.concat "" (List.init 8 (fun _ -> "界")) ^ " |";
+  ] in
+  let result =
+    Discord_agents.Agent_process.render_padded_table ~max_width:20 input
+  in
+  let well_formed s =
+    let n = String.length s in
+    let rec walk i =
+      if i >= n then true
+      else
+        let c = Char.code s.[i] in
+        let need =
+          if c < 0x80 then 0
+          else if c < 0xC0 then -1
+          else if c < 0xE0 then 1
+          else if c < 0xF0 then 2
+          else 3
+        in
+        if need < 0 || i + need >= n then false
+        else
+          let ok = ref true in
+          for k = 1 to need do
+            let cc = Char.code s.[i + k] in
+            if cc < 0x80 || cc >= 0xC0 then ok := false
+          done;
+          !ok && walk (i + 1 + need)
+    in
+    walk 0
+  in
+  Alcotest.(check bool) "rendered table is valid UTF-8"
+    true (well_formed result)
+
 let reformat_tables_tests = [
   Alcotest.test_case "plain text" `Quick test_reformat_plain_text;
   Alcotest.test_case "simple table" `Quick test_reformat_simple_table;
@@ -150,6 +187,8 @@ let reformat_tables_tests = [
   Alcotest.test_case "padding alignment" `Quick test_reformat_padding_alignment;
   Alcotest.test_case "separator regenerated" `Quick
     test_reformat_separator_regenerated;
+  Alcotest.test_case "table truncation is UTF-8 safe" `Quick
+    test_render_padded_table_truncates_utf8_safely;
 ]
 
 (* ── find_trailing_table_start ──────────────────────────────────── *)
@@ -317,6 +356,14 @@ let test_split_output_chunks_do_not_split_words () =
     Alcotest.(check bool) "chunk under display budget"
       true (Discord_agents.Agent_process.escaped_length chunk <= 15)
   ) chunks
+
+let test_split_output_keeps_fitting_suffix_together () =
+  let chunks =
+    Discord_agents.Agent_process.split_into_chunks
+      ~max_chars:10 "verylongword bye"
+  in
+  Alcotest.(check (list string)) "suffix stays in one chunk"
+    ["verylongwo"; "rd bye"] chunks
 
 (* Regression: !projects output with many entries must be safely chunkable.
    The original bug was that create_message sent a single ~5700-char message
@@ -531,6 +578,8 @@ let split_message_tests = [
     test_split_message_does_not_split_words;
   Alcotest.test_case "output chunking avoids word splits" `Quick
     test_split_output_chunks_do_not_split_words;
+  Alcotest.test_case "output chunking keeps fitting suffix" `Quick
+    test_split_output_keeps_fitting_suffix_together;
   Alcotest.test_case "projects-list regression" `Quick
     test_split_projects_list_shape;
   Alcotest.test_case "plan: short content → single chunk with reply_to" `Quick

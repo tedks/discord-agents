@@ -188,7 +188,7 @@ let load () =
   in
   (* Allow env var override for the token *)
   match Sys.getenv_opt "DISCORD_BOT_TOKEN" with
-  | Some token when token <> "" && config.discord_token = "" ->
+  | Some token when not (blank token) && blank config.discord_token ->
     { config with discord_token = token }
   | _ -> config
 
