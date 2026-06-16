@@ -79,7 +79,7 @@ The bot will:
 1. Connect to Discord
 2. Create an "Agent Projects" category if it doesn't exist
 3. Scan your `base_dirs` for git repos and create a channel for each
-4. Set up a control channel with a Claude session
+4. Set up a control channel with a Codex session
 
 ### Smoke test
 

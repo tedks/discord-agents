@@ -45,11 +45,11 @@ let settings_path home =
 let backup_path home = settings_path home ^ ".bak"
 let stale_temp_path home = settings_path home ^ ".tmp.stale"
 
-let test_load_defaults_to_claude () =
+let test_load_defaults_to_codex () =
   with_tmp_home (fun _home ->
     let settings = Discord_agents.Runtime_settings.load () in
     Alcotest.(check string) "default agent"
-      "claude"
+      "codex"
       (Discord_agents.Config.string_of_agent_kind settings.default_agent);
     Alcotest.(check (option string)) "rescue agent defaults to none"
       None
@@ -92,7 +92,7 @@ let test_load_uses_backup_when_primary_corrupt () =
   with_tmp_home (fun home ->
     let settings = Discord_agents.Runtime_settings.load () in
     match Discord_agents.Runtime_settings.set_default_agent
-            settings Discord_agents.Config.Codex with
+            settings Discord_agents.Config.Gemini with
     | Error err -> Alcotest.failf "save failed: %s" err
     | Ok () ->
       let oc = open_out (settings_path home) in
@@ -105,7 +105,7 @@ let test_load_uses_backup_when_primary_corrupt () =
         backup_stat.Unix.st_mtime;
       let recovered = Discord_agents.Runtime_settings.load () in
       Alcotest.(check string) "recovered default agent"
-        "codex"
+        "gemini"
         (Discord_agents.Config.string_of_agent_kind recovered.default_agent))
 
 let test_save_with_visible_but_unconfirmed_primary_updates_backup () =
@@ -137,7 +137,7 @@ let test_save_marks_primary_newer_when_backup_update_fails () =
   with_tmp_home (fun home ->
     let settings = Discord_agents.Runtime_settings.load () in
     match Discord_agents.Runtime_settings.set_default_agent
-            settings Discord_agents.Config.Codex with
+            settings Discord_agents.Config.Claude with
     | Error err -> Alcotest.failf "initial save failed: %s" err
     | Ok () ->
       settings.default_agent <- Discord_agents.Config.Gemini;
@@ -168,7 +168,7 @@ let test_set_top_level_policy_failure_leaves_settings_unchanged () =
       Alcotest.fail "set_top_level_policy unexpectedly succeeded"
     | Error _ ->
       Alcotest.(check string) "default agent unchanged"
-        "claude"
+        "codex"
         (Discord_agents.Config.string_of_agent_kind settings.default_agent);
       Alcotest.(check (option string)) "rescue agent unchanged"
         None
@@ -182,7 +182,7 @@ let test_load_ignores_stale_backup_when_primary_is_newer_and_corrupt () =
   with_tmp_home (fun home ->
     let settings = Discord_agents.Runtime_settings.load () in
     match Discord_agents.Runtime_settings.set_default_agent
-            settings Discord_agents.Config.Codex with
+            settings Discord_agents.Config.Claude with
     | Error err -> Alcotest.failf "initial save failed: %s" err
     | Ok () ->
       settings.default_agent <- Discord_agents.Config.Gemini;
@@ -205,7 +205,7 @@ let test_load_ignores_stale_backup_when_primary_is_newer_and_corrupt () =
         (backup_stat.Unix.st_mtime +. 10.0);
       let recovered = Discord_agents.Runtime_settings.load () in
       Alcotest.(check string) "stale backup ignored"
-        "claude"
+        "codex"
         (Discord_agents.Config.string_of_agent_kind recovered.default_agent);
       Alcotest.(check bool) "pending policy defaults clean after stale backup"
         false recovered.policy_sync_pending)
@@ -291,8 +291,8 @@ let test_xdg_falls_back_to_existing_legacy_home () =
 let () =
   Alcotest.run "runtime_settings" [
     ("settings", [
-      Alcotest.test_case "load defaults to claude" `Quick
-        test_load_defaults_to_claude;
+      Alcotest.test_case "load defaults to codex" `Quick
+        test_load_defaults_to_codex;
       Alcotest.test_case "save and reload roundtrip" `Quick
         test_save_and_reload_roundtrip;
       Alcotest.test_case "load uses backup when primary corrupt" `Quick

@@ -16,7 +16,7 @@ let lock_path () = settings_path () ^ ".lock"
 let backup_path () = settings_path () ^ ".bak"
 
 let default () = {
-  default_agent = Config.Claude;
+  default_agent = Config.Codex;
   rescue_agent = None;
   policy_sync_pending = false;
 }

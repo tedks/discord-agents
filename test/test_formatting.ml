@@ -1283,6 +1283,22 @@ let test_codex_command_completed () =
   Alcotest.(check (option string)) "completed emits Tool_result with output"
     (Some "hi\n") (expect_tool_result (parse_codex line))
 
+let test_codex_current_command_lifecycle () =
+  let started =
+    {|{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc 'printf codex_probe'","aggregated_output":"","exit_code":null,"status":"in_progress"}}|}
+  in
+  let completed =
+    {|{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc 'printf codex_probe'","aggregated_output":"codex_probe","exit_code":0,"status":"completed"}}|}
+  in
+  (match expect_tool (parse_codex started) with
+   | Some info ->
+     Alcotest.(check string) "tool name" "Bash" info.tool_name;
+     Alcotest.(check string) "summary"
+       "/bin/bash -lc 'printf codex_probe'" info.tool_summary
+   | None -> Alcotest.fail "expected command Tool_use");
+  Alcotest.(check (option string)) "completed emits current output"
+    (Some "codex_probe") (expect_tool_result (parse_codex completed))
+
 let test_codex_command_completed_nonzero_exit () =
   let line = {|{"type":"item.completed","item":{"id":"i1","type":"command_execution","command":"false","aggregated_output":"","exit_code":1,"status":"completed"}}|} in
   Alcotest.(check (option string)) "nonzero exit prefixed with [exit N]"
@@ -1357,6 +1373,7 @@ let codex_json_tests = [
   Alcotest.test_case "empty agent_message dropped" `Quick test_codex_agent_message_empty_dropped;
   Alcotest.test_case "command start is Tool_use Bash" `Quick test_codex_command_started;
   Alcotest.test_case "command complete is Tool_result" `Quick test_codex_command_completed;
+  Alcotest.test_case "current command lifecycle" `Quick test_codex_current_command_lifecycle;
   Alcotest.test_case "nonzero exit prefixed" `Quick test_codex_command_completed_nonzero_exit;
   Alcotest.test_case "empty success dropped" `Quick test_codex_command_completed_empty_dropped;
   Alcotest.test_case "file_change add" `Quick test_codex_file_change_add;
@@ -2892,6 +2909,27 @@ let test_gemini_tool_result_success () =
   Alcotest.(check (option string)) "success carries output"
     (Some "hello world") (expect_tool_result (parse_gemini line))
 
+let test_gemini_current_tool_lifecycle () =
+  let tool_use =
+    {|{"type":"tool_use","timestamp":"2026-06-16T03:49:46.874Z","tool_name":"run_shell_command","tool_id":"run_shell_command__run_shell_command_1781581786783_0","parameters":{"command":"printf gemini_probe","description":"Run printf gemini_probe to verify shell execution."}}|}
+  in
+  let tool_result =
+    {|{"type":"tool_result","timestamp":"2026-06-16T03:49:46.942Z","tool_id":"run_shell_command__run_shell_command_1781581786783_0","status":"success","output":"gemini_probe"}|}
+  in
+  let assistant =
+    {|{"type":"message","timestamp":"2026-06-16T03:49:48.329Z","role":"assistant","content":"done","delta":true}|}
+  in
+  (match expect_tool (parse_gemini tool_use) with
+   | Some info ->
+     Alcotest.(check string) "maps to Bash" "Bash" info.tool_name;
+     Alcotest.(check string) "summary is current command"
+       "printf gemini_probe" info.tool_summary
+   | None -> Alcotest.fail "expected current Tool_use");
+  Alcotest.(check (option string)) "current result output"
+    (Some "gemini_probe") (expect_tool_result (parse_gemini tool_result));
+  Alcotest.(check (option string)) "current assistant delta"
+    (Some "done") (expect_text (parse_gemini assistant))
+
 let test_gemini_tool_result_error () =
   let line = {|{"type":"tool_result","tool_id":"t1","status":"error","output":"bad path","error":{"type":"invalid","message":"nope"}}|} in
   match expect_tool_result (parse_gemini line) with
@@ -2939,6 +2977,7 @@ let gemini_json_tests = [
   Alcotest.test_case "write_file maps to Write" `Quick test_gemini_write_file_tool_use;
   Alcotest.test_case "unknown tool name passthrough" `Quick test_gemini_unknown_tool_passthrough;
   Alcotest.test_case "tool_result success carries output" `Quick test_gemini_tool_result_success;
+  Alcotest.test_case "current tool lifecycle" `Quick test_gemini_current_tool_lifecycle;
   Alcotest.test_case "tool_result error formatted" `Quick test_gemini_tool_result_error;
   Alcotest.test_case "empty tool_result dropped" `Quick test_gemini_tool_result_empty_dropped;
   Alcotest.test_case "result flushes" `Quick test_gemini_result_flushes;
