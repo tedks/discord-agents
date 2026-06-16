@@ -36,6 +36,20 @@ let take_stream_delta_chunk_len ~current_len text ~start =
       | _ when current_len > 0 -> 0
       | _ -> hard_len
 
+let split_trailing_word_for_carry s =
+  let n = String.length s in
+  if n = 0 || Agent_process.is_ascii_whitespace s.[n - 1] then None
+  else
+    let rec find_start i =
+      if i <= 0 then 0
+      else if Agent_process.is_ascii_whitespace s.[i - 1] then i
+      else find_start (i - 1)
+    in
+    let start = find_start n in
+    if start = 0 then None
+    else
+      Some (String.sub s 0 start, String.sub s start (n - start))
+
 (** Map tool names to emoji + verb for compact status display. *)
 (** Escape underscores in a tool name for Discord display.
     Discord interprets __ as underline and _ as italic, so we
@@ -292,6 +306,23 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       (* No table boundary (or entire buffer is a table) — split normally *)
       flush_and_reset ()
   in
+  let carry_trailing_word_to_next_message () =
+    match split_trailing_word_for_carry (Buffer.contents current_msg_buf) with
+    | None -> false
+    | Some (before, carry) ->
+      Buffer.clear current_msg_buf;
+      Buffer.add_string current_msg_buf before;
+      let (in_code, lang) = Agent_process.scan_fences before in
+      if in_code then
+        Buffer.add_string current_msg_buf "\n```";
+      flush_to_discord ();
+      Buffer.clear current_msg_buf;
+      current_msg_id := None;
+      if in_code then
+        Buffer.add_string current_msg_buf ("```" ^ lang ^ "\n");
+      Buffer.add_string current_msg_buf carry;
+      true
+  in
   (* Flush accumulated tool status lines to a single Discord message.
      Consecutive tool calls get batched into one message, edited in-place.
      Sanitization here mirrors flush_to_discord — tool inputs (file paths,
@@ -346,7 +377,9 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
         in
         if chunk_len = 0 then begin
           let before_len = Buffer.length current_msg_buf in
-          start_new_message ();
+          let carried = carry_trailing_word_to_next_message () in
+          if not carried then
+            start_new_message ();
           if Buffer.length current_msg_buf >= before_len then begin
             let remaining_capacity =
               max 1 (stream_message_max - Buffer.length current_msg_buf)

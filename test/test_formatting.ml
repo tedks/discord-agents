@@ -404,6 +404,28 @@ let test_stream_delta_utf8_boundary_after_flush () =
   Alcotest.(check int) "fresh chunk stops before emoji boundary"
     (String.length prefix) len_after_flush
 
+let test_stream_delta_carries_cross_delta_word_suffix () =
+  match Discord_agents.Agent_runner.split_trailing_word_for_carry
+          "prefix acc" with
+  | Some (before, carry) ->
+    Alcotest.(check string) "prefix flushed before suffix"
+      "prefix " before;
+    Alcotest.(check string) "suffix carried"
+      "acc" carry;
+    let len =
+      Discord_agents.Agent_runner.take_stream_delta_chunk_len
+        ~current_len:(String.length carry) "ount balance" ~start:0
+    in
+    Alcotest.(check int) "carried suffix joins continuation"
+      (String.length "ount balance") len
+  | None -> Alcotest.fail "expected trailing suffix to be carried"
+
+let test_stream_delta_does_not_carry_unbroken_buffer () =
+  Alcotest.(check bool) "no prefix to flush"
+    true
+    (Option.is_none
+       (Discord_agents.Agent_runner.split_trailing_word_for_carry "account"))
+
 (* Regression: !projects output with many entries must be safely chunkable.
    The original bug was that create_message sent a single ~5700-char message
    when 63 projects were discovered, and Discord silently rejected it.
@@ -625,6 +647,10 @@ let split_message_tests = [
     test_stream_delta_splits_long_word_when_fresh;
   Alcotest.test_case "stream delta preserves UTF-8 boundary" `Quick
     test_stream_delta_utf8_boundary_after_flush;
+  Alcotest.test_case "stream delta carries cross-delta suffix" `Quick
+    test_stream_delta_carries_cross_delta_word_suffix;
+  Alcotest.test_case "stream delta leaves unbroken buffer" `Quick
+    test_stream_delta_does_not_carry_unbroken_buffer;
   Alcotest.test_case "projects-list regression" `Quick
     test_split_projects_list_shape;
   Alcotest.test_case "plan: short content → single chunk with reply_to" `Quick
