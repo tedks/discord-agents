@@ -323,6 +323,10 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       Buffer.add_string current_msg_buf carry;
       true
   in
+  let start_new_message_preserving_trailing_word () =
+    if not (carry_trailing_word_to_next_message ()) then
+      start_new_message ()
+  in
   (* Flush accumulated tool status lines to a single Discord message.
      Consecutive tool calls get batched into one message, edited in-place.
      Sanitization here mirrors flush_to_discord — tool inputs (file paths,
@@ -370,7 +374,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
         (* Flush first if buffer is already at capacity (e.g. from a
            reopened code block prefix) to avoid zero-progress loops *)
         if Buffer.length current_msg_buf >= stream_message_max then
-          start_new_message ();
+          start_new_message_preserving_trailing_word ();
         let chunk_len =
           take_stream_delta_chunk_len
             ~current_len:(Buffer.length current_msg_buf) text ~start:!pos
@@ -396,7 +400,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
           pos := !pos + chunk_len
         end;
         if Buffer.length current_msg_buf >= stream_message_max then
-          start_new_message ()
+          start_new_message_preserving_trailing_word ()
       done;
       let now = Unix.gettimeofday () in
       if now -. !last_edit > 2.0 && Buffer.length current_msg_buf > 0 then begin

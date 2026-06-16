@@ -420,6 +420,28 @@ let test_stream_delta_carries_cross_delta_word_suffix () =
       (String.length "ount balance") len
   | None -> Alcotest.fail "expected trailing suffix to be carried"
 
+let test_stream_delta_exact_capacity_suffix_can_be_carried () =
+  let prefix =
+    String.make (Discord_agents.Agent_runner.stream_message_max - 4) 'a'
+    ^ " "
+  in
+  let page = prefix ^ "acc" in
+  Alcotest.(check int) "page exactly fills stream budget"
+    Discord_agents.Agent_runner.stream_message_max
+    (String.length page);
+  match Discord_agents.Agent_runner.split_trailing_word_for_carry page with
+  | Some (before, carry) ->
+    Alcotest.(check string) "exact-fill suffix carried" "acc" carry;
+    Alcotest.(check int) "flushed prefix has room"
+      (String.length prefix) (String.length before);
+    let len =
+      Discord_agents.Agent_runner.take_stream_delta_chunk_len
+        ~current_len:(String.length carry) "ount balance" ~start:0
+    in
+    Alcotest.(check int) "next delta joins exact-fill suffix"
+      (String.length "ount balance") len
+  | None -> Alcotest.fail "expected exact-fill suffix to be carried"
+
 let test_stream_delta_does_not_carry_unbroken_buffer () =
   Alcotest.(check bool) "no prefix to flush"
     true
@@ -649,6 +671,8 @@ let split_message_tests = [
     test_stream_delta_utf8_boundary_after_flush;
   Alcotest.test_case "stream delta carries cross-delta suffix" `Quick
     test_stream_delta_carries_cross_delta_word_suffix;
+  Alcotest.test_case "stream delta carries exact-capacity suffix" `Quick
+    test_stream_delta_exact_capacity_suffix_can_be_carried;
   Alcotest.test_case "stream delta leaves unbroken buffer" `Quick
     test_stream_delta_does_not_carry_unbroken_buffer;
   Alcotest.test_case "projects-list regression" `Quick
