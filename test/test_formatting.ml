@@ -2993,8 +2993,8 @@ let test_gemini_args_fresh () =
   let args = gemini_args ~session_id:"placeholder"
     ~session_id_confirmed:false ~prompt:"hello" in
   Alcotest.(check (list string))
-    "fresh invocation: -p prompt, -o stream-json, --yolo, no resume"
-    ["gemini"; "-p"; "hello"; "-o"; "stream-json"; "--yolo"]
+    "fresh invocation: skip trust, -p prompt, stream-json, --yolo, no resume"
+    ["gemini"; "--skip-trust"; "-p"; "hello"; "-o"; "stream-json"; "--yolo"]
     args
 
 let test_gemini_args_resume () =
@@ -3002,7 +3002,7 @@ let test_gemini_args_resume () =
     ~session_id_confirmed:true ~prompt:"continue" in
   Alcotest.(check (list string))
     "resume invocation appends --resume <id>"
-    ["gemini"; "-p"; "continue"; "-o"; "stream-json"; "--yolo";
+    ["gemini"; "--skip-trust"; "-p"; "continue"; "-o"; "stream-json"; "--yolo";
      "--resume"; "abc-123"]
     args
 
