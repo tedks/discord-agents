@@ -385,6 +385,26 @@ let take_fitting_prefix ?(start=0) ~max_chars s =
       let raw_step = if is_triple then 3 else utf8_step s start in
       min raw_step (n - start)
 
+let is_ascii_whitespace = function
+  | ' ' | '\t' | '\r' | '\n' -> true
+  | _ -> false
+
+(** Largest display-safe prefix, preferring a prior whitespace boundary
+    over the hard UTF-8 budget boundary. If no whitespace fits in the
+    window, falls back to [take_fitting_prefix] so long unbroken tokens
+    still make progress. *)
+let take_word_safe_fitting_prefix ?(start=0) ~max_chars s =
+  let hard_len = take_fitting_prefix ~start ~max_chars s in
+  let hard_end = start + hard_len in
+  let rec find_space i =
+    if i <= start then None
+    else if is_ascii_whitespace s.[i - 1] then Some i
+    else find_space (i - 1)
+  in
+  match find_space hard_end with
+  | Some i when i > start -> i - start
+  | _ -> hard_len
+
 (** UTF-8 safe truncation for inline summary strings: caps at [max_chars]
     bytes (post-fence-escape) and appends "...".  Returns [s] unchanged
     if it already fits.  Always lands on a UTF-8 codepoint boundary. *)
@@ -403,7 +423,7 @@ let chunk_long_line ~max_chars line =
     let chunks = ref [] in
     let pos = ref 0 in
     while !pos < n do
-      let len = take_fitting_prefix ~start:!pos ~max_chars line in
+      let len = take_word_safe_fitting_prefix ~start:!pos ~max_chars line in
       chunks := String.sub line !pos len :: !chunks;
       pos := !pos + len
     done;
@@ -453,7 +473,7 @@ let truncate_for_display ~max_lines ~max_chars (lines : string list) =
         else if shown = 0 then
           (* First line alone exceeds budget — char-truncate it so the
              user always sees something rather than an empty block. *)
-          let taken = take_fitting_prefix ~max_chars l in
+          let taken = take_word_safe_fitting_prefix ~max_chars l in
           let trimmed = String.sub l 0 taken in
           { display = [trimmed]; shown = 1;
             total = 1 + List.length rest;

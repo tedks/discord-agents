@@ -281,6 +281,43 @@ let test_split_no_separator_utf8_safe () =
     Alcotest.(check bool) "chunk is well-formed UTF-8" true (well_formed chunk)
   ) chunks
 
+let contains_substring text needle =
+  try ignore (Str.search_forward (Str.regexp_string needle) text 0); true
+  with Not_found -> false
+
+let test_split_message_does_not_split_words () =
+  let input =
+    String.concat " " [
+      String.make 20 'a';
+      "account";
+      "balance";
+      String.make 20 'b';
+    ]
+  in
+  let chunks = Discord_agents.Agent_process.split_message ~max_len:30 input in
+  let marked = String.concat "/" chunks in
+  Alcotest.(check bool) "account not split as ac/count"
+    false (contains_substring marked "ac/count");
+  List.iter (fun chunk ->
+    Alcotest.(check bool) "chunk under test limit"
+      true (String.length chunk <= 30)
+  ) chunks
+
+let test_split_output_chunks_do_not_split_words () =
+  let input =
+    "alpha beta account gamma delta account epsilon zeta"
+  in
+  let chunks =
+    Discord_agents.Agent_process.split_into_chunks ~max_chars:15 input
+  in
+  let marked = String.concat "/" chunks in
+  Alcotest.(check bool) "output chunks avoid ac/count"
+    false (contains_substring marked "ac/count");
+  List.iter (fun chunk ->
+    Alcotest.(check bool) "chunk under display budget"
+      true (Discord_agents.Agent_process.escaped_length chunk <= 15)
+  ) chunks
+
 (* Regression: !projects output with many entries must be safely chunkable.
    The original bug was that create_message sent a single ~5700-char message
    when 63 projects were discovered, and Discord silently rejected it.
@@ -490,6 +527,10 @@ let split_message_tests = [
     test_split_all_chunks_under_limit;
   Alcotest.test_case "no-separator fallback is UTF-8 safe" `Quick
     test_split_no_separator_utf8_safe;
+  Alcotest.test_case "split_message avoids word splits" `Quick
+    test_split_message_does_not_split_words;
+  Alcotest.test_case "output chunking avoids word splits" `Quick
+    test_split_output_chunks_do_not_split_words;
   Alcotest.test_case "projects-list regression" `Quick
     test_split_projects_list_shape;
   Alcotest.test_case "plan: short content → single chunk with reply_to" `Quick
@@ -1078,6 +1119,19 @@ let test_truncate_for_display_fence_heavy () =
   Alcotest.(check bool) "escaped text fits in budget"
     true (String.length escaped <= 1700)
 
+let test_truncate_for_display_does_not_split_words () =
+  let line = "alpha beta account gamma delta" in
+  let t = Discord_agents.Agent_process.truncate_for_display
+    ~max_lines:10 ~max_chars:15 [line] in
+  let marked = String.concat "/" t.display in
+  Alcotest.(check bool) "truncate fallback avoids ac/count"
+    false (contains_substring marked "ac/count");
+  (match t.display with
+   | [display] ->
+     Alcotest.(check bool) "display under budget"
+       true (Discord_agents.Agent_process.escaped_length display <= 15)
+   | _ -> Alcotest.fail "expected one truncated display line")
+
 let test_take_fitting_prefix_plain () =
   let s = String.make 5000 'a' in
   let taken = Discord_agents.Agent_process.take_fitting_prefix
@@ -1151,6 +1205,8 @@ let tool_detail_tests = [
   Alcotest.test_case "safety cap" `Quick test_detail_safety_cap;
   Alcotest.test_case "fence heavy" `Quick test_detail_fence_heavy;
   Alcotest.test_case "truncate fence heavy" `Quick test_truncate_for_display_fence_heavy;
+  Alcotest.test_case "truncate avoids word splits" `Quick
+    test_truncate_for_display_does_not_split_words;
   Alcotest.test_case "take_fitting_prefix plain" `Quick test_take_fitting_prefix_plain;
   Alcotest.test_case "take_fitting_prefix fences" `Quick test_take_fitting_prefix_fences;
   Alcotest.test_case "take_fitting_prefix utf8" `Quick test_take_fitting_prefix_utf8;
