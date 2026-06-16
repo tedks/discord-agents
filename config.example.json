@@ -1,0 +1,7 @@
+{
+  "discord_token": "your-bot-token",
+  "guild_id": "your-server-id",
+  "base_directories": ["~/Projects"],
+  "control_channel_id": null,
+  "projects": []
+}

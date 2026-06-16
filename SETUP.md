@@ -58,13 +58,13 @@ Create `~/.config/discord-agents/config.json`:
 {
   "discord_token": "your-bot-token-from-step-3",
   "guild_id": "your-server-id-from-step-4",
-  "base_dirs": ["~/Projects"]
+  "base_directories": ["~/Projects"]
 }
 ```
 
 - `discord_token` -- The bot token from step 3. Alternatively, set the `DISCORD_BOT_TOKEN` environment variable.
 - `guild_id` -- Your Discord server ID from step 4.
-- `base_dirs` -- List of directories to scan for git repos. Each repo becomes a project channel.
+- `base_directories` -- List of directories to scan for git repos. Each repo becomes a project channel. `base_dirs` is accepted as a legacy alias.
 - `control_channel_id` (optional) -- A specific channel ID for the control channel. If omitted, the bot creates one.
 
 ## 6. Build and run
