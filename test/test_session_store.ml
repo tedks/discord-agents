@@ -1,4 +1,4 @@
-module Agent_checkpoint = Discord_agents__Agent_checkpoint
+module Agent_checkpoint = Discord_agents.Agent_checkpoint
 
 let rec rm_rf path =
   match Unix.lstat path with
