@@ -11,6 +11,7 @@ module Agent_runner = Agent_runner
 module Discord_types = Discord_types
 module Discord_rest = Discord_rest
 module Discord_gateway = Discord_gateway
+module Agent_checkpoint = Agent_checkpoint
 module Session_store = Session_store
 module Channel_manager = Channel_manager
 module Command = Command

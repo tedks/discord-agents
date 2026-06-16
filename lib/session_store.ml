@@ -20,15 +20,8 @@ type pending_agent_change = {
   origin : pending_agent_origin;
 }
 
-type child_process_identity = {
-  pid : int;
-  start_ticks : int64;
-}
-
-type active_run = {
-  message_id : Discord_types.message_id;
-  child_process : child_process_identity option;
-}
+type child_process_identity = Agent_checkpoint.child_process_identity
+type active_run = Agent_checkpoint.any
 
 let string_of_pending_agent_origin = function
   | Default_rotation -> "default_rotation"
@@ -126,8 +119,9 @@ let sessions_to_json sessions =
          | None -> [])
       @ (match s.active_run with
          | Some active_run ->
-           [("active_message_id", `String active_run.message_id)]
-           @ (match active_run.child_process with
+           [("active_message_id",
+             `String (Agent_checkpoint.message_id_any active_run))]
+           @ (match Agent_checkpoint.child_process_any active_run with
               | Some child ->
                 [("active_child_pid", `Int child.pid);
                  ("active_child_start_ticks", json_of_int64 child.start_ticks)]
@@ -180,10 +174,11 @@ let sessions_of_json json =
         let child_process =
           match j |> member "active_child_pid",
                 int64_of_json (j |> member "active_child_start_ticks") with
-          | `Int pid, Some start_ticks -> Some { pid; start_ticks }
+          | `Int pid, Some start_ticks ->
+            Some (Agent_checkpoint.child_process_identity ~pid ~start_ticks)
           | _ -> None
         in
-        Some { message_id; child_process }
+        Some (Agent_checkpoint.of_persisted ~message_id ~child_process)
       | _ -> None
     in
     let session = {
@@ -507,7 +502,7 @@ let set_stop_requested t session stop_requested =
 
 let set_active_run t session active_run =
   let prior = session.active_run in
-  if prior = active_run then
+  if Agent_checkpoint.equal_any_option prior active_run then
     Ok ()
   else begin
     session.active_run <- active_run;

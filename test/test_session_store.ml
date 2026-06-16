@@ -1,3 +1,5 @@
+module Agent_checkpoint = Discord_agents.Agent_checkpoint
+
 let rec rm_rf path =
   match Unix.lstat path with
   | exception Unix.Unix_error (ENOENT, _, _) -> ()
@@ -34,6 +36,14 @@ let sessions_path home =
 
 let backup_path home = sessions_path home ^ ".bak"
 
+let write_primary_sessions home content =
+  let path = sessions_path home in
+  Discord_agents.Resource.ensure_parent_dir path;
+  let oc = open_out path in
+  Fun.protect
+    ~finally:(fun () -> close_out oc)
+    (fun () -> output_string oc content)
+
 let make_session () =
   Discord_agents.Session_store.make_session
     ~project_name:"control"
@@ -53,14 +63,48 @@ let find_control_session store =
 let expect_active_run session ~message_id ~pid ~start_ticks =
   match session.Discord_agents.Session_store.active_run with
   | Some active_run ->
-    Alcotest.(check string) "active message id" message_id active_run.message_id;
-    (match active_run.child_process with
+    Alcotest.(check string) "active message id" message_id
+      (Agent_checkpoint.message_id_any active_run);
+    (match Agent_checkpoint.child_process_any active_run with
      | Some child ->
        Alcotest.(check int) "child pid" pid child.pid;
        Alcotest.(check int64) "child start ticks" start_ticks child.start_ticks
      | None -> Alcotest.fail "expected persisted child process identity")
   | None ->
     Alcotest.fail "expected persisted active run"
+
+let expect_active_run_without_child session ~message_id =
+  match session.Discord_agents.Session_store.active_run with
+  | Some active_run ->
+    Alcotest.(check string) "active message id" message_id
+      (Agent_checkpoint.message_id_any active_run);
+    Alcotest.(check bool) "no child identity"
+      true
+      (Option.is_none
+         (Agent_checkpoint.child_process_any active_run))
+  | None ->
+    Alcotest.fail "expected persisted active run"
+
+let test_agent_checkpoint_tracks_child_by_construction () =
+  let open Agent_checkpoint in
+  let checkpoint = create ~message_id:"message-1" in
+  Alcotest.(check string) "untracked message id"
+    "message-1" (message_id checkpoint);
+  Alcotest.(check bool) "untracked has no child"
+    true (Option.is_none (child_process_any (erase checkpoint)));
+  let child = child_process_identity ~pid:1234 ~start_ticks:5678L in
+  let tracked = track_child checkpoint child in
+  let tracked_child = child_process tracked in
+  Alcotest.(check int) "tracked child pid" 1234 tracked_child.pid;
+  Alcotest.(check int64) "tracked child start ticks"
+    5678L tracked_child.start_ticks;
+  (match child_process_any (erase tracked) with
+   | Some erased_child ->
+     Alcotest.(check int) "erased child pid" 1234 erased_child.pid;
+     Alcotest.(check int64) "erased child start ticks"
+       5678L erased_child.start_ticks
+   | None ->
+     Alcotest.fail "expected erased tracked checkpoint to expose child")
 
 let test_save_updates_backup () =
   with_tmp_home (fun home ->
@@ -168,6 +212,51 @@ let test_save_marks_primary_newer_when_backup_update_fails () =
     Alcotest.(check bool) "primary stamped newer than stale backup"
       true (primary_stat.Unix.st_mtime > backup_stat.Unix.st_mtime))
 
+let test_persisted_active_run_without_child_loads () =
+  with_tmp_home (fun home ->
+    (* This is the real crash window after the active-run checkpoint
+       is saved and before the child process identity is captured. *)
+    write_primary_sessions home {|
+[
+  {
+    "project_name": "control",
+    "working_dir": "/tmp/project",
+    "agent_kind": "claude",
+    "session_id": "session-1",
+    "thread_id": "control",
+    "message_count": 0,
+    "active_message_id": "message-legacy"
+  }
+]
+|};
+    let store = Discord_agents.Session_store.create () in
+    let recovered = find_control_session store in
+    expect_active_run_without_child recovered ~message_id:"message-legacy")
+
+let test_persisted_active_run_with_child_loads () =
+  with_tmp_home (fun home ->
+    write_primary_sessions home {|
+[
+  {
+    "project_name": "control",
+    "working_dir": "/tmp/project",
+    "agent_kind": "claude",
+    "session_id": "session-1",
+    "thread_id": "control",
+    "message_count": 0,
+    "active_message_id": "message-legacy",
+    "active_child_pid": 4242,
+    "active_child_start_ticks": "123456789"
+  }
+]
+|};
+    let store = Discord_agents.Session_store.create () in
+    let recovered = find_control_session store in
+    expect_active_run recovered
+      ~message_id:"message-legacy"
+      ~pid:4242
+      ~start_ticks:123456789L)
+
 let test_load_ignores_stale_backup_when_primary_is_newer_and_corrupt () =
   with_tmp_home (fun home ->
     let store = Discord_agents.Session_store.create () in
@@ -200,10 +289,17 @@ let test_active_run_roundtrips_through_backup () =
     let store = Discord_agents.Session_store.create () in
     let session = make_session () in
     Discord_agents.Session_store.add store ~thread_id:"control" session;
-    let active_run = Some Discord_agents.Session_store.{
-      message_id = "message-42";
-      child_process = Some { pid = 4242; start_ticks = 123456789L };
-    } in
+    let child =
+      Agent_checkpoint.child_process_identity
+        ~pid:4242 ~start_ticks:123456789L
+    in
+    let active_run =
+      let checkpoint =
+        Agent_checkpoint.create ~message_id:"message-42"
+      in
+      Some (Agent_checkpoint.erase
+        (Agent_checkpoint.track_child checkpoint child))
+    in
     (match Discord_agents.Session_store.set_active_run store session active_run with
      | Ok () -> ()
      | Error err -> Alcotest.failf "set_active_run failed: %s" err);
@@ -246,6 +342,8 @@ let test_save_refuses_read_only_preflight () =
 let () =
   Alcotest.run "session_store" [
     ("persistence", [
+      Alcotest.test_case "agent checkpoint tracks child by construction" `Quick
+        test_agent_checkpoint_tracks_child_by_construction;
       Alcotest.test_case "save updates backup" `Quick
         test_save_updates_backup;
       Alcotest.test_case "load uses backup when primary corrupt" `Quick
@@ -258,6 +356,10 @@ let () =
         test_save_with_visible_but_unconfirmed_primary_updates_backup;
       Alcotest.test_case "failed backup leaves primary newer" `Quick
         test_save_marks_primary_newer_when_backup_update_fails;
+      Alcotest.test_case "persisted active run without child loads" `Quick
+        test_persisted_active_run_without_child_loads;
+      Alcotest.test_case "persisted active run with child loads" `Quick
+        test_persisted_active_run_with_child_loads;
       Alcotest.test_case "load ignores stale backup when primary is newer and corrupt" `Quick
         test_load_ignores_stale_backup_when_primary_is_newer_and_corrupt;
       Alcotest.test_case "active run roundtrips through backup" `Quick

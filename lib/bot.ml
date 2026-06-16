@@ -377,7 +377,8 @@ let proc_stat_of_pid pid =
 let rec child_process_identity_of_pid ?(attempts=5) ?(sleep=Unix.sleepf) pid =
   match proc_stat_of_pid pid with
   | Proc_stat_found info ->
-    Some Session_store.{ pid; start_ticks = info.start_ticks }
+    Some (Agent_checkpoint.child_process_identity
+      ~pid ~start_ticks:info.start_ticks)
   | Proc_stat_missing
   | Proc_stat_unknown when attempts > 1 ->
     sleep 0.01;
@@ -420,8 +421,7 @@ let pid_ownership ?expected_start_ticks ?(tracked_child=false) pid =
 
 let active_child_process (session : Session_store.session) =
   match session.active_run with
-  | Some { child_process = Some child; _ } -> Some child
-  | Some { child_process = None; _ }
+  | Some active_run -> Agent_checkpoint.child_process_any active_run
   | None -> None
 
 let drop_queued_messages ?(mark_failed=true) ?(async_marking=false) t
@@ -509,15 +509,10 @@ let request_tracked_child_stop t ~reason ~pid ~expected_start_ticks =
           log_unknown_child_ownership (reason ^ " SIGKILL") pid));
   signalled
 
-let compare_child_process_identity
-    (a : Session_store.child_process_identity)
-    (b : Session_store.child_process_identity) =
-  match Int.compare a.pid b.pid with
-  | 0 -> Int64.compare a.start_ticks b.start_ticks
-  | n -> n
-
 let reap_tracked_child_processes_blocking t ~reason children =
-  let children = List.sort_uniq compare_child_process_identity children in
+  let children =
+    List.sort_uniq Agent_checkpoint.compare_child_process_identity children
+  in
   let signalled = Eio_unix.run_in_systhread (fun () ->
     List.filter (fun (child : Session_store.child_process_identity) ->
       match pid_ownership ~expected_start_ticks:child.start_ticks
@@ -1106,12 +1101,13 @@ let reconcile_interrupted_active_runs
   let children =
     interrupted
     |> List.filter_map (fun (_session, (active_run : Session_store.active_run)) ->
-      active_run.child_process)
+      Agent_checkpoint.child_process_any active_run)
   in
   if children <> [] then
     reap_children t children;
   List.iter (fun ((session : Session_store.session), active_run) ->
-    mark_failed t session ~message_id:active_run.Session_store.message_id;
+    mark_failed t session
+      ~message_id:(Agent_checkpoint.message_id_any active_run);
     if forget_active_run t session ~context:"startup" then
       Logs.info (fun m ->
         m "bot: reconciled interrupted active run for %s"
@@ -1207,7 +1203,7 @@ let child_processes_for_restart t =
        | None -> Eio_unix.run_in_systhread (fun () ->
            child_process_identity_of_pid pid))
     | None -> None)
-  |> List.sort_uniq compare_child_process_identity
+  |> List.sort_uniq Agent_checkpoint.compare_child_process_identity
 
 (** Trigger a graceful restart: drain → reap → build → spawn.
     Callable from command handler or signal handler.
@@ -2351,16 +2347,14 @@ let rec process_session_message_with_hooks hooks t session
     (msg : Discord_types.message) channel_info =
   let child_pid = ref None in
   let checkpoint_failure = ref None in
-  let active_run = Session_store.{
-    message_id = msg.id;
-    child_process = None;
-  } in
+  let active_run = Agent_checkpoint.create ~message_id:msg.id in
   Fun.protect ~finally:(fun () ->
     Option.iter (unregister_child_pid t session) !child_pid
   ) (fun () ->
     let channel_id = msg.channel_id in
     let message_id = msg.id in
-    match hooks.set_active_run t.sessions session (Some active_run) with
+    match hooks.set_active_run t.sessions session
+            (Some (Agent_checkpoint.erase active_run)) with
     | Error err ->
       Logs.warn (fun m ->
         m "bot: failed to persist active run checkpoint for %s: %s"
@@ -2393,15 +2387,21 @@ let rec process_session_message_with_hooks hooks t session
         register_child_pid t session pid;
         (match hooks.capture_child_process pid with
          | Some child_process ->
+           let tracked_run =
+             Agent_checkpoint.track_child active_run child_process
+           in
+           (* Read through the tracked witness so failure cleanup uses
+              the same promoted state we attempted to persist. *)
+           let tracked_child = Agent_checkpoint.child_process tracked_run in
            (match hooks.set_active_run t.sessions session
-                    (Some { active_run with child_process = Some child_process }) with
+                    (Some (Agent_checkpoint.erase tracked_run)) with
             | Ok () -> ()
             | Error err ->
               checkpoint_failure := Some err;
               ignore (request_tracked_child_stop t
                 ~reason:"checkpoint failure"
                 ~pid
-                ~expected_start_ticks:(Some child_process.start_ticks));
+                ~expected_start_ticks:(Some tracked_child.start_ticks));
               Logs.warn (fun m ->
                 m "bot: failed to persist child identity for %s: %s"
                   session.thread_id err))
