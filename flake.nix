@@ -39,6 +39,7 @@
           ];
 
           shellHook = ''
+            export PATH="$HOME/.npm-global/bin:$PATH"
             echo "discord-agents OCaml dev shell"
             echo "  ocaml $(ocaml -version 2>/dev/null | head -1)"
             echo "  dune $(dune --version 2>/dev/null)"
