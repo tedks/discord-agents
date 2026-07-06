@@ -3,8 +3,9 @@
     These fixtures are captured line shapes from the three agent stream
     modes. The simulated interrupt happens after complete JSONL records
     have been emitted and while the next record is only partially written.
-    Production reads line-oriented JSON, so the incomplete tail must not be
-    handed to a line parser; already parsed events must remain intact. *)
+    Production reads line-oriented JSON; at EOF, Eio.Buf_read.line can return
+    the final unterminated line, so the partial tail is handed to the parser
+    and must degrade to Other without disturbing already parsed events. *)
 
 type expected = {
   text : string;
@@ -12,18 +13,8 @@ type expected = {
   tool_name : string option;
 }
 
-let parse_complete_jsonl ~parse chunk =
-  let len = String.length chunk in
-  let lines = String.split_on_char '\n' chunk in
-  let complete_lines =
-    if len > 0 && chunk.[len - 1] <> '\n' then
-      match List.rev lines with
-      | _partial :: rev_complete -> List.rev rev_complete
-      | [] -> []
-    else
-      lines
-  in
-  complete_lines
+let parse_jsonl_until_eof ~parse chunk =
+  String.split_on_char '\n' chunk
   |> List.filter (fun line -> line <> "")
   |> List.concat_map parse
 
@@ -44,17 +35,17 @@ let has_tool expected =
       tool_name = expected
     | _ -> false)
 
-let no_raw_tail tail =
-  List.for_all (function
-    | Discord_agents.Agent_process.Other raw -> raw <> tail
-    | _ -> true)
+let has_raw_tail tail =
+  List.exists (function
+    | Discord_agents.Agent_process.Other raw -> raw = tail
+    | _ -> false)
 
 let assert_interrupt_preserves_complete_events
     ~name ~parse ~complete_lines ~truncated_tail expected =
   let stream =
     String.concat "\n" complete_lines ^ "\n" ^ truncated_tail
   in
-  let events = parse_complete_jsonl ~parse stream in
+  let events = parse_jsonl_until_eof ~parse stream in
   Alcotest.(check bool) (name ^ " text survives interrupt")
     true (has_text expected.text events);
   (match expected.session_id with
@@ -67,8 +58,8 @@ let assert_interrupt_preserves_complete_events
      Alcotest.(check bool) (name ^ " tool event survives interrupt")
        true (has_tool tool_name events)
    | None -> ());
-  Alcotest.(check bool) (name ^ " truncated tail is not parsed")
-    true (no_raw_tail truncated_tail events)
+  Alcotest.(check bool) (name ^ " truncated tail degrades to Other")
+    true (has_raw_tail truncated_tail events)
 
 let test_claude_interrupt_preserves_events () =
   assert_interrupt_preserves_complete_events

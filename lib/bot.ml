@@ -2127,7 +2127,7 @@ let handle_command t msg cmd =
       "`!session-agent [agent]` / `!session_agent [agent]` — show or set the current channel session agent";
       "`!resume [agent] <session_id>` — resume a session (no agent = try the current effective top-level agent first)";
       "`!stop <thread_id>` — stop a session";
-      "`!esc` / `!int` / `!interrupt` — interrupt this thread's current turn";
+      "`!esc` / `!int` / `!interrupt` — stop this thread's active session";
       "`!rename [thread_id] <name>` — rename a thread";
       "`!status` — bot status and running processes";
       "`!refresh` — re-scan for new projects";
