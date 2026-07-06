@@ -668,6 +668,37 @@ let stop_session t ~thread_id =
         }
       | Error err -> Session_stop_failed err
 
+let reply_stop_outcome reply = function
+  | Session_not_found ->
+    reply "Session not found."
+  | Session_stopped { project_name; dropped_count } ->
+    let dropped_text =
+      if dropped_count = 0 then ""
+      else Printf.sprintf " Dropped %d queued message%s."
+        dropped_count (if dropped_count = 1 then "" else "s")
+    in
+    reply (Printf.sprintf "Stopped session for **%s**.%s"
+      project_name dropped_text)
+  | Session_stopping { project_name; had_running_process; dropped_count } ->
+    let process_text =
+      if had_running_process then
+        " Terminating the active agent process."
+      else
+        " The active session will stop as soon as its current turn or agent startup finishes."
+    in
+    let dropped_text =
+      if dropped_count = 0 then ""
+      else Printf.sprintf " Dropped %d queued message%s."
+        dropped_count (if dropped_count = 1 then "" else "s")
+    in
+    reply (Printf.sprintf
+      "Stopping session for **%s**.%s%s"
+      project_name process_text dropped_text)
+  | Session_already_stopping { project_name } ->
+    reply (Printf.sprintf "Session for **%s** is already stopping." project_name)
+  | Session_stop_failed err ->
+    reply (Printf.sprintf "Failed to stop session: %s" err)
+
 (** Find a usable working directory for a project. *)
 let working_dir_of_project (p : Project.t) =
   if p.is_bare then
@@ -1747,36 +1778,9 @@ let handle_command t msg cmd =
              reply (Printf.sprintf "Failed to persist resumed session: %s"
                (Printexc.to_string exn)))))
   | Command.Stop_session { thread_id } ->
-    (match stop_session t ~thread_id with
-     | Session_not_found ->
-       reply "Session not found."
-    | Session_stopped { project_name; dropped_count } ->
-      let dropped_text =
-        if dropped_count = 0 then ""
-        else Printf.sprintf " Dropped %d queued message%s."
-          dropped_count (if dropped_count = 1 then "" else "s")
-      in
-      reply (Printf.sprintf "Stopped session for **%s**.%s"
-        project_name dropped_text)
-     | Session_stopping { project_name; had_running_process; dropped_count } ->
-      let process_text =
-        if had_running_process then
-          " Terminating the active agent process."
-        else
-          " The active session will stop as soon as its current turn or agent startup finishes."
-       in
-       let dropped_text =
-         if dropped_count = 0 then ""
-         else Printf.sprintf " Dropped %d queued message%s."
-           dropped_count (if dropped_count = 1 then "" else "s")
-       in
-       reply (Printf.sprintf
-         "Stopping session for **%s**.%s%s"
-         project_name process_text dropped_text)
-     | Session_already_stopping { project_name } ->
-       reply (Printf.sprintf "Session for **%s** is already stopping." project_name)
-     | Session_stop_failed err ->
-       reply (Printf.sprintf "Failed to stop session: %s" err))
+    reply_stop_outcome reply (stop_session t ~thread_id)
+  | Command.Interrupt_session ->
+    reply_stop_outcome reply (stop_session t ~thread_id:channel_id)
   | Command.Default_agent None ->
     refresh_disk_state ();
     let base = Printf.sprintf "Default agent: `%s`."
@@ -2123,6 +2127,7 @@ let handle_command t msg cmd =
       "`!session-agent [agent]` / `!session_agent [agent]` — show or set the current channel session agent";
       "`!resume [agent] <session_id>` — resume a session (no agent = try the current effective top-level agent first)";
       "`!stop <thread_id>` — stop a session";
+      "`!esc` / `!int` / `!interrupt` — stop this thread's active session";
       "`!rename [thread_id] <name>` — rename a thread";
       "`!status` — bot status and running processes";
       "`!refresh` — re-scan for new projects";

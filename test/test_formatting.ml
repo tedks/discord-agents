@@ -677,6 +677,7 @@ let cmd_testable =
         Printf.sprintf "Resume_session(%s,%s)"
           (Discord_agents.Config.string_of_agent_kind k) session_id
       | Stop_session { thread_id } -> "Stop_session(" ^ thread_id ^ ")"
+      | Interrupt_session -> "Interrupt_session"
       | Cleanup_channels -> "Cleanup_channels"
       | Default_agent None -> "Default_agent"
       | Default_agent (Some k) ->
@@ -932,6 +933,19 @@ let test_parse_session_agent_invalid_kind () =
     Alcotest.(check pass) "invalid session agent is Unknown" () ()
   | _ -> Alcotest.fail "expected Unknown for invalid session agent kind"
 
+let test_parse_interrupt_aliases () =
+  List.iter (fun raw ->
+    Alcotest.(check cmd_testable) raw
+      Discord_agents.Command.Interrupt_session
+      (Discord_agents.Command.parse raw))
+    ["!esc"; "!int"; "!interrupt"]
+
+let test_parse_interrupt_rejects_args () =
+  match Discord_agents.Command.parse "!interrupt now" with
+  | Discord_agents.Command.Unknown _ ->
+    Alcotest.(check pass) "interrupt with args is Unknown" () ()
+  | _ -> Alcotest.fail "expected Unknown for interrupt args"
+
 let command_tests = [
   Alcotest.test_case "desktop" `Quick test_parse_desktop;
   Alcotest.test_case "mobile" `Quick test_parse_mobile;
@@ -970,6 +984,8 @@ let command_tests = [
   Alcotest.test_case "session-agent set" `Quick test_parse_session_agent_set;
   Alcotest.test_case "session_agent alias" `Quick test_parse_session_agent_underscore_alias;
   Alcotest.test_case "session-agent invalid kind" `Quick test_parse_session_agent_invalid_kind;
+  Alcotest.test_case "interrupt aliases" `Quick test_parse_interrupt_aliases;
+  Alcotest.test_case "interrupt rejects args" `Quick test_parse_interrupt_rejects_args;
 ]
 
 (* ── tool detail formatting ────────────────────────────────────── *)

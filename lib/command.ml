@@ -13,6 +13,7 @@ type t =
   (** [kind = None] means use the current effective top-level agent. *)
   | Resume_session of { session_id : string; kind : Config.agent_kind option }
   | Stop_session of { thread_id : string }
+  | Interrupt_session
   | Cleanup_channels
   | Default_agent of Config.agent_kind option
   | Rescue_agent of Config.agent_kind option option
@@ -80,6 +81,7 @@ let parse content =
      | Ok k -> Session_agent (Some k)
      | Error _ -> Unknown content)
   | ["stop"; thread_id] -> Stop_session { thread_id }
+  | ["esc"] | ["int"] | ["interrupt"] -> Interrupt_session
   | ["cleanup-channels"] | ["cleanup"] -> Cleanup_channels
   | "rename" :: rest when rest <> [] ->
     (* !rename <name> — rename current thread
