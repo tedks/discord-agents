@@ -150,6 +150,36 @@ TOOLS = [
         }
     },
     {
+        "name": "send_message",
+        "description": "Send a visible user-style message to another active session thread, then route it through the same handler as a Discord user message. Use list_sessions to find thread IDs. The message is queued if the target session is busy. Do not send command-looking messages. If replying to an inter-agent message, pass its remaining_hops value so loops terminate.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "thread_id": {
+                    "type": "string",
+                    "description": "Discord thread ID of the destination active session"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Plain message text to send. Must not start with ! and must fit in one Discord message.",
+                    "maxLength": 1600
+                },
+                "source_thread_id": {
+                    "type": "string",
+                    "description": "Optional Discord thread ID of the sending session, if known. Used for the visible origin marker and self-send rejection."
+                },
+                "remaining_hops": {
+                    "type": "integer",
+                    "description": "Loop guard. Defaults to 3 for a new chain. If replying to an inter-agent message, pass the remaining_hops value shown in that message.",
+                    "minimum": 1,
+                    "maximum": 5,
+                    "default": 3
+                }
+            },
+            "required": ["thread_id", "message"]
+        }
+    },
+    {
         "name": "stop_session",
         "description": "Stop an active bot session by Discord thread ID. Idle sessions stop immediately; busy sessions terminate the active agent run and then clean up the session.",
         "inputSchema": {
@@ -432,6 +462,14 @@ def handle_tool_call(name, arguments):
         lines = [f"- **{s['project_name']}** / {s['agent_kind']} — {s['message_count']} messages (thread: <#{s['thread_id']}>)"
                  for s in sessions]
         return "\n".join(lines)
+
+    elif name == "send_message":
+        result = control_request("send_message", arguments)
+        if "error" in result:
+            return result["error"]
+        tid = result.get("thread_id", "")
+        hops = result.get("remaining_hops", 0)
+        return f"Sent message to <#{tid}>. remaining_hops={hops}."
 
     elif name == "stop_session":
         result = control_request("stop_session", arguments)

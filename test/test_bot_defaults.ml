@@ -1563,6 +1563,37 @@ let test_process_session_message_keeps_run_replayable_on_completion_persist_fail
         true (Option.is_some saved.active_run)
     | None -> Alcotest.fail "expected reloaded session")
 
+let test_prepare_inter_agent_message_formats_origin_and_hop_marker () =
+  match Discord_agents.Bot.prepare_inter_agent_message
+          ~source_thread_id:"source-thread"
+          ~remaining_hops:3
+          "please review this"
+  with
+  | Error err -> Alcotest.fail err
+  | Ok prepared ->
+    Alcotest.(check int) "remaining hops"
+      2 prepared.delivered_remaining_hops;
+    Alcotest.(check string) "visible content"
+      "[inter-agent message; origin=source-thread; remaining_hops=2]\n\nplease review this"
+      prepared.visible_content
+
+let test_prepare_inter_agent_message_rejects_commands () =
+  match Discord_agents.Bot.prepare_inter_agent_message "!stop 123" with
+  | Ok _ -> Alcotest.fail "expected command-looking message to be rejected"
+  | Error err ->
+    Alcotest.(check string) "error"
+      "inter-agent messages cannot start with ! commands" err
+
+let test_prepare_inter_agent_message_rejects_exhausted_hops () =
+  match Discord_agents.Bot.prepare_inter_agent_message
+          ~remaining_hops:0
+          "loop back"
+  with
+  | Ok _ -> Alcotest.fail "expected exhausted hop count to be rejected"
+  | Error err ->
+    Alcotest.(check string) "error"
+      "inter-agent hop limit exhausted" err
+
 let test_reap_tracked_process_group_leader () =
   with_test_bot (fun bot ->
     let pid = Unix.create_process "/usr/bin/setsid"
@@ -1740,6 +1771,12 @@ let () =
         test_process_session_message_aborts_on_session_id_persist_failure;
       Alcotest.test_case "process message keeps run replayable on completion persist failure" `Quick
         test_process_session_message_keeps_run_replayable_on_completion_persist_failure;
+      Alcotest.test_case "inter-agent message includes origin and hop marker" `Quick
+        test_prepare_inter_agent_message_formats_origin_and_hop_marker;
+      Alcotest.test_case "inter-agent message rejects commands" `Quick
+        test_prepare_inter_agent_message_rejects_commands;
+      Alcotest.test_case "inter-agent message rejects exhausted hops" `Quick
+        test_prepare_inter_agent_message_rejects_exhausted_hops;
       Alcotest.test_case "reap tracked process-group leader" `Quick
         test_reap_tracked_process_group_leader;
       Alcotest.test_case "busy stop signals tracked child" `Quick

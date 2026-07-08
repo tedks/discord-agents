@@ -738,6 +738,7 @@ You have MCP tools available:
 - import_project: Clone a GitHub repository into the project registry and create its Discord project channel
 - list_projects: List all discovered projects
 - list_sessions: List active bot sessions
+- send_message: Send a visible user-style message to another active session thread
 - stop_session: Stop an active bot session by Discord thread ID
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume
@@ -779,6 +780,7 @@ You have MCP tools available:
 - import_project: Clone a GitHub repository into the project registry and create its Discord project channel
 - list_projects: List all discovered projects
 - list_sessions: List active bot sessions
+- send_message: Send a visible user-style message to another active session thread
 - stop_session: Stop an active bot session by Discord thread ID
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume
@@ -2872,6 +2874,64 @@ let process_session_message t session
   process_session_message_with_hooks default_process_message_hooks
     t session msg channel_info
 
+let max_inter_agent_message_bytes = 1600
+let max_inter_agent_hops = 5
+let default_inter_agent_hops = 3
+
+type prepared_inter_agent_message = {
+  visible_content : string;
+  delivered_remaining_hops : int;
+}
+
+type inter_agent_message_outcome =
+  | Inter_agent_message_sent of {
+      thread_id : Discord_types.channel_id;
+      message_id : Discord_types.message_id;
+      remaining_hops : int;
+    }
+  | Inter_agent_message_rejected of string
+
+let describe_inter_agent_source t source_thread_id =
+  match source_thread_id with
+  | None -> "another agent"
+  | Some tid ->
+    match Session_store.find_opt t.sessions ~thread_id:tid with
+    | Some session ->
+      Printf.sprintf "%s in <#%s>"
+        (Config.string_of_agent_kind session.agent_kind) tid
+    | None -> Printf.sprintf "thread <#%s>" tid
+
+let prepare_inter_agent_message ?source_thread_id ?remaining_hops message =
+  let message = String.trim message in
+  if message = "" then
+    Error "message must not be empty"
+  else if Command.is_command message then
+    Error "inter-agent messages cannot start with ! commands"
+  else if String.length message > max_inter_agent_message_bytes then
+    Error (Printf.sprintf
+      "message is too long (%d bytes max)" max_inter_agent_message_bytes)
+  else
+    let requested_hops =
+      Option.value remaining_hops ~default:default_inter_agent_hops
+    in
+    if requested_hops <= 0 then
+      Error "inter-agent hop limit exhausted"
+    else if requested_hops > max_inter_agent_hops then
+      Error (Printf.sprintf
+        "remaining_hops must be between 1 and %d" max_inter_agent_hops)
+    else
+      let delivered_remaining_hops = requested_hops - 1 in
+      let origin =
+        Option.value source_thread_id ~default:"unknown"
+        |> Resource.single_line
+      in
+      let visible_content =
+        Printf.sprintf
+          "[inter-agent message; origin=%s; remaining_hops=%d]\n\n%s"
+          origin delivered_remaining_hops message
+      in
+      Ok { visible_content; delivered_remaining_hops }
+
 let handle_thread_message t msg ?channel_info () =
   if t.draining then
     ignore (Discord_rest.create_message t.rest
@@ -2898,6 +2958,47 @@ let handle_thread_message t msg ?channel_info () =
         ) (fun () ->
           process_session_message t session msg channel_info))
     end
+
+let send_inter_agent_message t ?source_thread_id ?remaining_hops ~thread_id
+    ~message () =
+  if t.draining then
+    Inter_agent_message_rejected "Bot is restarting; try again shortly."
+  else if source_thread_id = Some thread_id then
+    Inter_agent_message_rejected
+      "source_thread_id and thread_id must be different"
+  else
+    match Session_store.find_opt t.sessions ~thread_id with
+    | None -> Inter_agent_message_rejected "Target session not found."
+    | Some _ ->
+      (match prepare_inter_agent_message ?source_thread_id ?remaining_hops message with
+       | Error err -> Inter_agent_message_rejected err
+       | Ok prepared ->
+         let source_label = describe_inter_agent_source t source_thread_id in
+         let content =
+           Printf.sprintf "**Message from %s**\n%s"
+             source_label prepared.visible_content
+         in
+         match Discord_rest.create_message t.rest ~channel_id:thread_id
+                 ~content () with
+         | Error err ->
+           Inter_agent_message_rejected
+             (Printf.sprintf "Failed to post message: %s" err)
+         | Ok posted_msg ->
+           let routed_msg = {
+             posted_msg with
+             content;
+             author = {
+               id = "inter-agent";
+               username = "inter-agent";
+               bot = Some false;
+             };
+           } in
+           handle_thread_message t routed_msg ();
+           Inter_agent_message_sent {
+             thread_id;
+             message_id = posted_msg.id;
+             remaining_hops = prepared.delivered_remaining_hops;
+           })
 
 (** Fork an agent run on a fresh session whose [processing] flag is
     already locked by the caller. Used by
