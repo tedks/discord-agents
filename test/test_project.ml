@@ -407,6 +407,8 @@ let test_default_branch_uses_remote_tracking_when_local_missing () =
       (Filename.quote repo) (Filename.quote origin));
     run (Printf.sprintf "git -C %s fetch -q origin"
       (Filename.quote repo));
+    run (Printf.sprintf "git -C %s tag main origin/main"
+      (Filename.quote repo));
     run (Printf.sprintf
       "git -C %s symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main"
       (Filename.quote repo));

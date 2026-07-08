@@ -309,7 +309,10 @@ let run_capture ?cwd args =
 
 let default_branch project =
   let branch_exists name =
-    match run_capture ["git"; "-C"; project.path; "rev-parse"; "--verify"; name] with
+    match run_capture
+      ["git"; "-C"; project.path; "show-ref"; "--verify"; "--quiet";
+       "refs/heads/" ^ name]
+    with
     | Ok _ -> true
     | Error _ -> false
   in
