@@ -1692,26 +1692,27 @@ let import_project t ~url ?name () =
         match requested_name with
         | Error err -> Error err
         | Ok requested_name ->
-        match Project.find_by_remote_url (projects t) url with
-        | Some existing ->
-          (match ensure_imported_project_ready t existing with
-           | Ok (channel_id, working_dir) ->
-             Ok {
-               imported_project = existing;
-               imported_channel_id = channel_id;
-               imported_working_dir = working_dir;
-               imported_existing = true;
-             }
-           | Error err -> Error err)
-        | None ->
-          let base_directory = match t.config.base_directories with
-            | first :: _ -> first
-            | [] -> "" in
-          if base_directory = "" then
-            Error "No base_directories configured."
-          else begin
-            t.refreshing <- true;
-            Fun.protect ~finally:(fun () -> t.refreshing <- false) (fun () ->
+        let base_directory = match t.config.base_directories with
+          | first :: _ -> first
+          | [] -> "" in
+        if base_directory = "" then
+          Error "No base_directories configured."
+        else begin
+          t.refreshing <- true;
+          Fun.protect ~finally:(fun () -> t.refreshing <- false) (fun () ->
+            let _old_count, _new_count = refresh_projects_snapshot t in
+            match Project.find_by_remote_url (projects t) url with
+            | Some existing ->
+              (match ensure_imported_project_ready t existing with
+               | Ok (channel_id, working_dir) ->
+                 Ok {
+                   imported_project = existing;
+                   imported_channel_id = channel_id;
+                   imported_working_dir = working_dir;
+                   imported_existing = true;
+                 }
+               | Error err -> Error err)
+            | None ->
               match
                 Eio_unix.run_in_systhread (fun () ->
                   Project.import_github ~base_directory ?name:requested_name url)
@@ -1732,7 +1733,7 @@ let import_project t ~url ?name () =
                       imported_working_dir = working_dir;
                       imported_existing = false;
                     })
-          end
+        end
 
 let cleanup_orphan_thread t ~thread_id ~context =
   match Discord_rest.delete_channel t.rest ~channel_id:thread_id () with
