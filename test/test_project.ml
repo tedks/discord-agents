@@ -388,6 +388,34 @@ let test_default_branch_for_non_bare_ignores_current_branch () =
     Alcotest.(check string) "falls back to main, not current branch"
       "main" (P.default_branch project))
 
+let test_default_branch_uses_remote_tracking_when_local_missing () =
+  with_tmpdir (fun base ->
+    let src = Filename.concat base "src" in
+    let origin = Filename.concat base "origin.git" in
+    let repo = Filename.concat base "repo" in
+    make_git_repo_with_commit src;
+    let run cmd =
+      let exit_code = Sys.command (Printf.sprintf "%s 2>/dev/null" cmd) in
+      if exit_code <> 0 then
+        Alcotest.failf "setup command failed (%d): %s" exit_code cmd
+    in
+    run (Printf.sprintf "git clone --bare %s %s"
+      (Filename.quote src) (Filename.quote origin));
+    mkdir_p repo;
+    run (Printf.sprintf "git -C %s init -q" (Filename.quote repo));
+    run (Printf.sprintf "git -C %s remote add origin %s"
+      (Filename.quote repo) (Filename.quote origin));
+    run (Printf.sprintf "git -C %s fetch -q origin"
+      (Filename.quote repo));
+    run (Printf.sprintf
+      "git -C %s symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main"
+      (Filename.quote repo));
+    let project =
+      P.{ name = "repo"; path = repo; is_bare = false; remote_url = None }
+    in
+    Alcotest.(check string) "uses remote-tracking ref when local branch missing"
+      "origin/main" (P.default_branch project))
+
 let discovery_tests = [
   Alcotest.test_case "flat repo" `Quick test_flat_repo;
   Alcotest.test_case "bare repo" `Quick test_bare_repo;
@@ -433,5 +461,7 @@ let () =
         test_ensure_default_worktree_uses_symbolic_head;
       Alcotest.test_case "non-bare default branch ignores current branch" `Quick
         test_default_branch_for_non_bare_ignores_current_branch;
+      Alcotest.test_case "non-bare default branch can use origin HEAD" `Quick
+        test_default_branch_uses_remote_tracking_when_local_missing;
     ];
   ]

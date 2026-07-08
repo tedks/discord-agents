@@ -308,14 +308,14 @@ let run_capture ?cwd args =
   | _ -> Error (Buffer.contents output)
 
 let default_branch project =
+  let branch_exists name =
+    match run_capture ["git"; "-C"; project.path; "rev-parse"; "--verify"; name] with
+    | Ok _ -> true
+    | Error _ -> false
+  in
   let fallback () =
-    let try_branch name =
-      match run_capture ["git"; "-C"; project.path; "rev-parse"; "--verify"; name] with
-      | Ok _ -> true
-      | Error _ -> false
-    in
-    if try_branch "main" then "main"
-    else if try_branch "master" then "master"
+    if branch_exists "main" then "main"
+    else if branch_exists "master" then "master"
     else "HEAD"
   in
   let symbolic_ref ref_name =
@@ -335,8 +335,10 @@ let default_branch project =
       let origin_prefix = "origin/" in
       if String.length branch > String.length origin_prefix
          && String.sub branch 0 (String.length origin_prefix) = origin_prefix
-      then String.sub branch (String.length origin_prefix)
-        (String.length branch - String.length origin_prefix)
+      then
+        let local = String.sub branch (String.length origin_prefix)
+          (String.length branch - String.length origin_prefix) in
+        if branch_exists local then local else branch
       else branch
     | None -> fallback ()
 
@@ -397,6 +399,9 @@ let unique_preserving_order items =
   in
   aux [] [] items
 
+let is_worktree_checkout_path path =
+  Sys.file_exists (Filename.concat path ".git")
+
 let default_worktree_path project =
   let branch = default_branch project in
   match
@@ -412,7 +417,8 @@ let default_worktree_path project =
     in
     match List.find_opt (fun name ->
       let path = Filename.concat project.path name in
-      try Sys.is_directory path with Sys_error _ -> false
+      (try Sys.is_directory path with Sys_error _ -> false)
+      && is_worktree_checkout_path path
     ) candidates with
     | Some name -> Ok (Filename.concat project.path name)
     | None ->
