@@ -297,6 +297,75 @@ let test_remove_worktree_prunes_missing_worktree_registration () =
       in
       Alcotest.(check bool) "stale registration pruned" false registered)
 
+let test_validate_github_url_accepts_supported_forms () =
+  let urls = [
+    "https://github.com/tedks/discord-agents.git";
+    "git@github.com:tedks/discord-agents.git";
+    "ssh://git@github.com/tedks/discord-agents.git";
+  ] in
+  List.iter (fun url ->
+    match P.validate_github_url url with
+    | Ok normalized -> Alcotest.(check string) "preserves url" url normalized
+    | Error err -> Alcotest.failf "expected valid GitHub URL %s: %s" url err
+  ) urls
+
+let test_validate_github_url_rejects_bad_hosts_and_paths () =
+  let urls = [
+    "https://github.example.com/tedks/discord-agents.git";
+    "https://github.com/tedks";
+    "https://github.com/tedks/discord-agents/extra";
+    "https://github.com/tedks/bad repo.git";
+    "git@example.com:tedks/discord-agents.git";
+  ] in
+  List.iter (fun url ->
+    match P.validate_github_url url with
+    | Ok _ -> Alcotest.failf "expected invalid GitHub URL: %s" url
+    | Error _ -> ()
+  ) urls
+
+let test_validate_import_name_rejects_path_traversal () =
+  List.iter (fun name ->
+    match P.validate_import_name name with
+    | Ok _ -> Alcotest.failf "expected invalid import name: %s" name
+    | Error _ -> ()
+  ) [""; "."; ".."; "../repo"; "owner/repo"; "bad repo"]
+
+let test_same_remote_url_normalizes_github_forms () =
+  Alcotest.(check bool) "https and ssh match"
+    true
+    (P.same_remote_url
+       "https://github.com/TedKS/Discord-Agents.git"
+       "git@github.com:tedks/discord-agents.git")
+
+let test_ensure_default_worktree_uses_symbolic_head () =
+  with_tmpdir (fun base ->
+    let src = Filename.concat base "src" in
+    let bare = Filename.concat base "bare" in
+    make_git_repo_with_commit src;
+    let run cmd =
+      let exit_code = Sys.command (Printf.sprintf "%s 2>/dev/null" cmd) in
+      if exit_code <> 0 then
+        Alcotest.failf "setup command failed (%d): %s" exit_code cmd
+    in
+    run (Printf.sprintf "git -C %s checkout -q -b release/v1"
+      (Filename.quote src));
+    run (Printf.sprintf "git clone --bare %s %s"
+      (Filename.quote src) (Filename.quote bare));
+    let project =
+      P.{ name = "bare"; path = bare; is_bare = true; remote_url = None }
+    in
+    Alcotest.(check string) "symbolic default branch"
+      "release/v1" (P.default_branch project);
+    match P.ensure_default_worktree project with
+    | Error err -> Alcotest.failf "ensure_default_worktree failed: %s" err
+    | Ok worktree_path ->
+      Alcotest.(check string) "sanitized path"
+        (Filename.concat bare "release-v1") worktree_path;
+      Alcotest.(check bool) "worktree exists"
+        true (Sys.file_exists worktree_path);
+      Alcotest.(check bool) "worktree registered"
+        true (List.mem ("release/v1", worktree_path) (P.list_worktrees project)))
+
 let discovery_tests = [
   Alcotest.test_case "flat repo" `Quick test_flat_repo;
   Alcotest.test_case "bare repo" `Quick test_bare_repo;
@@ -323,10 +392,22 @@ let discovery_tests = [
 let () =
   Alcotest.run "discord_project" [
     "discovery", discovery_tests;
+    "import validation", [
+      Alcotest.test_case "accepts supported GitHub URL forms" `Quick
+        test_validate_github_url_accepts_supported_forms;
+      Alcotest.test_case "rejects bad GitHub URLs" `Quick
+        test_validate_github_url_rejects_bad_hosts_and_paths;
+      Alcotest.test_case "rejects path traversal names" `Quick
+        test_validate_import_name_rejects_path_traversal;
+      Alcotest.test_case "normalizes GitHub remote forms" `Quick
+        test_same_remote_url_normalizes_github_forms;
+    ];
     "worktrees", [
       Alcotest.test_case "remove worktree deletes branch" `Quick
         test_remove_worktree_deletes_worktree_and_branch;
       Alcotest.test_case "remove missing worktree prunes registration" `Quick
         test_remove_worktree_prunes_missing_worktree_registration;
+      Alcotest.test_case "ensure default worktree follows symbolic HEAD" `Quick
+        test_ensure_default_worktree_uses_symbolic_head;
     ];
   ]

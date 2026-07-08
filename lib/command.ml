@@ -11,6 +11,7 @@ type t =
   | List_gemini_sessions
   | Start_agent of { project : string; kind : Config.agent_kind option }
   (** [kind = None] means use the current effective top-level agent. *)
+  | Import_project of { url : string; name : string option }
   | Resume_session of { session_id : string; kind : Config.agent_kind option }
   | Fork_session of { move : bool option }
   (** [move = None] means the handler applies the channel-specific default. *)
@@ -59,6 +60,10 @@ let parse content =
     Start_agent { project; kind = None }
   | ["start"] ->
     List_projects
+  | ["import-project"; url] | ["import_project"; url] ->
+    Import_project { url; name = None }
+  | ["import-project"; url; name] | ["import_project"; url; name] ->
+    Import_project { url; name = Some name }
   | ["resume"; session_id] -> Resume_session { session_id; kind = None }
   | ["resume"; kind_str; session_id] ->
     (match Config.agent_kind_of_string (String.lowercase_ascii kind_str) with

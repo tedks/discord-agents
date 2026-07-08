@@ -671,6 +671,10 @@ let cmd_testable =
       | Start_agent { project; kind = Some k } ->
         Printf.sprintf "Start_agent(%s,%s)"
           project (Discord_agents.Config.string_of_agent_kind k)
+      | Import_project { url; name = None } ->
+        "Import_project(" ^ url ^ ")"
+      | Import_project { url; name = Some name } ->
+        Printf.sprintf "Import_project(%s,%s)" url name
       | Resume_session { session_id; kind = None } ->
         "Resume_session(" ^ session_id ^ ")"
       | Resume_session { session_id; kind = Some k } ->
@@ -889,6 +893,21 @@ let test_parse_start_default_agent () =
        { project = "myproj"; kind = None })
     (Discord_agents.Command.parse "!start myproj")
 
+let test_parse_import_project () =
+  Alcotest.(check cmd_testable) "import project"
+    (Discord_agents.Command.Import_project
+       { url = "https://github.com/tedks/example.git"; name = None })
+    (Discord_agents.Command.parse
+       "!import-project https://github.com/tedks/example.git")
+
+let test_parse_import_project_with_name () =
+  Alcotest.(check cmd_testable) "import project with name"
+    (Discord_agents.Command.Import_project
+       { url = "git@github.com:tedks/example.git";
+         name = Some "local-example" })
+    (Discord_agents.Command.parse
+       "!import_project git@github.com:tedks/example.git local-example")
+
 let test_parse_default_agent_no_arg () =
   Alcotest.(check cmd_testable) "default-agent no arg"
     (Discord_agents.Command.Default_agent None)
@@ -1013,6 +1032,8 @@ let command_tests = [
   Alcotest.test_case "resume with codex kind" `Quick test_parse_resume_with_codex_kind;
   Alcotest.test_case "start with gemini kind" `Quick test_parse_start_gemini;
   Alcotest.test_case "start with default agent" `Quick test_parse_start_default_agent;
+  Alcotest.test_case "import-project" `Quick test_parse_import_project;
+  Alcotest.test_case "import_project with name" `Quick test_parse_import_project_with_name;
   Alcotest.test_case "default-agent no arg" `Quick test_parse_default_agent_no_arg;
   Alcotest.test_case "default-agent set" `Quick test_parse_default_agent_set;
   Alcotest.test_case "default_agent alias" `Quick test_parse_default_agent_underscore_alias;

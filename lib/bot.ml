@@ -261,6 +261,13 @@ type stop_outcome =
   | Session_already_stopping of { project_name : string }
   | Session_stop_failed of string
 
+type import_project_result = {
+  imported_project : Project.t;
+  imported_channel_id : Discord_types.channel_id;
+  imported_working_dir : string;
+  imported_existing : bool;
+}
+
 let fresh_session_like (session : Session_store.session)
     ~agent_kind ~session_override_kind =
   Session_store.make_session
@@ -705,13 +712,17 @@ let reply_stop_outcome reply = function
 (** Find a usable working directory for a project. *)
 let working_dir_of_project (p : Project.t) =
   if p.is_bare then
-    let candidates = ["master"; "main"] in
+    let branch = Project.default_branch p in
+    let candidates = [branch; "master"; "main"] |> List.sort_uniq String.compare in
     match List.find_opt (fun name ->
       let path = Filename.concat p.path name in
       try Sys.is_directory path with Sys_error _ -> false
     ) candidates with
     | Some name -> Ok (Filename.concat p.path name)
-    | None -> Error "bare repo has no master/ or main/ worktree"
+    | None ->
+      (match Project.list_worktrees p with
+       | (_branch, path) :: _ when path <> p.path -> Ok path
+       | _ -> Error "bare repo has no default worktree")
   else
     Ok p.path
 
@@ -734,6 +745,7 @@ let control_system_prompt projects =
 
 You have MCP tools available:
 - start_session: Start a new agent session for a project
+- import_project: Clone a GitHub repository into the project registry and create its Discord project channel
 - list_projects: List all discovered projects
 - list_sessions: List active bot sessions
 - stop_session: Stop an active bot session by Discord thread ID
@@ -774,6 +786,7 @@ let project_system_prompt (project : Project.t) =
 
 You have MCP tools available:
 - start_session: Start a new agent session (creates a thread + worktree)
+- import_project: Clone a GitHub repository into the project registry and create its Discord project channel
 - list_projects: List all discovered projects
 - list_sessions: List active bot sessions
 - stop_session: Stop an active bot session by Discord thread ID
@@ -1464,6 +1477,30 @@ let trigger_restart t ~notify =
     and swaps it in one assignment. No fiber can observe an intermediate
     state where projects and channels disagree.
 
+    Returns (old_count, new_count). Caller owns single-flight gating. *)
+let refresh_projects_snapshot t =
+  let old_count = List.length (projects t) in
+  (* Phase 1: Blocking filesystem scan — runs in a system thread
+     to avoid stalling the Eio event loop *)
+  let new_projects = Eio_unix.run_in_systhread (fun () ->
+    Project.discover ~base_directories:t.config.base_directories) in
+  (* Phase 2: Build new channel mappings in a fresh manager.
+     Must run in Eio context because Channel_manager.setup uses
+     Discord REST (cohttp-eio). The old project_state stays valid
+     for any concurrent message handling during this call. *)
+  let new_channels = Channel_manager.create () in
+  Channel_manager.set_category_id new_channels
+    (Channel_manager.category_id (channels t));
+  Channel_manager.setup ~rest:t.rest ~guild_id:t.config.guild_id
+    ~projects:new_projects new_channels;
+  (* Phase 3: Atomic swap — single assignment, no intermediate state *)
+  t.project_state <- { projects = new_projects; channels = new_channels };
+  let new_count = List.length new_projects in
+  Logs.info (fun m -> m "bot: refreshed projects: %d -> %d" old_count new_count);
+  old_count, new_count
+
+(** Re-run project discovery and update all derived state atomically.
+
     Returns (old_count, new_count), or None if a refresh is already
     in progress (single-flight: concurrent callers are rejected). *)
 let refresh_projects t =
@@ -1473,25 +1510,7 @@ let refresh_projects t =
   end else begin
     t.refreshing <- true;
     Fun.protect ~finally:(fun () -> t.refreshing <- false) (fun () ->
-      let old_count = List.length (projects t) in
-      (* Phase 1: Blocking filesystem scan — runs in a system thread
-         to avoid stalling the Eio event loop *)
-      let new_projects = Eio_unix.run_in_systhread (fun () ->
-        Project.discover ~base_directories:t.config.base_directories) in
-      (* Phase 2: Build new channel mappings in a fresh manager.
-         Must run in Eio context because Channel_manager.setup uses
-         Discord REST (cohttp-eio). The old project_state stays valid
-         for any concurrent message handling during this call. *)
-      let new_channels = Channel_manager.create () in
-      Channel_manager.set_category_id new_channels
-        (Channel_manager.category_id (channels t));
-      Channel_manager.setup ~rest:t.rest ~guild_id:t.config.guild_id
-        ~projects:new_projects new_channels;
-      (* Phase 3: Atomic swap — single assignment, no intermediate state *)
-      t.project_state <- { projects = new_projects; channels = new_channels };
-      let new_count = List.length new_projects in
-      Logs.info (fun m -> m "bot: refreshed projects: %d -> %d" old_count new_count);
-      Some (old_count, new_count))
+      Some (refresh_projects_snapshot t))
   end
 
 (** Render a "recent sessions" Discord listing in a uniform shape so
@@ -1628,6 +1647,93 @@ let create_explicit_channel_session t ~channel_id ~agent_kind =
           ~session_override_kind:(Some agent_kind);
         true
 
+let ensure_imported_project_ready t (project : Project.t) =
+  match Channel_manager.find_or_create ~rest:t.rest
+          ~guild_id:t.config.guild_id ~project (channels t) with
+  | None -> Error "Could not create or find the project channel."
+  | Some channel_id ->
+    (match working_dir_of_project project with
+     | Error err -> Error ("Could not resolve project working directory: " ^ err)
+     | Ok working_dir ->
+       (match Session_store.find_opt t.sessions ~thread_id:channel_id with
+        | Some _ -> Ok (channel_id, working_dir)
+        | None ->
+          try
+            create_persistent_channel_session t ~channel_id
+              ~project_name:project.name ~working_dir
+              ~system_prompt:(Some (project_system_prompt project))
+              ~agent_kind:(effective_top_level_agent t)
+              ~session_override_kind:None;
+            Ok (channel_id, working_dir)
+          with exn ->
+            Error (Printf.sprintf "Failed to create project channel session: %s"
+              (Printexc.to_string exn))))
+
+let import_project t ~url ?name () =
+  if t.draining then
+    Error "Bot is restarting; try again shortly."
+  else if t.refreshing then
+    Error "Project refresh/import already in progress."
+  else
+    match Disk_health.preflight_state_mutation () with
+    | Error err -> Error err
+    | Ok () ->
+      match Project.validate_github_url url with
+      | Error err -> Error err
+      | Ok url ->
+        let requested_name =
+          match name with
+          | Some n ->
+            (match Project.validate_import_name n with
+             | Ok n -> Ok (Some n)
+             | Error err -> Error err)
+          | None -> Ok None
+        in
+        match requested_name with
+        | Error err -> Error err
+        | Ok requested_name ->
+        match Project.find_by_remote_url (projects t) url with
+        | Some existing ->
+          (match ensure_imported_project_ready t existing with
+           | Ok (channel_id, working_dir) ->
+             Ok {
+               imported_project = existing;
+               imported_channel_id = channel_id;
+               imported_working_dir = working_dir;
+               imported_existing = true;
+             }
+           | Error err -> Error err)
+        | None ->
+          let base_directory = match t.config.base_directories with
+            | first :: _ -> first
+            | [] -> "" in
+          if base_directory = "" then
+            Error "No base_directories configured."
+          else begin
+            t.refreshing <- true;
+            Fun.protect ~finally:(fun () -> t.refreshing <- false) (fun () ->
+              match
+                Eio_unix.run_in_systhread (fun () ->
+                  Project.import_github ~base_directory ?name:requested_name url)
+              with
+              | Error err -> Error err
+              | Ok _ ->
+                let _old_count, _new_count = refresh_projects_snapshot t in
+                match Project.find_by_remote_url (projects t) url with
+                | None ->
+                  Error "Imported repository was cloned but was not discovered after refresh."
+                | Some imported ->
+                  match ensure_imported_project_ready t imported with
+                  | Error err -> Error err
+                  | Ok (channel_id, working_dir) ->
+                    Ok {
+                      imported_project = imported;
+                      imported_channel_id = channel_id;
+                      imported_working_dir = working_dir;
+                      imported_existing = false;
+                    })
+          end
+
 let cleanup_orphan_thread t ~thread_id ~context =
   match Discord_rest.delete_channel t.rest ~channel_id:thread_id () with
   | Ok _ -> ()
@@ -1704,6 +1810,17 @@ let handle_command t msg cmd =
     ) entries in
     reply (if lines = [] then "No active sessions."
       else "**Sessions:**\n" ^ String.concat "\n" lines)
+  | Command.Import_project { url; name } ->
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      match import_project t ~url ?name () with
+      | Error err -> reply (Printf.sprintf "Import failed: %s" err)
+      | Ok result ->
+        let action =
+          if result.imported_existing then "already existed" else "imported" in
+        reply (Printf.sprintf
+          "Project **%s** %s in <#%s>.\nWorking in: `%s`"
+          result.imported_project.name action result.imported_channel_id
+          result.imported_working_dir))
   | Command.List_claude_sessions ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       let entries =
@@ -2331,6 +2448,7 @@ let handle_command t msg cmd =
       "`!codex-sessions` — list recent Codex sessions";
       "`!gemini-sessions` — list recent Gemini sessions";
       "`!start <project> [agent]` — start a session (defaults to the current effective top-level agent)";
+      "`!import-project <github-url> [name]` — clone a GitHub repo into the project registry";
       "`!default-agent [agent]` / `!default_agent [agent]` — show or set the default agent (claude|codex|gemini)";
       "`!rescue-agent [agent|off]` / `!rescue_agent [agent|off]` — show or set the rescue agent used under disk pressure";
       "`!session-agent [agent]` / `!session_agent [agent]` — show or set the current channel session agent";
