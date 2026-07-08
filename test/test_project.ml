@@ -363,8 +363,30 @@ let test_ensure_default_worktree_uses_symbolic_head () =
         (Filename.concat bare "release-v1") worktree_path;
       Alcotest.(check bool) "worktree exists"
         true (Sys.file_exists worktree_path);
+      (match P.default_worktree_path project with
+       | Error err -> Alcotest.failf "default_worktree_path failed: %s" err
+       | Ok resolved ->
+         Alcotest.(check string) "default worktree resolves sanitized path"
+           worktree_path resolved);
       Alcotest.(check bool) "worktree registered"
         true (List.mem ("release/v1", worktree_path) (P.list_worktrees project)))
+
+let test_default_branch_for_non_bare_ignores_current_branch () =
+  with_tmpdir (fun base ->
+    let repo = Filename.concat base "repo" in
+    make_git_repo_with_commit repo;
+    let run cmd =
+      let exit_code = Sys.command (Printf.sprintf "%s 2>/dev/null" cmd) in
+      if exit_code <> 0 then
+        Alcotest.failf "setup command failed (%d): %s" exit_code cmd
+    in
+    run (Printf.sprintf "git -C %s checkout -q -b feature/work"
+      (Filename.quote repo));
+    let project =
+      P.{ name = "repo"; path = repo; is_bare = false; remote_url = None }
+    in
+    Alcotest.(check string) "falls back to main, not current branch"
+      "main" (P.default_branch project))
 
 let discovery_tests = [
   Alcotest.test_case "flat repo" `Quick test_flat_repo;
@@ -409,5 +431,7 @@ let () =
         test_remove_worktree_prunes_missing_worktree_registration;
       Alcotest.test_case "ensure default worktree follows symbolic HEAD" `Quick
         test_ensure_default_worktree_uses_symbolic_head;
+      Alcotest.test_case "non-bare default branch ignores current branch" `Quick
+        test_default_branch_for_non_bare_ignores_current_branch;
     ];
   ]

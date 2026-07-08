@@ -308,20 +308,7 @@ let run_capture ?cwd args =
   | _ -> Error (Buffer.contents output)
 
 let default_branch project =
-  match run_capture ["git"; "-C"; project.path; "symbolic-ref"; "--short"; "HEAD"] with
-  | Ok branch ->
-    let branch = String.trim branch in
-    if branch <> "" then branch
-    else
-      let try_branch name =
-        match run_capture ["git"; "-C"; project.path; "rev-parse"; "--verify"; name] with
-        | Ok _ -> true
-        | Error _ -> false
-      in
-      if try_branch "main" then "main"
-      else if try_branch "master" then "master"
-      else "HEAD"
-  | Error _ ->
+  let fallback () =
     let try_branch name =
       match run_capture ["git"; "-C"; project.path; "rev-parse"; "--verify"; name] with
       | Ok _ -> true
@@ -330,6 +317,28 @@ let default_branch project =
     if try_branch "main" then "main"
     else if try_branch "master" then "master"
     else "HEAD"
+  in
+  let symbolic_ref ref_name =
+    match run_capture ["git"; "-C"; project.path; "symbolic-ref"; "--short"; ref_name] with
+    | Ok branch ->
+      let branch = String.trim branch in
+      if branch = "" then None else Some branch
+    | Error _ -> None
+  in
+  if project.is_bare then
+    match symbolic_ref "HEAD" with
+    | Some branch -> branch
+    | None -> fallback ()
+  else
+    match symbolic_ref "refs/remotes/origin/HEAD" with
+    | Some branch ->
+      let origin_prefix = "origin/" in
+      if String.length branch > String.length origin_prefix
+         && String.sub branch 0 (String.length origin_prefix) = origin_prefix
+      then String.sub branch (String.length origin_prefix)
+        (String.length branch - String.length origin_prefix)
+      else branch
+    | None -> fallback ()
 
 (** List worktrees for a project. Returns (branch_name, worktree_path) pairs. *)
 let list_worktrees project =
@@ -377,19 +386,48 @@ let list_worktrees project =
   in
   parse_groups lines None None []
 
-let ensure_default_worktree project =
+let worktree_dir_name branch =
+  String.map (function '/' | '\\' | ':' -> '-' | c -> c) branch
+
+let unique_preserving_order items =
+  let rec aux seen acc = function
+    | [] -> List.rev acc
+    | x :: xs when List.mem x seen -> aux seen acc xs
+    | x :: xs -> aux (x :: seen) (x :: acc) xs
+  in
+  aux [] [] items
+
+let default_worktree_path project =
   let branch = default_branch project in
-  let existing =
+  match
     list_worktrees project
     |> List.find_opt (fun (b, path) ->
       b = branch && path <> project.path && Sys.file_exists path)
-  in
-  match existing with
+  with
   | Some (_, path) -> Ok path
   | None ->
+    let candidates =
+      unique_preserving_order
+        [branch; worktree_dir_name branch; "master"; "main"]
+    in
+    match List.find_opt (fun name ->
+      let path = Filename.concat project.path name in
+      try Sys.is_directory path with Sys_error _ -> false
+    ) candidates with
+    | Some name -> Ok (Filename.concat project.path name)
+    | None ->
+      (match List.find_opt (fun (_branch, path) ->
+         path <> project.path && Sys.file_exists path) (list_worktrees project) with
+       | Some (_, path) -> Ok path
+       | None -> Error "bare repo has no default worktree")
+
+let ensure_default_worktree project =
+  match default_worktree_path project with
+  | Ok path -> Ok path
+  | Error _ ->
+    let branch = default_branch project in
     let worktree_name =
-      branch
-      |> String.map (function '/' | '\\' | ':' -> '-' | c -> c)
+      worktree_dir_name branch
     in
     let worktree_path = Filename.concat project.path worktree_name in
     match run_capture

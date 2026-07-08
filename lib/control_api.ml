@@ -266,7 +266,9 @@ let handle_import_project (bot : Bot.t) params =
   let open Yojson.Safe.Util in
   let params = match params with Some p -> p | None ->
     failwith "missing params" in
-  let url = params |> member "url" |> to_string in
+  let url = match params |> member "url" |> to_string_option with
+    | Some url -> url
+    | None -> failwith "missing url" in
   let name = params |> member "name" |> to_string_option in
   match Bot.import_project bot ~url ?name () with
   | Error err -> error_response err

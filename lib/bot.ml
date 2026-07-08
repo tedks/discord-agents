@@ -712,17 +712,7 @@ let reply_stop_outcome reply = function
 (** Find a usable working directory for a project. *)
 let working_dir_of_project (p : Project.t) =
   if p.is_bare then
-    let branch = Project.default_branch p in
-    let candidates = [branch; "master"; "main"] |> List.sort_uniq String.compare in
-    match List.find_opt (fun name ->
-      let path = Filename.concat p.path name in
-      try Sys.is_directory path with Sys_error _ -> false
-    ) candidates with
-    | Some name -> Ok (Filename.concat p.path name)
-    | None ->
-      (match Project.list_worktrees p with
-       | (_branch, path) :: _ when path <> p.path -> Ok path
-       | _ -> Error "bare repo has no default worktree")
+    Project.default_worktree_path p
   else
     Ok p.path
 
