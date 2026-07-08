@@ -8,6 +8,14 @@ type agent_kind =
   | Gemini
 [@@deriving show, eq]
 
+type reasoning_effort =
+  | Low
+  | Medium
+  | High
+  | Xhigh
+  | Max
+[@@deriving show, eq]
+
 let agent_kind_of_string = function
   | "claude" -> Ok Claude
   | "codex" -> Ok Codex
@@ -18,6 +26,31 @@ let string_of_agent_kind = function
   | Claude -> "claude"
   | Codex -> "codex"
   | Gemini -> "gemini"
+
+let reasoning_effort_of_string = function
+  | "low" -> Ok Low
+  | "medium" -> Ok Medium
+  | "high" -> Ok High
+  | "xhigh" | "extra-high" | "extra_high" -> Ok Xhigh
+  | "max" -> Ok Max
+  | s -> Error (Printf.sprintf "unknown reasoning effort: %s" s)
+
+let string_of_reasoning_effort = function
+  | Low -> "low"
+  | Medium -> "medium"
+  | High -> "high"
+  | Xhigh -> "xhigh"
+  | Max -> "max"
+
+let reasoning_effort_of_yojson = function
+  | `String s ->
+    (match reasoning_effort_of_string s with
+     | Ok effort -> effort
+     | Error msg -> failwith msg)
+  | _ -> failwith "reasoning_effort: expected string"
+
+let yojson_of_reasoning_effort effort =
+  `String (string_of_reasoning_effort effort)
 
 let preferred_agent_order preferred =
   preferred

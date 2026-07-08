@@ -2053,6 +2053,9 @@ let test_context_header_truncates_utf8_boundary () =
     session_id_confirmed = true;
     thread_id = "thread";
     system_prompt = None;
+    model = None;
+    reasoning_effort = None;
+    goal = None;
     message_count = 0;
     processing = false;
     active_run = None;
@@ -2653,7 +2656,10 @@ let resume_helpers_tests = [
 
 (* ── codex_args ────────────────────────────────────────────────────── *)
 
-let codex_args = Discord_agents.Agent_process.codex_args
+let codex_args ~session_id ~session_id_confirmed ~prompt =
+  Discord_agents.Agent_process.codex_args
+    ~model:None ~reasoning_effort:None
+    ~session_id ~session_id_confirmed ~prompt
 
 (* The args list now contains MCP TOML overrides, so exact-list
    matching would be brittle. Tests assert on structural shape: the
@@ -2727,6 +2733,16 @@ let test_codex_args_resume_keeps_mcp () =
     true (contains_pair args "-c"
             {|mcp_servers.discord_agents.command="python3"|})
 
+let test_codex_args_model_and_effort_overrides () =
+  let args = Discord_agents.Agent_process.codex_args
+    ~model:(Some "gpt-5.5")
+    ~reasoning_effort:(Some Discord_agents.Config.Xhigh)
+    ~session_id:"x" ~session_id_confirmed:false ~prompt:"hi" in
+  Alcotest.(check bool) "model flag present"
+    true (contains_pair args "--model" "gpt-5.5");
+  Alcotest.(check bool) "reasoning effort override present"
+    true (contains_pair args "-c" {|model_reasoning_effort="xhigh"|})
+
 let codex_args_tests = [
   Alcotest.test_case "fresh exec shape" `Quick test_codex_args_fresh;
   Alcotest.test_case "resume shape" `Quick test_codex_args_resume;
@@ -2736,6 +2752,8 @@ let codex_args_tests = [
     test_codex_args_includes_mcp_overrides;
   Alcotest.test_case "resume keeps MCP overrides" `Quick
     test_codex_args_resume_keeps_mcp;
+  Alcotest.test_case "model and effort overrides" `Quick
+    test_codex_args_model_and_effort_overrides;
 ]
 
 (* ── escape_toml_string + compose_session_prompt ──────────────────── *)
@@ -2772,7 +2790,9 @@ let test_escape_toml_string_control_chars () =
       (Str.regexp_string "\\n") escaped 0); true
     with Not_found -> false)
 
-let compose = Discord_agents.Agent_process.compose_session_prompt
+let compose ~agent_kind ~system_prompt ~message_count ~user_prompt =
+  Discord_agents.Agent_process.compose_session_prompt
+    ~agent_kind ~system_prompt ~message_count ~goal_context:None ~user_prompt
 
 let test_compose_claude_no_prepend () =
   (* Claude has --append-system-prompt, so the user prompt is
@@ -2799,6 +2819,20 @@ let test_compose_codex_subsequent_turn_no_prepend () =
   let out = compose ~agent_kind:Discord_agents.Config.Codex
     ~system_prompt:(Some "INSTR") ~message_count:1 ~user_prompt:"hi" in
   Alcotest.(check string) "subsequent turn unchanged" "hi" out
+
+let test_compose_codex_goal_context_prepends_every_turn () =
+  let out = Discord_agents.Agent_process.compose_session_prompt
+    ~agent_kind:Discord_agents.Config.Codex
+    ~system_prompt:None ~message_count:2
+    ~goal_context:(Some "Objective: ship it")
+    ~user_prompt:"hi" in
+  Alcotest.(check bool) "goal context embedded" true
+    (try ignore (Str.search_forward
+      (Str.regexp_string "<codex-goal>") out 0); true
+    with Not_found -> false);
+  Alcotest.(check bool) "user prompt still present" true
+    (try ignore (Str.search_forward (Str.regexp_string "hi") out 0); true
+    with Not_found -> false)
 
 let test_compose_gemini_first_turn_prepends () =
   let out = compose ~agent_kind:Discord_agents.Config.Gemini
@@ -2828,6 +2862,8 @@ let prompt_helpers_tests = [
     test_compose_codex_first_turn_prepends;
   Alcotest.test_case "compose: Codex subsequent turn unchanged" `Quick
     test_compose_codex_subsequent_turn_no_prepend;
+  Alcotest.test_case "compose: Codex goal context prepends" `Quick
+    test_compose_codex_goal_context_prepends_every_turn;
   Alcotest.test_case "compose: Gemini first turn prepends bot-context" `Quick
     test_compose_gemini_first_turn_prepends;
   Alcotest.test_case "compose: no system prompt = passthrough" `Quick
@@ -2964,7 +3000,9 @@ let gemini_json_tests = [
 
 (* ── gemini_args ──────────────────────────────────────────────────── *)
 
-let gemini_args = Discord_agents.Agent_process.gemini_args
+let gemini_args ~session_id ~session_id_confirmed ~prompt =
+  Discord_agents.Agent_process.gemini_args
+    ~model:None ~session_id ~session_id_confirmed ~prompt
 
 let test_gemini_args_fresh () =
   let args = gemini_args ~session_id:"placeholder"
@@ -2983,9 +3021,21 @@ let test_gemini_args_resume () =
      "--resume"; "abc-123"]
     args
 
+let test_gemini_args_model_override () =
+  let args = Discord_agents.Agent_process.gemini_args
+    ~model:(Some "gemini-2.5-pro")
+    ~session_id:"placeholder"
+    ~session_id_confirmed:false ~prompt:"hello" in
+  Alcotest.(check (list string))
+    "model flag appears before prompt"
+    ["gemini"; "--model"; "gemini-2.5-pro";
+     "-p"; "hello"; "-o"; "stream-json"; "--yolo"]
+    args
+
 let gemini_args_tests = [
   Alcotest.test_case "fresh invocation args" `Quick test_gemini_args_fresh;
   Alcotest.test_case "resume invocation args" `Quick test_gemini_args_resume;
+  Alcotest.test_case "model override" `Quick test_gemini_args_model_override;
 ]
 
 (* ── caller_pinned_session_id ─────────────────────────────────────── *)

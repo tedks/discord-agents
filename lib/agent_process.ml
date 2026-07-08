@@ -1132,12 +1132,23 @@ let parse_gemini_stream_json_line line =
   with _ -> [Other line]
 
 (** Build the command args for an agent invocation. *)
-let claude_args ~session_id ~message_count ~prompt =
+let model_arg = function
+  | Some model when String.trim model <> "" -> ["--model"; String.trim model]
+  | _ -> []
+
+let claude_args ~model ~reasoning_effort
+    ~session_id ~message_count ~prompt =
   let session_flag =
     if message_count = 0 then ["--session-id"; session_id]
     else ["--resume"; session_id]
   in
-  ["claude"; "-p"; "--verbose"; "--output-format"; "stream-json"] @ session_flag @ [prompt]
+  let effort_arg = match reasoning_effort with
+    | Some effort ->
+      ["--effort"; Config.string_of_reasoning_effort effort]
+    | None -> []
+  in
+  ["claude"; "-p"; "--verbose"; "--output-format"; "stream-json"]
+  @ model_arg model @ effort_arg @ session_flag @ [prompt]
 
 (* ── MCP server config (shared by all three agents) ──────────────
 
@@ -1423,11 +1434,24 @@ let codex_mcp_overrides () =
     that the user runs it on a personal machine and Codex's sandbox
     has historically blocked legitimate edits inside the worktree.
     See issue #35 for making this configurable. *)
-let codex_args ~session_id ~session_id_confirmed ~prompt =
+let codex_reasoning_effort_overrides = function
+  | Some Config.Max ->
+    (* Codex's documented reasoning effort values do not include
+       [max]; callers reject this combination before invoking us. *)
+    []
+  | Some effort ->
+    ["-c"; Printf.sprintf "model_reasoning_effort=\"%s\""
+       (Config.string_of_reasoning_effort effort)]
+  | None -> []
+
+let codex_args ~model ~reasoning_effort
+    ~session_id ~session_id_confirmed ~prompt =
   let base = ["codex"; "exec"; "--json";
               "--dangerously-bypass-approvals-and-sandbox";
               "--skip-git-repo-check"]
+             @ model_arg model
              @ codex_mcp_overrides () in
+  let base = base @ codex_reasoning_effort_overrides reasoning_effort in
   if not session_id_confirmed then base @ ["--"; prompt]
   else base @ ["resume"; session_id; "--"; prompt]
 
@@ -1447,8 +1471,9 @@ let codex_args ~session_id ~session_id_confirmed ~prompt =
     Gemini's MCP server config is written into [.gemini/settings.json]
     by [setup_gemini_mcp], which run_streaming calls before invoking
     [gemini_args]. *)
-let gemini_args ~session_id ~session_id_confirmed ~prompt =
-  let base = ["gemini"; "-p"; prompt; "-o"; "stream-json"; "--yolo"] in
+let gemini_args ~model ~session_id ~session_id_confirmed ~prompt =
+  let base = ["gemini"] @ model_arg model
+             @ ["-p"; prompt; "-o"; "stream-json"; "--yolo"] in
   if not session_id_confirmed then base
   else base @ ["--resume"; session_id]
 
@@ -1486,12 +1511,18 @@ let setsid_command () =
 
     Pure function so it's testable without a subprocess. *)
 let compose_session_prompt ~agent_kind ~system_prompt ~message_count
-    ~user_prompt =
+    ~goal_context ~user_prompt =
   let needs_inline =
     message_count = 0
     && (match agent_kind with
         | Config.Codex | Config.Gemini -> true
         | Config.Claude -> false)
+  in
+  let user_prompt = match goal_context, agent_kind with
+    | Some goal, Config.Codex ->
+      Printf.sprintf "<codex-goal>\n%s\n</codex-goal>\n\n%s"
+        goal user_prompt
+    | _ -> user_prompt
   in
   match system_prompt with
   | Some sp when needs_inline ->
@@ -1504,7 +1535,8 @@ let compose_session_prompt ~agent_kind ~system_prompt ~message_count
     so the caller can track active subprocesses for cleanup.
     Returns when the process exits. *)
 let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
-    ?(session_id_confirmed=true) ?system_prompt ~prompt ~on_event ?on_pid () =
+    ?(session_id_confirmed=true) ?system_prompt ?(model=None)
+    ?(reasoning_effort=None) ?(goal_context=None) ~prompt ~on_event ?on_pid () =
   let mgr = Eio.Stdenv.process_mgr env in
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
@@ -1512,22 +1544,25 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
      turn (compose_session_prompt); Claude gets it via the dedicated
      [--append-system-prompt] flag instead. *)
   let prompt = compose_session_prompt
-    ~agent_kind:kind ~system_prompt ~message_count ~user_prompt:prompt in
+    ~agent_kind:kind ~system_prompt ~message_count ~goal_context
+    ~user_prompt:prompt in
   let close_noerr flow =
     try Eio.Resource.close flow with _ -> ()
   in
   let args = match kind with
     | Config.Claude ->
-      let base = claude_args ~session_id ~message_count ~prompt in
+      let base = claude_args ~model ~reasoning_effort
+        ~session_id ~message_count ~prompt in
       let base = base @ ["--mcp-config"; claude_mcp_config_path ()] in
       (match system_prompt with
        | Some sp -> base @ ["--append-system-prompt"; sp]
        | None -> base)
     | Config.Codex ->
-      codex_args ~session_id ~session_id_confirmed ~prompt
+      codex_args ~model ~reasoning_effort
+        ~session_id ~session_id_confirmed ~prompt
     | Config.Gemini ->
       setup_gemini_mcp ~working_dir;
-      gemini_args ~session_id ~session_id_confirmed ~prompt
+      gemini_args ~model ~session_id ~session_id_confirmed ~prompt
   in
   let args = [setsid_command (); "--wait"] @ args in
   let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in

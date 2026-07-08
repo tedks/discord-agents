@@ -215,6 +215,106 @@ TOOLS = [
         }
     },
     {
+        "name": "get_agent_config",
+        "description": "Show the per-session agent configuration for a Discord thread: agent kind, model override, effort override, goal, and login repair hint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "thread_id": {
+                    "type": "string",
+                    "description": "Discord thread ID of the session"
+                }
+            },
+            "required": ["thread_id"]
+        }
+    },
+    {
+        "name": "set_model",
+        "description": "Set or clear the model override for an existing Discord agent session. Use model=default or an empty/null value to clear.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "thread_id": {
+                    "type": "string",
+                    "description": "Discord thread ID of the session"
+                },
+                "model": {
+                    "type": ["string", "null"],
+                    "description": "Model name to pass to the agent CLI, or default/null to clear"
+                }
+            },
+            "required": ["thread_id"]
+        }
+    },
+    {
+        "name": "set_effort",
+        "description": "Set or clear the reasoning effort override for an existing Discord agent session. Claude supports low/medium/high/xhigh/max; Codex supports low/medium/high/xhigh here; Gemini effort is unsupported.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "thread_id": {
+                    "type": "string",
+                    "description": "Discord thread ID of the session"
+                },
+                "effort": {
+                    "type": ["string", "null"],
+                    "description": "Effort: low, medium, high, xhigh, max, or default/null to clear",
+                    "enum": ["low", "medium", "high", "xhigh", "max", "default", None]
+                }
+            },
+            "required": ["thread_id"]
+        }
+    },
+    {
+        "name": "set_goal",
+        "description": "Set, update, or clear a persisted session goal. With current codex exec integration this is injected as prompt context; native Codex /goal requires app-server.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "thread_id": {
+                    "type": "string",
+                    "description": "Discord thread ID of the session"
+                },
+                "objective": {
+                    "type": ["string", "null"],
+                    "description": "Goal objective, max 4000 bytes. Omit with clear=true to clear."
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Goal status",
+                    "enum": ["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]
+                },
+                "token_budget": {
+                    "type": ["integer", "null"],
+                    "description": "Optional positive token budget"
+                },
+                "clear": {
+                    "type": "boolean",
+                    "description": "Clear the stored goal"
+                }
+            },
+            "required": ["thread_id"]
+        }
+    },
+    {
+        "name": "start_login_flow",
+        "description": "Return the local command needed to repair login for an agent or session. The bot does not run OAuth itself.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "thread_id": {
+                    "type": "string",
+                    "description": "Discord thread ID whose agent needs login"
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Agent kind when no thread_id is supplied",
+                    "enum": ["claude", "codex", "gemini"]
+                }
+            }
+        }
+    },
+    {
         "name": "resume_session",
         "description": "Resume an existing Claude, Codex, or Gemini session in a new Discord thread. Use list_claude_sessions / list_codex_sessions / list_gemini_sessions to find a session ID. With kind unspecified, the bot tries the current effective top-level agent first, then the others.",
         "inputSchema": {
@@ -435,6 +535,75 @@ def handle_tool_call(name, arguments):
         if rescue_active and effective:
             parts.append(f"Disk pressure is active, so top-level sessions currently use `{effective}`.")
         return " ".join(parts)
+
+    elif name == "get_agent_config":
+        result = control_request("get_agent_config", arguments)
+        if "error" in result:
+            return result["error"]
+        model = result.get("model") or "default"
+        effort = result.get("effort") or "default"
+        goal = result.get("goal")
+        lines = [
+            f"Agent: `{result.get('agent_kind', '')}`",
+            f"Model: `{model}`",
+            f"Effort: `{effort}`",
+        ]
+        if goal:
+            objective = goal.get("objective", "")
+            status = goal.get("status", "active")
+            budget = goal.get("token_budget")
+            suffix = f", token budget {budget}" if budget else ""
+            lines.append(f"Goal: `{status}`{suffix} — {objective}")
+        else:
+            lines.append("Goal: none")
+        login = result.get("login_help") or {}
+        if login:
+            lines.append(f"Login repair: run `{login.get('command', '')}` on the bot host.")
+        mechanism = result.get("goal_mechanism")
+        if mechanism:
+            lines.append(f"Goal mechanism: {mechanism}.")
+        return "\n".join(lines)
+
+    elif name == "set_model":
+        result = control_request("set_model", arguments)
+        if "error" in result:
+            return result["error"]
+        model = result.get("model") or "default"
+        return f"Model override for <#{result.get('thread_id', '')}> is now `{model}`."
+
+    elif name == "set_effort":
+        result = control_request("set_effort", arguments)
+        if "error" in result:
+            return result["error"]
+        effort = result.get("effort") or "default"
+        return f"Effort override for <#{result.get('thread_id', '')}> is now `{effort}`."
+
+    elif name == "set_goal":
+        result = control_request("set_goal", arguments)
+        if "error" in result:
+            return result["error"]
+        goal = result.get("goal")
+        if not goal:
+            return f"Goal cleared for <#{result.get('thread_id', '')}>."
+        budget = goal.get("token_budget")
+        suffix = f" Token budget: `{budget}`." if budget else ""
+        mechanism = result.get("goal_mechanism")
+        mechanism_text = f" Mechanism: {mechanism}." if mechanism else ""
+        return (
+            f"Goal set for <#{result.get('thread_id', '')}>: "
+            f"`{goal.get('status', 'active')}` — {goal.get('objective', '')}."
+            f"{suffix}{mechanism_text}"
+        )
+
+    elif name == "start_login_flow":
+        result = control_request("start_login_flow", arguments)
+        if "error" in result:
+            return result["error"]
+        login = result.get("login") or {}
+        command = login.get("command", "")
+        note = login.get("note", "")
+        message = result.get("message", "")
+        return f"{message}\n\nRun on bot host: `{command}`\n{note}"
 
     elif name == "restart_bot":
         result = control_request("restart")
