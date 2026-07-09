@@ -230,7 +230,7 @@ TOOLS = [
     },
     {
         "name": "set_model",
-        "description": "Set or clear the model override for an existing Discord agent session. Use model=default or an empty/null value to clear.",
+        "description": "Set or clear the model override for an existing Discord agent session. Pass model explicitly; use model=default or an empty/null value to clear.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -243,12 +243,12 @@ TOOLS = [
                     "description": "Model name to pass to the agent CLI, or default/null to clear"
                 }
             },
-            "required": ["thread_id"]
+            "required": ["thread_id", "model"]
         }
     },
     {
         "name": "set_effort",
-        "description": "Set or clear the reasoning effort override for an existing Discord agent session. Claude supports low/medium/high/xhigh/max; Codex supports low/medium/high/xhigh here; Gemini effort is unsupported.",
+        "description": "Set or clear the reasoning effort override for an existing Discord agent session. Pass effort explicitly. Claude supports low/medium/high/xhigh/max; Codex supports low/medium/high/xhigh here; Gemini effort is unsupported.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -262,7 +262,7 @@ TOOLS = [
                     "enum": ["low", "medium", "high", "xhigh", "max", "default", None]
                 }
             },
-            "required": ["thread_id"]
+            "required": ["thread_id", "effort"]
         }
     },
     {

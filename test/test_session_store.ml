@@ -353,6 +353,19 @@ let test_session_agent_config_roundtrips () =
       Alcotest.(check (option int)) "goal token budget"
         (Some 1234) recovered_goal.token_budget)
 
+let test_invalid_optional_agent_config_does_not_abort_load () =
+  with_tmp_home (fun home ->
+    write_primary_sessions home
+      {|[{"thread_id":"control","project_name":"control","working_dir":"/tmp/project","agent_kind":"claude","session_id":"session-1","message_count":0,"model":42,"reasoning_effort":"future-effort","goal":{"objective":"Finish","status":"future-status","token_budget":1234}}]|};
+    let store = Discord_agents.Session_store.create () in
+    let recovered = find_control_session store in
+    Alcotest.(check (option string)) "invalid model ignored"
+      None recovered.Discord_agents.Session_store.model;
+    Alcotest.(check bool) "invalid effort ignored"
+      true (recovered.Discord_agents.Session_store.reasoning_effort = None);
+    Alcotest.(check bool) "invalid goal ignored"
+      true (recovered.Discord_agents.Session_store.goal = None))
+
 let test_save_refuses_read_only_preflight () =
   with_tmp_home (fun home ->
     let store = Discord_agents.Session_store.create () in
@@ -408,6 +421,8 @@ let () =
         test_active_run_roundtrips_through_backup;
       Alcotest.test_case "session agent config roundtrips" `Quick
         test_session_agent_config_roundtrips;
+      Alcotest.test_case "invalid optional agent config does not abort load" `Quick
+        test_invalid_optional_agent_config_does_not_abort_load;
       Alcotest.test_case "save refuses read-only preflight" `Quick
         test_save_refuses_read_only_preflight;
     ]);

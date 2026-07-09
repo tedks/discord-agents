@@ -1502,6 +1502,16 @@ let setsid_command () =
     failwith
       "agent_process: required command `setsid` was not found in PATH; install util-linux or start discord-agents with setsid available"
 
+let escape_prompt_block text =
+  let b = Buffer.create (String.length text) in
+  String.iter (function
+    | '&' -> Buffer.add_string b "&amp;"
+    | '<' -> Buffer.add_string b "&lt;"
+    | '>' -> Buffer.add_string b "&gt;"
+    | c -> Buffer.add_char b c
+  ) text;
+  Buffer.contents b
+
 (** Compose the per-turn prompt sent to a non-Claude agent, prepending
     the session's system prompt on the first turn so MCP-aware agents
     know what tools they have. Claude takes [--append-system-prompt]
@@ -1521,7 +1531,7 @@ let compose_session_prompt ~agent_kind ~system_prompt ~message_count
   let user_prompt = match goal_context, agent_kind with
     | Some goal, Config.Codex ->
       Printf.sprintf "<codex-goal>\n%s\n</codex-goal>\n\n%s"
-        goal user_prompt
+        (escape_prompt_block goal) user_prompt
     | _ -> user_prompt
   in
   match system_prompt with

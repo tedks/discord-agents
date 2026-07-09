@@ -114,6 +114,37 @@ let goal_of_json = function
     { objective; status; token_budget }
   | _ -> failwith "goal: expected object"
 
+let optional_string_field ~thread_id ~field = function
+  | `Null -> None
+  | `String s -> Some s
+  | _ ->
+    Logs.warn (fun m ->
+      m "session_store: ignoring invalid optional %s for session %s"
+        field thread_id);
+    None
+
+let optional_reasoning_effort_field ~thread_id = function
+  | `Null -> None
+  | json ->
+    (match Config.reasoning_effort_of_yojson json with
+     | effort -> Some effort
+     | exception exn ->
+       Logs.warn (fun m ->
+         m "session_store: ignoring invalid reasoning_effort for session %s: %s"
+           thread_id (Printexc.to_string exn));
+       None)
+
+let optional_goal_field ~thread_id = function
+  | `Null -> None
+  | json ->
+    (match goal_of_json json with
+     | goal -> Some goal
+     | exception exn ->
+       Logs.warn (fun m ->
+         m "session_store: ignoring invalid goal for session %s: %s"
+           thread_id (Printexc.to_string exn));
+       None)
+
 type session = {
   project_name : string;
   working_dir : string;
@@ -280,15 +311,12 @@ let sessions_of_json json =
       session_id_confirmed;
       thread_id;
       system_prompt = j |> member "system_prompt" |> to_string_option;
-      model = j |> member "model" |> to_string_option;
+      model = optional_string_field ~thread_id ~field:"model"
+        (j |> member "model");
       reasoning_effort =
-        (match j |> member "reasoning_effort" with
-         | `Null -> None
-         | json -> Some (Config.reasoning_effort_of_yojson json));
-      goal =
-        (match j |> member "goal" with
-         | `Null -> None
-         | json -> Some (goal_of_json json));
+        optional_reasoning_effort_field ~thread_id
+          (j |> member "reasoning_effort");
+      goal = optional_goal_field ~thread_id (j |> member "goal");
       message_count = j |> member "message_count" |> to_int;
       processing = false;
       pending_queue = Queue.create ();

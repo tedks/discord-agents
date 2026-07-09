@@ -833,7 +833,7 @@ let handle_get_agent_config (bot : Bot.t) params =
       ("goal_mechanism",
        `String (match session.agent_kind with
          | Config.Codex -> "bot_prompt_context; native /goal requires codex app-server"
-         | _ -> "bot_prompt_context"));
+         | _ -> "unsupported"));
     ]
 
 let string_param_opt params name =
@@ -841,6 +841,11 @@ let string_param_opt params name =
   match params |> member name with
   | `Null -> None
   | json -> to_string_option json
+
+let json_field params name =
+  match params with
+  | `Assoc fields -> List.assoc_opt name fields
+  | _ -> None
 
 let handle_set_model (bot : Bot.t) params =
   let open Yojson.Safe.Util in
@@ -851,13 +856,16 @@ let handle_set_model (bot : Bot.t) params =
   | None -> session_not_found_response
   | Some session ->
     let model =
-      match string_param_opt params "model" with
-      | None -> None
-      | Some s ->
+      match json_field params "model" with
+      | None ->
+        failwith "model is required; use null, empty string, or default to clear"
+      | Some `Null -> None
+      | Some (`String s) ->
         let s = String.trim s in
         if s = "" || String.equal (String.lowercase_ascii s) "default"
         then None
         else Some (Resource.truncate_utf8 ~max_bytes:200 s)
+      | Some _ -> failwith "model must be a string or null"
     in
     (match Session_store.set_model bot.sessions session model with
      | Error err -> error_response err
@@ -885,15 +893,18 @@ let handle_set_effort (bot : Bot.t) params =
   | None -> session_not_found_response
   | Some session ->
     let effort =
-      match string_param_opt params "effort" with
-      | None -> None
-      | Some s ->
+      match json_field params "effort" with
+      | None ->
+        failwith "effort is required; use null, empty string, or default to clear"
+      | Some `Null -> None
+      | Some (`String s) ->
         let s = String.trim (String.lowercase_ascii s) in
         if s = "" || String.equal s "default" then None
         else
           (match Config.reasoning_effort_of_string s with
            | Ok effort -> Some effort
            | Error msg -> failwith msg)
+      | Some _ -> failwith "effort must be a string or null"
     in
     (match effort_supported_for_agent session.agent_kind effort with
      | Error err -> error_response err
@@ -919,13 +930,8 @@ let handle_set_goal (bot : Bot.t) params =
       error_response
         "Goal config is currently supported only for Codex sessions."
     else
-      let field name =
-        match params with
-        | `Assoc fields -> List.assoc_opt name fields
-        | _ -> None
-      in
       let clear =
-        match field "clear" with
+        match json_field params "clear" with
         | Some (`Bool b) -> b
         | _ -> false
       in
@@ -956,7 +962,7 @@ let handle_set_goal (bot : Bot.t) params =
         else
           let current = session.goal in
           let objective =
-            match field "objective", current with
+            match json_field params "objective", current with
             | Some (`String objective), _ ->
               let objective = String.trim objective in
               if objective = "" then
@@ -971,7 +977,7 @@ let handle_set_goal (bot : Bot.t) params =
             | Some _, _ -> failwith "objective must be a string"
           in
           let status =
-            match parse_status (field "status"), current with
+            match parse_status (json_field params "status"), current with
             | Some status, _ -> status
             | None, Some goal -> goal.status
             | None, None -> Session_store.Goal_active
@@ -980,7 +986,7 @@ let handle_set_goal (bot : Bot.t) params =
             goal.token_budget)
           in
           let token_budget = parse_token_budget current_budget
-            (field "token_budget") in
+            (json_field params "token_budget") in
           Some { Session_store.objective = objective; status; token_budget }
       in
       (match Session_store.set_goal bot.sessions session goal with
@@ -995,14 +1001,14 @@ let handle_set_goal (bot : Bot.t) params =
 
 let handle_start_login_flow (bot : Bot.t) params =
   let open Yojson.Safe.Util in
-  let requested_agent =
+  let resolve_requested_agent () =
     match params with
     | Some p ->
       (match p |> member "thread_id" |> to_string_option with
        | Some thread_id ->
          (match Session_store.find_opt bot.sessions ~thread_id with
           | Some session -> Some session.agent_kind
-          | None -> failwith "Session not found.")
+          | None -> raise Not_found)
        | None ->
          (match p |> member "agent" |> to_string_option with
           | Some s ->
@@ -1012,13 +1018,16 @@ let handle_start_login_flow (bot : Bot.t) params =
           | None -> None))
     | None -> None
   in
-  let agent = Option.value requested_agent
-    ~default:(Bot.effective_top_level_agent bot) in
-  ok_response [
-    ("login", login_help_json agent);
-    ("message",
-     `String "Login is handled by the local agent CLI, not by discord-agents OAuth. Run the command on the bot host, then retry the session turn.");
-  ]
+  match resolve_requested_agent () with
+  | exception Not_found -> session_not_found_response
+  | requested_agent ->
+    let agent = Option.value requested_agent
+      ~default:(Bot.effective_top_level_agent bot) in
+    ok_response [
+      ("login", login_help_json agent);
+      ("message",
+       `String "Login is handled by the local agent CLI, not by discord-agents OAuth. Run the command on the bot host, then retry the session turn.");
+    ]
 
 let handle_stop_session (bot : Bot.t) params =
   let open Yojson.Safe.Util in
@@ -1165,7 +1174,7 @@ let handle_connection bot flow =
       Logs.warn (fun m -> m "control_api: slow request method=%s elapsed=%.3fs"
         !method_name elapsed)
 
-(* ── Server ────────────────────────────────────────────────────── *)
+(* ── Server ────────────────────────────────────────────────────────── *)
 
 let start ~(bot : Bot.t) ~sw ~(env : Eio_unix.Stdenv.base) =
   let path = socket_path () in
