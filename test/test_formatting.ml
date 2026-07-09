@@ -1710,6 +1710,36 @@ let test_make_session_default_claude_confirmed () =
     "Claude default is confirmed (--session-id pins it)"
     true s.session_id_confirmed
 
+let test_fork_from_session_id_roundtrip_and_set_session_id_clears () =
+  let session = Discord_agents.Session_store.make_session
+    ~project_name:"foo" ~working_dir:"/tmp/foo"
+    ~agent_kind:Discord_agents.Config.Claude
+    ~session_id:"placeholder-new-session"
+    ~fork_from_session_id:"source-session"
+    ~thread_id:"123" ~system_prompt:None ~initial_prompt:None ()
+  in
+  let map =
+    Discord_agents.Session_store.SessionMap.empty
+    |> Discord_agents.Session_store.SessionMap.add "123" session
+  in
+  let reparsed =
+    Discord_agents.Session_store.sessions_to_json map
+    |> Discord_agents.Session_store.sessions_of_json
+  in
+  let store = { Discord_agents.Session_store.sessions = reparsed;
+                last_reload = 0.0 } in
+  match Discord_agents.Session_store.SessionMap.bindings reparsed with
+  | [(_, s)] ->
+    Alcotest.(check (option string)) "fork source survives roundtrip"
+      (Some "source-session") s.fork_from_session_id;
+    Discord_agents.Session_store.set_session_id store s
+      ~session_id:"native-fork-result";
+    Alcotest.(check string) "new session id stored"
+      "native-fork-result" s.session_id;
+    Alcotest.(check (option string)) "fork source cleared"
+      None s.fork_from_session_id
+  | _ -> Alcotest.fail "expected exactly one session"
+
 let test_pending_agent_kind_roundtrip () =
   let session = Discord_agents.Session_store.make_session
     ~project_name:"foo" ~working_dir:"/tmp/foo"
@@ -1840,6 +1870,8 @@ let session_store_tests = [
     test_make_session_default_gemini_unconfirmed;
   Alcotest.test_case "fresh Claude default confirmed" `Quick
     test_make_session_default_claude_confirmed;
+  Alcotest.test_case "fork source roundtrip and clear" `Quick
+    test_fork_from_session_id_roundtrip_and_set_session_id_clears;
   Alcotest.test_case "pending agent kind roundtrip" `Quick
     test_pending_agent_kind_roundtrip;
   Alcotest.test_case "legacy pending agent defaults to default rotation" `Quick
@@ -2092,6 +2124,7 @@ let test_context_header_truncates_utf8_boundary () =
     agent_kind = Discord_agents.Config.Claude;
     session_override_kind = None;
     session_id = "sid";
+    fork_from_session_id = None;
     session_id_confirmed = true;
     thread_id = "thread";
     system_prompt = None;
@@ -2696,6 +2729,44 @@ let resume_helpers_tests = [
     test_format_session_listing_strips_newlines_in_wd;
 ]
 
+(* ── claude_args ───────────────────────────────────────────────────── *)
+
+let claude_args = Discord_agents.Agent_process.claude_args
+
+let test_claude_args_fresh () =
+  let args = claude_args ~session_id:"new-id"
+    ~message_count:0 ~fork_from_session_id:None
+    ~model:None ~reasoning_effort:None ~prompt:"hello" in
+  Alcotest.(check (list string)) "fresh pins caller id"
+    ["claude"; "-p"; "--verbose"; "--output-format"; "stream-json";
+     "--session-id"; "new-id"; "hello"]
+    args
+
+let test_claude_args_resume () =
+  let args = claude_args ~session_id:"existing-id"
+    ~message_count:2 ~fork_from_session_id:None
+    ~model:None ~reasoning_effort:None ~prompt:"continue" in
+  Alcotest.(check (list string)) "resume existing id"
+    ["claude"; "-p"; "--verbose"; "--output-format"; "stream-json";
+     "--resume"; "existing-id"; "continue"]
+    args
+
+let test_claude_args_native_fork () =
+  let args = claude_args ~fork_from_session_id:(Some "source-id")
+    ~session_id:"placeholder-new-id" ~message_count:0
+    ~model:None ~reasoning_effort:None ~prompt:"fork turn" in
+  Alcotest.(check (list string)) "fork resumes source with --fork-session"
+    ["claude"; "-p"; "--verbose"; "--output-format"; "stream-json";
+     "--resume"; "source-id"; "--fork-session"; "fork turn"]
+    args
+
+let claude_args_tests = [
+  Alcotest.test_case "fresh invocation args" `Quick test_claude_args_fresh;
+  Alcotest.test_case "resume invocation args" `Quick test_claude_args_resume;
+  Alcotest.test_case "native fork invocation args" `Quick
+    test_claude_args_native_fork;
+]
+
 (* ── codex_args ────────────────────────────────────────────────────── *)
 
 let codex_args ~session_id ~session_id_confirmed ~prompt =
@@ -3145,6 +3216,7 @@ let () =
     "escape_nested_fences", escape_nested_fences_tests;
     "codex_json", codex_json_tests;
     "codex_safety", codex_safety_tests;
+    "claude_args", claude_args_tests;
     "codex_args", codex_args_tests;
     "prompt_helpers", prompt_helpers_tests;
     "gemini_json", gemini_json_tests;

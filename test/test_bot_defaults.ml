@@ -255,7 +255,7 @@ let test_move_session_context_to_thread_archives_old_session () =
 
 let test_fork_session_context_to_thread_keeps_current_session () =
   with_test_bot (fun bot ->
-    let session = make_session Discord_agents.Config.Gemini in
+    let session = make_session Discord_agents.Config.Claude in
     session.message_count <- 3;
     Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
     let original_session_id = session.session_id in
@@ -275,8 +275,37 @@ let test_fork_session_context_to_thread_keeps_current_session () =
         true (saved_fork.session_id <> original_session_id);
       Alcotest.(check int) "fork message count starts fresh"
         0 saved_fork.message_count;
+      Alcotest.(check (option string)) "Claude fork resumes source once"
+        (Some original_session_id) saved_fork.fork_from_session_id)
+
+let test_fork_session_context_to_thread_fresh_for_gemini () =
+  with_test_bot (fun bot ->
+    let session = make_session Discord_agents.Config.Gemini in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    let original_session_id = session.session_id in
+    match Discord_agents.Bot.fork_session_context_to_thread bot session
+            ~fork_thread_id:"fork-thread" with
+    | Error err -> Alcotest.failf "fork_session_context_to_thread failed: %s" err
+    | Ok _forked ->
+      let saved_fork = find_session bot "fork-thread" in
+      Alcotest.(check bool) "fork got fresh id"
+        true (saved_fork.session_id <> original_session_id);
+      Alcotest.(check (option string)) "Gemini has no native fork source"
+        None saved_fork.fork_from_session_id;
       Alcotest.(check bool) "Gemini fork starts unconfirmed"
         false saved_fork.session_id_confirmed)
+
+let test_fork_thread_name_truncates_utf8_safely () =
+  let name =
+    Discord_agents.Bot.fork_thread_name
+      ~move:false
+      ~base:(String.make 79 'a' ^ "\xF0\x9F\x98\x80")
+      ~session_id:"12345678-1234-1234-1234-123456789abc"
+  in
+  Alcotest.(check bool) "thread name under Discord limit"
+    true (String.length name <= 80);
+  Alcotest.(check string) "thread name remains valid UTF-8"
+    name (Discord_agents.Resource.sanitize_utf8 name)
 
 let test_set_default_agent_defers_busy_control_session () =
   with_test_bot (fun bot ->
@@ -1594,6 +1623,10 @@ let () =
         test_move_session_context_to_thread_archives_old_session;
       Alcotest.test_case "no-move fork keeps current session" `Quick
         test_fork_session_context_to_thread_keeps_current_session;
+      Alcotest.test_case "Gemini no-move fork uses fresh fallback" `Quick
+        test_fork_session_context_to_thread_fresh_for_gemini;
+      Alcotest.test_case "fork thread name truncates UTF-8 safely" `Quick
+        test_fork_thread_name_truncates_utf8_safely;
       Alcotest.test_case "default rotation rechecks policy after pressure clears" `Quick
         test_finalize_pending_default_rotation_uses_current_policy_after_pressure_clears;
       Alcotest.test_case "default rotation rechecks active rescue policy" `Quick

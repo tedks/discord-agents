@@ -431,6 +431,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
           ~working_dir:session.working_dir
           ~kind:session.agent_kind
           ~session_id:session.session_id
+          ?fork_from_session_id:session.fork_from_session_id
           ~session_id_confirmed:session.session_id_confirmed
           ~message_count:session.message_count
           ?system_prompt:session.system_prompt

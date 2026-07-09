@@ -870,10 +870,13 @@ let fresh_context_session t (session : Session_store.session) ~thread_id =
 let thread_name_max = 80
 
 let truncate_for_thread_name s =
-  let s = Resource.single_line s |> String.trim in
+  let s =
+    Resource.single_line s
+    |> Resource.sanitize_utf8
+    |> String.trim
+  in
   let s = if s = "" then "session" else s in
-  if String.length s <= thread_name_max then s
-  else String.sub s 0 thread_name_max
+  Resource.truncate_utf8 ~max_bytes:thread_name_max s
 
 let fork_thread_name ~move ~base ~session_id =
   let prefix = if move then "archive" else "fork" in
@@ -941,8 +944,17 @@ let move_session_context_to_thread t (session : Session_store.session)
 
 let fork_session_context_to_thread t (session : Session_store.session)
     ~fork_thread_id =
+  let fork_from_session_id =
+    match session.agent_kind with
+    | Config.Claude -> Some session.session_id
+    | Config.Codex
+    | Config.Gemini -> None
+  in
   let forked_session =
-    fresh_context_session t session ~thread_id:fork_thread_id
+    {
+      (fresh_context_session t session ~thread_id:fork_thread_id) with
+      fork_from_session_id;
+    }
   in
   try
     Session_store.add t.sessions ~thread_id:fork_thread_id forked_session;
@@ -1954,13 +1966,24 @@ let handle_command t msg cmd =
                     ~context:"fork persistence failure";
                   reply (Printf.sprintf "Failed to persist forked session: %s" err)
                 | Ok forked_session ->
+                  let thread_content =
+                    match forked_session.fork_from_session_id with
+                    | Some source_id ->
+                      Printf.sprintf
+                        "Forked from <#%s>.\nNative `%s` fork from session `%s` will be created on the first message here."
+                        channel_id
+                        (Config.string_of_agent_kind forked_session.agent_kind)
+                        (Resource.short_id source_id)
+                    | None ->
+                      Printf.sprintf
+                        "Forked from <#%s>.\nFresh `%s` session `%s` is ready here."
+                        channel_id
+                        (Config.string_of_agent_kind forked_session.agent_kind)
+                        (Resource.short_id forked_session.session_id)
+                  in
                   ignore (Discord_rest.create_message t.rest
                     ~channel_id:thread_id
-                    ~content:(Printf.sprintf
-                      "Forked from <#%s>.\nFresh `%s` session `%s` is ready here."
-                      channel_id
-                      (Config.string_of_agent_kind forked_session.agent_kind)
-                      (Resource.short_id forked_session.session_id)) ());
+                    ~content:thread_content ());
                   reply (Printf.sprintf
                     "Fork created: <#%s>. The current session remains unchanged."
                     thread_id)))))
