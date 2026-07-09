@@ -1202,11 +1202,22 @@ let handle_send_message (bot : Bot.t) params =
           ~thread_id ~message () with
   | Bot.Inter_agent_message_sent sent ->
     ok_response [
+      ("state", `String "sent");
       ("thread_id", `String sent.thread_id);
       ("message_id", `String sent.message_id);
       ("remaining_hops", `Int sent.remaining_hops);
       ("message", `String (Printf.sprintf
         "Sent message to <#%s>. remaining_hops=%d"
+        sent.thread_id sent.remaining_hops));
+    ]
+  | Bot.Inter_agent_message_posted_not_routed sent ->
+    ok_response [
+      ("state", `String "posted_not_routed");
+      ("thread_id", `String sent.thread_id);
+      ("message_id", `String sent.message_id);
+      ("remaining_hops", `Int sent.remaining_hops);
+      ("message", `String (Printf.sprintf
+        "Posted message to <#%s>, but the target session disappeared before routing. remaining_hops=%d"
         sent.thread_id sent.remaining_hops));
     ]
   | Bot.Inter_agent_message_rejected err ->

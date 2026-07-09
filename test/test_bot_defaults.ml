@@ -1565,7 +1565,7 @@ let test_process_session_message_keeps_run_replayable_on_completion_persist_fail
 
 let test_prepare_inter_agent_message_formats_origin_and_hop_marker () =
   match Discord_agents.Bot.prepare_inter_agent_message
-          ~source_thread_id:"source-thread"
+          ~source_thread_id:"1234567890"
           ~remaining_hops:3
           "please review this"
   with
@@ -1574,7 +1574,7 @@ let test_prepare_inter_agent_message_formats_origin_and_hop_marker () =
     Alcotest.(check int) "remaining hops"
       2 prepared.delivered_remaining_hops;
     Alcotest.(check string) "visible content"
-      "[inter-agent message; origin=source-thread; remaining_hops=2]\n\nplease review this"
+      "[inter-agent message; claimed_source=1234567890; remaining_hops=2]\n\nplease review this"
       prepared.visible_content
 
 let test_prepare_inter_agent_message_rejects_commands () =
@@ -1593,6 +1593,140 @@ let test_prepare_inter_agent_message_rejects_exhausted_hops () =
   | Error err ->
     Alcotest.(check string) "error"
       "inter-agent hop limit exhausted" err
+
+let test_prepare_inter_agent_message_rejects_invalid_source () =
+  match Discord_agents.Bot.prepare_inter_agent_message
+          ~source_thread_id:"not-a-snowflake"
+          "hello"
+  with
+  | Ok _ -> Alcotest.fail "expected invalid source thread id to be rejected"
+  | Error err ->
+    Alcotest.(check string) "error"
+      "source_thread_id must be a Discord snowflake" err
+
+let make_posted_message ~channel_id ~message_id content =
+  {
+    (make_message ~message_id ~channel_id content) with
+    author = {
+      Discord_agents.Discord_types.id = "bot-1";
+      username = "discord-agents";
+      bot = Some true;
+    };
+  }
+
+let inter_agent_hooks ?post ?route () =
+  let post_inter_agent_message =
+    match post with
+    | Some f -> f
+    | None ->
+      (fun _rest ~channel_id ~content ->
+         Ok (make_posted_message ~channel_id ~message_id:"posted-1" content))
+  in
+  let route_inter_agent_message =
+    match route with
+    | Some f -> f
+    | None -> (fun _bot _msg -> ())
+  in
+  Discord_agents.Bot.{ post_inter_agent_message; route_inter_agent_message }
+
+let test_send_inter_agent_message_posts_and_routes_user_style_message () =
+  with_test_bot (fun bot ->
+    let target_thread_id = "1234567890" in
+    let session =
+      make_session ~thread_id:target_thread_id Discord_agents.Config.Codex
+    in
+    Discord_agents.Session_store.add bot.sessions
+      ~thread_id:target_thread_id session;
+    let posted_content = ref None in
+    let routed_message = ref None in
+    let hooks = inter_agent_hooks
+      ~post:(fun _rest ~channel_id ~content ->
+        posted_content := Some content;
+        Ok (make_posted_message ~channel_id ~message_id:"posted-1" content))
+      ~route:(fun _bot msg -> routed_message := Some msg)
+      ()
+    in
+    match Discord_agents.Bot.send_inter_agent_message_with_hooks hooks bot
+            ~source_thread_id:"9876543210"
+            ~remaining_hops:3
+            ~thread_id:target_thread_id
+            ~message:"please review this" () with
+    | Discord_agents.Bot.Inter_agent_message_sent sent ->
+      Alcotest.(check string) "message id" "posted-1" sent.message_id;
+      Alcotest.(check int) "remaining hops" 2 sent.remaining_hops;
+      let content = match !posted_content with
+        | Some content -> content
+        | None -> Alcotest.fail "expected posted content"
+      in
+      Alcotest.(check string) "visible claimed source"
+        "**Message from another agent (claimed source: <#9876543210>)**\n[inter-agent message; claimed_source=9876543210; remaining_hops=2]\n\nplease review this"
+        content;
+      (match !routed_message with
+       | Some msg ->
+         Alcotest.(check string) "routed content"
+           content msg.Discord_agents.Discord_types.content;
+         Alcotest.(check string) "routed author"
+           "inter-agent" msg.author.username;
+         Alcotest.(check (option bool)) "routed as user"
+           (Some false) msg.author.bot
+       | None -> Alcotest.fail "expected routed message")
+    | _ -> Alcotest.fail "expected sent outcome")
+
+let test_send_inter_agent_message_rejects_missing_target () =
+  with_test_bot (fun bot ->
+    let posted = ref false in
+    let hooks = inter_agent_hooks
+      ~post:(fun _rest ~channel_id:_ ~content:_ ->
+        posted := true;
+        Ok (make_posted_message ~channel_id:"1234567890"
+              ~message_id:"posted-1" "unused"))
+      ()
+    in
+    match Discord_agents.Bot.send_inter_agent_message_with_hooks hooks bot
+            ~thread_id:"1234567890" ~message:"hello" () with
+    | Discord_agents.Bot.Inter_agent_message_rejected err ->
+      Alcotest.(check string) "error" "Target session not found." err;
+      Alcotest.(check bool) "did not post" false !posted
+    | _ -> Alcotest.fail "expected rejected outcome")
+
+let test_send_inter_agent_message_reports_post_failure () =
+  with_test_bot (fun bot ->
+    let target_thread_id = "1234567890" in
+    Discord_agents.Session_store.add bot.sessions
+      ~thread_id:target_thread_id
+      (make_session ~thread_id:target_thread_id Discord_agents.Config.Codex);
+    let hooks = inter_agent_hooks
+      ~post:(fun _rest ~channel_id:_ ~content:_ -> Error "discord down")
+      ()
+    in
+    match Discord_agents.Bot.send_inter_agent_message_with_hooks hooks bot
+            ~thread_id:target_thread_id ~message:"hello" () with
+    | Discord_agents.Bot.Inter_agent_message_rejected err ->
+      Alcotest.(check string) "error"
+        "Failed to post message: discord down" err
+    | _ -> Alcotest.fail "expected rejected outcome")
+
+let test_send_inter_agent_message_reports_posted_not_routed () =
+  with_test_bot (fun bot ->
+    let target_thread_id = "1234567890" in
+    Discord_agents.Session_store.add bot.sessions
+      ~thread_id:target_thread_id
+      (make_session ~thread_id:target_thread_id Discord_agents.Config.Codex);
+    let routed = ref false in
+    let hooks = inter_agent_hooks
+      ~post:(fun _rest ~channel_id ~content ->
+        Discord_agents.Session_store.remove bot.sessions
+          ~thread_id:target_thread_id;
+        Ok (make_posted_message ~channel_id ~message_id:"posted-1" content))
+      ~route:(fun _bot _msg -> routed := true)
+      ()
+    in
+    match Discord_agents.Bot.send_inter_agent_message_with_hooks hooks bot
+            ~thread_id:target_thread_id ~message:"hello" () with
+    | Discord_agents.Bot.Inter_agent_message_posted_not_routed sent ->
+      Alcotest.(check string) "message id" "posted-1" sent.message_id;
+      Alcotest.(check bool) "did not route" false !routed
+    | _ -> Alcotest.fail "expected posted_not_routed outcome")
 
 let test_reap_tracked_process_group_leader () =
   with_test_bot (fun bot ->
@@ -1777,6 +1911,16 @@ let () =
         test_prepare_inter_agent_message_rejects_commands;
       Alcotest.test_case "inter-agent message rejects exhausted hops" `Quick
         test_prepare_inter_agent_message_rejects_exhausted_hops;
+      Alcotest.test_case "inter-agent message rejects invalid source" `Quick
+        test_prepare_inter_agent_message_rejects_invalid_source;
+      Alcotest.test_case "send inter-agent message posts and routes" `Quick
+        test_send_inter_agent_message_posts_and_routes_user_style_message;
+      Alcotest.test_case "send inter-agent message rejects missing target" `Quick
+        test_send_inter_agent_message_rejects_missing_target;
+      Alcotest.test_case "send inter-agent message reports post failure" `Quick
+        test_send_inter_agent_message_reports_post_failure;
+      Alcotest.test_case "send inter-agent message reports posted not routed" `Quick
+        test_send_inter_agent_message_reports_posted_not_routed;
       Alcotest.test_case "reap tracked process-group leader" `Quick
         test_reap_tracked_process_group_leader;
       Alcotest.test_case "busy stop signals tracked child" `Quick

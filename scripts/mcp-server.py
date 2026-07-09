@@ -166,7 +166,7 @@ TOOLS = [
                 },
                 "source_thread_id": {
                     "type": "string",
-                    "description": "Optional Discord thread ID of the sending session, if known. Used for the visible origin marker and self-send rejection."
+                    "description": "Optional claimed Discord thread ID of the sending session, if known. This is displayed as an untrusted claimed source until caller context is wired in."
                 },
                 "remaining_hops": {
                     "type": "integer",
@@ -469,6 +469,9 @@ def handle_tool_call(name, arguments):
             return result["error"]
         tid = result.get("thread_id", "")
         hops = result.get("remaining_hops", 0)
+        state = result.get("state", "sent")
+        if state == "posted_not_routed":
+            return f"Posted message to <#{tid}>, but the target session disappeared before routing. remaining_hops={hops}."
         return f"Sent message to <#{tid}>. remaining_hops={hops}."
 
     elif name == "stop_session":

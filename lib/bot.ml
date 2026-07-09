@@ -2889,22 +2889,51 @@ type inter_agent_message_outcome =
       message_id : Discord_types.message_id;
       remaining_hops : int;
     }
+  | Inter_agent_message_posted_not_routed of {
+      thread_id : Discord_types.channel_id;
+      message_id : Discord_types.message_id;
+      remaining_hops : int;
+    }
   | Inter_agent_message_rejected of string
 
-let describe_inter_agent_source t source_thread_id =
+type inter_agent_message_hooks = {
+  post_inter_agent_message :
+    Discord_rest.t ->
+    channel_id:Discord_types.channel_id ->
+    content:string ->
+    (Discord_types.message, string) result;
+  route_inter_agent_message :
+    t ->
+    Discord_types.message ->
+    unit;
+}
+
+let valid_discord_snowflake s =
+  let len = String.length s in
+  len > 0
+  && len <= 32
+  && String.for_all (fun c -> c >= '0' && c <= '9') s
+
+let claimed_source_label t source_thread_id =
   match source_thread_id with
   | None -> "another agent"
   | Some tid ->
     match Session_store.find_opt t.sessions ~thread_id:tid with
     | Some session ->
-      Printf.sprintf "%s in <#%s>"
+      Printf.sprintf "another agent (claimed source: %s in <#%s>)"
         (Config.string_of_agent_kind session.agent_kind) tid
-    | None -> Printf.sprintf "thread <#%s>" tid
+    | None -> Printf.sprintf "another agent (claimed source: <#%s>)" tid
 
 let prepare_inter_agent_message ?source_thread_id ?remaining_hops message =
   let message = String.trim message in
   if message = "" then
     Error "message must not be empty"
+  else if
+    (match source_thread_id with
+     | Some tid -> not (valid_discord_snowflake tid)
+     | None -> false)
+  then
+    Error "source_thread_id must be a Discord snowflake"
   else if Command.is_command message then
     Error "inter-agent messages cannot start with ! commands"
   else if String.length message > max_inter_agent_message_bytes then
@@ -2923,11 +2952,10 @@ let prepare_inter_agent_message ?source_thread_id ?remaining_hops message =
       let delivered_remaining_hops = requested_hops - 1 in
       let origin =
         Option.value source_thread_id ~default:"unknown"
-        |> Resource.single_line
       in
       let visible_content =
         Printf.sprintf
-          "[inter-agent message; origin=%s; remaining_hops=%d]\n\n%s"
+          "[inter-agent message; claimed_source=%s; remaining_hops=%d]\n\n%s"
           origin delivered_remaining_hops message
       in
       Ok { visible_content; delivered_remaining_hops }
@@ -2959,13 +2987,20 @@ let handle_thread_message t msg ?channel_info () =
           process_session_message t session msg channel_info))
     end
 
-let send_inter_agent_message t ?source_thread_id ?remaining_hops ~thread_id
-    ~message () =
+let default_inter_agent_message_hooks = {
+  post_inter_agent_message =
+    (fun rest ~channel_id ~content ->
+       Discord_rest.create_message rest ~channel_id ~content ());
+  route_inter_agent_message =
+    (fun t msg -> handle_thread_message t msg ());
+}
+
+let send_inter_agent_message_with_hooks hooks t ?source_thread_id
+    ?remaining_hops ~thread_id ~message () =
   if t.draining then
     Inter_agent_message_rejected "Bot is restarting; try again shortly."
-  else if source_thread_id = Some thread_id then
-    Inter_agent_message_rejected
-      "source_thread_id and thread_id must be different"
+  else if not (valid_discord_snowflake thread_id) then
+    Inter_agent_message_rejected "thread_id must be a Discord snowflake"
   else
     match Session_store.find_opt t.sessions ~thread_id with
     | None -> Inter_agent_message_rejected "Target session not found."
@@ -2973,32 +3008,45 @@ let send_inter_agent_message t ?source_thread_id ?remaining_hops ~thread_id
       (match prepare_inter_agent_message ?source_thread_id ?remaining_hops message with
        | Error err -> Inter_agent_message_rejected err
        | Ok prepared ->
-         let source_label = describe_inter_agent_source t source_thread_id in
+         let source_label = claimed_source_label t source_thread_id in
          let content =
            Printf.sprintf "**Message from %s**\n%s"
              source_label prepared.visible_content
          in
-         match Discord_rest.create_message t.rest ~channel_id:thread_id
-                 ~content () with
+         match hooks.post_inter_agent_message t.rest ~channel_id:thread_id
+                 ~content with
          | Error err ->
            Inter_agent_message_rejected
              (Printf.sprintf "Failed to post message: %s" err)
          | Ok posted_msg ->
-           let routed_msg = {
-             posted_msg with
-             content;
-             author = {
-               id = "inter-agent";
-               username = "inter-agent";
-               bot = Some false;
-             };
-           } in
-           handle_thread_message t routed_msg ();
-           Inter_agent_message_sent {
-             thread_id;
-             message_id = posted_msg.id;
-             remaining_hops = prepared.delivered_remaining_hops;
-           })
+           (match Session_store.find_opt t.sessions ~thread_id with
+            | None ->
+              Inter_agent_message_posted_not_routed {
+                thread_id;
+                message_id = posted_msg.id;
+                remaining_hops = prepared.delivered_remaining_hops;
+              }
+            | Some _ ->
+              let routed_msg = {
+                posted_msg with
+                content;
+                author = {
+                  id = "inter-agent";
+                  username = "inter-agent";
+                  bot = Some false;
+                };
+              } in
+              hooks.route_inter_agent_message t routed_msg;
+              Inter_agent_message_sent {
+                thread_id;
+                message_id = posted_msg.id;
+                remaining_hops = prepared.delivered_remaining_hops;
+              }))
+
+let send_inter_agent_message t ?source_thread_id ?remaining_hops ~thread_id
+    ~message () =
+  send_inter_agent_message_with_hooks default_inter_agent_message_hooks t
+    ?source_thread_id ?remaining_hops ~thread_id ~message ()
 
 (** Fork an agent run on a fresh session whose [processing] flag is
     already locked by the caller. Used by
