@@ -676,6 +676,10 @@ let cmd_testable =
       | Resume_session { session_id; kind = Some k } ->
         Printf.sprintf "Resume_session(%s,%s)"
           (Discord_agents.Config.string_of_agent_kind k) session_id
+      | Fork_session { move = None } -> "Fork_session(default)"
+      | Fork_session { move = Some true } -> "Fork_session(move)"
+      | Fork_session { move = Some false } -> "Fork_session(no_move)"
+      | Reset_session -> "Reset_session"
       | Stop_session { thread_id } -> "Stop_session(" ^ thread_id ^ ")"
       | Interrupt_session -> "Interrupt_session"
       | Cleanup_channels -> "Cleanup_channels"
@@ -825,6 +829,38 @@ let test_parse_resume_invalid_kind () =
     Alcotest.(check pass) "invalid kind is Unknown" () ()
   | _ -> Alcotest.fail "expected Unknown for invalid agent kind"
 
+let test_parse_fork_default () =
+  Alcotest.(check cmd_testable) "fork default"
+    (Discord_agents.Command.Fork_session { move = None })
+    (Discord_agents.Command.parse "!fork")
+
+let test_parse_fork_move () =
+  Alcotest.(check cmd_testable) "fork --move"
+    (Discord_agents.Command.Fork_session { move = Some true })
+    (Discord_agents.Command.parse "!fork --move")
+
+let test_parse_fork_no_move () =
+  Alcotest.(check cmd_testable) "fork --no-move"
+    (Discord_agents.Command.Fork_session { move = Some false })
+    (Discord_agents.Command.parse "!fork --no-move")
+
+let test_parse_fork_rejects_extra_args () =
+  match Discord_agents.Command.parse "!fork --move --no-move" with
+  | Discord_agents.Command.Unknown _ ->
+    Alcotest.(check pass) "fork with extra args is Unknown" () ()
+  | _ -> Alcotest.fail "expected Unknown for fork extra args"
+
+let test_parse_reset () =
+  Alcotest.(check cmd_testable) "reset"
+    Discord_agents.Command.Reset_session
+    (Discord_agents.Command.parse "!reset")
+
+let test_parse_reset_rejects_args () =
+  match Discord_agents.Command.parse "!reset now" with
+  | Discord_agents.Command.Unknown _ ->
+    Alcotest.(check pass) "reset with args is Unknown" () ()
+  | _ -> Alcotest.fail "expected Unknown for reset args"
+
 let test_parse_codex_sessions () =
   Alcotest.(check cmd_testable) "codex-sessions"
     Discord_agents.Command.List_codex_sessions
@@ -966,6 +1002,12 @@ let command_tests = [
   Alcotest.test_case "resume with gemini kind" `Quick test_parse_resume_with_gemini_kind;
   Alcotest.test_case "resume with claude kind" `Quick test_parse_resume_with_claude_kind;
   Alcotest.test_case "resume invalid kind" `Quick test_parse_resume_invalid_kind;
+  Alcotest.test_case "fork default" `Quick test_parse_fork_default;
+  Alcotest.test_case "fork move" `Quick test_parse_fork_move;
+  Alcotest.test_case "fork no-move" `Quick test_parse_fork_no_move;
+  Alcotest.test_case "fork rejects extra args" `Quick test_parse_fork_rejects_extra_args;
+  Alcotest.test_case "reset" `Quick test_parse_reset;
+  Alcotest.test_case "reset rejects args" `Quick test_parse_reset_rejects_args;
   Alcotest.test_case "codex-sessions" `Quick test_parse_codex_sessions;
   Alcotest.test_case "gemini-sessions" `Quick test_parse_gemini_sessions;
   Alcotest.test_case "resume with codex kind" `Quick test_parse_resume_with_codex_kind;
