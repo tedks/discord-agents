@@ -194,6 +194,90 @@ let find_session bot thread_id =
   | Some session -> session
   | None -> Alcotest.failf "expected session %s" thread_id
 
+let test_reset_session_context_replaces_current_session () =
+  with_test_bot (fun bot ->
+    let session =
+      make_session Discord_agents.Config.Codex
+    in
+    session.message_count <- 4;
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    let original_session_id = session.session_id in
+    match Discord_agents.Bot.reset_session_context bot session with
+    | Error err -> Alcotest.failf "reset_session_context failed: %s" err
+    | Ok replacement ->
+      let saved = find_control_session bot in
+      Alcotest.(check string) "returned session is persisted"
+        replacement.session_id saved.session_id;
+      Alcotest.(check bool) "fresh session id allocated"
+        true (saved.session_id <> original_session_id);
+      Alcotest.(check int) "message count reset" 0 saved.message_count;
+      Alcotest.(check string) "agent preserved"
+        "codex" (kind_string saved.agent_kind);
+      Alcotest.(check bool) "server-allocated id starts unconfirmed"
+        false saved.session_id_confirmed)
+
+let test_move_session_context_to_thread_archives_old_session () =
+  with_test_bot (fun bot ->
+    let session = make_session Discord_agents.Config.Claude in
+    session.message_count <- 7;
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    let original_session_id = session.session_id in
+    let block : Discord_agents.Bot.output_block = {
+      lines = [| "old output" |];
+      output_lines_used = 1;
+      next_line = 1;
+    } in
+    let scroll_state : Discord_agents.Bot.scroll_state = {
+      blocks = [block];
+      current_block = 1;
+    } in
+    Hashtbl.replace bot.scroll_states "control" scroll_state;
+    match Discord_agents.Bot.move_session_context_to_thread bot session
+            ~archive_thread_id:"archive-thread" with
+    | Error err -> Alcotest.failf "move_session_context_to_thread failed: %s" err
+    | Ok fresh ->
+      let archived = find_session bot "archive-thread" in
+      let current = find_control_session bot in
+      Alcotest.(check string) "old session id moved"
+        original_session_id archived.session_id;
+      Alcotest.(check int) "old message count moved"
+        7 archived.message_count;
+      Alcotest.(check string) "fresh session persisted"
+        fresh.session_id current.session_id;
+      Alcotest.(check bool) "current got fresh id"
+        true (current.session_id <> original_session_id);
+      Alcotest.(check int) "current message count reset"
+        0 current.message_count;
+      Alcotest.(check bool) "scroll state moved"
+        true (Option.is_some (Hashtbl.find_opt bot.scroll_states "archive-thread"));
+      Alcotest.(check bool) "current scroll state cleared"
+        true (Option.is_none (Hashtbl.find_opt bot.scroll_states "control")))
+
+let test_fork_session_context_to_thread_keeps_current_session () =
+  with_test_bot (fun bot ->
+    let session = make_session Discord_agents.Config.Gemini in
+    session.message_count <- 3;
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    let original_session_id = session.session_id in
+    match Discord_agents.Bot.fork_session_context_to_thread bot session
+            ~fork_thread_id:"fork-thread" with
+    | Error err -> Alcotest.failf "fork_session_context_to_thread failed: %s" err
+    | Ok forked ->
+      let current = find_control_session bot in
+      let saved_fork = find_session bot "fork-thread" in
+      Alcotest.(check string) "current session id unchanged"
+        original_session_id current.session_id;
+      Alcotest.(check int) "current message count unchanged"
+        3 current.message_count;
+      Alcotest.(check string) "forked session persisted"
+        forked.session_id saved_fork.session_id;
+      Alcotest.(check bool) "fork got fresh id"
+        true (saved_fork.session_id <> original_session_id);
+      Alcotest.(check int) "fork message count starts fresh"
+        0 saved_fork.message_count;
+      Alcotest.(check bool) "Gemini fork starts unconfirmed"
+        false saved_fork.session_id_confirmed)
+
 let test_set_default_agent_defers_busy_control_session () =
   with_test_bot (fun bot ->
     let session = make_session ~processing:true Discord_agents.Config.Claude in
@@ -1504,6 +1588,12 @@ let () =
         test_apply_pending_same_kind_session_override_pins_existing_session;
       Alcotest.test_case "busy pending change stays pending" `Quick
         test_apply_pending_busy_session_leaves_pending_intact;
+      Alcotest.test_case "reset context replaces current session" `Quick
+        test_reset_session_context_replaces_current_session;
+      Alcotest.test_case "move fork archives old session" `Quick
+        test_move_session_context_to_thread_archives_old_session;
+      Alcotest.test_case "no-move fork keeps current session" `Quick
+        test_fork_session_context_to_thread_keeps_current_session;
       Alcotest.test_case "default rotation rechecks policy after pressure clears" `Quick
         test_finalize_pending_default_rotation_uses_current_policy_after_pressure_clears;
       Alcotest.test_case "default rotation rechecks active rescue policy" `Quick
