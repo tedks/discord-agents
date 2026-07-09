@@ -915,54 +915,83 @@ let handle_set_goal (bot : Bot.t) params =
   match Session_store.find_opt bot.sessions ~thread_id with
   | None -> session_not_found_response
   | Some session ->
-    let clear =
-      match params |> member "clear" with
-      | `Bool b -> b
-      | _ -> false
-    in
-    let goal =
-      if clear then None
-      else
-        match string_param_opt params "objective" with
-        | None -> None
-        | Some objective ->
-          let objective = String.trim objective in
-          if objective = "" then None
+    if not (Config.equal_agent_kind session.agent_kind Config.Codex) then
+      error_response
+        "Goal config is currently supported only for Codex sessions."
+    else
+      let field name =
+        match params with
+        | `Assoc fields -> List.assoc_opt name fields
+        | _ -> None
+      in
+      let clear =
+        match field "clear" with
+        | Some (`Bool b) -> b
+        | _ -> false
+      in
+      let parse_status = function
+        | None | Some `Null -> None
+        | Some (`String s) ->
+          let s = String.trim s in
+          if s = "" then None
           else
-            let objective =
-              Resource.truncate_utf8 ~max_bytes:4000 objective
-            in
-            let status =
-              match string_param_opt params "status" with
-              | None -> Session_store.Goal_active
-              | Some s ->
-                let s = String.trim s in
-                if s = "" then Session_store.Goal_active
-                else
-                  (match Session_store.goal_status_of_string s with
-                   | Ok status -> status
-                   | Error msg -> failwith msg)
-            in
-            let token_budget =
-              match params |> member "token_budget" with
-              | `Null -> None
-              | `Int n when n > 0 -> Some n
-              | `Int _ -> failwith "token_budget must be positive"
-              | _ -> None
-            in
-            Some { Session_store.objective = objective; status; token_budget }
-    in
-    (match Session_store.set_goal bot.sessions session goal with
-     | Error err -> error_response err
-     | Ok () ->
-       ok_response [
-         ("thread_id", `String thread_id);
-         goal_field session;
-         ("goal_mechanism",
-          `String (match session.agent_kind with
-            | Config.Codex -> "bot_prompt_context; native /goal requires codex app-server"
-            | _ -> "bot_prompt_context"));
-       ])
+            (match Session_store.goal_status_of_string s with
+             | Ok status -> Some status
+             | Error msg -> failwith msg)
+        | Some _ -> failwith "status must be a string"
+      in
+      let parse_token_budget current = function
+        | None -> current
+        | Some `Null -> None
+        | Some (`Int n) when n > 0 -> Some n
+        | Some (`Intlit s) ->
+          (match int_of_string_opt s with
+           | Some n when n > 0 -> Some n
+           | _ -> failwith "token_budget must be positive")
+        | Some (`Int _) -> failwith "token_budget must be positive"
+        | Some _ -> failwith "token_budget must be a positive integer or null"
+      in
+      let goal =
+        if clear then None
+        else
+          let current = session.goal in
+          let objective =
+            match field "objective", current with
+            | Some (`String objective), _ ->
+              let objective = String.trim objective in
+              if objective = "" then
+                failwith "objective must be non-empty"
+              else
+                Resource.truncate_utf8 ~max_bytes:4000 objective
+            | Some `Null, Some goal
+            | None, Some goal -> goal.objective
+            | Some `Null, None
+            | None, None ->
+              failwith "objective is required when setting a new goal"
+            | Some _, _ -> failwith "objective must be a string"
+          in
+          let status =
+            match parse_status (field "status"), current with
+            | Some status, _ -> status
+            | None, Some goal -> goal.status
+            | None, None -> Session_store.Goal_active
+          in
+          let current_budget = Option.bind current (fun goal ->
+            goal.token_budget)
+          in
+          let token_budget = parse_token_budget current_budget
+            (field "token_budget") in
+          Some { Session_store.objective = objective; status; token_budget }
+      in
+      (match Session_store.set_goal bot.sessions session goal with
+       | Error err -> error_response err
+       | Ok () ->
+         ok_response [
+           ("thread_id", `String thread_id);
+           goal_field session;
+           ("goal_mechanism",
+            `String "bot_prompt_context; native /goal requires codex app-server");
+         ])
 
 let handle_start_login_flow (bot : Bot.t) params =
   let open Yojson.Safe.Util in

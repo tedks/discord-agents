@@ -267,7 +267,7 @@ TOOLS = [
     },
     {
         "name": "set_goal",
-        "description": "Set, update, or clear a persisted session goal. With current codex exec integration this is injected as prompt context; native Codex /goal requires app-server.",
+        "description": "Set, update, or clear a persisted Codex session goal. With current codex exec integration this is injected as prompt context; native Codex /goal requires app-server.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -277,7 +277,7 @@ TOOLS = [
                 },
                 "objective": {
                     "type": ["string", "null"],
-                    "description": "Goal objective, max 4000 bytes. Omit with clear=true to clear."
+                    "description": "Goal objective, max 4000 bytes. Required for a new goal; omit to update status/token_budget on an existing goal."
                 },
                 "status": {
                     "type": "string",
