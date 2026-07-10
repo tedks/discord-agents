@@ -13,6 +13,116 @@ type t = {
   remote_url : string option;
 }
 
+let strip_suffix s suffix =
+  let suffix_len = String.length suffix in
+  if String.length s >= suffix_len
+     && String.sub s (String.length s - suffix_len) suffix_len = suffix
+  then String.sub s 0 (String.length s - suffix_len)
+  else s
+
+let is_valid_github_path_part s =
+  s <> ""
+  && s <> "."
+  && s <> ".."
+  && String.for_all (function
+    | 'A'..'Z' | 'a'..'z' | '0'..'9' | '-' | '_' | '.' -> true
+    | _ -> false) s
+
+let parse_github_remote url =
+  let parse_path path =
+    let path = if String.length path > 0 && path.[0] = '/'
+      then String.sub path 1 (String.length path - 1)
+      else path in
+    let path = strip_suffix path ".git" in
+    match String.split_on_char '/' path with
+    | [owner; repo]
+      when is_valid_github_path_part owner
+           && is_valid_github_path_part repo ->
+      Some (String.lowercase_ascii owner, repo)
+    | _ -> None
+  in
+  let lower = String.lowercase_ascii url in
+  let https_prefix = "https://github.com/" in
+  let ssh_prefix = "git@github.com:" in
+  let ssh_url_prefix = "ssh://git@github.com/" in
+  if String.length lower > String.length https_prefix
+     && String.sub lower 0 (String.length https_prefix) = https_prefix
+  then
+    parse_path (String.sub url (String.length https_prefix)
+      (String.length url - String.length https_prefix))
+  else if String.length lower > String.length ssh_prefix
+          && String.sub lower 0 (String.length ssh_prefix) = ssh_prefix
+  then
+    parse_path (String.sub url (String.length ssh_prefix)
+      (String.length url - String.length ssh_prefix))
+  else if String.length lower > String.length ssh_url_prefix
+          && String.sub lower 0 (String.length ssh_url_prefix) = ssh_url_prefix
+  then
+    parse_path (String.sub url (String.length ssh_url_prefix)
+      (String.length url - String.length ssh_url_prefix))
+  else
+    None
+
+let validate_github_url url =
+  let url = String.trim url in
+  if url = "" then
+    Error "GitHub URL is required."
+  else if String.exists (fun c -> Char.code c < 0x20 || c = ' ') url then
+    Error "GitHub URL must not contain spaces or control characters."
+  else
+    match parse_github_remote url with
+    | Some _ -> Ok url
+    | None ->
+      Error "Expected a GitHub HTTPS or SSH URL like https://github.com/owner/repo.git or git@github.com:owner/repo.git."
+
+let repo_name_from_github_url url =
+  match parse_github_remote url with
+  | Some (_, repo) -> Some repo
+  | None -> None
+
+let validate_import_name name =
+  let name = String.trim name in
+  if name = "" then
+    Error "Project name is required."
+  else if String.length name > 100 then
+    Error "Project name must be 100 characters or fewer."
+  else if not (is_valid_github_path_part name) then
+    Error "Project name may contain only letters, numbers, dot, underscore, and hyphen."
+  else
+    Ok name
+
+let remote_key url =
+  match parse_github_remote url with
+  | Some (owner, repo) ->
+    Some ("github.com/" ^ owner ^ "/" ^ String.lowercase_ascii repo)
+  | None ->
+    let norm = String.lowercase_ascii url in
+    let norm = strip_suffix norm ".git" in
+    let stripped = List.fold_left (fun s prefix ->
+      if String.length s > String.length prefix &&
+         String.sub s 0 (String.length prefix) = prefix
+      then String.sub s (String.length prefix) (String.length s - String.length prefix)
+      else s
+    ) norm ["https://"; "http://"] in
+    (match String.split_on_char ':' stripped with
+     | [host; path] when not (String.contains host '/') ->
+       let host = match String.split_on_char '@' host with
+         | [_; h] -> h | _ -> host in
+       Some (host ^ "/" ^ path)
+     | _ when stripped <> "" -> Some stripped
+     | _ -> None)
+
+let same_remote_url a b =
+  match remote_key a, remote_key b with
+  | Some a, Some b -> String.equal a b
+  | _ -> false
+
+let find_by_remote_url projects url =
+  List.find_opt (fun (p : t) ->
+    match p.remote_url with
+    | Some remote -> same_remote_url remote url
+    | None -> false) projects
+
 let is_git_dir path =
   Sys.file_exists (Filename.concat path ".git")
 
@@ -124,28 +234,7 @@ let deduplicate projects =
     match p.remote_url with
     | None -> no_remote := p :: !no_remote
     | Some url ->
-      (* Normalize URL: strip .git, convert SSH to common format *)
-      let norm = String.lowercase_ascii url in
-      let norm = if String.length norm > 4 &&
-        String.sub norm (String.length norm - 4) 4 = ".git"
-        then String.sub norm 0 (String.length norm - 4) else norm in
-      (* Normalize to github.com/user/repo form *)
-      let key =
-        (* Strip protocol prefix first *)
-        let stripped = List.fold_left (fun s prefix ->
-          if String.length s > String.length prefix &&
-             String.sub s 0 (String.length prefix) = prefix
-          then String.sub s (String.length prefix) (String.length s - String.length prefix)
-          else s
-        ) norm ["https://"; "http://"] in
-        (* Handle SSH format: git@github.com:user/repo *)
-        match String.split_on_char ':' stripped with
-        | [host; path] when not (String.contains host '/') ->
-          let host = match String.split_on_char '@' host with
-            | [_; h] -> h | _ -> host in
-          host ^ "/" ^ path
-        | _ -> stripped
-      in
+      let key = Option.value (remote_key url) ~default:(String.lowercase_ascii url) in
       match UrlMap.find_opt key !by_url with
       | None -> by_url := UrlMap.add key p !by_url
       | Some existing ->
@@ -183,6 +272,78 @@ let deduplicate projects =
 let discover ~base_directories =
   let raw = List.concat_map discover_in_directory base_directories in
   deduplicate raw
+
+let rec mkdir_p path =
+  if path = "" || path = Filename.dirname path then ()
+  else if Sys.file_exists path then ()
+  else begin
+    mkdir_p (Filename.dirname path);
+    Unix.mkdir path 0o755
+  end
+
+let rec rm_rf path =
+  match Unix.lstat path with
+  | exception Unix.Unix_error (ENOENT, _, _) -> ()
+  | { Unix.st_kind = Unix.S_DIR; _ } ->
+    Sys.readdir path
+    |> Array.iter (fun name -> rm_rf (Filename.concat path name));
+    Unix.rmdir path
+  | _ -> Unix.unlink path
+
+let run_capture ?cwd args =
+  let prefix = match cwd with
+    | Some dir -> "cd " ^ Filename.quote dir ^ " && "
+    | None -> "" in
+  let cmd = prefix ^ String.concat " " (List.map Filename.quote args) ^ " 2>&1" in
+  let ic = Unix.open_process_in cmd in
+  let output = Buffer.create 256 in
+  (try
+     while true do
+       Buffer.add_string output (input_line ic);
+       Buffer.add_char output '\n'
+     done
+   with End_of_file -> ());
+  match Unix.close_process_in ic with
+  | Unix.WEXITED 0 -> Ok (Buffer.contents output)
+  | _ -> Error (Buffer.contents output)
+
+let default_branch project =
+  let branch_exists name =
+    match run_capture
+      ["git"; "-C"; project.path; "show-ref"; "--verify"; "--quiet";
+       "refs/heads/" ^ name]
+    with
+    | Ok _ -> true
+    | Error _ -> false
+  in
+  let fallback () =
+    if branch_exists "main" then "main"
+    else if branch_exists "master" then "master"
+    else "HEAD"
+  in
+  let symbolic_ref ref_name =
+    match run_capture ["git"; "-C"; project.path; "symbolic-ref"; "--short"; ref_name] with
+    | Ok branch ->
+      let branch = String.trim branch in
+      if branch = "" then None else Some branch
+    | Error _ -> None
+  in
+  if project.is_bare then
+    match symbolic_ref "HEAD" with
+    | Some branch -> branch
+    | None -> fallback ()
+  else
+    match symbolic_ref "refs/remotes/origin/HEAD" with
+    | Some branch ->
+      let origin_prefix = "origin/" in
+      if String.length branch > String.length origin_prefix
+         && String.sub branch 0 (String.length origin_prefix) = origin_prefix
+      then
+        let local = String.sub branch (String.length origin_prefix)
+          (String.length branch - String.length origin_prefix) in
+        if branch_exists local then local else branch
+      else branch
+    | None -> fallback ()
 
 (** List worktrees for a project. Returns (branch_name, worktree_path) pairs. *)
 let list_worktrees project =
@@ -230,21 +391,99 @@ let list_worktrees project =
   in
   parse_groups lines None None []
 
-(** Find the default branch for a project (main or master). *)
-let default_branch project =
-  (* Try git symbolic-ref, then fall back to checking common names *)
-  let try_branch name =
-    let cmd = Printf.sprintf "git -C %s rev-parse --verify %s 2>/dev/null"
-      (Filename.quote project.path) (Filename.quote name) in
-    let ic = Unix.open_process_in cmd in
-    let _output = try input_line ic with End_of_file -> "" in
-    match Unix.close_process_in ic with
-    | Unix.WEXITED 0 -> true
-    | _ -> false
+let worktree_dir_name branch =
+  String.map (function '/' | '\\' | ':' -> '-' | c -> c) branch
+
+let unique_preserving_order items =
+  let rec aux seen acc = function
+    | [] -> List.rev acc
+    | x :: xs when List.mem x seen -> aux seen acc xs
+    | x :: xs -> aux (x :: seen) (x :: acc) xs
   in
-  if try_branch "main" then "main"
-  else if try_branch "master" then "master"
-  else "HEAD"
+  aux [] [] items
+
+let is_worktree_checkout_path path =
+  Sys.file_exists (Filename.concat path ".git")
+
+let default_worktree_path project =
+  let branch = default_branch project in
+  match
+    list_worktrees project
+    |> List.find_opt (fun (b, path) ->
+      b = branch && path <> project.path && Sys.file_exists path)
+  with
+  | Some (_, path) -> Ok path
+  | None ->
+    let candidates =
+      unique_preserving_order
+        [branch; worktree_dir_name branch; "master"; "main"]
+    in
+    match List.find_opt (fun name ->
+      let path = Filename.concat project.path name in
+      (try Sys.is_directory path with Sys_error _ -> false)
+      && is_worktree_checkout_path path
+    ) candidates with
+    | Some name -> Ok (Filename.concat project.path name)
+    | None ->
+      (match List.find_opt (fun (_branch, path) ->
+         path <> project.path && Sys.file_exists path) (list_worktrees project) with
+       | Some (_, path) -> Ok path
+       | None -> Error "bare repo has no default worktree")
+
+let ensure_default_worktree project =
+  match default_worktree_path project with
+  | Ok path -> Ok path
+  | Error _ ->
+    let branch = default_branch project in
+    let worktree_name =
+      worktree_dir_name branch
+    in
+    let worktree_path = Filename.concat project.path worktree_name in
+    match run_capture
+      ["git"; "-C"; project.path; "worktree"; "add"; worktree_path; branch]
+    with
+    | Ok _ -> Ok worktree_path
+    | Error err ->
+      Error (Printf.sprintf "failed to create default worktree for %s: %s"
+        branch err)
+
+type import_result = {
+  project : t;
+  worktree_path : string;
+}
+
+let import_github ~base_directory ?name url =
+  match validate_github_url url with
+  | Error _ as err -> err
+  | Ok url ->
+    let name =
+      match name with
+      | Some n -> validate_import_name n
+      | None ->
+        (match repo_name_from_github_url url with
+         | Some n -> validate_import_name n
+         | None -> Error "Could not derive a project name from the GitHub URL.")
+    in
+    match name with
+    | Error _ as err -> err
+    | Ok name ->
+      let target = Filename.concat base_directory name in
+      if Sys.file_exists target then
+        Error (Printf.sprintf "Target path already exists: %s" target)
+      else begin
+        mkdir_p base_directory;
+        match run_capture ["git"; "clone"; "--bare"; url; target] with
+        | Error err ->
+          if Sys.file_exists target then rm_rf target;
+          Error (Printf.sprintf "git clone failed: %s" err)
+        | Ok _ ->
+          let project = { name; path = target; is_bare = true; remote_url = Some url } in
+          match ensure_default_worktree project with
+          | Ok worktree_path -> Ok { project; worktree_path }
+          | Error err ->
+            if Sys.file_exists target then rm_rf target;
+            Error err
+      end
 
 (** Create a new worktree with a new branch for an agent session.
     Bases the branch on the project's default branch (main/master). *)

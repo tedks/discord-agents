@@ -123,6 +123,25 @@ TOOLS = [
         }
     },
     {
+        "name": "import_project",
+        "description": "Clone a GitHub HTTPS or SSH URL into the bot's project registry, create its Discord project channel, and make the channel session-ready. Reuses local git credentials; no token is accepted.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "GitHub repository URL, e.g. https://github.com/owner/repo.git or git@github.com:owner/repo.git"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Optional local project directory name under the configured base directory. Defaults to the GitHub repository name.",
+                    "maxLength": 100
+                }
+            },
+            "required": ["url"]
+        }
+    },
+    {
         "name": "list_sessions",
         "description": "List active bot sessions (Discord threads with agent sessions attached).",
         "inputSchema": {
@@ -391,6 +410,17 @@ def handle_tool_call(name, arguments):
                  + (" [bare]" if p.get("is_bare") else "")
                  for i, p in enumerate(projects)]
         return "\n".join(lines) if lines else "No projects found."
+
+    elif name == "import_project":
+        result = control_request("import_project", arguments, timeout=300)
+        if "error" in result:
+            return result["error"]
+        pname = result.get("project_name", "")
+        cid = result.get("channel_id", "")
+        wd = result.get("working_dir", "")
+        existing = result.get("existing", False)
+        action = "already existed" if existing else "imported"
+        return f"Project **{pname}** {action} in <#{cid}>.\nWorking in: `{wd}`"
 
     elif name == "list_sessions":
         result = control_request("list_sessions")

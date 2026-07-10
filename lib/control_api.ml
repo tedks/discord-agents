@@ -262,6 +262,29 @@ let handle_list_sessions (bot : Bot.t) =
   ) entries in
   ok_response [("sessions", `List sessions)]
 
+let handle_import_project (bot : Bot.t) params =
+  let open Yojson.Safe.Util in
+  let params = match params with Some p -> p | None ->
+    failwith "missing params" in
+  let url = match params |> member "url" |> to_string_option with
+    | Some url -> url
+    | None -> failwith "missing url" in
+  let name = params |> member "name" |> to_string_option in
+  match Bot.import_project bot ~url ?name () with
+  | Error err -> error_response err
+  | Ok result ->
+    let project = result.Bot.imported_project in
+    ok_response [
+      ("project_name", `String project.name);
+      ("project_path", `String project.path);
+      ("is_bare", `Bool project.is_bare);
+      ("remote_url", match project.remote_url with
+        | Some url -> `String url | None -> `Null);
+      ("channel_id", `String result.imported_channel_id);
+      ("working_dir", `String result.imported_working_dir);
+      ("existing", `Bool result.imported_existing);
+    ]
+
 (** Extract [hours] from the optional params object, defaulting to 24. *)
 let hours_param params =
   match params with
@@ -1190,6 +1213,7 @@ let dispatch (bot : Bot.t) method_ params =
     | "health" -> handle_health bot
     | "list_projects" -> handle_list_projects bot
     | "list_sessions" -> handle_list_sessions bot
+    | "import_project" -> handle_import_project bot params
     | "list_claude_sessions" -> handle_list_claude_sessions bot params
     | "list_codex_sessions" -> handle_list_codex_sessions bot params
     | "list_gemini_sessions" -> handle_list_gemini_sessions bot params
