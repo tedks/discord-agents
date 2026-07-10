@@ -768,6 +768,335 @@ let handle_rescue_agent (bot : Bot.t) params =
          ("busy_count", `Int rotation.Bot.busy_count);
        ])
 
+let session_not_found_response =
+  error_response "Session not found."
+
+let model_field (session : Session_store.session) =
+  match session.model with
+  | Some model -> ("model", `String model)
+  | None -> ("model", `Null)
+
+let effort_field (session : Session_store.session) =
+  match session.reasoning_effort with
+  | Some effort ->
+    ("effort", `String (Config.string_of_reasoning_effort effort))
+  | None -> ("effort", `Null)
+
+let goal_json (goal : Session_store.session_goal) =
+  `Assoc ([
+    ("objective", `String goal.objective);
+    ("status", `String (Session_store.string_of_goal_status goal.status));
+  ] @
+  match goal.token_budget with
+  | Some n -> [("token_budget", `Int n)]
+  | None -> [])
+
+let goal_field (session : Session_store.session) =
+  match session.goal with
+  | Some goal -> ("goal", goal_json goal)
+  | None -> ("goal", `Null)
+
+let login_help_json agent =
+  let command, note =
+    match agent with
+    | Config.Claude ->
+      "claude auth login",
+      "Run this on the host where discord-agents runs. If your Claude CLI uses a different auth command, run that equivalent login locally."
+    | Config.Codex ->
+      "codex login",
+      "Run this on the host where discord-agents runs. For trusted automation, CODEX_ACCESS_TOKEN can be piped to `codex login --with-access-token`."
+    | Config.Gemini ->
+      "gcloud auth application-default login",
+      "Run this on the host where discord-agents runs. Gemini CLI does not expose a non-interactive login command in this install; if your Gemini setup uses another provider, run that provider's local login flow."
+  in
+  `Assoc [
+    ("agent", `String (Config.string_of_agent_kind agent));
+    ("command", `String command);
+    ("note", `String note);
+  ]
+
+let string_list_json values =
+  `List (List.map (fun value -> `String value) values)
+
+let clear_values_json =
+  `List [`String "default"; `String ""; `Null]
+
+let effort_values_for_agent = function
+  | Config.Claude -> ["low"; "medium"; "high"; "xhigh"; "max"]
+  | Config.Codex -> ["low"; "medium"; "high"; "xhigh"]
+  | Config.Gemini -> []
+
+let configuration_options_json agent =
+  `Assoc [
+    ("agent_kind", `Assoc [
+      ("values", string_list_json ["claude"; "codex"; "gemini"]);
+      ("current_thread_value", `String (Config.string_of_agent_kind agent));
+      ("mutable_for_current_session", `Bool false);
+      ("set_with", `String "start_session agent for new sessions, or Discord session-agent outside this MCP config surface");
+    ]);
+    ("model", `Assoc [
+      ("values", `String "any non-empty model string accepted by the selected agent CLI");
+      ("max_bytes", `Int 200);
+      ("clear_values", clear_values_json);
+    ]);
+    ("effort", `Assoc [
+      ("supported", `Bool (effort_values_for_agent agent <> []));
+      ("values", string_list_json (effort_values_for_agent agent));
+      ("clear_values", clear_values_json);
+      ("notes", `String (match agent with
+        | Config.Claude -> "Claude supports low, medium, high, xhigh, and max."
+        | Config.Codex -> "Codex supports low, medium, high, and xhigh here; max is Claude-only."
+        | Config.Gemini -> "Gemini CLI does not expose a reasoning effort flag in this integration."));
+    ]);
+    ("goal", `Assoc [
+      ("supported", `Bool (Config.equal_agent_kind agent Config.Codex));
+      ("objective", `Assoc [
+        ("values", `String "any non-empty string");
+        ("max_bytes", `Int 4000);
+      ]);
+      ("status_values", string_list_json
+        ["active"; "paused"; "blocked"; "usageLimited"; "budgetLimited"; "complete"]);
+      ("token_budget", `Assoc [
+        ("values", `String "positive integer or null");
+      ]);
+      ("clear_values", `String "clear=true");
+      ("mechanism", `String (match agent with
+        | Config.Codex -> "bot_prompt_context; native /goal requires codex app-server"
+        | _ -> "unsupported"));
+    ]);
+    ("login", `Assoc [
+      ("repair_tool", `String "start_login_flow");
+      ("agent_values", string_list_json ["claude"; "codex"; "gemini"]);
+    ]);
+  ]
+
+let command_briefing session =
+  let effort_text =
+    if effort_values_for_agent session.Session_store.agent_kind = [] then
+      "Effort is unsupported for this thread's agent."
+    else
+      "Set effort with set_effort."
+  in
+  Printf.sprintf
+    "Single command: get_agent_config {\"thread_id\":\"%s\"}. Agent kind is read-only here after session creation. Set model with set_model. %s Set or update Codex goals with set_goal, and get login repair instructions with start_login_flow."
+    session.Session_store.thread_id effort_text
+
+let handle_get_agent_config (bot : Bot.t) params =
+  let open Yojson.Safe.Util in
+  let params = match params with Some p -> p | None ->
+    failwith "missing params" in
+  let thread_id = params |> member "thread_id" |> to_string in
+  match Session_store.find_opt bot.sessions ~thread_id with
+  | None -> session_not_found_response
+  | Some session ->
+    ok_response [
+      ("thread_id", `String session.thread_id);
+      ("agent_kind", `String (Config.string_of_agent_kind session.agent_kind));
+      model_field session;
+      effort_field session;
+      goal_field session;
+      ("login_help", login_help_json session.agent_kind);
+      ("goal_mechanism",
+       `String (match session.agent_kind with
+         | Config.Codex -> "bot_prompt_context; native /goal requires codex app-server"
+         | _ -> "unsupported"));
+      ("configuration_options", configuration_options_json session.agent_kind);
+      ("command_briefing", `String (command_briefing session));
+    ]
+
+let string_param_opt params name =
+  let open Yojson.Safe.Util in
+  match params |> member name with
+  | `Null -> None
+  | json -> to_string_option json
+
+let json_field params name =
+  match params with
+  | `Assoc fields -> List.assoc_opt name fields
+  | _ -> None
+
+let handle_set_model (bot : Bot.t) params =
+  let open Yojson.Safe.Util in
+  let params = match params with Some p -> p | None ->
+    failwith "missing params" in
+  let thread_id = params |> member "thread_id" |> to_string in
+  match Session_store.find_opt bot.sessions ~thread_id with
+  | None -> session_not_found_response
+  | Some session ->
+    let model =
+      match json_field params "model" with
+      | None ->
+        failwith "model is required; use null, empty string, or default to clear"
+      | Some `Null -> None
+      | Some (`String s) ->
+        let s = String.trim s in
+        if s = "" || String.equal (String.lowercase_ascii s) "default"
+        then None
+        else Some (Resource.truncate_utf8 ~max_bytes:200 s)
+      | Some _ -> failwith "model must be a string or null"
+    in
+    (match Session_store.set_model bot.sessions session model with
+     | Error err -> error_response err
+     | Ok () ->
+       ok_response [
+         ("thread_id", `String thread_id);
+         ("agent_kind", `String (Config.string_of_agent_kind session.agent_kind));
+         model_field session;
+       ])
+
+let effort_supported_for_agent agent effort =
+  match agent, effort with
+  | Config.Gemini, Some _ ->
+    Error "Gemini CLI does not expose a reasoning effort flag in this integration."
+  | Config.Codex, Some Config.Max ->
+    Error "Codex reasoning effort supports low, medium, high, and xhigh here; max is Claude-only."
+  | _ -> Ok ()
+
+let handle_set_effort (bot : Bot.t) params =
+  let open Yojson.Safe.Util in
+  let params = match params with Some p -> p | None ->
+    failwith "missing params" in
+  let thread_id = params |> member "thread_id" |> to_string in
+  match Session_store.find_opt bot.sessions ~thread_id with
+  | None -> session_not_found_response
+  | Some session ->
+    let effort =
+      match json_field params "effort" with
+      | None ->
+        failwith "effort is required; use null, empty string, or default to clear"
+      | Some `Null -> None
+      | Some (`String s) ->
+        let s = String.trim (String.lowercase_ascii s) in
+        if s = "" || String.equal s "default" then None
+        else
+          (match Config.reasoning_effort_of_string s with
+           | Ok effort -> Some effort
+           | Error msg -> failwith msg)
+      | Some _ -> failwith "effort must be a string or null"
+    in
+    (match effort_supported_for_agent session.agent_kind effort with
+     | Error err -> error_response err
+     | Ok () ->
+       (match Session_store.set_reasoning_effort bot.sessions session effort with
+        | Error err -> error_response err
+        | Ok () ->
+          ok_response [
+            ("thread_id", `String thread_id);
+            ("agent_kind", `String (Config.string_of_agent_kind session.agent_kind));
+            effort_field session;
+          ]))
+
+let handle_set_goal (bot : Bot.t) params =
+  let open Yojson.Safe.Util in
+  let params = match params with Some p -> p | None ->
+    failwith "missing params" in
+  let thread_id = params |> member "thread_id" |> to_string in
+  match Session_store.find_opt bot.sessions ~thread_id with
+  | None -> session_not_found_response
+  | Some session ->
+    if not (Config.equal_agent_kind session.agent_kind Config.Codex) then
+      error_response
+        "Goal config is currently supported only for Codex sessions."
+    else
+      let clear =
+        match json_field params "clear" with
+        | Some (`Bool b) -> b
+        | _ -> false
+      in
+      let parse_status = function
+        | None | Some `Null -> None
+        | Some (`String s) ->
+          let s = String.trim s in
+          if s = "" then None
+          else
+            (match Session_store.goal_status_of_string s with
+             | Ok status -> Some status
+             | Error msg -> failwith msg)
+        | Some _ -> failwith "status must be a string"
+      in
+      let parse_token_budget current = function
+        | None -> current
+        | Some `Null -> None
+        | Some (`Int n) when n > 0 -> Some n
+        | Some (`Intlit s) ->
+          (match int_of_string_opt s with
+           | Some n when n > 0 -> Some n
+           | _ -> failwith "token_budget must be positive")
+        | Some (`Int _) -> failwith "token_budget must be positive"
+        | Some _ -> failwith "token_budget must be a positive integer or null"
+      in
+      let goal =
+        if clear then None
+        else
+          let current = session.goal in
+          let objective =
+            match json_field params "objective", current with
+            | Some (`String objective), _ ->
+              let objective = String.trim objective in
+              if objective = "" then
+                failwith "objective must be non-empty"
+              else
+                Resource.truncate_utf8 ~max_bytes:4000 objective
+            | Some `Null, Some goal
+            | None, Some goal -> goal.objective
+            | Some `Null, None
+            | None, None ->
+              failwith "objective is required when setting a new goal"
+            | Some _, _ -> failwith "objective must be a string"
+          in
+          let status =
+            match parse_status (json_field params "status"), current with
+            | Some status, _ -> status
+            | None, Some goal -> goal.status
+            | None, None -> Session_store.Goal_active
+          in
+          let current_budget = Option.bind current (fun goal ->
+            goal.token_budget)
+          in
+          let token_budget = parse_token_budget current_budget
+            (json_field params "token_budget") in
+          Some { Session_store.objective = objective; status; token_budget }
+      in
+      (match Session_store.set_goal bot.sessions session goal with
+       | Error err -> error_response err
+       | Ok () ->
+         ok_response [
+           ("thread_id", `String thread_id);
+           goal_field session;
+           ("goal_mechanism",
+            `String "bot_prompt_context; native /goal requires codex app-server");
+         ])
+
+let handle_start_login_flow (bot : Bot.t) params =
+  let open Yojson.Safe.Util in
+  let resolve_requested_agent () =
+    match params with
+    | Some p ->
+      (match p |> member "thread_id" |> to_string_option with
+       | Some thread_id ->
+         (match Session_store.find_opt bot.sessions ~thread_id with
+          | Some session -> Some session.agent_kind
+          | None -> raise Not_found)
+       | None ->
+         (match p |> member "agent" |> to_string_option with
+          | Some s ->
+            (match Config.agent_kind_of_string (String.lowercase_ascii s) with
+             | Ok agent -> Some agent
+             | Error msg -> failwith msg)
+          | None -> None))
+    | None -> None
+  in
+  match resolve_requested_agent () with
+  | exception Not_found -> session_not_found_response
+  | requested_agent ->
+    let agent = Option.value requested_agent
+      ~default:(Bot.effective_top_level_agent bot) in
+    ok_response [
+      ("login", login_help_json agent);
+      ("message",
+       `String "Login is handled by the local agent CLI, not by discord-agents OAuth. Run the command on the bot host, then retry the session turn.");
+    ]
+
 let handle_stop_session (bot : Bot.t) params =
   let open Yojson.Safe.Util in
   let params = match params with Some p -> p | None ->
@@ -869,6 +1198,11 @@ let dispatch (bot : Bot.t) method_ params =
     | "stop_session" -> handle_stop_session bot params
     | "default_agent" -> handle_default_agent bot params
     | "rescue_agent" -> handle_rescue_agent bot params
+    | "get_agent_config" -> handle_get_agent_config bot params
+    | "set_model" -> handle_set_model bot params
+    | "set_effort" -> handle_set_effort bot params
+    | "set_goal" -> handle_set_goal bot params
+    | "start_login_flow" -> handle_start_login_flow bot params
     | "restart" -> handle_restart bot
     | "rename_thread" -> handle_rename_thread bot params
     | "cleanup_channels" -> handle_cleanup_channels bot
@@ -908,7 +1242,7 @@ let handle_connection bot flow =
       Logs.warn (fun m -> m "control_api: slow request method=%s elapsed=%.3fs"
         !method_name elapsed)
 
-(* ── Server ────────────────────────────────────────────────────── *)
+(* ── Server ────────────────────────────────────────────────────────── *)
 
 let start ~(bot : Bot.t) ~sw ~(env : Eio_unix.Stdenv.base) =
   let path = socket_path () in

@@ -311,6 +311,61 @@ let test_active_run_roundtrips_through_backup () =
       ~pid:4242
       ~start_ticks:123456789L)
 
+let test_session_agent_config_roundtrips () =
+  with_tmp_home (fun _home ->
+    let store = Discord_agents.Session_store.create () in
+    let session = make_session () in
+    Discord_agents.Session_store.add store ~thread_id:"control" session;
+    (match Discord_agents.Session_store.set_model
+             store session (Some "gpt-5.5") with
+     | Ok () -> ()
+     | Error err -> Alcotest.failf "set_model failed: %s" err);
+    (match Discord_agents.Session_store.set_reasoning_effort
+             store session (Some Discord_agents.Config.Xhigh) with
+     | Ok () -> ()
+     | Error err -> Alcotest.failf "set_reasoning_effort failed: %s" err);
+    let goal = {
+      Discord_agents.Session_store.objective = "Finish issue 73";
+      status = Discord_agents.Session_store.Goal_active;
+      token_budget = Some 1234;
+    } in
+    (match Discord_agents.Session_store.set_goal store session (Some goal) with
+     | Ok () -> ()
+     | Error err -> Alcotest.failf "set_goal failed: %s" err);
+    let reloaded = Discord_agents.Session_store.create () in
+    let recovered = find_control_session reloaded in
+    Alcotest.(check (option string)) "model persisted"
+      (Some "gpt-5.5")
+      recovered.Discord_agents.Session_store.model;
+    Alcotest.(check (option string)) "effort persisted"
+      (Some "xhigh")
+      (Option.map Discord_agents.Config.string_of_reasoning_effort
+         recovered.Discord_agents.Session_store.reasoning_effort);
+    match recovered.Discord_agents.Session_store.goal with
+    | None -> Alcotest.fail "goal missing after reload"
+    | Some recovered_goal ->
+      Alcotest.(check string) "goal objective"
+        "Finish issue 73" recovered_goal.objective;
+      Alcotest.(check string) "goal status"
+        "active"
+        (Discord_agents.Session_store.string_of_goal_status
+           recovered_goal.status);
+      Alcotest.(check (option int)) "goal token budget"
+        (Some 1234) recovered_goal.token_budget)
+
+let test_invalid_optional_agent_config_does_not_abort_load () =
+  with_tmp_home (fun home ->
+    write_primary_sessions home
+      {|[{"thread_id":"control","project_name":"control","working_dir":"/tmp/project","agent_kind":"claude","session_id":"session-1","message_count":0,"model":42,"reasoning_effort":"future-effort","goal":{"objective":"Finish","status":"future-status","token_budget":1234}}]|};
+    let store = Discord_agents.Session_store.create () in
+    let recovered = find_control_session store in
+    Alcotest.(check (option string)) "invalid model ignored"
+      None recovered.Discord_agents.Session_store.model;
+    Alcotest.(check bool) "invalid effort ignored"
+      true (recovered.Discord_agents.Session_store.reasoning_effort = None);
+    Alcotest.(check bool) "invalid goal ignored"
+      true (recovered.Discord_agents.Session_store.goal = None))
+
 let test_save_refuses_read_only_preflight () =
   with_tmp_home (fun home ->
     let store = Discord_agents.Session_store.create () in
@@ -364,6 +419,10 @@ let () =
         test_load_ignores_stale_backup_when_primary_is_newer_and_corrupt;
       Alcotest.test_case "active run roundtrips through backup" `Quick
         test_active_run_roundtrips_through_backup;
+      Alcotest.test_case "session agent config roundtrips" `Quick
+        test_session_agent_config_roundtrips;
+      Alcotest.test_case "invalid optional agent config does not abort load" `Quick
+        test_invalid_optional_agent_config_does_not_abort_load;
       Alcotest.test_case "save refuses read-only preflight" `Quick
         test_save_refuses_read_only_preflight;
     ]);

@@ -271,6 +271,9 @@ let fresh_session_like (session : Session_store.session)
     ~session_id:(Resource.generate_uuid ())
     ~thread_id:session.thread_id
     ~system_prompt:session.system_prompt
+    ~model:session.model
+    ~reasoning_effort:session.reasoning_effort
+    ~goal:session.goal
     ~initial_prompt:None ()
 
 (** Drop scroll-state entries for threads that no longer have an active

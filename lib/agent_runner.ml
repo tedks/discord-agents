@@ -80,6 +80,18 @@ let build_context_header ~(session : Session_store.session) ~author_name
     channel_type
     (sanitize_context_value author_name)
 
+let goal_context (session : Session_store.session) =
+  match session.goal with
+  | None -> None
+  | Some goal ->
+    let status = Session_store.string_of_goal_status goal.status in
+    let budget = match goal.token_budget with
+      | Some n -> Printf.sprintf "\nToken budget: %d" n
+      | None -> ""
+    in
+    Some (Printf.sprintf "Status: %s%s\nObjective: %s"
+      status budget goal.objective)
+
 let prompt_preview prompt =
   if String.length prompt > 80 then
     Resource.truncate_utf8 ~max_bytes:80 prompt ^ "..."
@@ -422,6 +434,9 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
           ~session_id_confirmed:session.session_id_confirmed
           ~message_count:session.message_count
           ?system_prompt:session.system_prompt
+          ~model:session.model
+          ~reasoning_effort:session.reasoning_effort
+          ~goal_context:(goal_context session)
           ~prompt:context_prompt ~on_event ?on_pid ()) in
   (* All result-path messages route through here so they get split at
      Discord's 2000-char limit. Codex's turn.failed payloads can be

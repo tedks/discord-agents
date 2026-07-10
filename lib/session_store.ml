@@ -20,6 +20,20 @@ type pending_agent_change = {
   origin : pending_agent_origin;
 }
 
+type goal_status =
+  | Goal_active
+  | Goal_paused
+  | Goal_blocked
+  | Goal_usage_limited
+  | Goal_budget_limited
+  | Goal_complete
+
+type session_goal = {
+  objective : string;
+  status : goal_status;
+  token_budget : int option;
+}
+
 type child_process_identity = Agent_checkpoint.child_process_identity
 type active_run = Agent_checkpoint.any
 
@@ -42,6 +56,94 @@ let pending_agent_origin_of_json = function
            origin);
        Default_rotation)
   | _ -> Default_rotation
+
+let string_of_goal_status = function
+  | Goal_active -> "active"
+  | Goal_paused -> "paused"
+  | Goal_blocked -> "blocked"
+  | Goal_usage_limited -> "usageLimited"
+  | Goal_budget_limited -> "budgetLimited"
+  | Goal_complete -> "complete"
+
+let goal_status_of_string = function
+  | "active" -> Ok Goal_active
+  | "paused" -> Ok Goal_paused
+  | "blocked" -> Ok Goal_blocked
+  | "usageLimited" | "usage_limited" | "usage-limited" ->
+    Ok Goal_usage_limited
+  | "budgetLimited" | "budget_limited" | "budget-limited" ->
+    Ok Goal_budget_limited
+  | "complete" -> Ok Goal_complete
+  | s -> Error (Printf.sprintf "unknown goal status: %s" s)
+
+let goal_status_of_json = function
+  | `String s ->
+    (match goal_status_of_string s with
+     | Ok status -> status
+     | Error msg -> failwith msg)
+  | _ -> failwith "goal.status: expected string"
+
+let goal_to_json goal =
+  `Assoc ([
+    ("objective", `String goal.objective);
+    ("status", `String (string_of_goal_status goal.status));
+  ] @
+  match goal.token_budget with
+  | Some n -> [("token_budget", `Int n)]
+  | None -> [])
+
+let goal_of_json = function
+  | `Assoc fields ->
+    let objective =
+      match List.assoc_opt "objective" fields with
+      | Some (`String s) -> s
+      | Some _ -> failwith "goal.objective: expected string"
+      | None -> failwith "goal.objective: missing"
+    in
+    let status =
+      match List.assoc_opt "status" fields with
+      | Some json -> goal_status_of_json json
+      | None -> Goal_active
+    in
+    let token_budget =
+      match List.assoc_opt "token_budget" fields with
+      | Some (`Int n) -> Some n
+      | Some `Null | None -> None
+      | Some _ -> failwith "goal.token_budget: expected int or null"
+    in
+    { objective; status; token_budget }
+  | _ -> failwith "goal: expected object"
+
+let optional_string_field ~thread_id ~field = function
+  | `Null -> None
+  | `String s -> Some s
+  | _ ->
+    Logs.warn (fun m ->
+      m "session_store: ignoring invalid optional %s for session %s"
+        field thread_id);
+    None
+
+let optional_reasoning_effort_field ~thread_id = function
+  | `Null -> None
+  | json ->
+    (match Config.reasoning_effort_of_yojson json with
+     | effort -> Some effort
+     | exception exn ->
+       Logs.warn (fun m ->
+         m "session_store: ignoring invalid reasoning_effort for session %s: %s"
+           thread_id (Printexc.to_string exn));
+       None)
+
+let optional_goal_field ~thread_id = function
+  | `Null -> None
+  | json ->
+    (match goal_of_json json with
+     | goal -> Some goal
+     | exception exn ->
+       Logs.warn (fun m ->
+         m "session_store: ignoring invalid goal for session %s: %s"
+           thread_id (Printexc.to_string exn));
+       None)
 
 type session = {
   project_name : string;
@@ -66,6 +168,9 @@ type session = {
   mutable session_id_confirmed : bool;
   thread_id : Discord_types.channel_id;  (* threads are channels in Discord *)
   system_prompt : string option;
+  mutable model : string option;
+  mutable reasoning_effort : Config.reasoning_effort option;
+  mutable goal : session_goal option;
   mutable message_count : int;
   mutable processing : bool;
   pending_queue : pending_message Queue.t;
@@ -109,6 +214,16 @@ let sessions_to_json sessions =
          | None -> [])
       @ (match s.system_prompt with
          | Some sp -> [("system_prompt", `String sp)]
+         | None -> [])
+      @ (match s.model with
+         | Some model -> [("model", `String model)]
+         | None -> [])
+      @ (match s.reasoning_effort with
+         | Some effort ->
+           [("reasoning_effort", Config.yojson_of_reasoning_effort effort)]
+         | None -> [])
+      @ (match s.goal with
+         | Some goal -> [("goal", goal_to_json goal)]
          | None -> [])
       @ (match s.pending_agent_change with
          | Some pending ->
@@ -196,6 +311,12 @@ let sessions_of_json json =
       session_id_confirmed;
       thread_id;
       system_prompt = j |> member "system_prompt" |> to_string_option;
+      model = optional_string_field ~thread_id ~field:"model"
+        (j |> member "model");
+      reasoning_effort =
+        optional_reasoning_effort_field ~thread_id
+          (j |> member "reasoning_effort");
+      goal = optional_goal_field ~thread_id (j |> member "goal");
       message_count = j |> member "message_count" |> to_int;
       processing = false;
       pending_queue = Queue.create ();
@@ -361,6 +482,9 @@ let make_session ~project_name ~working_dir ~agent_kind ~session_id
     ~thread_id ~system_prompt ~initial_prompt
     ?(message_count = 0)
     ?(session_override_kind = None)
+    ?(model = None)
+    ?(reasoning_effort = None)
+    ?(goal = None)
     ?(pending_agent_change = None)
     ?(active_run = None)
     ?session_id_confirmed () =
@@ -369,7 +493,7 @@ let make_session ~project_name ~working_dir ~agent_kind ~session_id
     | None -> Config.caller_pinned_session_id agent_kind
   in
   { project_name; working_dir; agent_kind; session_override_kind; session_id;
-    session_id_confirmed; thread_id; system_prompt;
+    session_id_confirmed; thread_id; system_prompt; model; reasoning_effort; goal;
     message_count; processing = false;
     pending_queue = Queue.create (); pending_agent_change; initial_prompt;
     active_run; child_pid = None; stop_requested = false }
@@ -445,6 +569,44 @@ let set_session_override_kind t session session_override_kind =
     session.session_override_kind <- session_override_kind;
     persist_or_rollback
       (fun () -> session.session_override_kind <- prior)
+      (fun () -> save t)
+  end
+
+let set_model t session model =
+  let prior = session.model in
+  if Option.equal String.equal prior model then
+    Ok ()
+  else begin
+    session.model <- model;
+    persist_or_rollback
+      (fun () -> session.model <- prior)
+      (fun () -> save t)
+  end
+
+let set_reasoning_effort t session reasoning_effort =
+  let prior = session.reasoning_effort in
+  if Option.equal Config.equal_reasoning_effort prior reasoning_effort then
+    Ok ()
+  else begin
+    session.reasoning_effort <- reasoning_effort;
+    persist_or_rollback
+      (fun () -> session.reasoning_effort <- prior)
+      (fun () -> save t)
+  end
+
+let equal_goal a b =
+  String.equal a.objective b.objective
+  && a.status = b.status
+  && Option.equal Int.equal a.token_budget b.token_budget
+
+let set_goal t session goal =
+  let prior = session.goal in
+  if Option.equal equal_goal prior goal then
+    Ok ()
+  else begin
+    session.goal <- goal;
+    persist_or_rollback
+      (fun () -> session.goal <- prior)
       (fun () -> save t)
   end
 
