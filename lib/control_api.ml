@@ -831,6 +831,8 @@ let configuration_options_json agent =
     ("agent_kind", `Assoc [
       ("values", string_list_json ["claude"; "codex"; "gemini"]);
       ("current_thread_value", `String (Config.string_of_agent_kind agent));
+      ("mutable_for_current_session", `Bool false);
+      ("set_with", `String "start_session agent for new sessions, or Discord session-agent outside this MCP config surface");
     ]);
     ("model", `Assoc [
       ("values", `String "any non-empty model string accepted by the selected agent CLI");
@@ -869,9 +871,15 @@ let configuration_options_json agent =
   ]
 
 let command_briefing session =
+  let effort_text =
+    if effort_values_for_agent session.Session_store.agent_kind = [] then
+      "Effort is unsupported for this thread's agent."
+    else
+      "Set effort with set_effort."
+  in
   Printf.sprintf
-    "Single command: get_agent_config {\"thread_id\":\"%s\"}. Set model with set_model, set effort with set_effort, set or update Codex goals with set_goal, and get login repair instructions with start_login_flow."
-    session.Session_store.thread_id
+    "Single command: get_agent_config {\"thread_id\":\"%s\"}. Agent kind is read-only here after session creation. Set model with set_model. %s Set or update Codex goals with set_goal, and get login repair instructions with start_login_flow."
+    session.Session_store.thread_id effort_text
 
 let handle_get_agent_config (bot : Bot.t) params =
   let open Yojson.Safe.Util in

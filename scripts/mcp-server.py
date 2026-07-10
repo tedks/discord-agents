@@ -582,7 +582,11 @@ def handle_tool_call(name, arguments):
             lines.append("Potential values:")
             agent_options = options.get("agent_kind") or {}
             if agent_options.get("values"):
-                lines.append(f"- Agent kind: {render_values(agent_options.get('values'))}")
+                set_with = agent_options.get("set_with", "chosen when the session starts")
+                lines.append(
+                    f"- Agent kind: {render_values(agent_options.get('values'))}; "
+                    f"current thread is read-only here ({set_with})"
+                )
             model_options = options.get("model") or {}
             if model_options:
                 model_values = model_options.get("values", "any non-empty model string")
