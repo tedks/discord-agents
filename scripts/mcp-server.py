@@ -216,7 +216,7 @@ TOOLS = [
     },
     {
         "name": "get_agent_config",
-        "description": "Show the per-session agent configuration for a Discord thread: agent kind, model override, effort override, goal, and login repair hint.",
+        "description": "Show the per-session agent configuration for a Discord thread: current values, every supported config value, a single-command briefing, and login repair hint.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -540,6 +540,20 @@ def handle_tool_call(name, arguments):
         result = control_request("get_agent_config", arguments)
         if "error" in result:
             return result["error"]
+
+        def render_values(values):
+            if isinstance(values, list):
+                rendered = []
+                for value in values:
+                    if value is None:
+                        rendered.append("`null`")
+                    elif value == "":
+                        rendered.append('`""`')
+                    else:
+                        rendered.append(f"`{value}`")
+                return ", ".join(rendered)
+            return str(values)
+
         model = result.get("model") or "default"
         effort = result.get("effort") or "default"
         goal = result.get("goal")
@@ -562,6 +576,47 @@ def handle_tool_call(name, arguments):
         mechanism = result.get("goal_mechanism")
         if mechanism:
             lines.append(f"Goal mechanism: {mechanism}.")
+        options = result.get("configuration_options") or {}
+        if options:
+            lines.append("")
+            lines.append("Potential values:")
+            agent_options = options.get("agent_kind") or {}
+            if agent_options.get("values"):
+                lines.append(f"- Agent kind: {render_values(agent_options.get('values'))}")
+            model_options = options.get("model") or {}
+            if model_options:
+                model_values = model_options.get("values", "any non-empty model string")
+                clear_values = render_values(model_options.get("clear_values", []))
+                lines.append(
+                    f"- Model: {model_values}; clear with {clear_values}; "
+                    f"max {model_options.get('max_bytes', 200)} bytes"
+                )
+            effort_options = options.get("effort") or {}
+            if effort_options:
+                if effort_options.get("supported"):
+                    lines.append(
+                        f"- Effort: {render_values(effort_options.get('values', []))}; "
+                        f"clear with {render_values(effort_options.get('clear_values', []))}"
+                    )
+                else:
+                    lines.append(f"- Effort: unsupported for `{result.get('agent_kind', '')}`")
+            goal_options = options.get("goal") or {}
+            if goal_options:
+                if goal_options.get("supported"):
+                    objective = goal_options.get("objective") or {}
+                    lines.append(
+                        f"- Goal: objective is {objective.get('values', 'any non-empty string')} "
+                        f"(max {objective.get('max_bytes', 4000)} bytes); "
+                        f"status {render_values(goal_options.get('status_values', []))}; "
+                        f"token_budget {goal_options.get('token_budget', {}).get('values', 'positive integer or null')}; "
+                        f"clear with `{goal_options.get('clear_values', 'clear=true')}`"
+                    )
+                else:
+                    lines.append("- Goal: unsupported for this agent")
+        briefing = result.get("command_briefing")
+        if briefing:
+            lines.append("")
+            lines.append(f"Briefing: {briefing}")
         return "\n".join(lines)
 
     elif name == "set_model":

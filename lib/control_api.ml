@@ -815,6 +815,64 @@ let login_help_json agent =
     ("note", `String note);
   ]
 
+let string_list_json values =
+  `List (List.map (fun value -> `String value) values)
+
+let clear_values_json =
+  `List [`String "default"; `String ""; `Null]
+
+let effort_values_for_agent = function
+  | Config.Claude -> ["low"; "medium"; "high"; "xhigh"; "max"]
+  | Config.Codex -> ["low"; "medium"; "high"; "xhigh"]
+  | Config.Gemini -> []
+
+let configuration_options_json agent =
+  `Assoc [
+    ("agent_kind", `Assoc [
+      ("values", string_list_json ["claude"; "codex"; "gemini"]);
+      ("current_thread_value", `String (Config.string_of_agent_kind agent));
+    ]);
+    ("model", `Assoc [
+      ("values", `String "any non-empty model string accepted by the selected agent CLI");
+      ("max_bytes", `Int 200);
+      ("clear_values", clear_values_json);
+    ]);
+    ("effort", `Assoc [
+      ("supported", `Bool (effort_values_for_agent agent <> []));
+      ("values", string_list_json (effort_values_for_agent agent));
+      ("clear_values", clear_values_json);
+      ("notes", `String (match agent with
+        | Config.Claude -> "Claude supports low, medium, high, xhigh, and max."
+        | Config.Codex -> "Codex supports low, medium, high, and xhigh here; max is Claude-only."
+        | Config.Gemini -> "Gemini CLI does not expose a reasoning effort flag in this integration."));
+    ]);
+    ("goal", `Assoc [
+      ("supported", `Bool (Config.equal_agent_kind agent Config.Codex));
+      ("objective", `Assoc [
+        ("values", `String "any non-empty string");
+        ("max_bytes", `Int 4000);
+      ]);
+      ("status_values", string_list_json
+        ["active"; "paused"; "blocked"; "usageLimited"; "budgetLimited"; "complete"]);
+      ("token_budget", `Assoc [
+        ("values", `String "positive integer or null");
+      ]);
+      ("clear_values", `String "clear=true");
+      ("mechanism", `String (match agent with
+        | Config.Codex -> "bot_prompt_context; native /goal requires codex app-server"
+        | _ -> "unsupported"));
+    ]);
+    ("login", `Assoc [
+      ("repair_tool", `String "start_login_flow");
+      ("agent_values", string_list_json ["claude"; "codex"; "gemini"]);
+    ]);
+  ]
+
+let command_briefing session =
+  Printf.sprintf
+    "Single command: get_agent_config {\"thread_id\":\"%s\"}. Set model with set_model, set effort with set_effort, set or update Codex goals with set_goal, and get login repair instructions with start_login_flow."
+    session.Session_store.thread_id
+
 let handle_get_agent_config (bot : Bot.t) params =
   let open Yojson.Safe.Util in
   let params = match params with Some p -> p | None ->
@@ -834,6 +892,8 @@ let handle_get_agent_config (bot : Bot.t) params =
        `String (match session.agent_kind with
          | Config.Codex -> "bot_prompt_context; native /goal requires codex app-server"
          | _ -> "unsupported"));
+      ("configuration_options", configuration_options_json session.agent_kind);
+      ("command_briefing", `String (command_briefing session));
     ]
 
 let string_param_opt params name =
