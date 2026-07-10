@@ -864,6 +864,9 @@ let fresh_context_session t (session : Session_store.session) ~thread_id =
     ~session_id:(Resource.generate_uuid ())
     ~thread_id
     ~system_prompt:(refreshed_system_prompt t session)
+    ~model:session.model
+    ~reasoning_effort:session.reasoning_effort
+    ~goal:session.goal
     ~initial_prompt:None
     ()
 

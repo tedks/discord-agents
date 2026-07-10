@@ -194,12 +194,34 @@ let find_session bot thread_id =
   | Some session -> session
   | None -> Alcotest.failf "expected session %s" thread_id
 
+let configure_session session =
+  session.Discord_agents.Session_store.model <- Some "review-model";
+  session.reasoning_effort <- Some Discord_agents.Config.Xhigh;
+  session.goal <- Some {
+    Discord_agents.Session_store.objective = "Keep focused";
+    status = Discord_agents.Session_store.Goal_active;
+    token_budget = Some 1234;
+  }
+
+let check_config_preserved session =
+  Alcotest.(check (option string)) "model preserved"
+    (Some "review-model") session.Discord_agents.Session_store.model;
+  Alcotest.(check (option string)) "effort preserved"
+    (Some "xhigh")
+    (Option.map Discord_agents.Config.string_of_reasoning_effort
+       session.reasoning_effort);
+  Alcotest.(check (option string)) "goal preserved"
+    (Some "Keep focused")
+    (Option.map (fun goal -> goal.Discord_agents.Session_store.objective)
+       session.goal)
+
 let test_reset_session_context_replaces_current_session () =
   with_test_bot (fun bot ->
     let session =
       make_session Discord_agents.Config.Codex
     in
     session.message_count <- 4;
+    configure_session session;
     Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
     let original_session_id = session.session_id in
     match Discord_agents.Bot.reset_session_context bot session with
@@ -214,7 +236,8 @@ let test_reset_session_context_replaces_current_session () =
       Alcotest.(check string) "agent preserved"
         "codex" (kind_string saved.agent_kind);
       Alcotest.(check bool) "server-allocated id starts unconfirmed"
-        false saved.session_id_confirmed)
+        false saved.session_id_confirmed;
+      check_config_preserved saved)
 
 let test_move_session_context_to_thread_archives_old_session () =
   with_test_bot (fun bot ->
@@ -257,6 +280,7 @@ let test_fork_session_context_to_thread_keeps_current_session () =
   with_test_bot (fun bot ->
     let session = make_session Discord_agents.Config.Claude in
     session.message_count <- 3;
+    configure_session session;
     Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
     let original_session_id = session.session_id in
     match Discord_agents.Bot.fork_session_context_to_thread bot session
@@ -276,7 +300,8 @@ let test_fork_session_context_to_thread_keeps_current_session () =
       Alcotest.(check int) "fork message count starts fresh"
         0 saved_fork.message_count;
       Alcotest.(check (option string)) "Claude fork resumes source once"
-        (Some original_session_id) saved_fork.fork_from_session_id)
+        (Some original_session_id) saved_fork.fork_from_session_id;
+      check_config_preserved saved_fork)
 
 let test_fork_session_context_to_thread_fresh_for_gemini () =
   with_test_bot (fun bot ->
