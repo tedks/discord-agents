@@ -1137,10 +1137,13 @@ let model_arg = function
   | _ -> []
 
 let claude_args ~model ~reasoning_effort
-    ~session_id ~message_count ~prompt =
+    ~session_id ~message_count ~fork_from_session_id ~prompt =
   let session_flag =
-    if message_count = 0 then ["--session-id"; session_id]
-    else ["--resume"; session_id]
+    match fork_from_session_id with
+    | Some fork_from -> ["--resume"; fork_from; "--fork-session"]
+    | None when message_count = 0 -> ["--session-id"; session_id]
+    | None ->
+      ["--resume"; session_id]
   in
   let effort_arg = match reasoning_effort with
     | Some effort ->
@@ -1545,8 +1548,9 @@ let compose_session_prompt ~agent_kind ~system_prompt ~message_count
     so the caller can track active subprocesses for cleanup.
     Returns when the process exits. *)
 let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
-    ?(session_id_confirmed=true) ?system_prompt ?(model=None)
-    ?(reasoning_effort=None) ?(goal_context=None) ~prompt ~on_event ?on_pid () =
+    ?fork_from_session_id ?(session_id_confirmed=true) ?system_prompt
+    ?(model=None) ?(reasoning_effort=None) ?(goal_context=None)
+    ~prompt ~on_event ?on_pid () =
   let mgr = Eio.Stdenv.process_mgr env in
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
@@ -1562,7 +1566,8 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
   let args = match kind with
     | Config.Claude ->
       let base = claude_args ~model ~reasoning_effort
-        ~session_id ~message_count ~prompt in
+          ~fork_from_session_id ~session_id ~message_count ~prompt
+      in
       let base = base @ ["--mcp-config"; claude_mcp_config_path ()] in
       (match system_prompt with
        | Some sp -> base @ ["--append-system-prompt"; sp]

@@ -12,6 +12,9 @@ type t =
   | Start_agent of { project : string; kind : Config.agent_kind option }
   (** [kind = None] means use the current effective top-level agent. *)
   | Resume_session of { session_id : string; kind : Config.agent_kind option }
+  | Fork_session of { move : bool option }
+  (** [move = None] means the handler applies the channel-specific default. *)
+  | Reset_session
   | Stop_session of { thread_id : string }
   | Interrupt_session
   | Cleanup_channels
@@ -61,6 +64,10 @@ let parse content =
     (match Config.agent_kind_of_string (String.lowercase_ascii kind_str) with
      | Ok k -> Resume_session { session_id; kind = Some k }
      | Error _ -> Unknown content)
+  | ["fork"] -> Fork_session { move = None }
+  | ["fork"; "--move"] -> Fork_session { move = Some true }
+  | ["fork"; "--no-move"] -> Fork_session { move = Some false }
+  | ["reset"] -> Reset_session
   | ["default-agent"] | ["default_agent"] -> Default_agent None
   | ["default-agent"; kind_str] | ["default_agent"; kind_str] ->
     (match Config.agent_kind_of_string (String.lowercase_ascii kind_str) with

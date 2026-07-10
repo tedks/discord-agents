@@ -844,6 +844,127 @@ let replacement_session_for_agent t (session : Session_store.session)
   } in
   replacement
 
+let session_busy_for_context_change (session : Session_store.session) =
+  session.processing
+  || not (Queue.is_empty session.pending_queue)
+  || Option.is_some session.active_run
+  || session.stop_requested
+
+let context_change_busy_message action =
+  Printf.sprintf
+    "Cannot %s while this session is running, stopping, or has queued messages. Stop or wait for it to finish first."
+    action
+
+let fresh_context_session t (session : Session_store.session) ~thread_id =
+  Session_store.make_session
+    ~project_name:session.project_name
+    ~working_dir:session.working_dir
+    ~agent_kind:session.agent_kind
+    ~session_override_kind:session.session_override_kind
+    ~session_id:(Resource.generate_uuid ())
+    ~thread_id
+    ~system_prompt:(refreshed_system_prompt t session)
+    ~model:session.model
+    ~reasoning_effort:session.reasoning_effort
+    ~goal:session.goal
+    ~initial_prompt:None
+    ()
+
+let thread_name_max = 80
+
+let truncate_for_thread_name s =
+  let s =
+    Resource.single_line s
+    |> Resource.sanitize_utf8
+    |> String.trim
+  in
+  let s = if s = "" then "session" else s in
+  Resource.truncate_utf8 ~max_bytes:thread_name_max s
+
+let fork_thread_name ~move ~base ~session_id =
+  let prefix = if move then "archive" else "fork" in
+  truncate_for_thread_name
+    (Printf.sprintf "%s %s %s" prefix base (Resource.short_id session_id))
+
+let thread_parent_for_context_command t ~channel_id
+    ~(session : Session_store.session) =
+  match Discord_rest.get_channel t.rest ~channel_id () with
+  | Error err ->
+    Error (Printf.sprintf "Could not inspect this channel: %s" err)
+  | Ok ch ->
+    let name = Option.value ch.Discord_types.name
+      ~default:session.project_name in
+    match ch.type_ with
+    | Discord_types.Guild_public_thread
+    | Discord_types.Guild_private_thread ->
+      (match ch.parent_id with
+       | Some parent_id -> Ok (parent_id, name)
+       | None -> Error "This thread has no parent channel.")
+    | _ ->
+      Ok (channel_id, name)
+
+let replace_session_map t sessions =
+  Session_store.replace_sessions_with t.sessions sessions
+
+let reset_session_context t (session : Session_store.session) =
+  let replacement =
+    fresh_context_session t session ~thread_id:session.thread_id
+  in
+  try
+    Session_store.add t.sessions ~thread_id:session.thread_id replacement;
+    Hashtbl.remove t.scroll_states session.thread_id;
+    Ok replacement
+  with exn ->
+    Error (Printexc.to_string exn)
+
+let move_session_context_to_thread t (session : Session_store.session)
+    ~archive_thread_id =
+  let archived_session = {
+    session with
+    thread_id = archive_thread_id;
+    processing = false;
+    pending_queue = Queue.create ();
+    child_pid = None;
+  } in
+  let fresh_session =
+    fresh_context_session t session ~thread_id:session.thread_id
+  in
+  let sessions =
+    t.sessions.sessions
+    |> Session_store.SessionMap.remove session.thread_id
+    |> Session_store.SessionMap.add archive_thread_id archived_session
+    |> Session_store.SessionMap.add session.thread_id fresh_session
+  in
+  match replace_session_map t sessions with
+  | Error err -> Error err
+  | Ok () ->
+    (match Hashtbl.find_opt t.scroll_states session.thread_id with
+     | Some state ->
+       Hashtbl.replace t.scroll_states archive_thread_id state;
+       Hashtbl.remove t.scroll_states session.thread_id
+     | None -> ());
+    Ok fresh_session
+
+let fork_session_context_to_thread t (session : Session_store.session)
+    ~fork_thread_id =
+  let fork_from_session_id =
+    match session.agent_kind with
+    | Config.Claude -> Some session.session_id
+    | Config.Codex
+    | Config.Gemini -> None
+  in
+  let forked_session =
+    {
+      (fresh_context_session t session ~thread_id:fork_thread_id) with
+      fork_from_session_id;
+    }
+  in
+  try
+    Session_store.add t.sessions ~thread_id:fork_thread_id forked_session;
+    Ok forked_session
+  with exn ->
+    Error (Printexc.to_string exn)
+
 let align_persistent_sessions_to_agent
     ?(replacement_session=replacement_session_for_agent)
     t ~current_channel_id ~new_agent =
@@ -1784,6 +1905,91 @@ let handle_command t msg cmd =
     reply_stop_outcome reply (stop_session t ~thread_id)
   | Command.Interrupt_session ->
     reply_stop_outcome reply (stop_session t ~thread_id:channel_id)
+  | Command.Reset_session ->
+    (match Session_store.find_opt t.sessions ~thread_id:channel_id with
+     | None ->
+       reply "No session exists in this channel."
+     | Some session when session_busy_for_context_change session ->
+       reply (context_change_busy_message "reset context")
+     | Some session ->
+       (match reset_session_context t session with
+        | Ok replacement ->
+          reply (Printf.sprintf
+            "Context reset. Fresh `%s` session `%s` will be used for the next message."
+            (Config.string_of_agent_kind replacement.agent_kind)
+            (Resource.short_id replacement.session_id))
+        | Error err ->
+          reply (Printf.sprintf "Failed to reset context: %s" err)))
+  | Command.Fork_session { move } ->
+    (match Session_store.find_opt t.sessions ~thread_id:channel_id with
+     | None ->
+       reply "No session exists in this channel."
+     | Some session when session_busy_for_context_change session ->
+       reply (context_change_busy_message "fork context")
+     | Some session ->
+       let move =
+         Option.value move ~default:(is_persistent_channel t ~channel_id)
+       in
+       (match thread_parent_for_context_command t ~channel_id ~session with
+        | Error err -> reply err
+        | Ok (thread_parent, base_name) ->
+          let thread_name =
+            fork_thread_name ~move ~base:base_name
+              ~session_id:session.session_id
+          in
+          (match Discord_rest.create_thread_no_message t.rest
+                  ~channel_id:thread_parent ~name:thread_name () with
+           | Error err ->
+             reply (Printf.sprintf "Failed to create fork thread: %s" err)
+           | Ok thread_ch ->
+             let thread_id = thread_ch.Discord_types.id in
+             if move then
+               (match move_session_context_to_thread t session
+                        ~archive_thread_id:thread_id with
+                | Error err ->
+                  cleanup_orphan_thread t ~thread_id
+                    ~context:"fork move persistence failure";
+                  reply (Printf.sprintf "Failed to persist forked context: %s" err)
+                | Ok fresh_session ->
+                  ignore (Discord_rest.create_message t.rest
+                    ~channel_id:thread_id
+                    ~content:(Printf.sprintf
+                      "Archived context from <#%s>.\nSession `%s` continues here."
+                      channel_id (Resource.short_id session.session_id)) ());
+                  reply (Printf.sprintf
+                    "Moved context to <#%s>. This channel now has fresh `%s` session `%s`."
+                    thread_id
+                    (Config.string_of_agent_kind fresh_session.agent_kind)
+                    (Resource.short_id fresh_session.session_id)))
+             else
+               (match fork_session_context_to_thread t session
+                        ~fork_thread_id:thread_id with
+                | Error err ->
+                  cleanup_orphan_thread t ~thread_id
+                    ~context:"fork persistence failure";
+                  reply (Printf.sprintf "Failed to persist forked session: %s" err)
+                | Ok forked_session ->
+                  let thread_content =
+                    match forked_session.fork_from_session_id with
+                    | Some source_id ->
+                      Printf.sprintf
+                        "Forked from <#%s>.\nNative `%s` fork from session `%s` will be created on the first message here."
+                        channel_id
+                        (Config.string_of_agent_kind forked_session.agent_kind)
+                        (Resource.short_id source_id)
+                    | None ->
+                      Printf.sprintf
+                        "Forked from <#%s>.\nFresh `%s` session `%s` is ready here."
+                        channel_id
+                        (Config.string_of_agent_kind forked_session.agent_kind)
+                        (Resource.short_id forked_session.session_id)
+                  in
+                  ignore (Discord_rest.create_message t.rest
+                    ~channel_id:thread_id
+                    ~content:thread_content ());
+                  reply (Printf.sprintf
+                    "Fork created: <#%s>. The current session remains unchanged."
+                    thread_id)))))
   | Command.Default_agent None ->
     refresh_disk_state ();
     let base = Printf.sprintf "Default agent: `%s`."
@@ -2129,6 +2335,8 @@ let handle_command t msg cmd =
       "`!rescue-agent [agent|off]` / `!rescue_agent [agent|off]` — show or set the rescue agent used under disk pressure";
       "`!session-agent [agent]` / `!session_agent [agent]` — show or set the current channel session agent";
       "`!resume [agent] <session_id>` — resume a session (no agent = try the current effective top-level agent first)";
+      "`!fork [--move|--no-move]` — create a new thread for context management";
+      "`!reset` — clear this channel's session context";
       "`!stop <thread_id>` — stop a session";
       "`!esc` / `!int` / `!interrupt` — stop this thread's active session";
       "`!rename [thread_id] <name>` — rename a thread";

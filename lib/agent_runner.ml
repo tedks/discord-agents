@@ -342,10 +342,10 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
         last_edit := now
       end
     | Agent_process.Result { text = _; session_id } ->
-      (* Codex assigns session ids server-side (via thread.started);
-         forward any new id so the caller can persist it for resume.
-         Claude's final result also carries session_id but it matches
-         the pre-assigned value, so the callback is a no-op there. *)
+      (* Codex assigns session ids server-side (via thread.started), and
+         Claude native forks emit a new id from the result event. Forward any
+         id so the caller can persist it for resume and clear one-shot fork
+         state. *)
       (match session_id, on_session_id with
        | Some sid, Some cb -> cb sid
        | _ -> ());
@@ -431,6 +431,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
           ~working_dir:session.working_dir
           ~kind:session.agent_kind
           ~session_id:session.session_id
+          ?fork_from_session_id:session.fork_from_session_id
           ~session_id_confirmed:session.session_id_confirmed
           ~message_count:session.message_count
           ?system_prompt:session.system_prompt

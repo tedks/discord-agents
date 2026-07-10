@@ -159,6 +159,11 @@ type session = {
      [init]). Claude accepts a caller-supplied id, so its value
      never changes after creation. See [Config.caller_pinned_session_id]. *)
   mutable session_id : string;
+  (* One-shot native fork source. For Claude, the next run resumes
+     this session id with --fork-session and captures the new emitted
+     id through [set_session_id]. None for normal fresh/resumed runs
+     and for agents without a non-interactive fork path. *)
+  mutable fork_from_session_id : string option;
   (* True once the agent has acknowledged [session_id] as resumable.
      Always true for Claude (caller-supplied ids). For Codex and
      Gemini, starts false and flips true when the first server-side
@@ -211,6 +216,9 @@ let sessions_to_json sessions =
          | Some kind ->
            [("session_override_kind",
              `String (Config.string_of_agent_kind kind))]
+         | None -> [])
+      @ (match s.fork_from_session_id with
+         | Some sid -> [("fork_from_session_id", `String sid)]
          | None -> [])
       @ (match s.system_prompt with
          | Some sp -> [("system_prompt", `String sp)]
@@ -308,6 +316,8 @@ let sessions_of_json json =
             | Error _ -> None)
          | _ -> None);
       session_id = j |> member "session_id" |> to_string;
+      fork_from_session_id =
+        j |> member "fork_from_session_id" |> to_string_option;
       session_id_confirmed;
       thread_id;
       system_prompt = j |> member "system_prompt" |> to_string_option;
@@ -487,13 +497,15 @@ let make_session ~project_name ~working_dir ~agent_kind ~session_id
     ?(goal = None)
     ?(pending_agent_change = None)
     ?(active_run = None)
+    ?fork_from_session_id
     ?session_id_confirmed () =
   let session_id_confirmed = match session_id_confirmed with
     | Some b -> b
     | None -> Config.caller_pinned_session_id agent_kind
   in
   { project_name; working_dir; agent_kind; session_override_kind; session_id;
-    session_id_confirmed; thread_id; system_prompt; model; reasoning_effort; goal;
+    fork_from_session_id; session_id_confirmed; thread_id; system_prompt;
+    model; reasoning_effort; goal;
     message_count; processing = false;
     pending_queue = Queue.create (); pending_agent_change; initial_prompt;
     active_run; child_pid = None; stop_requested = false }
@@ -640,12 +652,15 @@ let set_session_id t session ~session_id =
   if not already then begin
     let prior_id = session.session_id in
     let prior_confirmed = session.session_id_confirmed in
+    let prior_fork_from = session.fork_from_session_id in
     session.session_id <- session_id;
     session.session_id_confirmed <- true;
+    session.fork_from_session_id <- None;
     match persist_or_rollback
             (fun () ->
               session.session_id <- prior_id;
-              session.session_id_confirmed <- prior_confirmed)
+              session.session_id_confirmed <- prior_confirmed;
+              session.fork_from_session_id <- prior_fork_from)
             (fun () -> save t) with
     | Ok () -> ()
     | Error err -> failwith err
