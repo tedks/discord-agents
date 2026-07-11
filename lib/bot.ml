@@ -3001,9 +3001,14 @@ let send_inter_agent_message_with_hooks hooks t ?source_thread_id
     Inter_agent_message_rejected "Bot is restarting; try again shortly."
   else if not (valid_discord_snowflake thread_id) then
     Inter_agent_message_rejected "thread_id must be a Discord snowflake"
+  else if source_thread_id = Some thread_id then
+    Inter_agent_message_rejected
+      "source_thread_id and thread_id must be different"
   else
     match Session_store.find_opt t.sessions ~thread_id with
     | None -> Inter_agent_message_rejected "Target session not found."
+    | Some session when session.stop_requested ->
+      Inter_agent_message_rejected "Target session is stopping."
     | Some _ ->
       (match prepare_inter_agent_message ?source_thread_id ?remaining_hops message with
        | Error err -> Inter_agent_message_rejected err

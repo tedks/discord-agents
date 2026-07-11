@@ -1689,6 +1689,53 @@ let test_send_inter_agent_message_rejects_missing_target () =
       Alcotest.(check bool) "did not post" false !posted
     | _ -> Alcotest.fail "expected rejected outcome")
 
+let test_send_inter_agent_message_rejects_stopping_target () =
+  with_test_bot (fun bot ->
+    let target_thread_id = "1234567890" in
+    let session =
+      make_session ~thread_id:target_thread_id Discord_agents.Config.Codex
+    in
+    session.stop_requested <- true;
+    Discord_agents.Session_store.add bot.sessions
+      ~thread_id:target_thread_id session;
+    let posted = ref false in
+    let hooks = inter_agent_hooks
+      ~post:(fun _rest ~channel_id:_ ~content:_ ->
+        posted := true;
+        Ok (make_posted_message ~channel_id:target_thread_id
+              ~message_id:"posted-1" "unused"))
+      ()
+    in
+    match Discord_agents.Bot.send_inter_agent_message_with_hooks hooks bot
+            ~thread_id:target_thread_id ~message:"hello" () with
+    | Discord_agents.Bot.Inter_agent_message_rejected err ->
+      Alcotest.(check string) "error" "Target session is stopping." err;
+      Alcotest.(check bool) "did not post" false !posted
+    | _ -> Alcotest.fail "expected rejected outcome")
+
+let test_send_inter_agent_message_rejects_claimed_self_send () =
+  with_test_bot (fun bot ->
+    let target_thread_id = "1234567890" in
+    Discord_agents.Session_store.add bot.sessions
+      ~thread_id:target_thread_id
+      (make_session ~thread_id:target_thread_id Discord_agents.Config.Codex);
+    let posted = ref false in
+    let hooks = inter_agent_hooks
+      ~post:(fun _rest ~channel_id:_ ~content:_ ->
+        posted := true;
+        Ok (make_posted_message ~channel_id:target_thread_id
+              ~message_id:"posted-1" "unused"))
+      ()
+    in
+    match Discord_agents.Bot.send_inter_agent_message_with_hooks hooks bot
+            ~source_thread_id:target_thread_id
+            ~thread_id:target_thread_id ~message:"hello" () with
+    | Discord_agents.Bot.Inter_agent_message_rejected err ->
+      Alcotest.(check string) "error"
+        "source_thread_id and thread_id must be different" err;
+      Alcotest.(check bool) "did not post" false !posted
+    | _ -> Alcotest.fail "expected rejected outcome")
+
 let test_send_inter_agent_message_reports_post_failure () =
   with_test_bot (fun bot ->
     let target_thread_id = "1234567890" in
@@ -1917,6 +1964,10 @@ let () =
         test_send_inter_agent_message_posts_and_routes_user_style_message;
       Alcotest.test_case "send inter-agent message rejects missing target" `Quick
         test_send_inter_agent_message_rejects_missing_target;
+      Alcotest.test_case "send inter-agent message rejects stopping target" `Quick
+        test_send_inter_agent_message_rejects_stopping_target;
+      Alcotest.test_case "send inter-agent message rejects claimed self-send" `Quick
+        test_send_inter_agent_message_rejects_claimed_self_send;
       Alcotest.test_case "send inter-agent message reports post failure" `Quick
         test_send_inter_agent_message_reports_post_failure;
       Alcotest.test_case "send inter-agent message reports posted not routed" `Quick

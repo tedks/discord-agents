@@ -161,7 +161,7 @@ TOOLS = [
                 },
                 "message": {
                     "type": "string",
-                    "description": "Plain message text to send. Must not start with ! and must fit in one Discord message.",
+                    "description": "Plain message text to send. Must not start with ! and must fit in one Discord message. The bot enforces a 1600-byte cap, so non-ASCII text may allow fewer characters.",
                     "maxLength": 1600
                 },
                 "source_thread_id": {
