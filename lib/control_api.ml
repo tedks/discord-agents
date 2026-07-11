@@ -1173,6 +1173,56 @@ let handle_stop_session (bot : Bot.t) params =
   | Bot.Session_stop_failed err ->
     error_response (Printf.sprintf "Failed to stop session: %s" err)
 
+let handle_send_message (bot : Bot.t) params =
+  let open Yojson.Safe.Util in
+  let params = match params with Some p -> p | None ->
+    failwith "missing params" in
+  let thread_id = params |> member "thread_id" |> to_string in
+  let message = params |> member "message" |> to_string in
+  let source_thread_id =
+    match params |> member "source_thread_id" |> to_string_option with
+    | Some s when String.trim s <> "" -> Some (String.trim s)
+    | _ -> None
+  in
+  let remaining_hops =
+    let raw = params |> member "remaining_hops" in
+    match raw with
+    | `Null -> Ok None
+    | `Int n -> Ok (Some n)
+    | `Intlit s | `String s ->
+      (match int_of_string_opt s with
+       | Some n -> Ok (Some n)
+       | None -> Error "remaining_hops must be an integer")
+    | _ -> Error "remaining_hops must be an integer"
+  in
+  match remaining_hops with
+  | Error err -> error_response err
+  | Ok remaining_hops ->
+  match Bot.send_inter_agent_message bot ?source_thread_id ?remaining_hops
+          ~thread_id ~message () with
+  | Bot.Inter_agent_message_sent sent ->
+    ok_response [
+      ("state", `String "sent");
+      ("thread_id", `String sent.thread_id);
+      ("message_id", `String sent.message_id);
+      ("remaining_hops", `Int sent.remaining_hops);
+      ("message", `String (Printf.sprintf
+        "Sent message to <#%s>. remaining_hops=%d"
+        sent.thread_id sent.remaining_hops));
+    ]
+  | Bot.Inter_agent_message_posted_not_routed sent ->
+    ok_response [
+      ("state", `String "posted_not_routed");
+      ("thread_id", `String sent.thread_id);
+      ("message_id", `String sent.message_id);
+      ("remaining_hops", `Int sent.remaining_hops);
+      ("message", `String (Printf.sprintf
+        "Posted message to <#%s>, but the target session disappeared before routing. remaining_hops=%d"
+        sent.thread_id sent.remaining_hops));
+    ]
+  | Bot.Inter_agent_message_rejected err ->
+    error_response err
+
 let handle_restart (bot : Bot.t) =
   Bot.trigger_restart bot ~notify:(fun msg ->
     Logs.info (fun m -> m "control_api restart: %s" msg));
@@ -1220,6 +1270,7 @@ let dispatch (bot : Bot.t) method_ params =
     | "start_session" -> handle_start_session bot params
     | "resume_session" -> handle_resume_session bot params
     | "stop_session" -> handle_stop_session bot params
+    | "send_message" -> handle_send_message bot params
     | "default_agent" -> handle_default_agent bot params
     | "rescue_agent" -> handle_rescue_agent bot params
     | "get_agent_config" -> handle_get_agent_config bot params
