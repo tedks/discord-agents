@@ -1775,6 +1775,29 @@ let test_send_inter_agent_message_reports_posted_not_routed () =
       Alcotest.(check bool) "did not route" false !routed
     | _ -> Alcotest.fail "expected posted_not_routed outcome")
 
+let test_send_inter_agent_message_reports_stopped_after_post () =
+  with_test_bot (fun bot ->
+    let target_thread_id = "1234567890" in
+    let session =
+      make_session ~thread_id:target_thread_id Discord_agents.Config.Codex
+    in
+    Discord_agents.Session_store.add bot.sessions
+      ~thread_id:target_thread_id session;
+    let routed = ref false in
+    let hooks = inter_agent_hooks
+      ~post:(fun _rest ~channel_id ~content ->
+        session.stop_requested <- true;
+        Ok (make_posted_message ~channel_id ~message_id:"posted-1" content))
+      ~route:(fun _bot _msg -> routed := true)
+      ()
+    in
+    match Discord_agents.Bot.send_inter_agent_message_with_hooks hooks bot
+            ~thread_id:target_thread_id ~message:"hello" () with
+    | Discord_agents.Bot.Inter_agent_message_posted_not_routed sent ->
+      Alcotest.(check string) "message id" "posted-1" sent.message_id;
+      Alcotest.(check bool) "did not route" false !routed
+    | _ -> Alcotest.fail "expected posted_not_routed outcome")
+
 let test_reap_tracked_process_group_leader () =
   with_test_bot (fun bot ->
     let pid = Unix.create_process "/usr/bin/setsid"
@@ -1972,6 +1995,8 @@ let () =
         test_send_inter_agent_message_reports_post_failure;
       Alcotest.test_case "send inter-agent message reports posted not routed" `Quick
         test_send_inter_agent_message_reports_posted_not_routed;
+      Alcotest.test_case "send inter-agent message reports stopped after post" `Quick
+        test_send_inter_agent_message_reports_stopped_after_post;
       Alcotest.test_case "reap tracked process-group leader" `Quick
         test_reap_tracked_process_group_leader;
       Alcotest.test_case "busy stop signals tracked child" `Quick

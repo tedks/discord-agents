@@ -3025,7 +3025,7 @@ let send_inter_agent_message_with_hooks hooks t ?source_thread_id
              (Printf.sprintf "Failed to post message: %s" err)
          | Ok posted_msg ->
            (match Session_store.find_opt t.sessions ~thread_id with
-            | None ->
+            | None | Some { stop_requested = true; _ } ->
               Inter_agent_message_posted_not_routed {
                 thread_id;
                 message_id = posted_msg.id;
