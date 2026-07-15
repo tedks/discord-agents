@@ -29,6 +29,99 @@ let with_tmp_home f =
 let config_path home =
   Filename.concat home ".config/discord-agents/config.json"
 
+let test_load_accepts_basic_schema_alias () =
+  with_tmp_home (fun home ->
+    let path = config_path home in
+    Discord_agents.Resource.ensure_parent_dir path;
+    Discord_agents.Resource.write_file_atomic path
+      {|{
+  "discord_token": "test-token",
+  "guild_id": "guild-1",
+  "base_dirs": ["~/Projects"]
+}|};
+    let config = Discord_agents.Config.load () in
+    Alcotest.(check string) "token" "test-token" config.discord_token;
+    Alcotest.(check string) "guild" "guild-1" config.guild_id;
+    Alcotest.(check (list string)) "base dirs"
+      ["~/Projects"] config.base_directories;
+    Alcotest.(check (option string)) "control channel default"
+      None config.control_channel_id;
+    Alcotest.(check int) "projects default" 0 (List.length config.projects))
+
+let test_load_prefers_canonical_base_directories () =
+  with_tmp_home (fun home ->
+    let path = config_path home in
+    Discord_agents.Resource.ensure_parent_dir path;
+    Discord_agents.Resource.write_file_atomic path
+      {|{
+  "discord_token": "test-token",
+  "guild_id": "guild-1",
+  "base_dirs": ["~/Old"],
+  "base_directories": ["~/Projects"]
+}|};
+    let config = Discord_agents.Config.load () in
+    Alcotest.(check (list string)) "canonical base directories"
+      ["~/Projects"] config.base_directories)
+
+let test_load_env_token_replaces_blank_config_token () =
+  with_tmp_home (fun home ->
+    let old_token = Sys.getenv_opt "DISCORD_BOT_TOKEN" in
+    Fun.protect
+      ~finally:(fun () -> restore_env "DISCORD_BOT_TOKEN" old_token)
+      (fun () ->
+        let path = config_path home in
+        Discord_agents.Resource.ensure_parent_dir path;
+        Discord_agents.Resource.write_file_atomic path
+          {|{
+  "discord_token": "   ",
+  "guild_id": "guild-1",
+  "base_directories": ["~/Projects"]
+}|};
+        Unix.putenv "DISCORD_BOT_TOKEN" "env-token";
+        let config = Discord_agents.Config.load () in
+        Alcotest.(check string) "env token"
+          "env-token" config.discord_token))
+
+let has_error_substring needle errors =
+  List.exists (fun err ->
+    try ignore (Str.search_forward (Str.regexp_string needle) err 0); true
+    with Not_found -> false
+  ) errors
+
+let test_validate_reports_required_fields () =
+  let config = {
+    Discord_agents.Config.default with
+    base_directories = ["~/Projects"; ""];
+    projects = [
+      { name = ""; path = "/tmp/project"; channel_id = None };
+      { name = "missing-path"; path = ""; channel_id = None };
+    ];
+  } in
+  match Discord_agents.Config.validate config with
+  | Ok () -> Alcotest.fail "expected config validation errors"
+  | Error errors ->
+    Alcotest.(check bool) "requires token"
+      true (has_error_substring "discord_token" errors);
+    Alcotest.(check bool) "requires guild"
+      true (has_error_substring "guild_id" errors);
+    Alcotest.(check bool) "rejects empty base dir"
+      true (has_error_substring "base_directories[1]" errors);
+    Alcotest.(check bool) "rejects empty project name"
+      true (has_error_substring "projects[0].name" errors);
+    Alcotest.(check bool) "rejects empty project path"
+      true (has_error_substring "projects[1].path" errors)
+
+let test_validate_smoke_test_allows_missing_guild () =
+  let config = {
+    Discord_agents.Config.default with
+    discord_token = "test-token";
+  } in
+  match Discord_agents.Config.validate ~require_guild_id:false config with
+  | Ok () -> ()
+  | Error errors ->
+    Alcotest.failf "expected smoke-test config to validate, got: %s"
+      (String.concat "; " errors)
+
 let test_save_reaps_stale_atomic_temp () =
   with_tmp_home (fun home ->
     let path = config_path home in
@@ -48,10 +141,55 @@ let test_save_reaps_stale_atomic_temp () =
     let mode = (Unix.stat path).Unix.st_perm land 0o777 in
     Alcotest.(check int) "config mode remains private" 0o600 mode)
 
+let test_save_load_roundtrip () =
+  with_tmp_home (fun _home ->
+    let config = {
+      Discord_agents.Config.discord_token = "test-token";
+      guild_id = "guild";
+      base_directories = ["~/Projects"; "/srv/src"];
+      control_channel_id = Some "control";
+      projects = [
+        { name = "repo"; path = "/srv/src/repo"; channel_id = Some "chan" };
+      ];
+    } in
+    Discord_agents.Config.save config;
+    let loaded = Discord_agents.Config.load () in
+    Alcotest.(check string) "token"
+      config.discord_token loaded.discord_token;
+    Alcotest.(check string) "guild"
+      config.guild_id loaded.guild_id;
+    Alcotest.(check (list string)) "base directories"
+      config.base_directories loaded.base_directories;
+    Alcotest.(check (option string)) "control channel"
+      config.control_channel_id loaded.control_channel_id;
+    Alcotest.(check int) "project count"
+      1 (List.length loaded.projects);
+    match loaded.projects with
+    | [project] ->
+      Alcotest.(check string) "project name" "repo" project.name;
+      Alcotest.(check string) "project path" "/srv/src/repo" project.path;
+      Alcotest.(check (option string)) "project channel"
+        (Some "chan") project.channel_id
+    | _ -> Alcotest.fail "expected one project")
+
 let () =
   Alcotest.run "config" [
+    ("schema", [
+      Alcotest.test_case "load accepts base_dirs alias" `Quick
+        test_load_accepts_basic_schema_alias;
+      Alcotest.test_case "canonical base_directories wins" `Quick
+        test_load_prefers_canonical_base_directories;
+      Alcotest.test_case "env token replaces blank config token" `Quick
+        test_load_env_token_replaces_blank_config_token;
+      Alcotest.test_case "validation reports required fields" `Quick
+        test_validate_reports_required_fields;
+      Alcotest.test_case "smoke-test validation allows missing guild" `Quick
+        test_validate_smoke_test_allows_missing_guild;
+    ]);
     ("persistence", [
       Alcotest.test_case "save reaps stale atomic temp" `Quick
         test_save_reaps_stale_atomic_temp;
+      Alcotest.test_case "save/load roundtrip" `Quick
+        test_save_load_roundtrip;
     ]);
   ]

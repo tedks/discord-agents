@@ -130,11 +130,13 @@ let () =
   let _lock_fd = if not test_mode then Some (acquire_pidfile ()) else None in
   Random.self_init ();  (* Seed PRNG for heartbeat jitter *)
   let config = Discord_agents.Config.load () in
-  if config.discord_token = "" then (
-    Logs.err (fun m -> m "no discord token configured");
-    Logs.err (fun m -> m "set discord_token in %s" (Discord_agents.Config.config_path ()));
-    exit 1
-  );
+  (match Discord_agents.Config.validate
+           ~require_guild_id:(not test_mode) config with
+   | Ok () -> ()
+   | Error errors ->
+     List.iter (fun err -> Logs.err (fun m -> m "config: %s" err)) errors;
+     Logs.err (fun m -> m "update %s" (Discord_agents.Config.config_path ()));
+     exit 1);
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
   if test_mode then
