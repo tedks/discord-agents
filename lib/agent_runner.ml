@@ -13,6 +13,53 @@
 (** Typing indicator refresh interval in seconds. *)
 let typing_interval = 8.0
 
+let stream_message_max = 1796
+
+let take_stream_delta_chunk_len ~current_len text ~start =
+  let remaining_capacity = stream_message_max - current_len in
+  if remaining_capacity <= 0 then 0
+  else
+    let hard_len =
+      Agent_process.take_fitting_prefix
+        ~start ~max_chars:remaining_capacity text
+    in
+    let hard_end = start + hard_len in
+    if hard_end >= String.length text then hard_len
+    else
+      let rec find_space i =
+        if i <= start then None
+        else if Agent_process.is_ascii_whitespace text.[i - 1] then Some i
+        else find_space (i - 1)
+      in
+      match find_space hard_end with
+      | Some i when i > start -> i - start
+      | _ when current_len > 0 -> 0
+      | _ -> hard_len
+
+let split_trailing_word_for_carry s =
+  let n = String.length s in
+  if n = 0 || Agent_process.is_ascii_whitespace s.[n - 1] then None
+  else
+    let rec find_start i =
+      if i <= 0 then 0
+      else if Agent_process.is_ascii_whitespace s.[i - 1] then i
+      else find_start (i - 1)
+    in
+    let start = find_start n in
+    if start = 0 then None
+    else
+      Some (String.sub s 0 start, String.sub s start (n - start))
+
+let buffer_ends_with_table text =
+  let rec last_nonblank = function
+    | [] -> None
+    | line :: rest ->
+      if String.trim line = "" then last_nonblank rest else Some line
+  in
+  match last_nonblank (List.rev (String.split_on_char '\n' text)) with
+  | Some line -> Agent_process.is_table_line line
+  | None -> false
+
 (** Map tool names to emoji + verb for compact status display. *)
 (** Escape underscores in a tool name for Discord display.
     Discord interprets __ as underline and _ as italic, so we
@@ -281,6 +328,29 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
       (* No table boundary (or entire buffer is a table) — split normally *)
       flush_and_reset ()
   in
+  let carry_trailing_word_to_next_message () =
+    let buf_text = Buffer.contents current_msg_buf in
+    if buffer_ends_with_table buf_text then false
+    else match split_trailing_word_for_carry buf_text with
+    | None -> false
+    | Some (before, carry) ->
+      Buffer.clear current_msg_buf;
+      Buffer.add_string current_msg_buf before;
+      let (in_code, lang) = Agent_process.scan_fences before in
+      if in_code then
+        Buffer.add_string current_msg_buf "\n```";
+      flush_to_discord ();
+      Buffer.clear current_msg_buf;
+      current_msg_id := None;
+      if in_code then
+        Buffer.add_string current_msg_buf ("```" ^ lang ^ "\n");
+      Buffer.add_string current_msg_buf carry;
+      true
+  in
+  let start_new_message_preserving_trailing_word () =
+    if not (carry_trailing_word_to_next_message ()) then
+      start_new_message ()
+  in
   (* Flush accumulated tool status lines to a single Discord message.
      Consecutive tool calls get batched into one message, edited in-place.
      Sanitization here mirrors flush_to_discord — tool inputs (file paths,
@@ -320,21 +390,41 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
         current_msg_id := None
       end;
       Buffer.add_string result_buf text;
-      (* Split at 1800-char boundaries, reserving space for closing ```
+      (* Split near 1800-char boundaries, reserving space for closing ```
          if we might be inside a code block (worst case: 4 chars for "\n```") *)
       let text_len = String.length text in
       let pos = ref 0 in
       while !pos < text_len do
         (* Flush first if buffer is already at capacity (e.g. from a
            reopened code block prefix) to avoid zero-progress loops *)
-        if Buffer.length current_msg_buf >= 1796 then
-          start_new_message ();
-        let remaining_capacity = 1796 - Buffer.length current_msg_buf in
-        let chunk_len = min remaining_capacity (text_len - !pos) in
-        Buffer.add_substring current_msg_buf text !pos chunk_len;
-        pos := !pos + chunk_len;
-        if Buffer.length current_msg_buf >= 1796 then
-          start_new_message ()
+        if Buffer.length current_msg_buf >= stream_message_max then
+          start_new_message_preserving_trailing_word ();
+        let chunk_len =
+          take_stream_delta_chunk_len
+            ~current_len:(Buffer.length current_msg_buf) text ~start:!pos
+        in
+        if chunk_len = 0 then begin
+          let before_len = Buffer.length current_msg_buf in
+          let carried = carry_trailing_word_to_next_message () in
+          if not carried then
+            start_new_message ();
+          if Buffer.length current_msg_buf >= before_len then begin
+            let remaining_capacity =
+              max 1 (stream_message_max - Buffer.length current_msg_buf)
+            in
+            let forced_len =
+              Agent_process.take_fitting_prefix
+                ~start:!pos ~max_chars:remaining_capacity text
+            in
+            Buffer.add_substring current_msg_buf text !pos forced_len;
+            pos := !pos + forced_len
+          end
+        end else begin
+          Buffer.add_substring current_msg_buf text !pos chunk_len;
+          pos := !pos + chunk_len
+        end;
+        if Buffer.length current_msg_buf >= stream_message_max then
+          start_new_message_preserving_trailing_word ()
       done;
       let now = Unix.gettimeofday () in
       if now -. !last_edit > 2.0 && Buffer.length current_msg_buf > 0 then begin

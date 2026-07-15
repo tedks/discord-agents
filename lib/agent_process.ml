@@ -78,6 +78,24 @@ let is_separator_row cells =
     String.to_seq cell |> Seq.for_all (fun c -> c = '-' || c = ':')
   ) cells
 
+let utf8_prefix_len_for_table_cell ~max_bytes s =
+  let n = String.length s in
+  let rec loop i =
+    if i >= n || i >= max_bytes then i
+    else
+      let c = Char.code s.[i] in
+      let raw_step =
+        if c < 0x80 then 1
+        else if c < 0xC0 then 1
+        else if c < 0xE0 then 2
+        else if c < 0xF0 then 3
+        else 4
+      in
+      let step = min raw_step (n - i) in
+      if i + step > max_bytes then i else loop (i + step)
+  in
+  loop 0
+
 (** Default wrapping widths for desktop and mobile Discord clients. *)
 let desktop_width = 120
 let mobile_width = 60
@@ -195,7 +213,9 @@ let render_padded_table ?(max_width=desktop_width) table_lines =
       end else begin
         Buffer.add_char buf ' ';
         let display = if String.length cell > w
-          then String.sub cell 0 w
+          then
+            let taken = utf8_prefix_len_for_table_cell ~max_bytes:w cell in
+            String.sub cell 0 taken
           else cell in
         Buffer.add_string buf display;
         for _ = 1 to w - String.length display do Buffer.add_char buf ' ' done;
@@ -385,6 +405,29 @@ let take_fitting_prefix ?(start=0) ~max_chars s =
       let raw_step = if is_triple then 3 else utf8_step s start in
       min raw_step (n - start)
 
+let is_ascii_whitespace = function
+  | ' ' | '\t' | '\r' | '\n' -> true
+  | _ -> false
+
+(** Largest display-safe prefix, preferring a prior whitespace boundary
+    over the hard UTF-8 budget boundary. If no whitespace fits in the
+    window, falls back to [take_fitting_prefix] so long unbroken tokens
+    still make progress. *)
+let take_word_safe_fitting_prefix ?(start=0) ~max_chars s =
+  let n = String.length s in
+  let hard_len = take_fitting_prefix ~start ~max_chars s in
+  let hard_end = start + hard_len in
+  if hard_end >= n then hard_len
+  else
+    let rec find_space i =
+      if i <= start then None
+      else if is_ascii_whitespace s.[i - 1] then Some i
+      else find_space (i - 1)
+    in
+    match find_space hard_end with
+    | Some i when i > start -> i - start
+    | _ -> hard_len
+
 (** UTF-8 safe truncation for inline summary strings: caps at [max_chars]
     bytes (post-fence-escape) and appends "...".  Returns [s] unchanged
     if it already fits.  Always lands on a UTF-8 codepoint boundary. *)
@@ -403,7 +446,7 @@ let chunk_long_line ~max_chars line =
     let chunks = ref [] in
     let pos = ref 0 in
     while !pos < n do
-      let len = take_fitting_prefix ~start:!pos ~max_chars line in
+      let len = take_word_safe_fitting_prefix ~start:!pos ~max_chars line in
       chunks := String.sub line !pos len :: !chunks;
       pos := !pos + len
     done;
@@ -453,7 +496,7 @@ let truncate_for_display ~max_lines ~max_chars (lines : string list) =
         else if shown = 0 then
           (* First line alone exceeds budget — char-truncate it so the
              user always sees something rather than an empty block. *)
-          let taken = take_fitting_prefix ~max_chars l in
+          let taken = take_word_safe_fitting_prefix ~max_chars l in
           let trimmed = String.sub l 0 taken in
           { display = [trimmed]; shown = 1;
             total = 1 + List.length rest;
