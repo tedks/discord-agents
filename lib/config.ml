@@ -52,6 +52,37 @@ let reasoning_effort_of_yojson = function
 let yojson_of_reasoning_effort effort =
   `String (string_of_reasoning_effort effort)
 
+let reasoning_efforts_for_agent = function
+  | Claude -> [Low; Medium; High; Xhigh; Max]
+  | Codex -> [Low; Medium; High; Xhigh]
+  | Gemini -> []
+
+let reasoning_effort_strings_for_agent agent =
+  List.map string_of_reasoning_effort (reasoning_efforts_for_agent agent)
+
+let supports_reasoning_effort agent =
+  reasoning_efforts_for_agent agent <> []
+
+let unsupported_reasoning_effort_message agent effort =
+  match agent, effort with
+  | Gemini, _ ->
+    "Gemini CLI does not expose a reasoning effort flag in this integration."
+  | Codex, Max ->
+    "Codex reasoning effort does not support max; max is Claude-only."
+  | _ ->
+    Printf.sprintf "%s reasoning effort does not support %s."
+      (String.capitalize_ascii (string_of_agent_kind agent))
+      (string_of_reasoning_effort effort)
+
+let validate_reasoning_effort_for_agent agent effort =
+  match effort with
+  | None -> Ok ()
+  | Some effort ->
+    if List.exists (equal_reasoning_effort effort)
+        (reasoning_efforts_for_agent agent)
+    then Ok ()
+    else Error (unsupported_reasoning_effort_message agent effort)
+
 let preferred_agent_order preferred =
   preferred
   :: List.filter (fun kind -> not (equal_agent_kind kind preferred))

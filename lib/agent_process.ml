@@ -1482,8 +1482,9 @@ let codex_mcp_overrides () =
     See issue #35 for making this configurable. *)
 let codex_reasoning_effort_overrides = function
   | Some Config.Max ->
-    (* Codex's documented reasoning effort values do not include
-       [max]; callers reject this combination before invoking us. *)
+    (* Callers reject this combination through Config, but keep the
+       process boundary defensive so persisted bad state cannot pass an
+       unsupported Codex override. *)
     []
   | Some effort ->
     ["-c"; Printf.sprintf "model_reasoning_effort=\"%s\""

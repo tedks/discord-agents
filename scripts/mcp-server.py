@@ -297,7 +297,7 @@ TOOLS = [
     },
     {
         "name": "set_effort",
-        "description": "Set or clear the reasoning effort override for an existing Discord agent session. Pass effort explicitly. Claude supports low/medium/high/xhigh/max; Codex supports low/medium/high/xhigh here; Gemini effort is unsupported.",
+        "description": "Set or clear the reasoning effort override for an existing Discord agent session. Pass effort explicitly. Use get_agent_config for the selected thread's supported values; set_effort validates against that thread's agent.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -307,8 +307,7 @@ TOOLS = [
                 },
                 "effort": {
                     "type": ["string", "null"],
-                    "description": "Effort: low, medium, high, xhigh, max, or default/null to clear",
-                    "enum": ["low", "medium", "high", "xhigh", "max", "default", None]
+                    "description": "Reasoning effort value for the thread's agent, or default/null to clear"
                 }
             },
             "required": ["thread_id", "effort"]

@@ -844,10 +844,11 @@ let string_list_json values =
 let clear_values_json =
   `List [`String "default"; `String ""; `Null]
 
-let effort_values_for_agent = function
-  | Config.Claude -> ["low"; "medium"; "high"; "xhigh"; "max"]
-  | Config.Codex -> ["low"; "medium"; "high"; "xhigh"]
-  | Config.Gemini -> []
+let effort_notes agent =
+  if Config.supports_reasoning_effort agent then
+    "Supported effort values are listed in values and validated for this thread's agent."
+  else
+    "This agent does not expose a reasoning effort flag in this integration."
 
 let configuration_options_json agent =
   `Assoc [
@@ -863,13 +864,11 @@ let configuration_options_json agent =
       ("clear_values", clear_values_json);
     ]);
     ("effort", `Assoc [
-      ("supported", `Bool (effort_values_for_agent agent <> []));
-      ("values", string_list_json (effort_values_for_agent agent));
+      ("supported", `Bool (Config.supports_reasoning_effort agent));
+      ("values", string_list_json
+        (Config.reasoning_effort_strings_for_agent agent));
       ("clear_values", clear_values_json);
-      ("notes", `String (match agent with
-        | Config.Claude -> "Claude supports low, medium, high, xhigh, and max."
-        | Config.Codex -> "Codex supports low, medium, high, and xhigh here; max is Claude-only."
-        | Config.Gemini -> "Gemini CLI does not expose a reasoning effort flag in this integration."));
+      ("notes", `String (effort_notes agent));
     ]);
     ("goal", `Assoc [
       ("supported", `Bool (Config.equal_agent_kind agent Config.Codex));
@@ -895,7 +894,8 @@ let configuration_options_json agent =
 
 let command_briefing session =
   let effort_text =
-    if effort_values_for_agent session.Session_store.agent_kind = [] then
+    if not (Config.supports_reasoning_effort session.Session_store.agent_kind)
+    then
       "Effort is unsupported for this thread's agent."
     else
       "Set effort with set_effort."
@@ -967,14 +967,6 @@ let handle_set_model (bot : Bot.t) params =
          model_field session;
        ])
 
-let effort_supported_for_agent agent effort =
-  match agent, effort with
-  | Config.Gemini, Some _ ->
-    Error "Gemini CLI does not expose a reasoning effort flag in this integration."
-  | Config.Codex, Some Config.Max ->
-    Error "Codex reasoning effort supports low, medium, high, and xhigh here; max is Claude-only."
-  | _ -> Ok ()
-
 let handle_set_effort (bot : Bot.t) params =
   let open Yojson.Safe.Util in
   let params = match params with Some p -> p | None ->
@@ -997,7 +989,8 @@ let handle_set_effort (bot : Bot.t) params =
            | Error msg -> failwith msg)
       | Some _ -> failwith "effort must be a string or null"
     in
-    (match effort_supported_for_agent session.agent_kind effort with
+    (match Config.validate_reasoning_effort_for_agent
+             session.agent_kind effort with
      | Error err -> error_response err
      | Ok () ->
        (match Session_store.set_reasoning_effort bot.sessions session effort with
