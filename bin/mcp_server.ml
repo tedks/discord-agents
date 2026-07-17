@@ -1,9 +1,8 @@
-let handle_tool_call (call : Discord_agents.Mcp_server.tool_call) =
-  Error (
-    Printf.sprintf
-      "OCaml MCP tools/call is not wired yet for tool: %s"
-      call.name
-  )
+let control_client =
+  Discord_agents.Control_client.unix ()
+
+let handle_tool_call call =
+  Discord_agents.Mcp_handler.handle_tool_call ~control_client call
 
 let write_response json =
   print_endline (Yojson.Safe.to_string json);
