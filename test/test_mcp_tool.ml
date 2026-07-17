@@ -26,6 +26,18 @@ let repo_file path =
   in
   search (Sys.getcwd ())
 
+let read_file path =
+  let ic = open_in_bin path in
+  Fun.protect ~finally:(fun () -> close_in ic) (fun () ->
+    let n = in_channel_length ic in
+    really_input_string ic n)
+
+let mcp_server_path =
+  lazy (repo_file "scripts/mcp-server.py")
+
+let mcp_server_py =
+  lazy (read_file (Lazy.force mcp_server_path))
+
 let read_process_output command =
   let ic = Unix.open_process_in command in
   let buf = Buffer.create 4096 in
@@ -42,7 +54,6 @@ let read_process_output command =
   | Unix.WSTOPPED n -> failf "command stopped %d: %s" n command
 
 let python_tools_json () =
-  let script = repo_file "scripts/mcp-server.py" in
   let program =
     "import json, runpy, sys; "
     ^ "ns = runpy.run_path(sys.argv[1]); "
@@ -51,10 +62,50 @@ let python_tools_json () =
   let command =
     Printf.sprintf "python3 -c %s %s"
       (Filename.quote program)
-      (Filename.quote script)
+      (Filename.quote (Lazy.force mcp_server_path))
   in
   read_process_output command
   |> Yojson.Safe.from_string
+
+let python_default_timeout_s =
+  lazy (
+  let regexp =
+    Str.regexp "def control_request(method, params=None, timeout=\\([0-9]+\\))"
+  in
+  match Str.search_forward regexp (Lazy.force mcp_server_py) 0 with
+  | exception Not_found -> failf "could not find Python control_request timeout"
+  | _ -> int_of_string (Str.matched_group 1 (Lazy.force mcp_server_py))
+  )
+
+let python_explicit_timeouts =
+  lazy (
+  let regexp =
+    Str.regexp "control_request(\"\\([^\"]+\\)\"[^\n]*timeout=\\([0-9]+\\)"
+  in
+  let text = Lazy.force mcp_server_py in
+  let rec loop pos acc =
+    match Str.search_forward regexp text pos with
+    | exception Not_found -> acc
+    | _ ->
+      let method_name = Str.matched_group 1 text in
+      let timeout_s = int_of_string (Str.matched_group 2 text) in
+      let acc =
+        match List.assoc_opt method_name acc with
+        | None -> (method_name, timeout_s) :: acc
+        | Some existing when existing = timeout_s -> acc
+        | Some existing ->
+          failf "conflicting Python timeout for %s: %d and %d"
+            method_name existing timeout_s
+      in
+      loop (Str.match_end ()) acc
+  in
+  loop 0 []
+  )
+
+let python_timeout_s method_name =
+  Option.value
+    (List.assoc_opt method_name (Lazy.force python_explicit_timeouts))
+    ~default:(Lazy.force python_default_timeout_s)
 
 let rec canonical_json = function
   | `Assoc fields ->
@@ -185,7 +236,7 @@ let test_tool_control_methods_match_control_metadata () =
     | Some method_spec ->
       Alcotest.(check int)
         (Mcp_tool.tool_name spec)
-        (Control_api.method_spec_timeout_s method_spec)
+        (python_timeout_s (Control_api.method_spec_name method_spec))
         (Mcp_tool.control_method_timeout_s spec));
   let tool_control_names =
     Mcp_tool.all_specs
