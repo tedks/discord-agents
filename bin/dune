@@ -3,3 +3,7 @@
  (public_name discord-agents)
  (package discord_agents)
  (libraries discord_agents eio_main logs logs.fmt fmt fmt.tty))
+
+(executable
+ (name mcp_server)
+ (libraries discord_agents yojson))
