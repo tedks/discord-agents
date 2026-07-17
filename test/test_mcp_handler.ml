@@ -173,6 +173,39 @@ let test_server_wraps_list_projects_result () =
   | Some actual, Some expected -> check_json "MCP response" expected actual
   | _ -> failf "expected MCP response"
 
+let test_server_wraps_list_projects_control_error () =
+  let control_client =
+    Control_client.make ~request:(fun _request ->
+      Ok (`Assoc [("error", `String "Bot is not running.")]))
+  in
+  let line =
+    {|{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"list_projects"}}|}
+  in
+  let actual =
+    Mcp_server.handle_line
+      ~handle_tool_call:(Mcp_handler.handle_tool_call ~control_client)
+      line
+  in
+  let expected =
+    Some (`Assoc [
+      ("jsonrpc", `String "2.0");
+      ("id", `Int 9);
+      ("result", `Assoc [
+        ("content", `List [
+          `Assoc [
+            ("type", `String "text");
+            ("text", `String "Bot is not running.");
+          ];
+        ]);
+        ("isError", `Bool true);
+      ]);
+    ])
+  in
+  match actual, expected with
+  | Some actual, Some expected ->
+    check_json "MCP error response" expected actual
+  | _ -> failf "expected MCP error response"
+
 let temp_dir_counter = ref 0
 
 let make_short_temp_dir () =
@@ -311,6 +344,8 @@ let () =
         test_handler_unsupported_tool;
       Alcotest.test_case "server wraps list_projects result" `Quick
         test_server_wraps_list_projects_result;
+      Alcotest.test_case "server wraps list_projects control error" `Quick
+        test_server_wraps_list_projects_control_error;
     ]);
     ("control client", [
       Alcotest.test_case "unix roundtrip" `Quick

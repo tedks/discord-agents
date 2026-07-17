@@ -1,7 +1,7 @@
 (library
  (name discord_agents)
  (public_name discord_agents)
-(libraries eio_main cohttp-eio tls-eio ca-certs mirage-crypto-rng.unix base64 yojson logs fmt uri unix)
+ (libraries eio_main cohttp-eio tls-eio ca-certs mirage-crypto-rng.unix base64 yojson logs fmt uri unix)
  (foreign_stubs
   (language c)
   (names disk_space_stubs rlimit_stubs))

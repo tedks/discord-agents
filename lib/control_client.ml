@@ -42,16 +42,28 @@ let request_line request =
 
 let max_response_size = 1_000_000
 
+let rec write_substring fd data offset length =
+  match Unix.write_substring fd data offset length with
+  | written -> written
+  | exception Unix.Unix_error (Unix.EINTR, _, _) ->
+    write_substring fd data offset length
+
 let write_all fd data =
   let length = String.length data in
   let rec loop offset =
     if offset < length then begin
-      let written = Unix.write_substring fd data offset (length - offset) in
+      let written = write_substring fd data offset (length - offset) in
       if written = 0 then raise End_of_file;
       loop (offset + written)
     end
   in
   loop 0
+
+let rec read_chunk fd chunk =
+  match Unix.read fd chunk 0 (Bytes.length chunk) with
+  | n -> n
+  | exception Unix.Unix_error (Unix.EINTR, _, _) ->
+    read_chunk fd chunk
 
 let find_newline bytes length =
   let rec loop index =
@@ -68,7 +80,7 @@ let read_line fd =
     if total > max_response_size then
       Error "Control API error: response too large"
     else
-      match Unix.read fd chunk 0 (Bytes.length chunk) with
+      match read_chunk fd chunk with
       | 0 ->
         if Buffer.length buffer = 0 then
           Error "Control API error: empty response"
@@ -80,18 +92,24 @@ let read_line fd =
            if total + newline > max_response_size then
              Error "Control API error: response too large"
            else begin
-           Buffer.add_subbytes buffer chunk 0 newline;
+             Buffer.add_subbytes buffer chunk 0 newline;
              Ok (Buffer.contents buffer)
            end
          | None ->
            if total + n > max_response_size then
              Error "Control API error: response too large"
            else begin
-           Buffer.add_subbytes buffer chunk 0 n;
+             Buffer.add_subbytes buffer chunk 0 n;
              loop (total + n)
            end)
   in
   loop 0
+
+let rec connect fd address =
+  match Unix.connect fd address with
+  | () -> ()
+  | exception Unix.Unix_error (Unix.EINTR, _, _) ->
+    connect fd address
 
 let error_of_unix = function
   | Unix.ENOENT -> "Bot is not running (control socket not found)."
@@ -102,15 +120,15 @@ let error_of_unix = function
     Printf.sprintf "Control API error: %s" (Unix.error_message code)
 
 let request_unix ~socket_path request =
-  let fd = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
   try
+    let fd = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
     Fun.protect ~finally:(fun () ->
       try Unix.close fd with Unix.Unix_error _ -> ())
       (fun () ->
         let timeout = float_of_int request.timeout_s in
         Unix.setsockopt_float fd Unix.SO_RCVTIMEO timeout;
         Unix.setsockopt_float fd Unix.SO_SNDTIMEO timeout;
-        Unix.connect fd (Unix.ADDR_UNIX socket_path);
+        connect fd (Unix.ADDR_UNIX socket_path);
         write_all fd (request_line request);
         match read_line fd with
         | Error _ as error -> error
