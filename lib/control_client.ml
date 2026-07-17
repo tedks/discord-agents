@@ -105,12 +105,6 @@ let read_line fd =
   in
   loop 0
 
-let rec connect fd address =
-  match Unix.connect fd address with
-  | () -> ()
-  | exception Unix.Unix_error (Unix.EINTR, _, _) ->
-    connect fd address
-
 let error_of_unix = function
   | Unix.ENOENT -> "Bot is not running (control socket not found)."
   | Unix.ECONNREFUSED -> "Bot is not running (connection refused)."
@@ -128,7 +122,7 @@ let request_unix ~socket_path request =
         let timeout = float_of_int request.timeout_s in
         Unix.setsockopt_float fd Unix.SO_RCVTIMEO timeout;
         Unix.setsockopt_float fd Unix.SO_SNDTIMEO timeout;
-        connect fd (Unix.ADDR_UNIX socket_path);
+        Unix.connect fd (Unix.ADDR_UNIX socket_path);
         write_all fd (request_line request);
         match read_line fd with
         | Error _ as error -> error
