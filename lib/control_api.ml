@@ -1323,57 +1323,62 @@ let handle_cleanup_channels (bot : Bot.t) =
 
 (* ── Router ────────────────────────────────────────────────────── *)
 
-let method_spec ?(mcp_exposed=true) ?(timeout_s=60) ~id ~mutability ~handler () =
+let method_spec ?(timeout_s=60) ~id ~mutability ~mcp_exposed ~handler () =
   { id; name = string_of_method_id id; mutability; mcp_exposed; timeout_s;
     handler }
 
 let all_method_specs = [
   method_spec ~id:Health_id ~mutability:Read_only ~mcp_exposed:false
     ~handler:(fun bot _params -> handle_health bot) ();
-  method_spec ~id:List_projects_id ~mutability:Read_only
+  method_spec ~id:List_projects_id ~mutability:Read_only ~mcp_exposed:true
     ~handler:(fun bot _params -> handle_list_projects bot) ();
-  method_spec ~id:List_sessions_id ~mutability:Read_only
+  method_spec ~id:List_sessions_id ~mutability:Read_only ~mcp_exposed:true
     ~handler:(fun bot _params -> handle_list_sessions bot) ();
-  method_spec ~id:Import_project_id ~mutability:Mutates_projects
+  method_spec ~id:Import_project_id ~mutability:Mutates_projects ~mcp_exposed:true
     ~timeout_s:300
     ~handler:(fun bot params -> handle_import_project bot params) ();
   method_spec ~id:List_claude_sessions_id ~mutability:Read_only
+    ~mcp_exposed:true
     ~handler:(fun bot params -> handle_list_claude_sessions bot params) ();
   method_spec ~id:List_codex_sessions_id ~mutability:Read_only
+    ~mcp_exposed:true
     ~handler:(fun bot params -> handle_list_codex_sessions bot params) ();
   method_spec ~id:List_gemini_sessions_id ~mutability:Read_only
+    ~mcp_exposed:true
     ~handler:(fun bot params -> handle_list_gemini_sessions bot params) ();
-  method_spec ~id:Start_session_id ~mutability:Mutates_session
+  method_spec ~id:Start_session_id ~mutability:Mutates_session ~mcp_exposed:true
     ~timeout_s:120
     ~handler:(fun bot params -> handle_start_session bot params) ();
-  method_spec ~id:Resume_session_id ~mutability:Mutates_session
+  method_spec ~id:Resume_session_id ~mutability:Mutates_session ~mcp_exposed:true
     ~timeout_s:120
     ~handler:(fun bot params -> handle_resume_session bot params) ();
-  method_spec ~id:Stop_session_id ~mutability:Mutates_session
+  method_spec ~id:Stop_session_id ~mutability:Mutates_session ~mcp_exposed:true
     ~handler:(fun bot params -> handle_stop_session bot params) ();
-  method_spec ~id:Send_message_id ~mutability:Mutates_session
+  method_spec ~id:Send_message_id ~mutability:Mutates_session ~mcp_exposed:true
     ~handler:(fun bot params -> handle_send_message bot params) ();
-  method_spec ~id:Default_agent_id ~mutability:Mutates_runtime
+  method_spec ~id:Default_agent_id ~mutability:Mutates_runtime ~mcp_exposed:true
     ~handler:(fun bot params -> handle_default_agent bot params) ();
-  method_spec ~id:Rescue_agent_id ~mutability:Mutates_runtime
+  method_spec ~id:Rescue_agent_id ~mutability:Mutates_runtime ~mcp_exposed:true
     ~handler:(fun bot params -> handle_rescue_agent bot params) ();
-  method_spec ~id:Get_agent_config_id ~mutability:Read_only
+  method_spec ~id:Get_agent_config_id ~mutability:Read_only ~mcp_exposed:true
     ~handler:(fun bot params -> handle_get_agent_config bot params) ();
-  method_spec ~id:Set_model_id ~mutability:Mutates_session
+  method_spec ~id:Set_model_id ~mutability:Mutates_session ~mcp_exposed:true
     ~handler:(fun bot params -> handle_set_model bot params) ();
-  method_spec ~id:Set_effort_id ~mutability:Mutates_session
+  method_spec ~id:Set_effort_id ~mutability:Mutates_session ~mcp_exposed:true
     ~handler:(fun bot params -> handle_set_effort bot params) ();
-  method_spec ~id:Set_goal_id ~mutability:Mutates_session
+  method_spec ~id:Set_goal_id ~mutability:Mutates_session ~mcp_exposed:true
     ~handler:(fun bot params -> handle_set_goal bot params) ();
-  method_spec ~id:Start_login_flow_id ~mutability:Read_only
+  method_spec ~id:Start_login_flow_id ~mutability:Read_only ~mcp_exposed:true
     ~handler:(fun bot params -> handle_start_login_flow bot params) ();
-  method_spec ~id:Restart_id ~mutability:Restarts_process
+  method_spec ~id:Restart_id ~mutability:Restarts_process ~mcp_exposed:true
     ~handler:(fun bot _params -> handle_restart bot) ();
-  method_spec ~id:Rename_thread_id ~mutability:Mutates_discord
+  method_spec ~id:Rename_thread_id ~mutability:Mutates_discord ~mcp_exposed:true
     ~handler:(fun bot params -> handle_rename_thread bot params) ();
   method_spec ~id:Cleanup_channels_id ~mutability:Mutates_discord
+    ~mcp_exposed:true
     ~handler:(fun bot _params -> handle_cleanup_channels bot) ();
   method_spec ~id:Refresh_projects_id ~mutability:Mutates_projects
+    ~mcp_exposed:true
     ~handler:(fun bot _params -> handle_refresh_projects bot) ();
 ]
 
