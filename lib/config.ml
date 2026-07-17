@@ -90,7 +90,7 @@ let yojson_of_agent_kind k = `String (string_of_agent_kind k)
 type project = {
   name : string;
   path : string; (** Absolute path to the project's bare repo or working directory *)
-  channel_id : string option; (** Discord channel ID, populated once created *)
+  channel_id : string option [@default None]; (** Discord channel ID, populated once created *)
 } [@@deriving show, yojson]
 
 type t = {
@@ -111,6 +111,15 @@ let default = {
 
 let field fields name = List.assoc_opt name fields
 
+let known_top_level_fields =
+  ["discord_token"; "base_directories"; "base_dirs"; "guild_id";
+   "control_channel_id"; "projects"]
+
+let unknown_top_level_fields fields =
+  List.filter_map (fun (name, _) ->
+    if List.mem name known_top_level_fields then None else Some name
+  ) fields
+
 let string_field ~name = function
   | `String s -> s
   | _ -> failwith (Printf.sprintf "%s: expected string" name)
@@ -130,6 +139,9 @@ let project_list_field ~name = function
 
 let t_of_yojson = function
   | `Assoc fields ->
+    (match unknown_top_level_fields fields with
+     | [] -> ()
+     | name :: _ -> failwith (Printf.sprintf "unknown config field: %s" name));
     let discord_token =
       match field fields "discord_token" with
       | Some json -> string_field ~name:"discord_token" json
@@ -181,6 +193,9 @@ let validation_errors ?(require_guild_id=true) config =
     add "discord_token is required, unless DISCORD_BOT_TOKEN is set";
   if require_guild_id && blank config.guild_id then
     add "guild_id is required";
+  (match config.control_channel_id with
+   | Some id when blank id -> add "control_channel_id must not be empty"
+   | _ -> ());
   List.iteri (fun i path ->
     if blank path then
       add (Printf.sprintf "base_directories[%d] must not be empty" i)
@@ -189,7 +204,11 @@ let validation_errors ?(require_guild_id=true) config =
     if blank project.name then
       add (Printf.sprintf "projects[%d].name must not be empty" i);
     if blank project.path then
-      add (Printf.sprintf "projects[%d].path must not be empty" i)
+      add (Printf.sprintf "projects[%d].path must not be empty" i);
+    match project.channel_id with
+    | Some id when blank id ->
+      add (Printf.sprintf "projects[%d].channel_id must not be empty" i)
+    | _ -> ()
   ) config.projects;
   List.rev !errors
 
@@ -224,6 +243,15 @@ let load () =
   | Some token when not (blank token) && blank config.discord_token ->
     { config with discord_token = token }
   | _ -> config
+
+let load_result () =
+  try Ok (load ()) with
+  | Yojson.Json_error msg ->
+    Error [Printf.sprintf "invalid JSON: %s" msg]
+  | Failure msg ->
+    Error [msg]
+  | exn ->
+    Error [Printexc.to_string exn]
 
 let save config =
   let path = config_path () in

@@ -63,6 +63,25 @@ let test_load_prefers_canonical_base_directories () =
     Alcotest.(check (list string)) "canonical base directories"
       ["~/Projects"] config.base_directories)
 
+let test_load_accepts_project_without_channel_id () =
+  with_tmp_home (fun home ->
+    let path = config_path home in
+    Discord_agents.Resource.ensure_parent_dir path;
+    Discord_agents.Resource.write_file_atomic path
+      {|{
+  "discord_token": "test-token",
+  "guild_id": "guild-1",
+  "projects": [{"name": "repo", "path": "/srv/repo"}]
+}|};
+    let config = Discord_agents.Config.load () in
+    match config.projects with
+    | [project] ->
+      Alcotest.(check string) "project name" "repo" project.name;
+      Alcotest.(check string) "project path" "/srv/repo" project.path;
+      Alcotest.(check (option string)) "channel id default"
+        None project.channel_id
+    | _ -> Alcotest.fail "expected one project")
+
 let test_load_env_token_replaces_blank_config_token () =
   with_tmp_home (fun home ->
     let old_token = Sys.getenv_opt "DISCORD_BOT_TOKEN" in
@@ -92,9 +111,10 @@ let test_validate_reports_required_fields () =
   let config = {
     Discord_agents.Config.default with
     base_directories = ["~/Projects"; ""];
+    control_channel_id = Some " ";
     projects = [
       { name = ""; path = "/tmp/project"; channel_id = None };
-      { name = "missing-path"; path = ""; channel_id = None };
+      { name = "missing-path"; path = ""; channel_id = Some "" };
     ];
   } in
   match Discord_agents.Config.validate config with
@@ -106,10 +126,14 @@ let test_validate_reports_required_fields () =
       true (has_error_substring "guild_id" errors);
     Alcotest.(check bool) "rejects empty base dir"
       true (has_error_substring "base_directories[1]" errors);
+    Alcotest.(check bool) "rejects empty control channel"
+      true (has_error_substring "control_channel_id" errors);
     Alcotest.(check bool) "rejects empty project name"
       true (has_error_substring "projects[0].name" errors);
     Alcotest.(check bool) "rejects empty project path"
-      true (has_error_substring "projects[1].path" errors)
+      true (has_error_substring "projects[1].path" errors);
+    Alcotest.(check bool) "rejects empty project channel"
+      true (has_error_substring "projects[1].channel_id" errors)
 
 let test_validate_smoke_test_allows_missing_guild () =
   let config = {
@@ -121,6 +145,46 @@ let test_validate_smoke_test_allows_missing_guild () =
   | Error errors ->
     Alcotest.failf "expected smoke-test config to validate, got: %s"
       (String.concat "; " errors)
+
+let test_load_result_reports_parse_errors () =
+  with_tmp_home (fun home ->
+    let path = config_path home in
+    Discord_agents.Resource.ensure_parent_dir path;
+    Discord_agents.Resource.write_file_atomic path
+      {|{"discord_token": }|};
+    match Discord_agents.Config.load_result () with
+    | Ok _ -> Alcotest.fail "expected parse error"
+    | Error errors ->
+      Alcotest.(check bool) "reports invalid JSON"
+        true (has_error_substring "invalid JSON" errors))
+
+let test_load_result_reports_schema_errors () =
+  with_tmp_home (fun home ->
+    let path = config_path home in
+    Discord_agents.Resource.ensure_parent_dir path;
+    Discord_agents.Resource.write_file_atomic path
+      {|{"discord_token": 42}|};
+    match Discord_agents.Config.load_result () with
+    | Ok _ -> Alcotest.fail "expected schema error"
+    | Error errors ->
+      Alcotest.(check bool) "reports field type error"
+        true (has_error_substring "discord_token: expected string" errors))
+
+let test_load_result_reports_unknown_fields () =
+  with_tmp_home (fun home ->
+    let path = config_path home in
+    Discord_agents.Resource.ensure_parent_dir path;
+    Discord_agents.Resource.write_file_atomic path
+      {|{
+  "discord_token": "test-token",
+  "guild_id": "guild-1",
+  "base_directores": ["~/Projects"]
+}|};
+    match Discord_agents.Config.load_result () with
+    | Ok _ -> Alcotest.fail "expected unknown field error"
+    | Error errors ->
+      Alcotest.(check bool) "reports unknown field"
+        true (has_error_substring "unknown config field: base_directores" errors))
 
 let test_save_reaps_stale_atomic_temp () =
   with_tmp_home (fun home ->
@@ -179,12 +243,20 @@ let () =
         test_load_accepts_basic_schema_alias;
       Alcotest.test_case "canonical base_directories wins" `Quick
         test_load_prefers_canonical_base_directories;
+      Alcotest.test_case "load accepts project without channel_id" `Quick
+        test_load_accepts_project_without_channel_id;
       Alcotest.test_case "env token replaces blank config token" `Quick
         test_load_env_token_replaces_blank_config_token;
       Alcotest.test_case "validation reports required fields" `Quick
         test_validate_reports_required_fields;
       Alcotest.test_case "smoke-test validation allows missing guild" `Quick
         test_validate_smoke_test_allows_missing_guild;
+      Alcotest.test_case "load_result reports parse errors" `Quick
+        test_load_result_reports_parse_errors;
+      Alcotest.test_case "load_result reports schema errors" `Quick
+        test_load_result_reports_schema_errors;
+      Alcotest.test_case "load_result reports unknown fields" `Quick
+        test_load_result_reports_unknown_fields;
     ]);
     ("persistence", [
       Alcotest.test_case "save reaps stale atomic temp" `Quick
