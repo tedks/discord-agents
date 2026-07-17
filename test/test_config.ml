@@ -236,6 +236,70 @@ let test_save_load_roundtrip () =
         (Some "chan") project.channel_id
     | _ -> Alcotest.fail "expected one project")
 
+let test_reasoning_effort_values_by_agent () =
+  let values agent =
+    Discord_agents.Config.reasoning_effort_strings_for_agent agent
+  in
+  Alcotest.(check (list string)) "claude efforts"
+    ["low"; "medium"; "high"; "xhigh"; "max"]
+    (values Discord_agents.Config.Claude);
+  Alcotest.(check (list string)) "codex efforts"
+    ["low"; "medium"; "high"; "xhigh"]
+    (values Discord_agents.Config.Codex);
+  Alcotest.(check (list string)) "gemini efforts"
+    [] (values Discord_agents.Config.Gemini)
+
+let test_validate_reasoning_effort_for_agent () =
+  let validate = Discord_agents.Config.validate_reasoning_effort_for_agent in
+  let all_efforts = [
+    Discord_agents.Config.Low;
+    Discord_agents.Config.Medium;
+    Discord_agents.Config.High;
+    Discord_agents.Config.Xhigh;
+    Discord_agents.Config.Max;
+  ] in
+  List.iter (fun agent ->
+    let supported = Discord_agents.Config.reasoning_efforts_for_agent agent in
+    List.iter (fun effort ->
+      let result = validate agent (Some effort) in
+      let expected =
+        List.exists (Discord_agents.Config.equal_reasoning_effort effort)
+          supported
+      in
+      Alcotest.(check bool)
+        (Printf.sprintf "%s %s validation follows supported list"
+           (Discord_agents.Config.string_of_agent_kind agent)
+           (Discord_agents.Config.string_of_reasoning_effort effort))
+        expected
+        (match result with Ok () -> true | Error _ -> false)
+    ) all_efforts
+  ) [
+    Discord_agents.Config.Claude;
+    Discord_agents.Config.Codex;
+    Discord_agents.Config.Gemini;
+  ];
+  (match validate Discord_agents.Config.Codex (Some Discord_agents.Config.Max) with
+   | Ok () -> Alcotest.fail "expected Codex max effort to be rejected"
+   | Error msg ->
+     Alcotest.(check bool) "codex max names max as Claude-only"
+       true (has_error_substring "max is Claude-only" [msg]));
+  (match validate Discord_agents.Config.Gemini (Some Discord_agents.Config.High) with
+   | Ok () -> Alcotest.fail "expected Gemini effort to be rejected"
+   | Error msg ->
+     Alcotest.(check bool) "gemini unsupported"
+       true (has_error_substring "Gemini CLI does not expose" [msg]));
+  Alcotest.(check bool) "clearing effort accepted for Gemini"
+    true
+    (match validate Discord_agents.Config.Gemini None with
+     | Ok () -> true
+     | Error _ -> false);
+  Alcotest.(check bool) "xhigh accepted for Codex"
+    true
+    (match validate Discord_agents.Config.Codex
+             (Some Discord_agents.Config.Xhigh) with
+     | Ok () -> true
+     | Error _ -> false)
+
 let () =
   Alcotest.run "config" [
     ("schema", [
@@ -257,6 +321,12 @@ let () =
         test_load_result_reports_schema_errors;
       Alcotest.test_case "load_result reports unknown fields" `Quick
         test_load_result_reports_unknown_fields;
+    ]);
+    ("agent capabilities", [
+      Alcotest.test_case "reasoning effort values by agent" `Quick
+        test_reasoning_effort_values_by_agent;
+      Alcotest.test_case "validate reasoning effort for agent" `Quick
+        test_validate_reasoning_effort_for_agent;
     ]);
     ("persistence", [
       Alcotest.test_case "save reaps stale atomic temp" `Quick
