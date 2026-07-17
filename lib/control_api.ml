@@ -55,6 +55,79 @@ let error_response msg =
 let json_of_int64 n =
   `Intlit (Int64.to_string n)
 
+type method_id =
+  | Health_id
+  | List_projects_id
+  | List_sessions_id
+  | Import_project_id
+  | List_claude_sessions_id
+  | List_codex_sessions_id
+  | List_gemini_sessions_id
+  | Start_session_id
+  | Resume_session_id
+  | Stop_session_id
+  | Send_message_id
+  | Default_agent_id
+  | Rescue_agent_id
+  | Get_agent_config_id
+  | Set_model_id
+  | Set_effort_id
+  | Set_goal_id
+  | Start_login_flow_id
+  | Restart_id
+  | Rename_thread_id
+  | Cleanup_channels_id
+  | Refresh_projects_id
+
+type mutability =
+  | Read_only
+  | Mutates_session
+  | Mutates_runtime
+  | Mutates_projects
+  | Mutates_discord
+  | Restarts_process
+
+type method_spec = {
+  id : method_id;
+  name : string;
+  mutability : mutability;
+  mcp_exposed : bool;
+  timeout_s : int;
+  handler : Bot.t -> Yojson.Safe.t option -> Yojson.Safe.t;
+}
+
+let string_of_method_id = function
+  | Health_id -> "health"
+  | List_projects_id -> "list_projects"
+  | List_sessions_id -> "list_sessions"
+  | Import_project_id -> "import_project"
+  | List_claude_sessions_id -> "list_claude_sessions"
+  | List_codex_sessions_id -> "list_codex_sessions"
+  | List_gemini_sessions_id -> "list_gemini_sessions"
+  | Start_session_id -> "start_session"
+  | Resume_session_id -> "resume_session"
+  | Stop_session_id -> "stop_session"
+  | Send_message_id -> "send_message"
+  | Default_agent_id -> "default_agent"
+  | Rescue_agent_id -> "rescue_agent"
+  | Get_agent_config_id -> "get_agent_config"
+  | Set_model_id -> "set_model"
+  | Set_effort_id -> "set_effort"
+  | Set_goal_id -> "set_goal"
+  | Start_login_flow_id -> "start_login_flow"
+  | Restart_id -> "restart"
+  | Rename_thread_id -> "rename_thread"
+  | Cleanup_channels_id -> "cleanup_channels"
+  | Refresh_projects_id -> "refresh_projects"
+
+let string_of_mutability = function
+  | Read_only -> "read_only"
+  | Mutates_session -> "mutates_session"
+  | Mutates_runtime -> "mutates_runtime"
+  | Mutates_projects -> "mutates_projects"
+  | Mutates_discord -> "mutates_discord"
+  | Restarts_process -> "restarts_process"
+
 let cleanup_orphan_thread rest ~thread_id ~context =
   match Discord_rest.delete_channel rest ~channel_id:thread_id () with
   | Ok _ -> ()
@@ -1250,32 +1323,87 @@ let handle_cleanup_channels (bot : Bot.t) =
 
 (* ── Router ────────────────────────────────────────────────────── *)
 
+let method_spec ?(mcp_exposed=true) ?(timeout_s=60) ~id ~mutability ~handler () =
+  { id; name = string_of_method_id id; mutability; mcp_exposed; timeout_s;
+    handler }
+
+let all_method_specs = [
+  method_spec ~id:Health_id ~mutability:Read_only ~mcp_exposed:false
+    ~handler:(fun bot _params -> handle_health bot) ();
+  method_spec ~id:List_projects_id ~mutability:Read_only
+    ~handler:(fun bot _params -> handle_list_projects bot) ();
+  method_spec ~id:List_sessions_id ~mutability:Read_only
+    ~handler:(fun bot _params -> handle_list_sessions bot) ();
+  method_spec ~id:Import_project_id ~mutability:Mutates_projects
+    ~timeout_s:300
+    ~handler:(fun bot params -> handle_import_project bot params) ();
+  method_spec ~id:List_claude_sessions_id ~mutability:Read_only
+    ~handler:(fun bot params -> handle_list_claude_sessions bot params) ();
+  method_spec ~id:List_codex_sessions_id ~mutability:Read_only
+    ~handler:(fun bot params -> handle_list_codex_sessions bot params) ();
+  method_spec ~id:List_gemini_sessions_id ~mutability:Read_only
+    ~handler:(fun bot params -> handle_list_gemini_sessions bot params) ();
+  method_spec ~id:Start_session_id ~mutability:Mutates_session
+    ~timeout_s:120
+    ~handler:(fun bot params -> handle_start_session bot params) ();
+  method_spec ~id:Resume_session_id ~mutability:Mutates_session
+    ~timeout_s:120
+    ~handler:(fun bot params -> handle_resume_session bot params) ();
+  method_spec ~id:Stop_session_id ~mutability:Mutates_session
+    ~handler:(fun bot params -> handle_stop_session bot params) ();
+  method_spec ~id:Send_message_id ~mutability:Mutates_session
+    ~handler:(fun bot params -> handle_send_message bot params) ();
+  method_spec ~id:Default_agent_id ~mutability:Mutates_runtime
+    ~handler:(fun bot params -> handle_default_agent bot params) ();
+  method_spec ~id:Rescue_agent_id ~mutability:Mutates_runtime
+    ~handler:(fun bot params -> handle_rescue_agent bot params) ();
+  method_spec ~id:Get_agent_config_id ~mutability:Read_only
+    ~handler:(fun bot params -> handle_get_agent_config bot params) ();
+  method_spec ~id:Set_model_id ~mutability:Mutates_session
+    ~handler:(fun bot params -> handle_set_model bot params) ();
+  method_spec ~id:Set_effort_id ~mutability:Mutates_session
+    ~handler:(fun bot params -> handle_set_effort bot params) ();
+  method_spec ~id:Set_goal_id ~mutability:Mutates_session
+    ~handler:(fun bot params -> handle_set_goal bot params) ();
+  method_spec ~id:Start_login_flow_id ~mutability:Read_only
+    ~handler:(fun bot params -> handle_start_login_flow bot params) ();
+  method_spec ~id:Restart_id ~mutability:Restarts_process
+    ~handler:(fun bot _params -> handle_restart bot) ();
+  method_spec ~id:Rename_thread_id ~mutability:Mutates_discord
+    ~handler:(fun bot params -> handle_rename_thread bot params) ();
+  method_spec ~id:Cleanup_channels_id ~mutability:Mutates_discord
+    ~handler:(fun bot _params -> handle_cleanup_channels bot) ();
+  method_spec ~id:Refresh_projects_id ~mutability:Mutates_projects
+    ~handler:(fun bot _params -> handle_refresh_projects bot) ();
+]
+
+let method_spec_id spec = spec.id
+
+let method_spec_name spec = spec.name
+
+let method_spec_mutability spec = spec.mutability
+
+let method_spec_timeout_s spec = spec.timeout_s
+
+let method_spec_mcp_exposed spec = spec.mcp_exposed
+
+let method_spec_of_name name =
+  List.find_opt (fun spec -> String.equal spec.name name) all_method_specs
+
+let method_spec_of_id id =
+  List.find_opt (fun spec -> spec.id = id) all_method_specs
+
+let mcp_exposed_method_specs =
+  List.filter method_spec_mcp_exposed all_method_specs
+
+let mcp_control_method_names =
+  List.map method_spec_name mcp_exposed_method_specs
+
 let dispatch (bot : Bot.t) method_ params =
   try
-    match method_ with
-    | "health" -> handle_health bot
-    | "list_projects" -> handle_list_projects bot
-    | "list_sessions" -> handle_list_sessions bot
-    | "import_project" -> handle_import_project bot params
-    | "list_claude_sessions" -> handle_list_claude_sessions bot params
-    | "list_codex_sessions" -> handle_list_codex_sessions bot params
-    | "list_gemini_sessions" -> handle_list_gemini_sessions bot params
-    | "start_session" -> handle_start_session bot params
-    | "resume_session" -> handle_resume_session bot params
-    | "stop_session" -> handle_stop_session bot params
-    | "send_message" -> handle_send_message bot params
-    | "default_agent" -> handle_default_agent bot params
-    | "rescue_agent" -> handle_rescue_agent bot params
-    | "get_agent_config" -> handle_get_agent_config bot params
-    | "set_model" -> handle_set_model bot params
-    | "set_effort" -> handle_set_effort bot params
-    | "set_goal" -> handle_set_goal bot params
-    | "start_login_flow" -> handle_start_login_flow bot params
-    | "restart" -> handle_restart bot
-    | "rename_thread" -> handle_rename_thread bot params
-    | "cleanup_channels" -> handle_cleanup_channels bot
-    | "refresh_projects" -> handle_refresh_projects bot
-    | _ -> error_response (Printf.sprintf "Unknown method: %s" method_)
+    match method_spec_of_name method_ with
+    | Some spec -> spec.handler bot params
+    | None -> error_response (Printf.sprintf "Unknown method: %s" method_)
   with exn ->
     raise_if_cancelled exn;
     Logs.warn (fun m -> m "control_api: handler error: %s" (Printexc.to_string exn));
