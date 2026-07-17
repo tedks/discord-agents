@@ -133,6 +133,21 @@ let test_tools_call_defaults_arguments () =
   | calls ->
     failf "expected one handler call, got %d" (List.length calls)
 
+let test_tools_call_treats_null_arguments_as_absent () =
+  handler_calls := [];
+  let handler =
+    recording_handler (Ok "listed")
+  in
+  expect_response "tools/call null args" ~handler
+    {|{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"list_projects","arguments":null}}|}
+    (response ~id:(`Int 41) ~result:(text_result "listed"));
+  match !handler_calls with
+  | [{ Mcp_server.name; arguments }] ->
+    Alcotest.(check string) "tool name" "list_projects" name;
+    check_json "arguments" (`Assoc []) arguments
+  | calls ->
+    failf "expected one handler call, got %d" (List.length calls)
+
 let test_tools_call_error_result () =
   let handler _call = Error "not yet" in
   expect_response "tools/call error" ~handler
@@ -197,6 +212,8 @@ let () =
         test_tools_call_invokes_handler;
       Alcotest.test_case "tools/call defaults arguments" `Quick
         test_tools_call_defaults_arguments;
+      Alcotest.test_case "tools/call null arguments" `Quick
+        test_tools_call_treats_null_arguments_as_absent;
       Alcotest.test_case "tools/call error result" `Quick
         test_tools_call_error_result;
       Alcotest.test_case "tools/call rejects missing params" `Quick

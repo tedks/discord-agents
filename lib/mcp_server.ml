@@ -19,6 +19,8 @@ let protocol_version = "2024-11-05"
 
 let server_name = "discord-agents-mcp"
 
+(* Keep aligned with scripts/mcp-server.py while Python remains the runtime
+   MCP entrypoint. *)
 let server_version = "0.2.0"
 
 let raise_if_fatal exn =
@@ -107,6 +109,7 @@ let call_tool (handle_tool_call : tool_handler) fields =
        let arguments =
          match field "arguments" params with
          | None -> Ok (`Assoc [])
+         | Some `Null -> Ok (`Assoc [])
          | Some (`Assoc _ as arguments) -> Ok arguments
          | Some _ -> invalid_params "tools/call params.arguments must be an object"
        in
