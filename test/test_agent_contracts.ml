@@ -131,6 +131,12 @@ let codex_command ~ephemeral ~session_id ~session_id_confirmed prompt =
   in
   String.concat " " (List.map Filename.quote args)
 
+let gemini_command ~session_id ~session_id_confirmed prompt =
+  Discord_agents.Agent_process.gemini_args
+    ~model:None ~session_id ~session_id_confirmed ~prompt
+  |> List.map Filename.quote
+  |> String.concat " "
+
 let codex_fresh =
   Alcotest.test_case "fresh exec emits thread.started + agent_message"
     `Slow (fun () ->
@@ -214,9 +220,9 @@ let claude_resume =
 let gemini_fresh =
   Alcotest.test_case "fresh -p emits init session_id + assistant text"
     `Slow (fun () ->
-      let cmd =
-        "gemini -p 'reply with the single word ok' -o stream-json --yolo"
-      in
+      let cmd = gemini_command ~session_id:""
+        ~session_id_confirmed:false
+        "reply with the single word ok" in
       let events = invoke_or_skip ~label:"gemini fresh" ~cmd
         ~parse:Discord_agents.Agent_process.parse_gemini_stream_json_line in
       Alcotest.(check bool)
@@ -229,9 +235,9 @@ let gemini_fresh =
 let gemini_resume =
   Alcotest.test_case "resume preserves the captured session id"
     `Slow (fun () ->
-      let fresh_cmd =
-        "gemini -p 'reply with the single word ok' -o stream-json --yolo"
-      in
+      let fresh_cmd = gemini_command ~session_id:""
+        ~session_id_confirmed:false
+        "reply with the single word ok" in
       let fresh_events = invoke_or_skip ~label:"gemini fresh (for resume)"
         ~cmd:fresh_cmd
         ~parse:Discord_agents.Agent_process.parse_gemini_stream_json_line in
@@ -239,10 +245,9 @@ let gemini_resume =
         | Some s -> s
         | None -> Alcotest.fail "gemini fresh did not emit a session id"
       in
-      let resume_cmd = Printf.sprintf
-        "gemini -p 'reply with the single word ok' -o stream-json --yolo \
-         --resume %s" sid
-      in
+      let resume_cmd = gemini_command ~session_id:sid
+        ~session_id_confirmed:true
+        "reply with the single word ok" in
       let resume_events = invoke_or_skip ~label:"gemini resume"
         ~cmd:resume_cmd
         ~parse:Discord_agents.Agent_process.parse_gemini_stream_json_line in

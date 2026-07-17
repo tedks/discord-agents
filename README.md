@@ -7,6 +7,8 @@ There is a `!command` interface to server management, and control channels also 
 discord-agents is intended to be a simple interface to agentic coding on your personal machines and is not intended to be used in shared Discord servers. There is no authentication, and it has the full capabilities of a coding agent launched as the user you started it as. There is no sandboxing in discord-agents itself; use Unix and Claude sandboxing if you require it.
 
 Only tested on GNU+Linux. Environment managed by Nix. Built with OCaml 5.3.
+Claude Code is the default agent CLI. Gemini sessions require
+`@google/gemini-cli` 0.40.0 or newer.
 
 ![discord-agents screenshot](docs/screenshot.png)
 

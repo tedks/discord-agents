@@ -27,6 +27,10 @@ npm install -g @anthropic-ai/claude-code
 
 Make sure `claude` is on your PATH and you've authenticated (`claude` will prompt on first run).
 
+Gemini sessions are optional. To use them, install `@google/gemini-cli`
+version 0.40.0 or newer; older Gemini CLI releases reject the
+`--skip-trust` flag that discord-agents uses for headless worktree runs.
+
 ## 3. Create a Discord bot
 
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications)

@@ -1463,9 +1463,12 @@ let codex_args ~model ~reasoning_effort
     Result. Subsequent runs resume only when [session_id_confirmed],
     matching the same coherence contract Codex uses.
 
-    [--yolo] auto-approves tool calls so Gemini doesn't block on an
-    interactive approval prompt that the non-interactive subprocess
-    can't answer. It is *not* a full equivalent of Codex's
+    [--skip-trust] is required for bot-created worktrees that Gemini
+    has not seen interactively before; without it, headless runs exit
+    before emitting stream-json events. [--yolo] auto-approves tool
+    calls so Gemini doesn't block on an interactive approval prompt
+    that the non-interactive subprocess can't answer. It is *not* a
+    full equivalent of Codex's
     [--dangerously-bypass-approvals-and-sandbox]: that flag also
     drops Codex's filesystem sandbox, while Gemini's [--yolo] only
     covers approvals. The closer Codex analogue for [--yolo] is
@@ -1475,7 +1478,7 @@ let codex_args ~model ~reasoning_effort
     by [setup_gemini_mcp], which run_streaming calls before invoking
     [gemini_args]. *)
 let gemini_args ~model ~session_id ~session_id_confirmed ~prompt =
-  let base = ["gemini"] @ model_arg model
+  let base = ["gemini"; "--skip-trust"] @ model_arg model
              @ ["-p"; prompt; "-o"; "stream-json"; "--yolo"] in
   if not session_id_confirmed then base
   else base @ ["--resume"; session_id]
