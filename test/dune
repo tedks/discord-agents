@@ -1,5 +1,5 @@
 (tests
- (names test_formatting test_project test_agent_contracts test_discord_rest test_gateway
+ (names test_command test_formatting test_project test_agent_contracts test_discord_rest test_gateway
  test_runtime_settings test_bot_defaults test_session_store test_disk_health test_config
   test_runtime_limits test_stream_interrupt)
  (libraries discord_agents alcotest str unix yojson eio.mock eio_main cohttp-eio
