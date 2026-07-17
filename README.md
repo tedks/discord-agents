@@ -22,7 +22,7 @@ cat > ~/.config/discord-agents/config.json << 'EOF'
 {
   "discord_token": "your-bot-token",
   "guild_id": "your-server-id",
-  "base_dirs": ["~/Projects"]
+  "base_directories": ["~/Projects"]
 }
 EOF
 
@@ -40,6 +40,13 @@ Then in Discord:
 Or just chat in any project channel -- the agent will respond directly.
 
 See [SETUP.md](SETUP.md) for detailed installation and Discord bot setup instructions.
+
+`config.json` is validated at startup. The required fields are
+`discord_token` (or `DISCORD_BOT_TOKEN`) and `guild_id`; optional
+fields default to `base_directories: []`, `control_channel_id: null`,
+and `projects: []`. The older `base_dirs` key is still accepted as an
+alias, but new configs should use `base_directories`. See
+[`config.example.json`](config.example.json).
 
 ## Commands
 

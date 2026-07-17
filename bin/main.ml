@@ -126,15 +126,25 @@ let () =
     | _ -> None
   in
   Logs.info (fun m -> m "discord-agents starting%s" (if test_mode then " (test mode)" else ""));
-  (* Acquire pidfile lock — keeps fd open for process lifetime *)
-  let _lock_fd = if not test_mode then Some (acquire_pidfile ()) else None in
   Random.self_init ();  (* Seed PRNG for heartbeat jitter *)
-  let config = Discord_agents.Config.load () in
-  if config.discord_token = "" then (
-    Logs.err (fun m -> m "no discord token configured");
-    Logs.err (fun m -> m "set discord_token in %s" (Discord_agents.Config.config_path ()));
-    exit 1
-  );
+  let config =
+    match Discord_agents.Config.load_result () with
+    | Ok config -> config
+    | Error errors ->
+      List.iter (fun err -> Logs.err (fun m -> m "config: %s" err)) errors;
+      Logs.err (fun m -> m "update %s" (Discord_agents.Config.config_path ()));
+      exit 1
+  in
+  (match Discord_agents.Config.validate ~require_guild_id:(not test_mode) config with
+   | Ok () -> ()
+   | Error errors ->
+     List.iter (fun err -> Logs.err (fun m -> m "config: %s" err)) errors;
+     Logs.err (fun m -> m "update %s" (Discord_agents.Config.config_path ()));
+     exit 1);
+  (* Acquire pidfile lock after config validation so a bad config cannot
+     terminate a healthy running bot and then fail to start. Keeps fd open
+     for process lifetime. *)
+  let _lock_fd = if not test_mode then Some (acquire_pidfile ()) else None in
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
   if test_mode then
