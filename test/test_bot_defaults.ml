@@ -33,7 +33,17 @@ let with_tmp_home f =
       Unix.putenv "XDG_CONFIG_HOME" "";
       f ())
 
-let with_test_bot f =
+let test_rest ~env ~token call : Discord_agents.Discord_rest.t =
+  Mirage_crypto_rng_unix.use_default ();
+  {
+    token;
+    call;
+    clock = Eio.Stdenv.mono_clock env;
+    rest_state = Discord_agents.Discord_rest.create_health_state ();
+    api_base = Discord_agents.Discord_rest.api_base;
+  }
+
+let with_test_bot ?rest_call f =
   with_tmp_home (fun () ->
     Eio_main.run @@ fun env ->
     Eio.Switch.run @@ fun sw ->
@@ -52,10 +62,15 @@ let with_test_bot f =
         projects = [];
         channels = Discord_agents.Channel_manager.create ();
       } in
+      let rest = match rest_call with
+        | Some call -> test_rest ~env ~token:"test-token" call
+        | None ->
+          Discord_agents.Discord_rest.create ~sw ~env ~token:"test-token"
+      in
       let bot : Discord_agents.Bot.t = {
         config;
         settings;
-        rest = Discord_agents.Discord_rest.create ~sw ~env ~token:"test-token";
+        rest;
         gateway = Discord_agents.Discord_gateway.create
           ~token:"test-token"
           ~intents:Discord_agents.Discord_gateway.default_intents
@@ -145,6 +160,76 @@ let make_message ?(message_id="message-1") ?(channel_id="control") content =
     attachments = [];
     referenced_message = None;
   }
+
+let response ?(headers=Http.Header.of_list []) code body =
+  (Http.Response.make ~status:(Http.Status.of_int code) ~headers (),
+   body,
+   false)
+
+let posted_message_json ~id ~channel_id ~content =
+  `Assoc [
+    ("id", `String id);
+    ("channel_id", `String channel_id);
+    ("author", `Assoc [
+      ("id", `String "bot-1");
+      ("username", `String "discord-agents");
+      ("bot", `Bool true);
+    ]);
+    ("content", `String content);
+    ("timestamp", `String "2026-01-01T00:00:00.000000+00:00");
+  ]
+  |> Yojson.Safe.to_string
+
+let request_body_content = function
+  | None -> ""
+  | Some body ->
+    let open Yojson.Safe.Util in
+    Discord_agents.Discord_rest.read_body body
+    |> Yojson.Safe.from_string
+    |> member "content"
+    |> to_string
+
+let channel_id_of_create_message_path path =
+  match String.split_on_char '/' path with
+  | [""; "api"; "v10"; "channels"; channel_id; "messages"] -> channel_id
+  | [""; "channels"; channel_id; "messages"] -> channel_id
+  | _ -> Alcotest.failf "unexpected create_message path: %s" path
+
+let test_draining_routes_commands_through_command_policy () =
+  let posted = ref [] in
+  let next_id = ref 0 in
+  let rest_call ~headers:_ ?body meth uri =
+    Alcotest.(check string) "drain reply uses create_message POST"
+      "POST" (Http.Method.to_string meth);
+    let channel_id = channel_id_of_create_message_path (Uri.path uri) in
+    let content = request_body_content body in
+    posted := content :: !posted;
+    incr next_id;
+    response 200
+      (posted_message_json
+        ~id:(Printf.sprintf "reply-%d" !next_id)
+        ~channel_id
+        ~content)
+  in
+  with_test_bot ~rest_call (fun bot ->
+    bot.Discord_agents.Bot.draining <- true;
+    Discord_agents.Bot.handle_message bot
+      (make_message ~message_id:"m-help" "!help");
+    Discord_agents.Bot.handle_message bot
+      (make_message ~message_id:"m-start" "!start demo");
+    Discord_agents.Bot.handle_message bot
+      (make_message ~message_id:"m-unknown" "!bogus");
+    match List.rev !posted with
+    | [help; start; unknown] ->
+      Alcotest.(check bool) "help command allowed during drain"
+        true (String.starts_with ~prefix:"**Commands:**" help);
+      Alcotest.(check string) "mutating command blocked during drain"
+        "Bot is restarting. Try again shortly." start;
+      Alcotest.(check string) "unknown command blocked during drain"
+        "Bot is restarting. Try again shortly." unknown
+    | other ->
+      Alcotest.failf "expected 3 posted messages, got %d"
+        (List.length other))
 
 let wait_for_process_exit pid =
   let deadline = Unix.gettimeofday () +. 5.0 in
@@ -1975,6 +2060,8 @@ let () =
         test_process_session_message_aborts_on_session_id_persist_failure;
       Alcotest.test_case "process message keeps run replayable on completion persist failure" `Quick
         test_process_session_message_keeps_run_replayable_on_completion_persist_failure;
+      Alcotest.test_case "draining routes commands through command policy" `Quick
+        test_draining_routes_commands_through_command_policy;
       Alcotest.test_case "inter-agent message includes origin and hop marker" `Quick
         test_prepare_inter_agent_message_formats_origin_and_hop_marker;
       Alcotest.test_case "inter-agent message rejects commands" `Quick

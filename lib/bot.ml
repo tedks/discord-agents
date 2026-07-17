@@ -2433,36 +2433,7 @@ let handle_command t msg cmd =
       ) in
       reply (String.concat "\n" status_lines))
   | Command.Help ->
-    reply (String.concat "\n" [
-      "**Commands:**";
-      "`!projects` — list discovered projects";
-      "`!sessions` — list active bot sessions";
-      "`!claude-sessions` — list recent Claude sessions";
-      "`!codex-sessions` — list recent Codex sessions";
-      "`!gemini-sessions` — list recent Gemini sessions";
-      "`!start <project> [agent]` — start a session (defaults to the current effective top-level agent)";
-      "`!import-project <github-url> [name]` — clone a GitHub repo into the project registry";
-      "`!default-agent [agent]` / `!default_agent [agent]` — show or set the default agent (claude|codex|gemini)";
-      "`!rescue-agent [agent|off]` / `!rescue_agent [agent|off]` — show or set the rescue agent used under disk pressure";
-      "`!session-agent [agent]` / `!session_agent [agent]` — show or set the current channel session agent";
-      "`!resume [agent] <session_id>` — resume a session (no agent = try the current effective top-level agent first)";
-      "`!fork [--move|--no-move]` — create a new thread for context management";
-      "`!reset` — clear this channel's session context";
-      "`!stop <thread_id>` — stop a session";
-      "`!esc` / `!int` / `!interrupt` — stop this thread's active session";
-      "`!rename [thread_id] <name>` — rename a thread";
-      "`!status` — bot status and running processes";
-      "`!refresh` — re-scan for new projects";
-      "`!cleanup` — delete stale channels";
-      "`!restart` — rebuild and restart (warns but doesn't block active sessions)";
-      "`!version` — build info and runtime status";
-      "`!desktop` — set wrapping to desktop width";
-      "`!mobile` — set wrapping to mobile width";
-      "`!wrapping [n]` — show or set line wrap width";
-      "`!lines [n]` — show or set output lines for tool/code display";
-      "`!scroll [n]` — view truncated output (n=block: 1=last, 2=2nd last; repeats advance)";
-      "`!help` — this message";
-    ])
+    reply (String.concat "\n" ("**Commands:**" :: Command.help_lines))
   | Command.Desktop ->
     t.wrap_width <- Agent_process.desktop_width;
     reply (Printf.sprintf "Wrapping set to desktop (%d chars)."
@@ -3137,13 +3108,9 @@ let handle_message t (msg : Discord_types.message) =
   if t.draining then begin
     if Command.is_command msg.content then
       let cmd = Command.parse msg.content in
-      match cmd with
-      | Command.Status | Command.List_projects | Command.List_sessions
-      | Command.List_claude_sessions | Command.List_codex_sessions
-      | Command.List_gemini_sessions
-      | Command.Help ->
+      if Command.is_allowed_during_drain cmd then
         handle_command_safely t msg cmd
-      | _ ->
+      else
         ignore (Discord_rest.create_message t.rest
           ~channel_id:msg.Discord_types.channel_id
           ~content:"Bot is restarting. Try again shortly." ())
