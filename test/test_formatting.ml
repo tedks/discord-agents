@@ -131,6 +131,43 @@ let test_reformat_separator_regenerated () =
        true (String.length sep > 10)
    | [] -> Alcotest.fail "no separator row found")
 
+let test_render_padded_table_truncates_utf8_safely () =
+  let input = [
+    "| Icon | Description |";
+    "|---|---|";
+    "| " ^ String.concat "" (List.init 8 (fun _ -> "😀")) ^ " | " ^
+      String.concat "" (List.init 8 (fun _ -> "界")) ^ " |";
+  ] in
+  let result =
+    Discord_agents.Agent_process.render_padded_table ~max_width:20 input
+  in
+  let well_formed s =
+    let n = String.length s in
+    let rec walk i =
+      if i >= n then true
+      else
+        let c = Char.code s.[i] in
+        let need =
+          if c < 0x80 then 0
+          else if c < 0xC0 then -1
+          else if c < 0xE0 then 1
+          else if c < 0xF0 then 2
+          else 3
+        in
+        if need < 0 || i + need >= n then false
+        else
+          let ok = ref true in
+          for k = 1 to need do
+            let cc = Char.code s.[i + k] in
+            if cc < 0x80 || cc >= 0xC0 then ok := false
+          done;
+          !ok && walk (i + 1 + need)
+    in
+    walk 0
+  in
+  Alcotest.(check bool) "rendered table is valid UTF-8"
+    true (well_formed result)
+
 let reformat_tables_tests = [
   Alcotest.test_case "plain text" `Quick test_reformat_plain_text;
   Alcotest.test_case "simple table" `Quick test_reformat_simple_table;
@@ -150,6 +187,8 @@ let reformat_tables_tests = [
   Alcotest.test_case "padding alignment" `Quick test_reformat_padding_alignment;
   Alcotest.test_case "separator regenerated" `Quick
     test_reformat_separator_regenerated;
+  Alcotest.test_case "table truncation is UTF-8 safe" `Quick
+    test_render_padded_table_truncates_utf8_safely;
 ]
 
 (* ── find_trailing_table_start ──────────────────────────────────── *)
@@ -280,6 +319,144 @@ let test_split_no_separator_utf8_safe () =
   List.iter (fun chunk ->
     Alcotest.(check bool) "chunk is well-formed UTF-8" true (well_formed chunk)
   ) chunks
+
+let contains_substring text needle =
+  try ignore (Str.search_forward (Str.regexp_string needle) text 0); true
+  with Not_found -> false
+
+let test_split_message_does_not_split_words () =
+  let input =
+    String.concat " " [
+      String.make 20 'a';
+      "account";
+      "balance";
+      String.make 20 'b';
+    ]
+  in
+  let chunks = Discord_agents.Agent_process.split_message ~max_len:30 input in
+  let marked = String.concat "/" chunks in
+  Alcotest.(check bool) "account not split as ac/count"
+    false (contains_substring marked "ac/count");
+  List.iter (fun chunk ->
+    Alcotest.(check bool) "chunk under test limit"
+      true (String.length chunk <= 30)
+  ) chunks
+
+let test_split_output_chunks_do_not_split_words () =
+  let input =
+    "alpha beta account gamma delta account epsilon zeta"
+  in
+  let chunks =
+    Discord_agents.Agent_process.split_into_chunks ~max_chars:15 input
+  in
+  let marked = String.concat "/" chunks in
+  Alcotest.(check bool) "output chunks avoid ac/count"
+    false (contains_substring marked "ac/count");
+  List.iter (fun chunk ->
+    Alcotest.(check bool) "chunk under display budget"
+      true (Discord_agents.Agent_process.escaped_length chunk <= 15)
+  ) chunks
+
+let test_split_output_keeps_fitting_suffix_together () =
+  let chunks =
+    Discord_agents.Agent_process.split_into_chunks
+      ~max_chars:10 "verylongword bye"
+  in
+  Alcotest.(check (list string)) "suffix stays in one chunk"
+    ["verylongwo"; "rd bye"] chunks
+
+let test_stream_delta_flushes_before_splitting_word () =
+  let len =
+    Discord_agents.Agent_runner.take_stream_delta_chunk_len
+      ~current_len:(Discord_agents.Agent_runner.stream_message_max - 5)
+      "account balance" ~start:0
+  in
+  Alcotest.(check int) "flush before account split" 0 len
+
+let test_stream_delta_splits_long_word_when_fresh () =
+  let text =
+    String.make (Discord_agents.Agent_runner.stream_message_max + 10) 'a'
+  in
+  let len =
+    Discord_agents.Agent_runner.take_stream_delta_chunk_len
+      ~current_len:0 text ~start:0
+  in
+  Alcotest.(check int) "fresh message takes hard budget"
+    Discord_agents.Agent_runner.stream_message_max len
+
+let test_stream_delta_utf8_boundary_after_flush () =
+  let emoji = "\xF0\x9F\x98\x80" in
+  let text = emoji ^ " account" in
+  let len_before_flush =
+    Discord_agents.Agent_runner.take_stream_delta_chunk_len
+      ~current_len:(Discord_agents.Agent_runner.stream_message_max - 1)
+      text ~start:0
+  in
+  Alcotest.(check int) "flush before slicing emoji" 0 len_before_flush;
+  let prefix =
+    String.make (Discord_agents.Agent_runner.stream_message_max - 1) 'a'
+  in
+  let text = prefix ^ emoji ^ " account" in
+  let len_after_flush =
+    Discord_agents.Agent_runner.take_stream_delta_chunk_len
+      ~current_len:0 text ~start:0
+  in
+  Alcotest.(check int) "fresh chunk stops before emoji boundary"
+    (String.length prefix) len_after_flush
+
+let test_stream_delta_carries_cross_delta_word_suffix () =
+  match Discord_agents.Agent_runner.split_trailing_word_for_carry
+          "prefix acc" with
+  | Some (before, carry) ->
+    Alcotest.(check string) "prefix flushed before suffix"
+      "prefix " before;
+    Alcotest.(check string) "suffix carried"
+      "acc" carry;
+    let len =
+      Discord_agents.Agent_runner.take_stream_delta_chunk_len
+        ~current_len:(String.length carry) "ount balance" ~start:0
+    in
+    Alcotest.(check int) "carried suffix joins continuation"
+      (String.length "ount balance") len
+  | None -> Alcotest.fail "expected trailing suffix to be carried"
+
+let test_stream_delta_exact_capacity_suffix_can_be_carried () =
+  let prefix =
+    String.make (Discord_agents.Agent_runner.stream_message_max - 4) 'a'
+    ^ " "
+  in
+  let page = prefix ^ "acc" in
+  Alcotest.(check int) "page exactly fills stream budget"
+    Discord_agents.Agent_runner.stream_message_max
+    (String.length page);
+  match Discord_agents.Agent_runner.split_trailing_word_for_carry page with
+  | Some (before, carry) ->
+    Alcotest.(check string) "exact-fill suffix carried" "acc" carry;
+    Alcotest.(check int) "flushed prefix has room"
+      (String.length prefix) (String.length before);
+    let len =
+      Discord_agents.Agent_runner.take_stream_delta_chunk_len
+        ~current_len:(String.length carry) "ount balance" ~start:0
+    in
+    Alcotest.(check int) "next delta joins exact-fill suffix"
+      (String.length "ount balance") len
+  | None -> Alcotest.fail "expected exact-fill suffix to be carried"
+
+let test_stream_delta_does_not_carry_unbroken_buffer () =
+  Alcotest.(check bool) "no prefix to flush"
+    true
+    (Option.is_none
+       (Discord_agents.Agent_runner.split_trailing_word_for_carry "account"))
+
+let test_stream_delta_detects_table_suffix () =
+  Alcotest.(check bool) "trailing table detected"
+    true
+    (Discord_agents.Agent_runner.buffer_ends_with_table
+       "intro\n| Name | Value |\n| account | balance |");
+  Alcotest.(check bool) "plain text is not table suffix"
+    false
+    (Discord_agents.Agent_runner.buffer_ends_with_table
+       "intro\naccount balance")
 
 (* Regression: !projects output with many entries must be safely chunkable.
    The original bug was that create_message sent a single ~5700-char message
@@ -490,6 +667,26 @@ let split_message_tests = [
     test_split_all_chunks_under_limit;
   Alcotest.test_case "no-separator fallback is UTF-8 safe" `Quick
     test_split_no_separator_utf8_safe;
+  Alcotest.test_case "split_message avoids word splits" `Quick
+    test_split_message_does_not_split_words;
+  Alcotest.test_case "output chunking avoids word splits" `Quick
+    test_split_output_chunks_do_not_split_words;
+  Alcotest.test_case "output chunking keeps fitting suffix" `Quick
+    test_split_output_keeps_fitting_suffix_together;
+  Alcotest.test_case "stream delta flushes before word split" `Quick
+    test_stream_delta_flushes_before_splitting_word;
+  Alcotest.test_case "stream delta splits long fresh word" `Quick
+    test_stream_delta_splits_long_word_when_fresh;
+  Alcotest.test_case "stream delta preserves UTF-8 boundary" `Quick
+    test_stream_delta_utf8_boundary_after_flush;
+  Alcotest.test_case "stream delta carries cross-delta suffix" `Quick
+    test_stream_delta_carries_cross_delta_word_suffix;
+  Alcotest.test_case "stream delta carries exact-capacity suffix" `Quick
+    test_stream_delta_exact_capacity_suffix_can_be_carried;
+  Alcotest.test_case "stream delta leaves unbroken buffer" `Quick
+    test_stream_delta_does_not_carry_unbroken_buffer;
+  Alcotest.test_case "stream delta detects table suffix" `Quick
+    test_stream_delta_detects_table_suffix;
   Alcotest.test_case "projects-list regression" `Quick
     test_split_projects_list_shape;
   Alcotest.test_case "plan: short content → single chunk with reply_to" `Quick
@@ -1157,6 +1354,19 @@ let test_truncate_for_display_fence_heavy () =
   Alcotest.(check bool) "escaped text fits in budget"
     true (String.length escaped <= 1700)
 
+let test_truncate_for_display_does_not_split_words () =
+  let line = "alpha beta account gamma delta" in
+  let t = Discord_agents.Agent_process.truncate_for_display
+    ~max_lines:10 ~max_chars:15 [line] in
+  let marked = String.concat "/" t.display in
+  Alcotest.(check bool) "truncate fallback avoids ac/count"
+    false (contains_substring marked "ac/count");
+  (match t.display with
+   | [display] ->
+     Alcotest.(check bool) "display under budget"
+       true (Discord_agents.Agent_process.escaped_length display <= 15)
+   | _ -> Alcotest.fail "expected one truncated display line")
+
 let test_take_fitting_prefix_plain () =
   let s = String.make 5000 'a' in
   let taken = Discord_agents.Agent_process.take_fitting_prefix
@@ -1230,6 +1440,8 @@ let tool_detail_tests = [
   Alcotest.test_case "safety cap" `Quick test_detail_safety_cap;
   Alcotest.test_case "fence heavy" `Quick test_detail_fence_heavy;
   Alcotest.test_case "truncate fence heavy" `Quick test_truncate_for_display_fence_heavy;
+  Alcotest.test_case "truncate avoids word splits" `Quick
+    test_truncate_for_display_does_not_split_words;
   Alcotest.test_case "take_fitting_prefix plain" `Quick test_take_fitting_prefix_plain;
   Alcotest.test_case "take_fitting_prefix fences" `Quick test_take_fitting_prefix_fences;
   Alcotest.test_case "take_fitting_prefix utf8" `Quick test_take_fitting_prefix_utf8;
