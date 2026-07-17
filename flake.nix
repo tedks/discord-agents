@@ -36,6 +36,7 @@
             ocamlformat
           ] ++ deps ++ [
             pkgs.gmp
+            pkgs.python3
           ];
 
           shellHook = ''
@@ -51,6 +52,7 @@
           version = "0.1.0";
           src = ./.;
           buildInputs = deps;
+          nativeCheckInputs = [ pkgs.python3 ];
         };
       });
 }
