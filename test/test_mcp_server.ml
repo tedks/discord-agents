@@ -25,6 +25,16 @@ let response ~id ~result =
     ("result", result);
   ]
 
+let error_response ~id ~code ~message =
+  `Assoc [
+    ("jsonrpc", `String "2.0");
+    ("id", id);
+    ("error", `Assoc [
+      ("code", `Int code);
+      ("message", `String message);
+    ]);
+  ]
+
 let text_result ?(is_error=false) text =
   let fields = [
     ("content", `List [
@@ -59,8 +69,15 @@ let expect_no_response label line =
 
 let test_initialize () =
   expect_response "initialize"
-    {|{"jsonrpc":"2.0","id":1,"method":"initialize"}|}
-    (response ~id:(`Int 1) ~result:Mcp_server.initialize_result)
+    {|{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test-client","version":"0.1"}}}|}
+    (response ~id:(`Int 1) ~result:(`Assoc [
+      ("protocolVersion", `String "2024-11-05");
+      ("capabilities", `Assoc [("tools", `Assoc [])]);
+      ("serverInfo", `Assoc [
+        ("name", `String "discord-agents-mcp");
+        ("version", `String "0.2.0");
+      ]);
+    ]))
 
 let test_notifications_initialized_is_ignored () =
   expect_no_response "initialized notification"
@@ -71,6 +88,10 @@ let test_tools_list_uses_typed_descriptors () =
     {|{"jsonrpc":"2.0","id":"tools","method":"tools/list"}|}
     (response ~id:(`String "tools")
        ~result:(`Assoc [("tools", Mcp_tool.tool_definitions_json)]))
+
+let test_tools_list_notification_is_ignored () =
+  expect_no_response "tools/list notification"
+    {|{"jsonrpc":"2.0","method":"tools/list"}|}
 
 let test_ping () =
   expect_response "ping"
@@ -118,6 +139,24 @@ let test_tools_call_error_result () =
     {|{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"x"}}|}
     (response ~id:(`Int 5) ~result:(text_result ~is_error:true "not yet"))
 
+let test_tools_call_rejects_missing_params () =
+  expect_response "tools/call missing params"
+    {|{"jsonrpc":"2.0","id":50,"method":"tools/call"}|}
+    (error_response ~id:(`Int 50) ~code:(-32602)
+       ~message:"tools/call params must be an object")
+
+let test_tools_call_rejects_missing_name () =
+  expect_response "tools/call missing name"
+    {|{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"arguments":{}}}|}
+    (error_response ~id:(`Int 51) ~code:(-32602)
+       ~message:"tools/call params.name must be a non-empty string")
+
+let test_tools_call_rejects_non_object_arguments () =
+  expect_response "tools/call non-object arguments"
+    {|{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"x","arguments":[]}}|}
+    (error_response ~id:(`Int 52) ~code:(-32602)
+       ~message:"tools/call params.arguments must be an object")
+
 let test_tools_call_exception_becomes_tool_error () =
   let handler _call = failwith "boom" in
   expect_response "tools/call exception" ~handler
@@ -128,21 +167,20 @@ let test_tools_call_exception_becomes_tool_error () =
 let test_unknown_request_returns_jsonrpc_error () =
   expect_response "unknown request"
     {|{"jsonrpc":"2.0","id":7,"method":"missing"}|}
-    (`Assoc [
-      ("jsonrpc", `String "2.0");
-      ("id", `Int 7);
-      ("error", `Assoc [
-        ("code", `Int (-32601));
-        ("message", `String "Unknown method: missing");
-      ]);
-    ])
+    (error_response ~id:(`Int 7) ~code:(-32601)
+       ~message:"Unknown method: missing")
 
 let test_unknown_notification_is_ignored () =
   expect_no_response "unknown notification"
     {|{"jsonrpc":"2.0","method":"missing"}|}
 
-let test_invalid_json_is_ignored () =
-  expect_no_response "invalid json" "{"
+let test_invalid_json_returns_parse_error () =
+  expect_response "invalid json" "{"
+    (error_response ~id:`Null ~code:(-32700) ~message:"Parse error")
+
+let test_invalid_request_returns_error () =
+  expect_response "invalid request" "[]"
+    (error_response ~id:`Null ~code:(-32600) ~message:"Invalid Request")
 
 let () =
   Alcotest.run "mcp_server" [
@@ -152,6 +190,8 @@ let () =
         test_notifications_initialized_is_ignored;
       Alcotest.test_case "tools/list descriptors" `Quick
         test_tools_list_uses_typed_descriptors;
+      Alcotest.test_case "tools/list notification" `Quick
+        test_tools_list_notification_is_ignored;
       Alcotest.test_case "ping" `Quick test_ping;
       Alcotest.test_case "tools/call invokes handler" `Quick
         test_tools_call_invokes_handler;
@@ -159,12 +199,21 @@ let () =
         test_tools_call_defaults_arguments;
       Alcotest.test_case "tools/call error result" `Quick
         test_tools_call_error_result;
+      Alcotest.test_case "tools/call rejects missing params" `Quick
+        test_tools_call_rejects_missing_params;
+      Alcotest.test_case "tools/call rejects missing name" `Quick
+        test_tools_call_rejects_missing_name;
+      Alcotest.test_case "tools/call rejects non-object arguments" `Quick
+        test_tools_call_rejects_non_object_arguments;
       Alcotest.test_case "tools/call exception" `Quick
         test_tools_call_exception_becomes_tool_error;
       Alcotest.test_case "unknown request" `Quick
         test_unknown_request_returns_jsonrpc_error;
       Alcotest.test_case "unknown notification" `Quick
         test_unknown_notification_is_ignored;
-      Alcotest.test_case "invalid json" `Quick test_invalid_json_is_ignored;
+      Alcotest.test_case "invalid json" `Quick
+        test_invalid_json_returns_parse_error;
+      Alcotest.test_case "invalid request" `Quick
+        test_invalid_request_returns_error;
     ]);
   ]

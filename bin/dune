@@ -6,6 +6,4 @@
 
 (executable
  (name mcp_server)
- (public_name discord-agents-mcp-ocaml)
- (package discord_agents)
  (libraries discord_agents yojson))

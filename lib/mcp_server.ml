@@ -11,11 +11,15 @@ type tool_call = {
 
 type tool_handler = tool_call -> (string, string) result
 
+type request_id =
+  | Request of Yojson.Safe.t
+  | Notification
+
 let protocol_version = "2024-11-05"
 
 let server_name = "discord-agents-mcp"
 
-let server_version = "0.3.0"
+let server_version = "0.2.0"
 
 let raise_if_fatal exn =
   match exn with
@@ -34,8 +38,8 @@ let string_field name fields =
 
 let id_field fields =
   match field "id" fields with
-  | Some id -> id
-  | None -> `Null
+  | Some id -> Request id
+  | None -> Notification
 
 let response ~id ~result =
   `Assoc [
@@ -53,6 +57,16 @@ let error ~id ~code ~message =
       ("message", `String message);
     ]);
   ]
+
+let maybe_response ~id ~result =
+  match id with
+  | Notification -> None
+  | Request id -> Some (response ~id ~result)
+
+let maybe_error ~id ~code ~message =
+  match id with
+  | Notification -> None
+  | Request id -> Some (error ~id ~code ~message)
 
 let initialize_result =
   `Assoc [
@@ -81,45 +95,54 @@ let tool_response ?(is_error=false) text =
 let tools_list_result =
   `Assoc [("tools", Mcp_tool.tool_definitions_json)]
 
-let call_tool handle_tool_call fields =
-  let params =
-    match field "params" fields with
-    | Some (`Assoc params) -> params
-    | _ -> []
-  in
-  let arguments =
-    match field "arguments" params with
-    | Some arguments -> arguments
-    | None -> `Assoc []
-  in
-  let call = {
-    name = string_field "name" params;
-    arguments;
-  } in
-  try
-    match handle_tool_call call with
-    | Ok text -> tool_response text
-    | Error message -> tool_response ~is_error:true message
-  with exn ->
-    raise_if_fatal exn;
-    tool_response ~is_error:true (Printf.sprintf "Error: %s" (Printexc.to_string exn))
+let invalid_params message =
+  Error message
+
+let call_tool (handle_tool_call : tool_handler) fields =
+  match field "params" fields with
+  | None -> invalid_params "tools/call params must be an object"
+  | Some (`Assoc params) ->
+    (match field "name" params with
+     | Some (`String name) when name <> "" ->
+       let arguments =
+         match field "arguments" params with
+         | None -> Ok (`Assoc [])
+         | Some (`Assoc _ as arguments) -> Ok arguments
+         | Some _ -> invalid_params "tools/call params.arguments must be an object"
+       in
+       (match arguments with
+        | Error _ as error -> error
+        | Ok arguments ->
+          let call = { name; arguments } in
+          Ok (
+            try
+              match handle_tool_call call with
+              | Ok text -> tool_response text
+              | Error message -> tool_response ~is_error:true message
+            with exn ->
+              raise_if_fatal exn;
+              tool_response ~is_error:true
+                (Printf.sprintf "Error: %s" (Printexc.to_string exn))
+          ))
+     | _ -> invalid_params "tools/call params.name must be a non-empty string")
+  | Some _ -> invalid_params "tools/call params must be an object"
 
 let handle_json ~handle_tool_call = function
   | `Assoc fields ->
     let id = id_field fields in
     (match string_field "method" fields with
-     | "initialize" -> Some (response ~id ~result:initialize_result)
+     | "initialize" -> maybe_response ~id ~result:initialize_result
      | "notifications/initialized" -> None
-     | "tools/list" -> Some (response ~id ~result:tools_list_result)
+     | "tools/list" -> maybe_response ~id ~result:tools_list_result
      | "tools/call" ->
-       Some (response ~id ~result:(call_tool handle_tool_call fields))
-     | "ping" -> Some (response ~id ~result:(`Assoc []))
+       (match call_tool handle_tool_call fields with
+        | Ok result -> maybe_response ~id ~result
+        | Error message -> maybe_error ~id ~code:(-32602) ~message)
+     | "ping" -> maybe_response ~id ~result:(`Assoc [])
      | method_name ->
-       if field "id" fields = None then None
-       else
-         Some (error ~id ~code:(-32601)
-                 ~message:(Printf.sprintf "Unknown method: %s" method_name)))
-  | _ -> None
+       maybe_error ~id ~code:(-32601)
+         ~message:(Printf.sprintf "Unknown method: %s" method_name))
+  | _ -> Some (error ~id:`Null ~code:(-32600) ~message:"Invalid Request")
 
 let handle_line ~handle_tool_call line =
   match String.trim line with
@@ -127,4 +150,5 @@ let handle_line ~handle_tool_call line =
   | trimmed ->
     match Yojson.Safe.from_string trimmed with
     | json -> handle_json ~handle_tool_call json
-    | exception Yojson.Json_error _ -> None
+    | exception Yojson.Json_error _ ->
+      Some (error ~id:`Null ~code:(-32700) ~message:"Parse error")
