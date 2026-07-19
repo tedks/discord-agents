@@ -89,7 +89,10 @@ let list_projects_response projects =
     ("projects", `List projects);
   ]
 
-let session ?(session_id="session-1") project_name agent_kind message_count thread_id =
+let session ?(session_id="session-1")
+    ~project_name ~agent_kind ~message_count ~thread_id () =
+  (* session_id is deliberately present and ignored by the formatter: the
+     MCP output must tolerate extra fields from the control API. *)
   `Assoc [
     ("project_name", `String project_name);
     ("agent_kind", `String agent_kind);
@@ -143,9 +146,14 @@ let test_format_list_sessions_matches_python () =
   check_list_sessions_parity "empty" (list_sessions_response []);
   check_list_sessions_parity "sessions"
     (list_sessions_response [
-      session "alpha" "claude" 3 "111";
-      session ~session_id:"session-2" "beta" "codex" 0 "222";
+      session ~project_name:"alpha" ~agent_kind:"claude"
+        ~message_count:3 ~thread_id:"111" ();
+      session ~session_id:"session-2"
+        ~project_name:"beta" ~agent_kind:"codex"
+        ~message_count:0 ~thread_id:"222" ();
     ]);
+  check_list_sessions_parity "null sessions"
+    (`Assoc [("ok", `Bool true); ("sessions", `Null)]);
   check_list_sessions_parity "missing sessions"
     (`Assoc [("ok", `Bool true)])
 
@@ -155,6 +163,86 @@ let test_format_list_sessions_control_error () =
     (Error "Bot is not running.")
     (Mcp_formatter.format_list_sessions
        (`Assoc [("error", `String "Bot is not running.")]))
+
+let test_format_list_sessions_malformed_response () =
+  let check label expected response =
+    Alcotest.(check (result string string))
+      label
+      expected
+      (Mcp_formatter.format_list_sessions response)
+  in
+  check "response object"
+    (Error "Control API response must be an object")
+    `Null;
+  check "error string"
+    (Error "Control API error field must be a string")
+    (`Assoc [("error", `Bool true)]);
+  check "sessions array"
+    (Error "Control API sessions field must be an array")
+    (`Assoc [("sessions", `String "bad")]);
+  check "session object"
+    (Error "session entry must be an object")
+    (`Assoc [("sessions", `List [`String "bad"])]);
+  check "project name"
+    (Error "session.project_name must be a string")
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("project_name", `Bool true);
+        ("agent_kind", `String "claude");
+        ("message_count", `Int 1);
+        ("thread_id", `String "123");
+      ];
+    ])]);
+  check "agent kind"
+    (Error "session.agent_kind must be a string")
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("project_name", `String "repo");
+        ("agent_kind", `Bool true);
+        ("message_count", `Int 1);
+        ("thread_id", `String "123");
+      ];
+    ])]);
+  check "message count"
+    (Error "session.message_count must be an integer")
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("project_name", `String "repo");
+        ("agent_kind", `String "claude");
+        ("message_count", `String "1");
+        ("thread_id", `String "123");
+      ];
+    ])]);
+  check "invalid int literal"
+    (Error "session.message_count must be an integer")
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("project_name", `String "repo");
+        ("agent_kind", `String "claude");
+        ("message_count", `Intlit "not-an-int");
+        ("thread_id", `String "123");
+      ];
+    ])]);
+  check "thread id"
+    (Error "session.thread_id must be a string")
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("project_name", `String "repo");
+        ("agent_kind", `String "claude");
+        ("message_count", `Int 1);
+        ("thread_id", `Int 123);
+      ];
+    ])]);
+  check "int literal"
+    (Ok "- **repo** / claude — 42 messages (thread: <#123>)")
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("project_name", `String "repo");
+        ("agent_kind", `String "claude");
+        ("message_count", `Intlit "42");
+        ("thread_id", `String "123");
+      ];
+    ])])
 
 let test_handler_list_projects_requests_control_api () =
   let calls = ref [] in
@@ -182,7 +270,10 @@ let test_handler_list_projects_requests_control_api () =
 let test_handler_list_sessions_requests_control_api () =
   let calls = ref [] in
   let response =
-    list_sessions_response [session "repo" "gemini" 12 "123"]
+    list_sessions_response [
+      session ~project_name:"repo" ~agent_kind:"gemini"
+        ~message_count:12 ~thread_id:"123" ();
+    ]
   in
   let control_client =
     Control_client.make ~request:(fun request ->
@@ -280,7 +371,10 @@ let test_server_wraps_list_projects_control_error () =
 let test_server_wraps_list_sessions_result () =
   let control_client =
     Control_client.make ~request:(fun _request ->
-      Ok (list_sessions_response [session "alpha" "claude" 7 "987"]))
+      Ok (list_sessions_response [
+        session ~project_name:"alpha" ~agent_kind:"claude"
+          ~message_count:7 ~thread_id:"987" ();
+      ]))
   in
   let line =
     {|{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"list_sessions"}}|}
@@ -443,6 +537,8 @@ let () =
         test_format_list_sessions_matches_python;
       Alcotest.test_case "list_sessions control error" `Quick
         test_format_list_sessions_control_error;
+      Alcotest.test_case "list_sessions malformed response" `Quick
+        test_format_list_sessions_malformed_response;
     ]);
     ("handler", [
       Alcotest.test_case "list_projects requests control API" `Quick
