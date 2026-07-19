@@ -51,7 +51,7 @@ let read_process_output command =
   | Unix.WSIGNALED n -> failf "command signaled %d: %s" n command
   | Unix.WSTOPPED n -> failf "command stopped %d: %s" n command
 
-let python_list_projects_output response =
+let python_tool_output tool_name response =
   let script = repo_file "scripts/mcp-server.py" in
   let program =
     "import json, runpy, sys; "
@@ -59,15 +59,22 @@ let python_list_projects_output response =
     ^ "response = json.loads(sys.argv[2]); "
     ^ "ns['handle_tool_call'].__globals__['control_request'] = "
     ^ "lambda method, params=None, timeout=60: response; "
-    ^ "sys.stdout.write(ns['handle_tool_call']('list_projects', {}))"
+    ^ "sys.stdout.write(ns['handle_tool_call'](sys.argv[3], {}))"
   in
   let command =
-    Printf.sprintf "python3 -c %s %s %s"
+    Printf.sprintf "python3 -c %s %s %s %s"
       (Filename.quote program)
       (Filename.quote script)
       (Filename.quote (Yojson.Safe.to_string response))
+      (Filename.quote tool_name)
   in
   read_process_output command
+
+let python_list_projects_output response =
+  python_tool_output "list_projects" response
+
+let python_list_sessions_output response =
+  python_tool_output "list_sessions" response
 
 let project ?(is_bare=false) name path =
   `Assoc [
@@ -82,10 +89,37 @@ let list_projects_response projects =
     ("projects", `List projects);
   ]
 
+let session ?(session_id="session-1")
+    ~project_name ~agent_kind ~message_count ~thread_id () =
+  (* session_id is deliberately present and ignored by the formatter: the
+     MCP output must tolerate extra fields from the control API. *)
+  `Assoc [
+    ("project_name", `String project_name);
+    ("agent_kind", `String agent_kind);
+    ("message_count", `Int message_count);
+    ("thread_id", `String thread_id);
+    ("session_id", `String session_id);
+  ]
+
+let list_sessions_response sessions =
+  `Assoc [
+    ("ok", `Bool true);
+    ("sessions", `List sessions);
+  ]
+
 let check_list_projects_parity label response =
   let expected = python_list_projects_output response in
   let actual =
     match Mcp_formatter.format_list_projects response with
+    | Ok text -> text
+    | Error message -> failf "%s: formatter error: %s" label message
+  in
+  Alcotest.(check string) label expected actual
+
+let check_list_sessions_parity label response =
+  let expected = python_list_sessions_output response in
+  let actual =
+    match Mcp_formatter.format_list_sessions response with
     | Ok text -> text
     | Error message -> failf "%s: formatter error: %s" label message
   in
@@ -108,6 +142,156 @@ let test_format_list_projects_control_error () =
     (Mcp_formatter.format_list_projects
        (`Assoc [("error", `String "Bot is not running.")]))
 
+let test_format_list_projects_malformed_response () =
+  let check label expected response =
+    Alcotest.(check (result string string))
+      label
+      expected
+      (Mcp_formatter.format_list_projects response)
+  in
+  check "response object"
+    (Error "Control API response must be an object")
+    `Null;
+  check "error string"
+    (Error "Control API error field must be a string")
+    (`Assoc [("error", `Bool true)]);
+  check "projects array"
+    (Error "Control API projects field must be an array")
+    (`Assoc [("projects", `String "bad")]);
+  check "projects null"
+    (Error "Control API projects field must be an array")
+    (`Assoc [("projects", `Null)]);
+  check "project object"
+    (Error "project entry must be an object")
+    (`Assoc [("projects", `List [`String "bad"])]);
+  check "project name"
+    (Error "project.name must be a string")
+    (`Assoc [("projects", `List [
+      `Assoc [
+        ("name", `Bool true);
+        ("path", `String "/tmp/repo");
+      ];
+    ])]);
+  check "project path"
+    (Error "project.path must be a string")
+    (`Assoc [("projects", `List [
+      `Assoc [
+        ("name", `String "repo");
+        ("path", `Bool true);
+      ];
+    ])]);
+  check "non-bool is_bare"
+    (Ok "1. **repo** — `/tmp/repo`")
+    (`Assoc [("projects", `List [
+      `Assoc [
+        ("name", `String "repo");
+        ("path", `String "/tmp/repo");
+        ("is_bare", `String "yes");
+      ];
+    ])])
+
+let test_format_list_sessions_matches_python () =
+  check_list_sessions_parity "empty" (list_sessions_response []);
+  check_list_sessions_parity "sessions"
+    (list_sessions_response [
+      session ~project_name:"alpha" ~agent_kind:"claude"
+        ~message_count:3 ~thread_id:"111" ();
+      session ~session_id:"session-2"
+        ~project_name:"beta" ~agent_kind:"codex"
+        ~message_count:0 ~thread_id:"222" ();
+    ]);
+  check_list_sessions_parity "null sessions"
+    (`Assoc [("ok", `Bool true); ("sessions", `Null)]);
+  check_list_sessions_parity "missing sessions"
+    (`Assoc [("ok", `Bool true)])
+
+let test_format_list_sessions_control_error () =
+  Alcotest.(check (result string string))
+    "control error"
+    (Error "Bot is not running.")
+    (Mcp_formatter.format_list_sessions
+       (`Assoc [("error", `String "Bot is not running.")]))
+
+let test_format_list_sessions_malformed_response () =
+  let check label expected response =
+    Alcotest.(check (result string string))
+      label
+      expected
+      (Mcp_formatter.format_list_sessions response)
+  in
+  check "response object"
+    (Error "Control API response must be an object")
+    `Null;
+  check "error string"
+    (Error "Control API error field must be a string")
+    (`Assoc [("error", `Bool true)]);
+  check "sessions array"
+    (Error "Control API sessions field must be an array")
+    (`Assoc [("sessions", `String "bad")]);
+  check "session object"
+    (Error "session entry must be an object")
+    (`Assoc [("sessions", `List [`String "bad"])]);
+  check "project name"
+    (Error "session.project_name must be a string")
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("project_name", `Bool true);
+        ("agent_kind", `String "claude");
+        ("message_count", `Int 1);
+        ("thread_id", `String "123");
+      ];
+    ])]);
+  check "agent kind"
+    (Error "session.agent_kind must be a string")
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("project_name", `String "repo");
+        ("agent_kind", `Bool true);
+        ("message_count", `Int 1);
+        ("thread_id", `String "123");
+      ];
+    ])]);
+  check "message count"
+    (Error "session.message_count must be an integer")
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("project_name", `String "repo");
+        ("agent_kind", `String "claude");
+        ("message_count", `String "1");
+        ("thread_id", `String "123");
+      ];
+    ])]);
+  check "invalid int literal"
+    (Error "session.message_count must be an in-range integer")
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("project_name", `String "repo");
+        ("agent_kind", `String "claude");
+        ("message_count", `Intlit "999999999999999999999999999999");
+        ("thread_id", `String "123");
+      ];
+    ])]);
+  check "thread id"
+    (Error "session.thread_id must be a string")
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("project_name", `String "repo");
+        ("agent_kind", `String "claude");
+        ("message_count", `Int 1);
+        ("thread_id", `Int 123);
+      ];
+    ])]);
+  check "int literal"
+    (Ok "- **repo** / claude — 42 messages (thread: <#123>)")
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("project_name", `String "repo");
+        ("agent_kind", `String "claude");
+        ("message_count", `Intlit "42");
+        ("thread_id", `String "123");
+      ];
+    ])])
+
 let test_handler_list_projects_requests_control_api () =
   let calls = ref [] in
   let response =
@@ -126,6 +310,32 @@ let test_handler_list_projects_requests_control_api () =
   match !calls with
   | [request] ->
     Alcotest.(check string) "method" "list_projects" request.method_name;
+    Alcotest.(check int) "timeout" 60 request.timeout_s;
+    Alcotest.(check bool) "params omitted" true
+      (Option.is_none request.params)
+  | calls -> failf "expected one control request, got %d" (List.length calls)
+
+let test_handler_list_sessions_requests_control_api () =
+  let calls = ref [] in
+  let response =
+    list_sessions_response [
+      session ~project_name:"repo" ~agent_kind:"gemini"
+        ~message_count:12 ~thread_id:"123" ();
+    ]
+  in
+  let control_client =
+    Control_client.make ~request:(fun request ->
+      calls := request :: !calls;
+      Ok response)
+  in
+  let call = { Mcp_server.name = "list_sessions"; arguments = `Assoc [] } in
+  Alcotest.(check (result string string))
+    "handler output"
+    (Ok "- **repo** / gemini — 12 messages (thread: <#123>)")
+    (Mcp_handler.handle_tool_call ~control_client call);
+  match !calls with
+  | [request] ->
+    Alcotest.(check string) "method" "list_sessions" request.method_name;
     Alcotest.(check int) "timeout" 60 request.timeout_s;
     Alcotest.(check bool) "params omitted" true
       (Option.is_none request.params)
@@ -205,6 +415,41 @@ let test_server_wraps_list_projects_control_error () =
   | Some actual, Some expected ->
     check_json "MCP error response" expected actual
   | _ -> failf "expected MCP error response"
+
+let test_server_wraps_list_sessions_result () =
+  let control_client =
+    Control_client.make ~request:(fun _request ->
+      Ok (list_sessions_response [
+        session ~project_name:"alpha" ~agent_kind:"claude"
+          ~message_count:7 ~thread_id:"987" ();
+      ]))
+  in
+  let line =
+    {|{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"list_sessions"}}|}
+  in
+  let actual =
+    Mcp_server.handle_line
+      ~handle_tool_call:(Mcp_handler.handle_tool_call ~control_client)
+      line
+  in
+  let expected =
+    Some (`Assoc [
+      ("jsonrpc", `String "2.0");
+      ("id", `Int 10);
+      ("result", `Assoc [
+        ("content", `List [
+          `Assoc [
+            ("type", `String "text");
+            ("text",
+             `String "- **alpha** / claude — 7 messages (thread: <#987>)");
+          ];
+        ]);
+      ]);
+    ])
+  in
+  match actual, expected with
+  | Some actual, Some expected -> check_json "MCP response" expected actual
+  | _ -> failf "expected MCP response"
 
 let temp_dir_counter = ref 0
 
@@ -336,16 +581,28 @@ let () =
         test_format_list_projects_matches_python;
       Alcotest.test_case "list_projects control error" `Quick
         test_format_list_projects_control_error;
+      Alcotest.test_case "list_projects malformed response" `Quick
+        test_format_list_projects_malformed_response;
+      Alcotest.test_case "list_sessions matches Python" `Quick
+        test_format_list_sessions_matches_python;
+      Alcotest.test_case "list_sessions control error" `Quick
+        test_format_list_sessions_control_error;
+      Alcotest.test_case "list_sessions malformed response" `Quick
+        test_format_list_sessions_malformed_response;
     ]);
     ("handler", [
       Alcotest.test_case "list_projects requests control API" `Quick
         test_handler_list_projects_requests_control_api;
+      Alcotest.test_case "list_sessions requests control API" `Quick
+        test_handler_list_sessions_requests_control_api;
       Alcotest.test_case "unsupported tool" `Quick
         test_handler_unsupported_tool;
       Alcotest.test_case "server wraps list_projects result" `Quick
         test_server_wraps_list_projects_result;
       Alcotest.test_case "server wraps list_projects control error" `Quick
         test_server_wraps_list_projects_control_error;
+      Alcotest.test_case "server wraps list_sessions result" `Quick
+        test_server_wraps_list_sessions_result;
     ]);
     ("control client", [
       Alcotest.test_case "unix roundtrip" `Quick
