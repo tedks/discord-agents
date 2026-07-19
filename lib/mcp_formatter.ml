@@ -11,7 +11,12 @@ let string_field object_name name fields =
       Printf.sprintf "%s.%s must be a string" object_name name
     )
 
-let int_error object_name name =
+let int_type_error object_name name =
+  Error (
+    Printf.sprintf "%s.%s must be an integer" object_name name
+  )
+
+let int_range_error object_name name =
   Error (
     Printf.sprintf "%s.%s must be an in-range integer" object_name name
   )
@@ -22,8 +27,8 @@ let int_field object_name name fields =
   | Some (`Intlit value) ->
     (match int_of_string_opt value with
      | Some value -> Ok value
-     | None -> int_error object_name name)
-  | _ -> int_error object_name name
+     | None -> int_range_error object_name name)
+  | _ -> int_type_error object_name name
 
 let bool_field_default default name fields =
   match field name fields with
@@ -76,6 +81,8 @@ let project_line index = function
            string_field "project" "path" fields with
      | Ok name, Ok path ->
        let bare_suffix =
+         (* Control_api emits a bool here; malformed non-bools fail closed
+            instead of inheriting Python's broad truthiness. *)
          if bool_field_default false "is_bare" fields then " [bare]" else ""
        in
        Ok (Printf.sprintf "%d. **%s** — `%s`%s"

@@ -179,6 +179,15 @@ let test_format_list_projects_malformed_response () =
         ("name", `String "repo");
         ("path", `Bool true);
       ];
+    ])]);
+  check "non-bool is_bare"
+    (Ok "1. **repo** — `/tmp/repo`")
+    (`Assoc [("projects", `List [
+      `Assoc [
+        ("name", `String "repo");
+        ("path", `String "/tmp/repo");
+        ("is_bare", `String "yes");
+      ];
     ])])
 
 let test_format_list_sessions_matches_python () =
@@ -243,7 +252,7 @@ let test_format_list_sessions_malformed_response () =
       ];
     ])]);
   check "message count"
-    (Error "session.message_count must be an in-range integer")
+    (Error "session.message_count must be an integer")
     (`Assoc [("sessions", `List [
       `Assoc [
         ("project_name", `String "repo");
@@ -258,7 +267,7 @@ let test_format_list_sessions_malformed_response () =
       `Assoc [
         ("project_name", `String "repo");
         ("agent_kind", `String "claude");
-        ("message_count", `Intlit "not-an-int");
+        ("message_count", `Intlit "999999999999999999999999999999");
         ("thread_id", `String "123");
       ];
     ])]);
