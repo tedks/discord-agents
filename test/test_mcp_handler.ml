@@ -142,6 +142,45 @@ let test_format_list_projects_control_error () =
     (Mcp_formatter.format_list_projects
        (`Assoc [("error", `String "Bot is not running.")]))
 
+let test_format_list_projects_malformed_response () =
+  let check label expected response =
+    Alcotest.(check (result string string))
+      label
+      expected
+      (Mcp_formatter.format_list_projects response)
+  in
+  check "response object"
+    (Error "Control API response must be an object")
+    `Null;
+  check "error string"
+    (Error "Control API error field must be a string")
+    (`Assoc [("error", `Bool true)]);
+  check "projects array"
+    (Error "Control API projects field must be an array")
+    (`Assoc [("projects", `String "bad")]);
+  check "projects null"
+    (Error "Control API projects field must be an array")
+    (`Assoc [("projects", `Null)]);
+  check "project object"
+    (Error "project entry must be an object")
+    (`Assoc [("projects", `List [`String "bad"])]);
+  check "project name"
+    (Error "project.name must be a string")
+    (`Assoc [("projects", `List [
+      `Assoc [
+        ("name", `Bool true);
+        ("path", `String "/tmp/repo");
+      ];
+    ])]);
+  check "project path"
+    (Error "project.path must be a string")
+    (`Assoc [("projects", `List [
+      `Assoc [
+        ("name", `String "repo");
+        ("path", `Bool true);
+      ];
+    ])])
+
 let test_format_list_sessions_matches_python () =
   check_list_sessions_parity "empty" (list_sessions_response []);
   check_list_sessions_parity "sessions"
@@ -204,7 +243,7 @@ let test_format_list_sessions_malformed_response () =
       ];
     ])]);
   check "message count"
-    (Error "session.message_count must be an integer")
+    (Error "session.message_count must be an in-range integer")
     (`Assoc [("sessions", `List [
       `Assoc [
         ("project_name", `String "repo");
@@ -214,7 +253,7 @@ let test_format_list_sessions_malformed_response () =
       ];
     ])]);
   check "invalid int literal"
-    (Error "session.message_count must be an integer")
+    (Error "session.message_count must be an in-range integer")
     (`Assoc [("sessions", `List [
       `Assoc [
         ("project_name", `String "repo");
@@ -533,6 +572,8 @@ let () =
         test_format_list_projects_matches_python;
       Alcotest.test_case "list_projects control error" `Quick
         test_format_list_projects_control_error;
+      Alcotest.test_case "list_projects malformed response" `Quick
+        test_format_list_projects_malformed_response;
       Alcotest.test_case "list_sessions matches Python" `Quick
         test_format_list_sessions_matches_python;
       Alcotest.test_case "list_sessions control error" `Quick

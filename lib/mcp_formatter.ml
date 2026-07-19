@@ -11,20 +11,19 @@ let string_field object_name name fields =
       Printf.sprintf "%s.%s must be a string" object_name name
     )
 
+let int_error object_name name =
+  Error (
+    Printf.sprintf "%s.%s must be an in-range integer" object_name name
+  )
+
 let int_field object_name name fields =
   match field name fields with
   | Some (`Int value) -> Ok value
   | Some (`Intlit value) ->
     (match int_of_string_opt value with
      | Some value -> Ok value
-     | None ->
-       Error (
-         Printf.sprintf "%s.%s must be an integer" object_name name
-       ))
-  | _ ->
-    Error (
-      Printf.sprintf "%s.%s must be an integer" object_name name
-    )
+     | None -> int_error object_name name)
+  | _ -> int_error object_name name
 
 let bool_field_default default name fields =
   match field name fields with
@@ -111,6 +110,8 @@ let session_line = function
 
 let format_list_sessions response =
   format_response
+    (* Python treats explicit null sessions as empty because list_sessions
+       guards with [if not sessions]; list_projects intentionally does not. *)
     ~null_list_is_empty:true
     ~field_name:"sessions"
     ~empty_message:"No active sessions."
