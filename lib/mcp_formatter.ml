@@ -941,3 +941,56 @@ let format_start_login_flow response =
     | Error message, _ | _, Error message -> Error message
   in
   format_object ~format_fields response
+
+let format_import_project response =
+  let format_fields fields =
+    match string_field_default "" "import_project" "project_name" fields,
+          string_field_default "" "import_project" "channel_id" fields,
+          string_field_default "" "import_project" "working_dir" fields with
+    | Ok project_name, Ok channel_id, Ok working_dir ->
+      let action =
+        if bool_field_default false "existing" fields then
+          "already existed"
+        else
+          "imported"
+      in
+      Ok (Printf.sprintf
+            "Project **%s** %s in <#%s>.\nWorking in: `%s`"
+            project_name action channel_id working_dir)
+    | Error message, _, _
+    | _, Error message, _
+    | _, _, Error message -> Error message
+  in
+  format_object ~format_fields response
+
+let format_message_response object_name default_message response =
+  let format_fields fields =
+    string_field_default default_message object_name "message" fields
+  in
+  format_object ~format_fields response
+
+let format_restart_bot response =
+  format_message_response "restart_bot" "Restart initiated." response
+
+let format_rename_thread response =
+  format_message_response "rename_thread" "Renamed." response
+
+let format_cleanup_channels response =
+  format_message_response "cleanup_channels" "Done." response
+
+let format_refresh_projects response =
+  let format_fields fields =
+    match int_field_default 0 "refresh_projects" "total" fields,
+          int_field_default 0 "refresh_projects" "delta" fields with
+    | Ok total, Ok delta ->
+      if delta > 0 then
+        let plural = if delta = 1 then "" else "s" in
+        Ok (Printf.sprintf
+              "Refreshed: found %d new project%s (%d total)."
+              delta plural total)
+      else
+        Ok (Printf.sprintf
+              "Refreshed: no new projects (%d total)." total)
+    | Error message, _ | _, Error message -> Error message
+  in
+  format_object ~format_fields response

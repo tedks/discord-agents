@@ -338,6 +338,29 @@ let start_login_flow_response
     ("login", login);
   ]
 
+let import_project_response ?(project_name="repo") ?(channel_id="123")
+    ?(working_dir="/src/repo") ?(existing=false) () =
+  `Assoc [
+    ("ok", `Bool true);
+    ("project_name", `String project_name);
+    ("channel_id", `String channel_id);
+    ("working_dir", `String working_dir);
+    ("existing", `Bool existing);
+  ]
+
+let message_response message =
+  `Assoc [
+    ("ok", `Bool true);
+    ("message", `String message);
+  ]
+
+let refresh_projects_response ?(total=4) ?(delta=0) () =
+  `Assoc [
+    ("ok", `Bool true);
+    ("total", `Int total);
+    ("delta", `Int delta);
+  ]
+
 let check_list_projects_parity label response =
   let expected = python_list_projects_output response in
   let actual =
@@ -1463,6 +1486,105 @@ let test_format_config_tools_malformed_response () =
     Mcp_formatter.format_start_login_flow
     (`Assoc [("login", `Assoc [("command", `Bool true)])])
 
+let test_format_admin_tools_match_python () =
+  check_tool_parity
+    ~arguments:(`Assoc [
+      ("url", `String "https://github.com/tedks/example.git");
+    ])
+    "import project"
+    "import_project"
+    Mcp_formatter.format_import_project
+    (import_project_response ~project_name:"example"
+       ~channel_id:"111" ~working_dir:"/src/example" ());
+  check_tool_parity
+    ~arguments:(`Assoc [
+      ("url", `String "https://github.com/tedks/example.git");
+    ])
+    "import existing project"
+    "import_project"
+    Mcp_formatter.format_import_project
+    (import_project_response ~project_name:"example"
+       ~channel_id:"111" ~working_dir:"/src/example" ~existing:true ());
+  check_tool_parity
+    "restart"
+    "restart_bot"
+    Mcp_formatter.format_restart_bot
+    (message_response "Restart initiated.");
+  check_tool_parity
+    ~arguments:(`Assoc [
+      ("thread_id", `String "123");
+      ("name", `String "new name");
+    ])
+    "rename"
+    "rename_thread"
+    Mcp_formatter.format_rename_thread
+    (message_response "Renamed to new name.");
+  check_tool_parity
+    "cleanup"
+    "cleanup_channels"
+    Mcp_formatter.format_cleanup_channels
+    (message_response "Cleaned up 2 stale channels.");
+  check_tool_parity
+    "refresh no new"
+    "refresh_projects"
+    Mcp_formatter.format_refresh_projects
+    (refresh_projects_response ~total:4 ~delta:0 ());
+  check_tool_parity
+    "refresh one new"
+    "refresh_projects"
+    Mcp_formatter.format_refresh_projects
+    (refresh_projects_response ~total:5 ~delta:1 ());
+  check_tool_parity
+    "refresh multiple new"
+    "refresh_projects"
+    Mcp_formatter.format_refresh_projects
+    (refresh_projects_response ~total:7 ~delta:3 ())
+
+let test_format_admin_tools_control_error () =
+  let check label formatter =
+    Alcotest.(check (result string string))
+      label
+      (Error "failed")
+      (formatter (`Assoc [("error", `String "failed")]))
+  in
+  check "import control error" Mcp_formatter.format_import_project;
+  check "restart control error" Mcp_formatter.format_restart_bot;
+  check "rename control error" Mcp_formatter.format_rename_thread;
+  check "cleanup control error" Mcp_formatter.format_cleanup_channels;
+  check "refresh control error" Mcp_formatter.format_refresh_projects
+
+let test_format_admin_tools_malformed_response () =
+  let check label expected formatter response =
+    Alcotest.(check (result string string))
+      label
+      expected
+      (formatter response)
+  in
+  check "import project_name"
+    (Error "import_project.project_name must be a string")
+    Mcp_formatter.format_import_project
+    (`Assoc [("project_name", `Bool true)]);
+  check "import channel_id"
+    (Error "import_project.channel_id must be a string")
+    Mcp_formatter.format_import_project
+    (`Assoc [("channel_id", `Bool true)]);
+  check "import working_dir"
+    (Error "import_project.working_dir must be a string")
+    Mcp_formatter.format_import_project
+    (`Assoc [("working_dir", `Bool true)]);
+  check "restart message"
+    (Error "restart_bot.message must be a string")
+    Mcp_formatter.format_restart_bot
+    (`Assoc [("message", `Bool true)]);
+  check "refresh total"
+    (Error "refresh_projects.total must be an integer")
+    Mcp_formatter.format_refresh_projects
+    (`Assoc [("total", `String "4")]);
+  check "refresh delta"
+    (Error "refresh_projects.delta must be an integer")
+    Mcp_formatter.format_refresh_projects
+    (`Assoc [("delta", `String "1")])
+
 let test_handler_list_projects_requests_control_api () =
   let calls = ref [] in
   let response =
@@ -1823,6 +1945,64 @@ let test_handler_config_tools_request_control_api () =
     ~response:(start_login_flow_response ())
     ~expected_output:"Login is handled by the local agent CLI.\n\nRun on bot host: `codex login`\nRun this on the bot host."
 
+let check_no_arg_handler_requests_control_api
+    ~tool_name ~method_name ~response ~expected_output =
+  let calls = ref [] in
+  let control_client =
+    Control_client.make ~request:(fun request ->
+      calls := request :: !calls;
+      Ok response)
+  in
+  let call = { Mcp_server.name = tool_name; arguments = `Assoc [] } in
+  Alcotest.(check (result string string))
+    "handler output"
+    (Ok expected_output)
+    (Mcp_handler.handle_tool_call ~control_client call);
+  match !calls with
+  | [request] ->
+    Alcotest.(check string) "method" method_name request.method_name;
+    Alcotest.(check int) "timeout" 60 request.timeout_s;
+    Alcotest.(check bool) "params omitted" true
+      (Option.is_none request.params)
+  | calls -> failf "expected one control request, got %d" (List.length calls)
+
+let test_handler_admin_tools_request_control_api () =
+  check_handler_requests_control_api
+    ~timeout_s:300
+    ~tool_name:"import_project"
+    ~method_name:"import_project"
+    ~arguments:(`Assoc [
+      ("url", `String "https://github.com/tedks/example.git");
+    ])
+    ~response:(import_project_response ~project_name:"example"
+       ~channel_id:"111" ~working_dir:"/src/example" ())
+    ~expected_output:"Project **example** imported in <#111>.\nWorking in: `/src/example`";
+  check_handler_requests_control_api
+    ~timeout_s:60
+    ~tool_name:"rename_thread"
+    ~method_name:"rename_thread"
+    ~arguments:(`Assoc [
+      ("thread_id", `String "123");
+      ("name", `String "new name");
+    ])
+    ~response:(message_response "Renamed to new name.")
+    ~expected_output:"Renamed to new name.";
+  check_no_arg_handler_requests_control_api
+    ~tool_name:"restart_bot"
+    ~method_name:"restart"
+    ~response:(message_response "Restart initiated.")
+    ~expected_output:"Restart initiated.";
+  check_no_arg_handler_requests_control_api
+    ~tool_name:"cleanup_channels"
+    ~method_name:"cleanup_channels"
+    ~response:(message_response "No stale channels.")
+    ~expected_output:"No stale channels.";
+  check_no_arg_handler_requests_control_api
+    ~tool_name:"refresh_projects"
+    ~method_name:"refresh_projects"
+    ~response:(refresh_projects_response ~total:5 ~delta:1 ())
+    ~expected_output:"Refreshed: found 1 new project (5 total)."
+
 let test_handler_unsupported_tool () =
   let control_client =
     Control_client.make ~request:(fun _request ->
@@ -2032,6 +2212,38 @@ let test_server_wraps_config_result () =
   | Some actual, Some expected -> check_json "MCP response" expected actual
   | _ -> failf "expected MCP response"
 
+let test_server_wraps_admin_result () =
+  let control_client =
+    Control_client.make ~request:(fun _request ->
+      Ok (refresh_projects_response ~total:7 ~delta:3 ()))
+  in
+  let line =
+    {|{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"refresh_projects"}}|}
+  in
+  let actual =
+    Mcp_server.handle_line
+      ~handle_tool_call:(Mcp_handler.handle_tool_call ~control_client)
+      line
+  in
+  let expected =
+    Some (`Assoc [
+      ("jsonrpc", `String "2.0");
+      ("id", `Int 14);
+      ("result", `Assoc [
+        ("content", `List [
+          `Assoc [
+            ("type", `String "text");
+            ("text",
+             `String "Refreshed: found 3 new projects (7 total).");
+          ];
+        ]);
+      ]);
+    ])
+  in
+  match actual, expected with
+  | Some actual, Some expected -> check_json "MCP response" expected actual
+  | _ -> failf "expected MCP response"
+
 let temp_dir_counter = ref 0
 
 let make_short_temp_dir () =
@@ -2194,6 +2406,12 @@ let () =
         test_format_config_tools_malformed_response;
       Alcotest.test_case "config tools documented divergences" `Quick
         test_format_config_tools_documented_divergences;
+      Alcotest.test_case "admin tools match Python" `Quick
+        test_format_admin_tools_match_python;
+      Alcotest.test_case "admin tools control error" `Quick
+        test_format_admin_tools_control_error;
+      Alcotest.test_case "admin tools malformed response" `Quick
+        test_format_admin_tools_malformed_response;
     ]);
     ("handler", [
       Alcotest.test_case "list_projects requests control API" `Quick
@@ -2214,6 +2432,8 @@ let () =
         test_resource_string_helpers;
       Alcotest.test_case "config tools request control API" `Quick
         test_handler_config_tools_request_control_api;
+      Alcotest.test_case "admin tools request control API" `Quick
+        test_handler_admin_tools_request_control_api;
       Alcotest.test_case "unsupported tool" `Quick
         test_handler_unsupported_tool;
       Alcotest.test_case "server wraps list_projects result" `Quick
@@ -2228,6 +2448,8 @@ let () =
         test_server_wraps_lifecycle_result;
       Alcotest.test_case "server wraps config result" `Quick
         test_server_wraps_config_result;
+      Alcotest.test_case "server wraps admin result" `Quick
+        test_server_wraps_admin_result;
     ]);
     ("control client", [
       Alcotest.test_case "unix roundtrip" `Quick
