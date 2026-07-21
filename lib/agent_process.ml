@@ -1199,7 +1199,8 @@ let claude_args ~model ~reasoning_effort
 (* ── MCP server config (shared by all three agents) ──────────────
 
    All three agents expose the bot's MCP tools (start_session,
-   list_*, etc.) by pointing at scripts/mcp-server.py. They each
+   list_*, etc.) by pointing at the OCaml discord-agents-mcp
+   executable. They each
    accept the pointer through a different mechanism:
 
    - Claude takes a [--mcp-config <path>] flag; we write the JSON to
@@ -1211,34 +1212,56 @@ let claude_args ~model ~reasoning_effort
      [<cwd>/.gemini/settings.json]. We write the file into the
      worktree and add [.gemini/] to [.git/info/exclude]. *)
 
-let mcp_script_path = lazy (
-  (* Allow an explicit override for installs where the script doesn't
-     live next to the executable (e.g. a standalone binary, or a
-     packaged install). Falls through to the heuristic search if
-     unset. *)
-  match Sys.getenv_opt "DISCORD_AGENTS_MCP_SCRIPT" with
-  | Some path when path <> "" -> path
+let absolute_path path =
+  if Filename.is_relative path then Filename.concat (Sys.getcwd ()) path
+  else path
+
+let first_existing paths =
+  List.find_opt Sys.file_exists paths
+
+let rec find_upwards ~from ~relative =
+  let candidate = Filename.concat from relative in
+  if Sys.file_exists candidate then Some candidate
+  else
+    let parent = Filename.dirname from in
+    if String.equal parent from then None
+    else find_upwards ~from:parent ~relative
+
+let mcp_command_path = lazy (
+  match Sys.getenv_opt "DISCORD_AGENTS_MCP_COMMAND" with
+  | Some path when String.trim path <> "" -> path
   | _ ->
     try
-      let exe = Sys.executable_name in
-      let exe = if Filename.is_relative exe
-        then Filename.concat (Sys.getcwd ()) exe else exe in
-      let rec find_root path =
-        let candidate = Filename.concat path "scripts/mcp-server.py" in
-        if Sys.file_exists candidate then candidate
-        else
-          let parent = Filename.dirname path in
-          if parent = path then "scripts/mcp-server.py"
-          else find_root parent
-      in
-      find_root (Filename.dirname exe)
-    with _ -> "scripts/mcp-server.py"
+      let exe_dir = Sys.executable_name |> absolute_path |> Filename.dirname in
+      match first_existing [
+        Filename.concat exe_dir "discord-agents-mcp";
+        Filename.concat exe_dir "mcp_server.exe";
+      ] with
+      | Some path -> path
+      | None ->
+        (match find_upwards ~from:(Sys.getcwd ())
+                 ~relative:"_build/default/bin/mcp_server.exe" with
+         | Some path -> path
+         | None -> "discord-agents-mcp")
+    with _ -> "discord-agents-mcp"
 )
 
+let mcp_command () =
+  Lazy.force mcp_command_path
+
+let mcp_server_entry () =
+  `Assoc [
+    ("command", `String (mcp_command ()));
+    ("args", `List []);
+  ]
+
 let mcp_json = lazy (
-  Printf.sprintf
-    {|{"mcpServers":{"discord-agents":{"command":"python3","args":["%s"]}}}|}
-    (Lazy.force mcp_script_path)
+  Yojson.Safe.to_string
+    (`Assoc [
+      ("mcpServers", `Assoc [
+        ("discord-agents", mcp_server_entry ());
+      ]);
+    ])
 )
 
 let write_file_safely ~path contents =
@@ -1315,10 +1338,7 @@ let claude_mcp_config_path () =
     couldn't have meaningfully held our entry, so we'd lose nothing
     by replacing it. *)
 let merge_gemini_settings existing =
-  let our_entry = `Assoc [
-    ("command", `String "python3");
-    ("args", `List [`String (Lazy.force mcp_script_path)]);
-  ] in
+  let our_entry = mcp_server_entry () in
   let render_fresh () =
     Yojson.Safe.pretty_to_string
       (`Assoc [("mcpServers", `Assoc [("discord-agents", our_entry)])])
@@ -1452,10 +1472,10 @@ let escape_toml_string s =
     Codex invocation, without touching the user's ~/.codex/config.toml.
     Two key=value pairs because Codex parses each [-c] independently. *)
 let codex_mcp_overrides () =
-  let path = escape_toml_string (Lazy.force mcp_script_path) in
-  [ "-c"; {|mcp_servers.discord_agents.command="python3"|};
-    "-c"; Printf.sprintf
-      {|mcp_servers.discord_agents.args=["%s"]|} path ]
+  let command = escape_toml_string (mcp_command ()) in
+  [ "-c"; Printf.sprintf
+      {|mcp_servers.discord_agents.command="%s"|} command;
+    "-c"; {|mcp_servers.discord_agents.args=[]|} ]
 
 (** Codex allocates its session id server-side in the thread.started
     event, so the UUID the bot pre-generated is invalid for resume on

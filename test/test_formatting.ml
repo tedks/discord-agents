@@ -2159,8 +2159,12 @@ let test_merge_gemini_settings_overwrites_our_entry () =
   let open Yojson.Safe.Util in
   let our_cmd = json |> member "mcpServers" |> member "discord-agents"
                 |> member "command" |> to_string in
-  Alcotest.(check string) "stale entry replaced with current python3"
-    "python3" our_cmd
+  let our_args = json |> member "mcpServers" |> member "discord-agents"
+                 |> member "args" |> to_list in
+  Alcotest.(check string) "stale entry replaced with current MCP command"
+    (Discord_agents.Agent_process.mcp_command ()) our_cmd;
+  Alcotest.(check int) "OCaml MCP server has no wrapper args"
+    0 (List.length our_args)
 
 let test_merge_gemini_settings_creates_when_absent () =
   let merged = Discord_agents.Agent_process.merge_gemini_settings None in
@@ -3062,22 +3066,27 @@ let test_codex_args_includes_mcp_overrides () =
      Two -c overrides register the discord-agents server. *)
   let args = codex_args ~session_id:"x" ~session_id_confirmed:false
     ~prompt:"hi" in
+  let command_override =
+    Printf.sprintf {|mcp_servers.discord_agents.command="%s"|}
+      (Discord_agents.Agent_process.escape_toml_string
+         (Discord_agents.Agent_process.mcp_command ()))
+  in
   Alcotest.(check bool) "registers discord_agents.command"
-    true (contains_pair args "-c"
-            {|mcp_servers.discord_agents.command="python3"|});
+    true (contains_pair args "-c" command_override);
   Alcotest.(check bool) "registers discord_agents.args" true
-    (List.exists (fun s ->
-      try ignore (Str.search_forward
-        (Str.regexp_string "mcp_servers.discord_agents.args=[") s 0); true
-      with Not_found -> false) args)
+    (contains_pair args "-c" {|mcp_servers.discord_agents.args=[]|})
 
 let test_codex_args_resume_keeps_mcp () =
   (* Resuming a Codex session should still expose MCP tools. *)
   let args = codex_args ~session_id:"x" ~session_id_confirmed:true
     ~prompt:"hi" in
+  let command_override =
+    Printf.sprintf {|mcp_servers.discord_agents.command="%s"|}
+      (Discord_agents.Agent_process.escape_toml_string
+         (Discord_agents.Agent_process.mcp_command ()))
+  in
   Alcotest.(check bool) "MCP override present on resume too"
-    true (contains_pair args "-c"
-            {|mcp_servers.discord_agents.command="python3"|})
+    true (contains_pair args "-c" command_override)
 
 let test_codex_args_model_and_effort_overrides () =
   let args = Discord_agents.Agent_process.codex_args

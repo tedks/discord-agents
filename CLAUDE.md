@@ -150,13 +150,13 @@ Gemini tool names (`run_shell_command`, `read_file`, `write_file`, `replace`, `s
 
 ## MCP configuration
 
-The bot exposes MCP tools (`start_session`, `stop_session`, `list_sessions`, etc.) via `scripts/mcp-server.py`. All three agents now pick it up — each through a different mechanism:
+The bot exposes MCP tools (`start_session`, `stop_session`, `list_sessions`, etc.) via the `discord-agents-mcp` OCaml stdio server. All three agents pick it up through a different mechanism:
 
 - **Claude** — `--mcp-config <path>` flag; we write the config to `~/.config/discord-agents/mcp-generated.json`.
-- **Codex** — TOML overrides via `-c key=value` per invocation: `mcp_servers.discord_agents.command="python3"` and `mcp_servers.discord_agents.args=["..."]`. Doesn't touch the user's `~/.codex/config.toml`.
+- **Codex** — TOML overrides via `-c key=value` per invocation: `mcp_servers.discord_agents.command="discord-agents-mcp"` and `mcp_servers.discord_agents.args=[]`. Doesn't touch the user's `~/.codex/config.toml`.
 - **Gemini** — has no `--mcp-config` flag; loads `mcpServers` from `<cwd>/.gemini/settings.json`. The bot merges its entry into any existing settings file (preserving the user's other MCP servers and unrelated keys) at session start and appends `.gemini/` to the worktree's `.git/info/exclude`.
 
-For non-default install layouts where the script doesn't live next to the executable, set `DISCORD_AGENTS_MCP_SCRIPT=/path/to/mcp-server.py` to override the heuristic search.
+For non-default install layouts, set `DISCORD_AGENTS_MCP_COMMAND=/path/to/discord-agents-mcp` to override the heuristic search.
 
 ## System prompts
 

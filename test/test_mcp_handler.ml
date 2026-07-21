@@ -3,6 +3,7 @@ module Control_client = Discord_agents.Control_client
 module Mcp_formatter = Discord_agents.Mcp_formatter
 module Mcp_handler = Discord_agents.Mcp_handler
 module Mcp_server = Discord_agents.Mcp_server
+module Mcp_tool = Discord_agents.Mcp_tool
 
 let failf fmt = Format.kasprintf (fun message -> Alcotest.fail message) fmt
 
@@ -2194,6 +2195,25 @@ let test_handler_unsupported_tool () =
     (Error "OCaml MCP tools/call is not wired yet for tool: not_a_tool")
     (Mcp_handler.handle_tool_call ~control_client call)
 
+let test_all_mcp_tools_are_wired () =
+  Mcp_tool.all_specs
+  |> List.iter (fun spec ->
+    let tool_name = Mcp_tool.tool_name spec in
+    let calls = ref 0 in
+    let control_client =
+      Control_client.make ~request:(fun _request ->
+        incr calls;
+        Error "wired")
+    in
+    let call = { Mcp_server.name = tool_name; arguments = `Assoc [] } in
+    Alcotest.(check (result string string))
+      (tool_name ^ " dispatch")
+      (Error "wired")
+      (Mcp_handler.handle_tool_call ~control_client call);
+    Alcotest.(check bool)
+      (tool_name ^ " called control API")
+      true (!calls > 0))
+
 let test_server_wraps_list_projects_result () =
   let control_client =
     Control_client.make ~request:(fun _request ->
@@ -2620,6 +2640,8 @@ let () =
         test_handler_covers_every_advertised_tool;
       Alcotest.test_case "unsupported tool" `Quick
         test_handler_unsupported_tool;
+      Alcotest.test_case "all MCP tools are wired" `Quick
+        test_all_mcp_tools_are_wired;
       Alcotest.test_case "server wraps list_projects result" `Quick
         test_server_wraps_list_projects_result;
       Alcotest.test_case "server wraps list_projects control error" `Quick

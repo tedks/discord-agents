@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""MCP server for discord-agents bot control.
+"""Compatibility MCP server for discord-agents bot control.
 
 Thin stdio-to-UDS proxy: receives MCP tool calls via JSON-RPC over stdin,
 forwards them to the bot's control API over a Unix domain socket, and
 returns the formatted response.
+
+The production runtime uses the OCaml discord-agents-mcp executable. This
+script remains as a parity oracle and fallback shim.
 
 All session state, Discord REST calls, and worktree management are owned
 by the bot process. This server never touches sessions.json or Discord
