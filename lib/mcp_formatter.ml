@@ -30,6 +30,20 @@ let int_field object_name name fields =
      | None -> int_range_error object_name name)
   | _ -> int_type_error object_name name
 
+let int_field_default default object_name name fields =
+  match field name fields with
+  | None -> Ok default
+  | Some _ -> int_field object_name name fields
+
+let string_field_default default object_name name fields =
+  match field name fields with
+  | None -> Ok default
+  | Some (`String value) -> Ok value
+  | _ ->
+    Error (
+      Printf.sprintf "%s.%s must be a string" object_name name
+    )
+
 let bool_field_default default name fields =
   match field name fields with
   | Some (`Bool value) -> value
@@ -45,18 +59,18 @@ let list_field ?(null_is_empty=false) name fields =
       Printf.sprintf "Control API %s field must be an array" name
     )
 
-let finish_lines ~empty_message lines =
+let finish_lines ?(footer="") ~empty_message lines =
   match lines with
   | [] -> Ok empty_message
-  | lines -> Ok (lines |> List.rev |> String.concat "\n")
+  | lines -> Ok ((lines |> List.rev |> String.concat "\n") ^ footer)
 
-let format_lines ?(null_list_is_empty=false)
+let format_lines ?(null_list_is_empty=false) ?(footer="")
     ~field_name ~empty_message ~line_of_item fields =
   match list_field ~null_is_empty:null_list_is_empty field_name fields with
   | Error _ as error -> error
   | Ok items ->
     let rec loop index lines = function
-      | [] -> finish_lines ~empty_message lines
+      | [] -> finish_lines ~footer ~empty_message lines
       | item :: rest ->
         match line_of_item index item with
         | Error _ as error -> error
@@ -64,7 +78,7 @@ let format_lines ?(null_list_is_empty=false)
     in
     loop 0 [] items
 
-let format_response ?(null_list_is_empty=false)
+let format_response ?(null_list_is_empty=false) ?(footer="")
     ~field_name ~empty_message ~line_of_item = function
   | `Assoc fields ->
     (match field "error" fields with
@@ -72,7 +86,7 @@ let format_response ?(null_list_is_empty=false)
      | Some _ -> Error "Control API error field must be a string"
      | None ->
        format_lines ~null_list_is_empty
-         ~field_name ~empty_message ~line_of_item fields)
+         ~footer ~field_name ~empty_message ~line_of_item fields)
   | _ -> Error "Control API response must be an object"
 
 let project_line index = function
@@ -123,4 +137,78 @@ let format_list_sessions response =
     ~field_name:"sessions"
     ~empty_message:"No active sessions."
     ~line_of_item:(fun _index -> session_line)
+    response
+
+let age_minutes_text age_minutes =
+  if age_minutes < 60 then
+    Printf.sprintf "%dm ago" age_minutes
+  else
+    Printf.sprintf "%dh ago" (age_minutes / 60)
+
+let recent_working_dir fields =
+  match field "working_dir" fields with
+  | None | Some `Null -> Ok "(unknown project)"
+  | Some (`String "") -> Ok "(unknown project)"
+  | Some (`String value) -> Ok value
+  | Some _ -> Error "recent_session.working_dir must be a string"
+
+let claude_recent_session_line = function
+  | `Assoc fields ->
+    (match string_field "recent_session" "session_id_short" fields,
+           int_field_default 0 "recent_session" "age_minutes" fields,
+           string_field_default "(no summary)"
+             "recent_session" "summary" fields with
+     | Ok session_id_short, Ok age_minutes, Ok summary ->
+       Ok (Printf.sprintf "- `%s` %s — %s"
+             session_id_short (age_minutes_text age_minutes) summary)
+     | Error message, _, _
+     | _, Error message, _
+     | _, _, Error message -> Error message)
+  | _ -> Error "recent_session entry must be an object"
+
+let cli_recent_session_line = function
+  | `Assoc fields ->
+    (match string_field "recent_session" "session_id_short" fields,
+           int_field_default 0 "recent_session" "age_minutes" fields,
+           recent_working_dir fields,
+           string_field_default "(no summary)"
+             "recent_session" "summary" fields with
+     | Ok session_id_short, Ok age_minutes, Ok working_dir, Ok summary ->
+       Ok (Printf.sprintf "- `%s` %s — %s — %s"
+             session_id_short (age_minutes_text age_minutes)
+             working_dir summary)
+     | Error message, _, _, _
+     | _, Error message, _, _
+     | _, _, Error message, _
+     | _, _, _, Error message -> Error message)
+  | _ -> Error "recent_session entry must be an object"
+
+let format_recent_sessions ~empty_message ~footer ~line_of_item response =
+  format_response
+    ~null_list_is_empty:true
+    ~footer
+    ~field_name:"sessions"
+    ~empty_message
+    ~line_of_item:(fun _index item -> line_of_item item)
+    response
+
+let format_list_claude_sessions response =
+  format_recent_sessions
+    ~empty_message:"No recent Claude sessions found."
+    ~footer:"\n\nUse resume_session with a session ID prefix to attach."
+    ~line_of_item:claude_recent_session_line
+    response
+
+let format_list_codex_sessions response =
+  format_recent_sessions
+    ~empty_message:"No recent Codex sessions found."
+    ~footer:"\n\nUse resume_session with kind=codex to attach."
+    ~line_of_item:cli_recent_session_line
+    response
+
+let format_list_gemini_sessions response =
+  format_recent_sessions
+    ~empty_message:"No recent Gemini sessions found."
+    ~footer:"\n\nUse resume_session with kind=gemini to attach."
+    ~line_of_item:cli_recent_session_line
     response

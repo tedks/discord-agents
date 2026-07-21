@@ -51,22 +51,24 @@ let read_process_output command =
   | Unix.WSIGNALED n -> failf "command signaled %d: %s" n command
   | Unix.WSTOPPED n -> failf "command stopped %d: %s" n command
 
-let python_tool_output tool_name response =
+let python_tool_output ?(arguments=`Assoc []) tool_name response =
   let script = repo_file "scripts/mcp-server.py" in
   let program =
     "import json, runpy, sys; "
     ^ "ns = runpy.run_path(sys.argv[1]); "
     ^ "response = json.loads(sys.argv[2]); "
+    ^ "arguments = json.loads(sys.argv[4]); "
     ^ "ns['handle_tool_call'].__globals__['control_request'] = "
     ^ "lambda method, params=None, timeout=60: response; "
-    ^ "sys.stdout.write(ns['handle_tool_call'](sys.argv[3], {}))"
+    ^ "sys.stdout.write(ns['handle_tool_call'](sys.argv[3], arguments))"
   in
   let command =
-    Printf.sprintf "python3 -c %s %s %s %s"
+    Printf.sprintf "python3 -c %s %s %s %s %s"
       (Filename.quote program)
       (Filename.quote script)
       (Filename.quote (Yojson.Safe.to_string response))
       (Filename.quote tool_name)
+      (Filename.quote (Yojson.Safe.to_string arguments))
   in
   read_process_output command
 
@@ -107,6 +109,27 @@ let list_sessions_response sessions =
     ("sessions", `List sessions);
   ]
 
+let recent_session ?(session_id="session-1") ?working_dir
+    ?(summary="recent work") ?(age_minutes=17) session_id_short =
+  let fields = [
+    ("session_id", `String session_id);
+    ("session_id_short", `String session_id_short);
+    ("summary", `String summary);
+    ("age_minutes", `Int age_minutes);
+  ] in
+  let fields =
+    match working_dir with
+    | None -> fields
+    | Some working_dir -> ("working_dir", `String working_dir) :: fields
+  in
+  `Assoc (List.rev fields)
+
+let recent_sessions_response sessions =
+  `Assoc [
+    ("ok", `Bool true);
+    ("sessions", `List sessions);
+  ]
+
 let check_list_projects_parity label response =
   let expected = python_list_projects_output response in
   let actual =
@@ -120,6 +143,15 @@ let check_list_sessions_parity label response =
   let expected = python_list_sessions_output response in
   let actual =
     match Mcp_formatter.format_list_sessions response with
+    | Ok text -> text
+    | Error message -> failf "%s: formatter error: %s" label message
+  in
+  Alcotest.(check string) label expected actual
+
+let check_recent_sessions_parity label tool_name formatter response =
+  let expected = python_tool_output tool_name response in
+  let actual =
+    match formatter response with
     | Ok text -> text
     | Error message -> failf "%s: formatter error: %s" label message
   in
@@ -292,6 +324,138 @@ let test_format_list_sessions_malformed_response () =
       ];
     ])])
 
+let test_format_recent_sessions_matches_python () =
+  check_recent_sessions_parity "claude empty"
+    "list_claude_sessions"
+    Mcp_formatter.format_list_claude_sessions
+    (recent_sessions_response []);
+  check_recent_sessions_parity "claude sessions"
+    "list_claude_sessions"
+    Mcp_formatter.format_list_claude_sessions
+    (recent_sessions_response [
+      recent_session ~age_minutes:12 ~summary:"fixed tests" "abcd1234";
+      recent_session ~age_minutes:125 ~summary:"wrote plan" "efgh5678";
+    ]);
+  check_recent_sessions_parity "claude missing summary"
+    "list_claude_sessions"
+    Mcp_formatter.format_list_claude_sessions
+    (recent_sessions_response [
+      `Assoc [
+        ("session_id_short", `String "abcd1234");
+        ("age_minutes", `Int 3);
+      ];
+    ]);
+  check_recent_sessions_parity "codex sessions"
+    "list_codex_sessions"
+    Mcp_formatter.format_list_codex_sessions
+    (recent_sessions_response [
+      recent_session ~working_dir:"/src/alpha"
+        ~age_minutes:59 ~summary:"ported tool" "abcd1234";
+      recent_session ~working_dir:"/src/beta"
+        ~age_minutes:60 ~summary:"reviewed output" "efgh5678";
+    ]);
+  check_recent_sessions_parity "codex unknown project"
+    "list_codex_sessions"
+    Mcp_formatter.format_list_codex_sessions
+    (recent_sessions_response [
+      recent_session ~working_dir:"" ~age_minutes:1 "abcd1234";
+      `Assoc [
+        ("session_id_short", `String "efgh5678");
+        ("age_minutes", `Int 2);
+        ("summary", `String "missing wd");
+      ];
+    ]);
+  check_recent_sessions_parity "gemini sessions"
+    "list_gemini_sessions"
+    Mcp_formatter.format_list_gemini_sessions
+    (recent_sessions_response [
+      recent_session ~working_dir:"/src/gamma"
+        ~age_minutes:240 ~summary:"added MCP support" "abcd1234";
+    ]);
+  check_recent_sessions_parity "null sessions"
+    "list_gemini_sessions"
+    Mcp_formatter.format_list_gemini_sessions
+    (`Assoc [("ok", `Bool true); ("sessions", `Null)]);
+  check_recent_sessions_parity "missing sessions"
+    "list_codex_sessions"
+    Mcp_formatter.format_list_codex_sessions
+    (`Assoc [("ok", `Bool true)])
+
+let test_format_recent_sessions_control_error () =
+  Alcotest.(check (result string string))
+    "control error"
+    (Error "Bot is not running.")
+    (Mcp_formatter.format_list_claude_sessions
+       (`Assoc [("error", `String "Bot is not running.")]))
+
+let test_format_recent_sessions_malformed_response () =
+  let check label expected formatter response =
+    Alcotest.(check (result string string))
+      label
+      expected
+      (formatter response)
+  in
+  check "response object"
+    (Error "Control API response must be an object")
+    Mcp_formatter.format_list_claude_sessions
+    `Null;
+  check "error string"
+    (Error "Control API error field must be a string")
+    Mcp_formatter.format_list_claude_sessions
+    (`Assoc [("error", `Bool true)]);
+  check "sessions array"
+    (Error "Control API sessions field must be an array")
+    Mcp_formatter.format_list_claude_sessions
+    (`Assoc [("sessions", `String "bad")]);
+  check "session object"
+    (Error "recent_session entry must be an object")
+    Mcp_formatter.format_list_claude_sessions
+    (`Assoc [("sessions", `List [`String "bad"])]);
+  check "session id short"
+    (Error "recent_session.session_id_short must be a string")
+    Mcp_formatter.format_list_claude_sessions
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("session_id_short", `Bool true);
+      ];
+    ])]);
+  check "age minutes"
+    (Error "recent_session.age_minutes must be an integer")
+    Mcp_formatter.format_list_claude_sessions
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("session_id_short", `String "abcd1234");
+        ("age_minutes", `String "1");
+      ];
+    ])]);
+  check "invalid age literal"
+    (Error "recent_session.age_minutes must be an in-range integer")
+    Mcp_formatter.format_list_claude_sessions
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("session_id_short", `String "abcd1234");
+        ("age_minutes", `Intlit "999999999999999999999999999999");
+      ];
+    ])]);
+  check "summary"
+    (Error "recent_session.summary must be a string")
+    Mcp_formatter.format_list_claude_sessions
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("session_id_short", `String "abcd1234");
+        ("summary", `Bool true);
+      ];
+    ])]);
+  check "working dir"
+    (Error "recent_session.working_dir must be a string")
+    Mcp_formatter.format_list_codex_sessions
+    (`Assoc [("sessions", `List [
+      `Assoc [
+        ("session_id_short", `String "abcd1234");
+        ("working_dir", `Bool true);
+      ];
+    ])])
+
 let test_handler_list_projects_requests_control_api () =
   let calls = ref [] in
   let response =
@@ -340,6 +504,54 @@ let test_handler_list_sessions_requests_control_api () =
     Alcotest.(check bool) "params omitted" true
       (Option.is_none request.params)
   | calls -> failf "expected one control request, got %d" (List.length calls)
+
+let check_recent_handler_requests_control_api
+    ~tool_name ~method_name ~response ~expected_output =
+  let calls = ref [] in
+  let arguments = `Assoc [("hours", `Int 6)] in
+  let control_client =
+    Control_client.make ~request:(fun request ->
+      calls := request :: !calls;
+      Ok response)
+  in
+  let call = { Mcp_server.name = tool_name; arguments } in
+  Alcotest.(check (result string string))
+    "handler output"
+    (Ok expected_output)
+    (Mcp_handler.handle_tool_call ~control_client call);
+  match !calls with
+  | [request] ->
+    Alcotest.(check string) "method" method_name request.method_name;
+    Alcotest.(check int) "timeout" 60 request.timeout_s;
+    (match request.params with
+     | Some params -> check_json "params" arguments params
+     | None -> failf "expected params")
+  | calls -> failf "expected one control request, got %d" (List.length calls)
+
+let test_handler_recent_sessions_request_control_api () =
+  check_recent_handler_requests_control_api
+    ~tool_name:"list_claude_sessions"
+    ~method_name:"list_claude_sessions"
+    ~response:(recent_sessions_response [
+      recent_session ~age_minutes:61 ~summary:"tracked bug" "abcd1234";
+    ])
+    ~expected_output:"- `abcd1234` 1h ago — tracked bug\n\nUse resume_session with a session ID prefix to attach.";
+  check_recent_handler_requests_control_api
+    ~tool_name:"list_codex_sessions"
+    ~method_name:"list_codex_sessions"
+    ~response:(recent_sessions_response [
+      recent_session ~working_dir:"/src/repo"
+        ~age_minutes:4 ~summary:"fixed test" "abcd1234";
+    ])
+    ~expected_output:"- `abcd1234` 4m ago — /src/repo — fixed test\n\nUse resume_session with kind=codex to attach.";
+  check_recent_handler_requests_control_api
+    ~tool_name:"list_gemini_sessions"
+    ~method_name:"list_gemini_sessions"
+    ~response:(recent_sessions_response [
+      recent_session ~working_dir:"/src/repo"
+        ~age_minutes:120 ~summary:"checked stack" "abcd1234";
+    ])
+    ~expected_output:"- `abcd1234` 2h ago — /src/repo — checked stack\n\nUse resume_session with kind=gemini to attach."
 
 let test_handler_unsupported_tool () =
   let control_client =
@@ -442,6 +654,41 @@ let test_server_wraps_list_sessions_result () =
             ("type", `String "text");
             ("text",
              `String "- **alpha** / claude — 7 messages (thread: <#987>)");
+          ];
+        ]);
+      ]);
+    ])
+  in
+  match actual, expected with
+  | Some actual, Some expected -> check_json "MCP response" expected actual
+  | _ -> failf "expected MCP response"
+
+let test_server_wraps_recent_sessions_result () =
+  let control_client =
+    Control_client.make ~request:(fun _request ->
+      Ok (recent_sessions_response [
+        recent_session ~working_dir:"/src/alpha"
+          ~age_minutes:7 ~summary:"ported recent sessions" "abcd1234";
+      ]))
+  in
+  let line =
+    {|{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"list_codex_sessions","arguments":{"hours":2}}}|}
+  in
+  let actual =
+    Mcp_server.handle_line
+      ~handle_tool_call:(Mcp_handler.handle_tool_call ~control_client)
+      line
+  in
+  let expected =
+    Some (`Assoc [
+      ("jsonrpc", `String "2.0");
+      ("id", `Int 11);
+      ("result", `Assoc [
+        ("content", `List [
+          `Assoc [
+            ("type", `String "text");
+            ("text",
+             `String "- `abcd1234` 7m ago — /src/alpha — ported recent sessions\n\nUse resume_session with kind=codex to attach.");
           ];
         ]);
       ]);
@@ -589,12 +836,20 @@ let () =
         test_format_list_sessions_control_error;
       Alcotest.test_case "list_sessions malformed response" `Quick
         test_format_list_sessions_malformed_response;
+      Alcotest.test_case "recent sessions match Python" `Quick
+        test_format_recent_sessions_matches_python;
+      Alcotest.test_case "recent sessions control error" `Quick
+        test_format_recent_sessions_control_error;
+      Alcotest.test_case "recent sessions malformed response" `Quick
+        test_format_recent_sessions_malformed_response;
     ]);
     ("handler", [
       Alcotest.test_case "list_projects requests control API" `Quick
         test_handler_list_projects_requests_control_api;
       Alcotest.test_case "list_sessions requests control API" `Quick
         test_handler_list_sessions_requests_control_api;
+      Alcotest.test_case "recent sessions request control API" `Quick
+        test_handler_recent_sessions_request_control_api;
       Alcotest.test_case "unsupported tool" `Quick
         test_handler_unsupported_tool;
       Alcotest.test_case "server wraps list_projects result" `Quick
@@ -603,6 +858,8 @@ let () =
         test_server_wraps_list_projects_control_error;
       Alcotest.test_case "server wraps list_sessions result" `Quick
         test_server_wraps_list_sessions_result;
+      Alcotest.test_case "server wraps recent sessions result" `Quick
+        test_server_wraps_recent_sessions_result;
     ]);
     ("control client", [
       Alcotest.test_case "unix roundtrip" `Quick
