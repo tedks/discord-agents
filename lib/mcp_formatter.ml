@@ -97,6 +97,14 @@ let format_response ?(null_list_is_empty=false) ?footer
          ?footer ~field_name ~empty_message ~line_of_item fields)
   | _ -> Error "Control API response must be an object"
 
+let format_object ~format_fields = function
+  | `Assoc fields ->
+    (match field "error" fields with
+     | Some (`String message) -> Error message
+     | Some _ -> Error "Control API error field must be a string"
+     | None -> format_fields fields)
+  | _ -> Error "Control API response must be an object"
+
 let project_line index = function
   | `Assoc fields ->
     (match string_field "project" "name" fields,
@@ -258,3 +266,70 @@ let format_list_gemini_sessions response =
     ~footer:"Use resume_session with kind=gemini to attach."
     ~with_working_dir:true
     response
+
+let string_prefix max_length value =
+  if String.length value <= max_length then value
+  else String.sub value 0 max_length
+
+let python_capitalize_ascii value =
+  value
+  |> String.lowercase_ascii
+  |> String.capitalize_ascii
+
+let format_start_session response =
+  let format_fields fields =
+    match string_field_default "" "start_session" "thread_id" fields,
+          string_field_default "" "start_session" "working_dir" fields,
+          string_field_default "" "start_session" "project_name" fields with
+    | Ok thread_id, Ok working_dir, Ok project_name ->
+      Ok (Printf.sprintf
+            "Started session for **%s** in <#%s>.\nWorking in: `%s`"
+            project_name thread_id working_dir)
+    | Error message, _, _
+    | _, Error message, _
+    | _, _, Error message -> Error message
+  in
+  format_object ~format_fields response
+
+let format_resume_session response =
+  let format_fields fields =
+    match string_field_default "" "resume_session" "thread_id" fields,
+          string_field_default "" "resume_session" "session_id" fields,
+          string_field_default "" "resume_session" "agent_kind" fields with
+    | Ok thread_id, Ok session_id, Ok agent_kind ->
+      let sid_short = string_prefix 8 session_id in
+      let kind_label =
+        if String.equal agent_kind "" then ""
+        else Printf.sprintf "%s " (python_capitalize_ascii agent_kind)
+      in
+      Ok (Printf.sprintf "Resumed %ssession `%s` in <#%s>."
+            kind_label sid_short thread_id)
+    | Error message, _, _
+    | _, Error message, _
+    | _, _, Error message -> Error message
+  in
+  format_object ~format_fields response
+
+let format_send_message response =
+  let format_fields fields =
+    match string_field_default "" "send_message" "thread_id" fields,
+          int_field_default 0 "send_message" "remaining_hops" fields,
+          string_field_default "sent" "send_message" "state" fields with
+    | Ok thread_id, Ok remaining_hops, Ok "posted_not_routed" ->
+      Ok (Printf.sprintf
+            "Posted message to <#%s>, but the target session disappeared before routing. remaining_hops=%d."
+            thread_id remaining_hops)
+    | Ok thread_id, Ok remaining_hops, Ok _ ->
+      Ok (Printf.sprintf "Sent message to <#%s>. remaining_hops=%d."
+            thread_id remaining_hops)
+    | Error message, _, _
+    | _, Error message, _
+    | _, _, Error message -> Error message
+  in
+  format_object ~format_fields response
+
+let format_stop_session response =
+  let format_fields fields =
+    string_field_default "Stop requested." "stop_session" "message" fields
+  in
+  format_object ~format_fields response
