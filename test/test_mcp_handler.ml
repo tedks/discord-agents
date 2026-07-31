@@ -1614,17 +1614,32 @@ let test_format_admin_tools_documented_divergences () =
          ("channel_id", `String "111");
          ("working_dir", `String "/src/repo\n- forged");
        ]));
+  let invalid_utf8 =
+    `Assoc [
+      ("ok", `Bool true);
+      ("project_name", `String "\xED\xA0\x80");
+      ("channel_id", `String "111");
+      ("working_dir", `String "/src/repo");
+    ]
+  in
+  (* Record what we diverge from, not just what we do. Python carries
+     the lone surrogate through its formatting and then cannot encode it
+     for output at all — "surrogates not allowed" — which is the
+     downstream failure the sanitize exists to prevent: the bytes reach
+     an encoder that refuses them rather than a renderer that shows
+     them. *)
+  (match python_tool_call_failure "import_project" invalid_utf8 with
+   | None -> failf "expected the Python handler to fail on a lone surrogate"
+   | Some traceback ->
+     Alcotest.(check bool)
+       "python cannot encode the surrogate"
+       true
+       (contains_substring traceback "UnicodeEncodeError"));
   Alcotest.(check (result string string))
     "import reply replaces invalid bytes"
     (Ok "Project **\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD** imported in <#111>.\n\
          Working in: `/src/repo`")
-    (Mcp_formatter.format_import_project
-       (`Assoc [
-         ("ok", `Bool true);
-         ("project_name", `String "\xED\xA0\x80");
-         ("channel_id", `String "111");
-         ("working_dir", `String "/src/repo");
-       ]));
+    (Mcp_formatter.format_import_project invalid_utf8);
   (* Fail-closed where Python renders a non-string, or raises. *)
   let null_project_name =
     `Assoc [
@@ -2141,19 +2156,32 @@ let test_handler_admin_tools_request_control_api () =
    rather than after the runtime cutover points real agents at this
    executable. *)
 let test_handler_covers_every_advertised_tool () =
-  let control_client =
-    Control_client.make ~request:(fun _request ->
-      Ok (`Assoc [("error", `String "stub")]))
-  in
   Discord_agents.Mcp_tool.all_specs
   |> List.iter (fun spec ->
     let name = Discord_agents.Mcp_tool.tool_name spec in
+    let calls = ref [] in
+    let control_client =
+      Control_client.make ~request:(fun request ->
+        calls := request :: !calls;
+        (* Not "no project matching", so start_session's retry stays
+           out of the way. *)
+        Ok (`Assoc [("error", `String "stub")]))
+    in
     let call = { Mcp_server.name; arguments = `Assoc [] } in
-    match Mcp_handler.handle_tool_call ~control_client call with
-    | Error message
-      when contains_substring message "is not wired yet" ->
-      failf "advertised tool %s is not handled: %s" name message
-    | _ -> ())
+    (match Mcp_handler.handle_tool_call ~control_client call with
+     | Error message
+       when contains_substring message "is not wired yet" ->
+       failf "advertised tool %s is not handled: %s" name message
+     | _ -> ());
+    (* Name coverage alone would let a tool reach the wrong control
+       method. The spec says which one it should be, so check it. *)
+    match List.rev !calls with
+    | request :: _ ->
+      Alcotest.(check string)
+        (Printf.sprintf "%s control method" name)
+        (Discord_agents.Mcp_tool.control_method_name spec)
+        request.Control_client.method_name
+    | [] -> failf "advertised tool %s issued no control request" name)
 
 let test_handler_unsupported_tool () =
   let control_client =
