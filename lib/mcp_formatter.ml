@@ -193,9 +193,11 @@ let recent_working_dir fields =
    Codex reads [session_id] and [cwd] out of the same rollout record,
    Claude takes its id from a filename. So scrub all three rather than
    rest the invariant on the shape of upstream data.
-   [Bot.format_session_listing] (lib/bot.ml) does the same for the
-   Discord-side listing. Python does not, so this is a deliberate
-   divergence, visible only for pathological input. *)
+   [Bot.format_session_listing] (lib/bot.ml:1512) scrubs the working dir
+   and summary of the Discord-side listing for the same reason, but not
+   its session id — issue #103 tracks closing that half. Python does not
+   scrub at all, so this is a deliberate divergence, visible only for
+   pathological input. *)
 let recent_session_line ~with_working_dir = function
   | `Assoc fields ->
     let working_dir =

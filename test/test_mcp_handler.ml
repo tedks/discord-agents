@@ -34,7 +34,12 @@ let repo_file path =
   in
   search (Sys.getcwd ())
 
-let read_process_output command =
+(* Always drain the pipe before [close_process_in]. Closing the read end
+   of an unread pipe leaves the child writing into a pipe with no
+   reader: CPython turns that into BrokenPipeError at flush and exits
+   120 regardless of what the handler did, which would make any
+   exit-status assertion built on this vacuously true. *)
+let run_process command =
   let ic = Unix.open_process_in command in
   let buf = Buffer.create 4096 in
   let chunk = Bytes.create 4096 in
@@ -45,58 +50,61 @@ let read_process_output command =
        | n -> Buffer.add_subbytes buf chunk 0 n
      done
    with End_of_file -> ());
-  match Unix.close_process_in ic with
-  | Unix.WEXITED 0 -> Buffer.contents buf
-  | Unix.WEXITED n -> failf "command exited %d: %s" n command
-  | Unix.WSIGNALED n -> failf "command signaled %d: %s" n command
-  | Unix.WSTOPPED n -> failf "command stopped %d: %s" n command
+  (Unix.close_process_in ic, Buffer.contents buf)
+
+let read_process_output command =
+  match run_process command with
+  | Unix.WEXITED 0, output -> output
+  | Unix.WEXITED n, output ->
+    failf "command exited %d: %s\n%s" n command output
+  | Unix.WSIGNALED n, _ -> failf "command signaled %d: %s" n command
+  | Unix.WSTOPPED n, _ -> failf "command stopped %d: %s" n command
+
+(* Run the Python MCP handler against a canned control-API response.
+   [merge_stderr] keeps the traceback for callers asserting on failure;
+   parity callers leave it off so a traceback can't be mistaken for
+   handler output. *)
+let python_tool_command ?(arguments=`Assoc []) ?(merge_stderr=false)
+    tool_name response =
+  let script = repo_file "scripts/mcp-server.py" in
+  let program =
+    "import json, runpy, sys; "
+    ^ "ns = runpy.run_path(sys.argv[1]); "
+    ^ "response = json.loads(sys.argv[2]); "
+    ^ "arguments = json.loads(sys.argv[4]); "
+    ^ "ns['handle_tool_call'].__globals__['control_request'] = "
+    ^ "lambda method, params=None, timeout=60: response; "
+    ^ "sys.stdout.write(ns['handle_tool_call'](sys.argv[3], arguments))"
+  in
+  Printf.sprintf "python3 -c %s %s %s %s %s%s"
+    (Filename.quote program)
+    (Filename.quote script)
+    (Filename.quote (Yojson.Safe.to_string response))
+    (Filename.quote tool_name)
+    (Filename.quote (Yojson.Safe.to_string arguments))
+    (if merge_stderr then " 2>&1" else "")
 
 let python_tool_output ?(arguments=`Assoc []) tool_name response =
-  let script = repo_file "scripts/mcp-server.py" in
-  let program =
-    "import json, runpy, sys; "
-    ^ "ns = runpy.run_path(sys.argv[1]); "
-    ^ "response = json.loads(sys.argv[2]); "
-    ^ "arguments = json.loads(sys.argv[4]); "
-    ^ "ns['handle_tool_call'].__globals__['control_request'] = "
-    ^ "lambda method, params=None, timeout=60: response; "
-    ^ "sys.stdout.write(ns['handle_tool_call'](sys.argv[3], arguments))"
-  in
-  let command =
-    Printf.sprintf "python3 -c %s %s %s %s %s"
-      (Filename.quote program)
-      (Filename.quote script)
-      (Filename.quote (Yojson.Safe.to_string response))
-      (Filename.quote tool_name)
-      (Filename.quote (Yojson.Safe.to_string arguments))
-  in
-  read_process_output command
+  read_process_output (python_tool_command ~arguments tool_name response)
 
-(* True when the Python handler raises rather than returning text — the
-   oracle's behavior for inputs where it has no defined output, which we
-   answer with a field-specific error instead. *)
-let python_tool_call_fails ?(arguments=`Assoc []) tool_name response =
-  let script = repo_file "scripts/mcp-server.py" in
-  let program =
-    "import json, runpy, sys; "
-    ^ "ns = runpy.run_path(sys.argv[1]); "
-    ^ "response = json.loads(sys.argv[2]); "
-    ^ "arguments = json.loads(sys.argv[4]); "
-    ^ "ns['handle_tool_call'].__globals__['control_request'] = "
-    ^ "lambda method, params=None, timeout=60: response; "
-    ^ "sys.stdout.write(ns['handle_tool_call'](sys.argv[3], arguments))"
-  in
-  let command =
-    Printf.sprintf "python3 -c %s %s %s %s %s 2>/dev/null"
-      (Filename.quote program)
-      (Filename.quote script)
-      (Filename.quote (Yojson.Safe.to_string response))
-      (Filename.quote tool_name)
-      (Filename.quote (Yojson.Safe.to_string arguments))
-  in
-  match Unix.close_process_in (Unix.open_process_in command) with
-  | Unix.WEXITED 0 -> false
-  | _ -> true
+(* [Some traceback] when the Python handler raises instead of returning
+   text — the oracle's behavior for inputs where it has no defined
+   output, which we answer with a field-specific error instead.
+   [None] when it exits cleanly. *)
+let python_tool_call_failure ?(arguments=`Assoc []) tool_name response =
+  match
+    run_process
+      (python_tool_command ~arguments ~merge_stderr:true tool_name response)
+  with
+  | Unix.WEXITED 0, _ -> None
+  | _, output -> Some output
+
+let contains_substring haystack needle =
+  let n = String.length needle and h = String.length haystack in
+  n = 0 ||
+  (let rec loop i = i + n <= h && (String.sub haystack i n = needle
+                                   || loop (i + 1)) in
+   loop 0)
 
 let python_list_projects_output response =
   python_tool_output "list_projects" response
@@ -569,10 +577,24 @@ let test_format_recent_sessions_documented_divergences () =
       ];
     ]
   in
+  (* Guard against a vacuous oracle check: the same probe must report a
+     clean exit for a response Python handles, or "python raises here"
+     below would hold for every input and pin nothing. *)
   Alcotest.(check bool)
-    "python raises on a null age"
+    "probe reports success for a well-formed response"
     true
-    (python_tool_call_fails "list_claude_sessions" null_age);
+    (Option.is_none
+       (python_tool_call_failure "list_claude_sessions"
+          (recent_sessions_response [
+            recent_session ~age_minutes:5 ~summary:"fine" "abcd1234";
+          ])));
+  (match python_tool_call_failure "list_claude_sessions" null_age with
+   | None -> failf "expected the Python handler to raise on a null age"
+   | Some traceback ->
+     Alcotest.(check bool)
+       "python raises TypeError on a null age"
+       true
+       (contains_substring traceback "TypeError"));
   Alcotest.(check (result string string))
     "null age fails closed"
     (Error "recent_session.age_minutes must be an integer")
