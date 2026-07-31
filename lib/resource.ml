@@ -246,6 +246,49 @@ let generate_uuid () =
     listing and resume reply uses. Safe on shorter inputs. *)
 let short_id sid = String.sub sid 0 (min 8 (String.length sid))
 
+(** Whether [needle] occurs anywhere in [haystack]. The empty needle is
+    present in everything, matching the substring conventions of both
+    [str.__contains__] and [String.starts_with]. Naive scan: callers
+    match short needles against short strings. *)
+let contains_substring ~haystack ~needle =
+  let haystack_length = String.length haystack in
+  let needle_length = String.length needle in
+  let rec loop index =
+    if needle_length = 0 then true
+    else if index + needle_length > haystack_length then false
+    else if String.equal (String.sub haystack index needle_length) needle then
+      true
+    else loop (index + 1)
+  in
+  loop 0
+
+(** First [max_chars] Unicode codepoints of [s] — what Python's [s[:n]]
+    does to a decoded str, as opposed to [String.sub], which counts
+    bytes and can cut a multibyte character in half. A half-encoded
+    character would go straight into the JSON we serialize, where a
+    strict decoder on the other side raises rather than renders.
+
+    A malformed lead or lone continuation byte counts as one character,
+    so the walk always advances and the result never exceeds
+    [max_chars] characters. Well-formed input never ends mid-sequence.
+    Use [truncate_utf8] instead when the budget is in bytes. *)
+let utf8_prefix ~max_chars s =
+  let length = String.length s in
+  let rec loop pos chars =
+    if chars >= max_chars || pos >= length then pos
+    else
+      let lead = Char.code s.[pos] in
+      let width =
+        if lead < 0x80 then 1
+        else if lead < 0xC0 then 1   (* lone continuation byte *)
+        else if lead < 0xE0 then 2
+        else if lead < 0xF0 then 3
+        else 4
+      in
+      loop (min length (pos + width)) (chars + 1)
+  in
+  String.sub s 0 (loop 0 0)
+
 (** Replace each \n / \r / \t in [s] with a single space. The
     replacement is 1:1 (a run of three newlines becomes three
     spaces, not one) — visually equivalent in Discord and simpler

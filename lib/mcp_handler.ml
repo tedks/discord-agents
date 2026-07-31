@@ -12,24 +12,16 @@ let request_and_format ?params control_client method_id formatter =
   | Error _ as error -> error
   | Ok response -> formatter response
 
-let string_contains text needle =
-  let text_length = String.length text in
-  let needle_length = String.length needle in
-  let rec loop index =
-    if needle_length = 0 then true
-    else if index + needle_length > text_length then false
-    else if String.equal (String.sub text index needle_length) needle then true
-    else loop (index + 1)
-  in
-  loop 0
-
+(* Python matches the retry trigger with [in] on a lowercased message
+   (scripts/mcp-server.py), so the comparison is case-insensitive on
+   both sides. *)
 let response_error_contains fragment = function
   | `Assoc fields ->
     (match List.assoc_opt "error" fields with
      | Some (`String message) ->
-       string_contains
-         (String.lowercase_ascii message)
-         (String.lowercase_ascii fragment)
+       Resource.contains_substring
+         ~haystack:(String.lowercase_ascii message)
+         ~needle:(String.lowercase_ascii fragment)
      | _ -> false)
   | _ -> false
 
