@@ -2297,8 +2297,15 @@ let test_mcp_command_resolution () =
 (* Gemini is the only agent whose MCP config is a file it reads on
    every run, so "start without MCP" has to mean removing our entry, not
    just declining to write one — a settings.json written while a build
-   tree existed keeps naming that path after the tree is gone. *)
+   tree existed keeps naming that path after the tree is gone.
+
+   Withdrawal only ever rewrites a file we can prove holds our entry.
+   The register path may discard a file it can't parse (it has to
+   install something, so a file that could never have held our entry
+   costs nothing to replace); withdrawal has nothing to install, so the
+   same clobber would be pure loss. *)
 let test_gemini_settings_withdraw_our_entry () =
+  let withdraw = Discord_agents.Agent_process.gemini_settings_without_our_entry in
   let existing = {|{
     "mcpServers": {
       "discord-agents": { "command": "/gone/mcp_server.exe", "args": [] },
@@ -2306,28 +2313,32 @@ let test_gemini_settings_withdraw_our_entry () =
     },
     "theme": "dark"
   }|} in
-  let withdrawn =
-    Discord_agents.Agent_process.gemini_settings_without_our_entry
-      (Some existing)
+  (match withdraw (Some existing) with
+   | None -> Alcotest.fail "expected our stale entry to be withdrawn"
+   | Some updated ->
+     let json = Yojson.Safe.from_string updated in
+     let open Yojson.Safe.Util in
+     let servers = json |> member "mcpServers" |> to_assoc in
+     Alcotest.(check bool) "our stale entry is gone"
+       false (List.mem_assoc "discord-agents" servers);
+     Alcotest.(check bool) "the user's server survives"
+       true (List.mem_assoc "user-tool" servers);
+     Alcotest.(check bool) "unrelated keys survive"
+       true (List.mem_assoc "theme" (json |> to_assoc)));
+  (* Every shape we can't prove holds our entry is left alone. Each of
+     these previously came back as {"mcpServers": {}}. *)
+  let untouched label input =
+    Alcotest.(check bool) label true (Option.is_none (withdraw input))
   in
-  let json = Yojson.Safe.from_string withdrawn in
-  let open Yojson.Safe.Util in
-  let servers = json |> member "mcpServers" |> to_assoc in
-  Alcotest.(check bool) "our stale entry is gone"
-    false (List.mem_assoc "discord-agents" servers);
-  Alcotest.(check bool) "the user's server survives"
-    true (List.mem_assoc "user-tool" servers);
-  Alcotest.(check bool) "unrelated keys survive"
-    true (List.mem_assoc "theme" (json |> to_assoc));
-  (* Withdrawing from a file that never had our entry is a no-op, and
-     from nothing at all leaves an empty server map rather than an
-     entry pointing nowhere. *)
-  let fresh =
-    Discord_agents.Agent_process.gemini_settings_without_our_entry None
-  in
-  Alcotest.(check int) "nothing registered when starting from nothing"
-    0 (List.length
-         (Yojson.Safe.from_string fresh |> member "mcpServers" |> to_assoc))
+  untouched "no file" None;
+  untouched "unparseable" (Some "not valid json {");
+  untouched "truncated" (Some {|{"theme":"dark","contextFileName":"GEM|});
+  untouched "not an object" (Some "[1, 2, 3]");
+  untouched "mcpServers is not an object"
+    (Some {|{"theme":"dark","mcpServers":[{"user":1}]}|});
+  untouched "no entry of ours"
+    (Some {|{"theme":"dark","mcpServers":{"user-tool":{"command":"x"}}}|});
+  untouched "no mcpServers at all" (Some {|{"theme":"dark"}|})
 
 let test_merge_gemini_settings_creates_when_absent () =
   let merged = Discord_agents.Agent_process.merge_gemini_settings None in
@@ -2865,7 +2876,7 @@ let test_setup_gemini_mcp_writes_settings_in_regular_repo () =
       "git init -q -b main %s 2>&1 >/dev/null"
       (Filename.quote dir)) in
     Alcotest.(check int) "git init succeeded" 0 rc;
-    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir;
+    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir ();
     let settings_path = Filename.concat dir ".gemini/settings.json" in
     Alcotest.(check bool) "settings.json created"
       true (Sys.file_exists settings_path);
@@ -2889,8 +2900,8 @@ let test_setup_gemini_mcp_idempotent () =
     (* Run twice. Second invocation must be a no-op shape: settings
        still has our entry, and the exclude has exactly one .gemini/
        line (not two). *)
-    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir;
-    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir;
+    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir ();
+    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir ();
     let settings = read_all (Filename.concat dir ".gemini/settings.json") in
     let json = Yojson.Safe.from_string settings in
     let open Yojson.Safe.Util in
@@ -2911,6 +2922,67 @@ let test_setup_gemini_mcp_idempotent () =
         1 (List.length gemini_lines);
       ignore (count_substr exclude ".gemini/"))
 
+(* The caller, not just the helper. Both prior rounds were about
+   setup_gemini_mcp's behavior when no MCP server resolved, and neither
+   round's test could reach it — the real value is a memoized global, so
+   reverting the fix left the suite green. ?resolved is the seam. *)
+let test_setup_gemini_mcp_unresolved_withdraws_our_entry () =
+  with_temp_dir (fun dir ->
+    let rc = Sys.command (Printf.sprintf
+      "git init -q -b main %s 2>&1 >/dev/null" (Filename.quote dir)) in
+    Alcotest.(check int) "git init succeeded" 0 rc;
+    let gemini_dir = Filename.concat dir ".gemini" in
+    Unix.mkdir gemini_dir 0o755;
+    let settings_path = Filename.concat gemini_dir "settings.json" in
+    let write path contents =
+      let oc = open_out path in
+      output_string oc contents;
+      close_out oc
+    in
+    write settings_path {|{
+      "mcpServers": {
+        "discord-agents": { "command": "/gone/mcp_server.exe", "args": [] },
+        "user-tool": { "command": "their-cmd", "args": [] }
+      },
+      "theme": "dark"
+    }|};
+    Discord_agents.Agent_process.setup_gemini_mcp
+      ~resolved:None ~working_dir:dir ();
+    let json = Yojson.Safe.from_string (read_all settings_path) in
+    let open Yojson.Safe.Util in
+    let servers = json |> member "mcpServers" |> to_assoc in
+    Alcotest.(check bool) "stale entry removed by the caller"
+      false (List.mem_assoc "discord-agents" servers);
+    Alcotest.(check bool) "user's server survives"
+      true (List.mem_assoc "user-tool" servers);
+    (* A file we can't prove holds our entry is left byte-for-byte. *)
+    let garbage = "not valid json {" in
+    write settings_path garbage;
+    Discord_agents.Agent_process.setup_gemini_mcp
+      ~resolved:None ~working_dir:dir ();
+    Alcotest.(check string) "unparseable settings left untouched"
+      garbage (read_all settings_path))
+
+let test_setup_gemini_mcp_unresolved_touches_nothing_else () =
+  with_temp_dir (fun dir ->
+    let rc = Sys.command (Printf.sprintf
+      "git init -q -b main %s 2>&1 >/dev/null" (Filename.quote dir)) in
+    Alcotest.(check int) "git init succeeded" 0 rc;
+    Discord_agents.Agent_process.setup_gemini_mcp
+      ~resolved:None ~working_dir:dir ();
+    (* With no server to register, creating .gemini/ and adding a
+       .gemini/ line to the user's info/exclude are changes made on
+       their behalf for no benefit — the exclude line would hide their
+       own .gemini/ from git status. *)
+    Alcotest.(check bool) "no .gemini directory created"
+      false (Sys.file_exists (Filename.concat dir ".gemini"));
+    let exclude_path = Filename.concat dir ".git/info/exclude" in
+    let exclude =
+      if Sys.file_exists exclude_path then read_all exclude_path else ""
+    in
+    Alcotest.(check bool) "info/exclude not touched"
+      false (count_substr exclude ".gemini/" > 0))
+
 let test_setup_gemini_mcp_preserves_user_settings () =
   with_temp_dir (fun dir ->
     let rc = Sys.command (Printf.sprintf
@@ -2929,7 +3001,7 @@ let test_setup_gemini_mcp_preserves_user_settings () =
     let oc = open_out settings_path in
     output_string oc user_config;
     close_out oc;
-    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir;
+    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir ();
     let json = Yojson.Safe.from_string (read_all settings_path) in
     let open Yojson.Safe.Util in
     let servers = json |> member "mcpServers" |> to_assoc in
@@ -2953,7 +3025,7 @@ let test_setup_gemini_mcp_fails_closed_on_read_errors () =
     let exclude_path = Filename.concat dir ".git/info/exclude" in
     Sys.remove exclude_path;
     Unix.mkdir exclude_path 0o755;
-    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir;
+    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir ();
     Alcotest.(check bool) "settings path left untouched"
       true (Sys.is_directory settings_path);
     Alcotest.(check bool) "exclude path left untouched"
@@ -3109,6 +3181,10 @@ let resume_helpers_tests = [
     test_mcp_command_resolution;
   Alcotest.test_case "gemini settings withdraw our entry" `Quick
     test_gemini_settings_withdraw_our_entry;
+  Alcotest.test_case "setup_gemini_mcp unresolved withdraws our entry" `Quick
+    test_setup_gemini_mcp_unresolved_withdraws_our_entry;
+  Alcotest.test_case "setup_gemini_mcp unresolved touches nothing else" `Quick
+    test_setup_gemini_mcp_unresolved_touches_nothing_else;
   Alcotest.test_case "merge_gemini_settings invalid input falls back" `Quick
     test_merge_gemini_settings_invalid_input_falls_back;
   Alcotest.test_case "merge_gemini_settings non-object falls back" `Quick

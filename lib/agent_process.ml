@@ -1420,15 +1420,24 @@ let claude_mcp_config_path () =
        does not degrade when --mcp-config names a missing file, it exits
        1 — so promising a path we didn't write would turn a no-tools
        session into no session at all, exactly when read-only-disk
-       handling is trying to keep sessions alive. *)
-    if Sys.file_exists config_path then Some config_path
-    else begin
+       handling is trying to keep sessions alive.
+
+       Read it back rather than stat it: the write is a rename, so a
+       refused write leaves whatever was there before — a config from
+       another worktree naming an executable that no longer exists,
+       which is the silent-no-tools failure this PR is closing. A
+       directory at that path would also satisfy [Sys.file_exists] and
+       then make Claude exit 1. *)
+    let intended = Lazy.force mcp_json in
+    match read_file_result config_path with
+    | File_contents actual when String.equal actual intended ->
+      Some config_path
+    | _ ->
       Logs.warn (fun m ->
-        m "MCP config %s could not be written; starting Claude without \
-           --mcp-config rather than pointing it at a missing file"
-          config_path);
+        m "MCP config %s does not match what we tried to write; \
+           starting Claude without --mcp-config rather than pointing it \
+           at a stale or missing config" config_path);
       None
-    end
 
 (** Inject our [discord-agents] entry into a Gemini settings JSON
     string (preserving any other [mcpServers] and unrelated
@@ -1476,8 +1485,28 @@ let gemini_settings_with ~our_entry existing =
 let merge_gemini_settings existing =
   gemini_settings_with ~our_entry:(Some (mcp_server_entry ())) existing
 
+(* [None] means "leave the file exactly as it is".
+
+   The register path's "parseable but non-object: discard" reasoning
+   does not transfer here. There we *must* install our entry, so
+   replacing a file that could never have held it costs nothing. Here
+   there is nothing to install, so rewriting a file we can't understand
+   is pure loss — a truncated or hand-commented settings.json, or one
+   whose [mcpServers] isn't an object, would come back as
+   [{"mcpServers": {}}] with the user's keys gone. We only rewrite when
+   we can see our own entry to remove. *)
 let gemini_settings_without_our_entry existing =
-  gemini_settings_with ~our_entry:None existing
+  match existing with
+  | None -> None
+  | Some text ->
+    match Yojson.Safe.from_string text with
+    | exception _ -> None
+    | `Assoc fields ->
+      (match List.assoc_opt "mcpServers" fields with
+       | Some (`Assoc servers) when List.mem_assoc "discord-agents" servers ->
+         Some (gemini_settings_with ~our_entry:None (Some text))
+       | _ -> None)
+    | _ -> None
 
 (** Resolve the [info/exclude] file Git actually reads for
     [working_dir]. Uses [git rev-parse --git-path info/exclude],
@@ -1532,36 +1561,49 @@ let merge_gemini_exclude existing =
     repo's [info/exclude]. Both writes are idempotent — re-running
     against a worktree we've already configured leaves the file and
     the exclude line unchanged in shape. *)
-let setup_gemini_mcp ~working_dir =
-  let resolved = mcp_command_opt () in
+(* [?resolved] exists so the unresolved branch is reachable from a
+   test: the real value is a process-global memoized lazy, so without a
+   seam here nothing could exercise the very path the last two review
+   rounds were about. *)
+let setup_gemini_mcp ?resolved ~working_dir () =
+  let resolved =
+    match resolved with Some r -> r | None -> mcp_command_opt ()
+  in
   if working_dir = "" then ()
     (* Defense-in-depth: the resume handlers reject empty working_dir
        before we get here, but a future caller shouldn't write
        .gemini/ into the bot's own directory by accident. *)
   else
   let gemini_dir = Filename.concat working_dir ".gemini" in
+  let settings_path = Filename.concat gemini_dir "settings.json" in
+  (* Unresolved: withdraw our entry rather than leave one naming a
+     command that is no longer there. Control and project channel
+     sessions run in persistent directories, not throwaway worktrees,
+     so a settings.json written while a build tree existed outlives it.
+     But touch nothing else — no .gemini/ to create, no info/exclude
+     line to add, and no rewrite of a file that doesn't contain our
+     entry. With no server to register, every one of those would be a
+     change made on a user's behalf for no benefit. *)
+  match resolved with
+  | None ->
+    (match read_file_result settings_path with
+     | File_read_error exn -> log_file_read_failure ~path:settings_path exn
+     | File_missing -> ()
+     | File_contents existing ->
+       (match gemini_settings_without_our_entry (Some existing) with
+        | None -> ()
+        | Some updated -> write_file_safely ~path:settings_path updated))
+  | Some _ ->
   (try
      if not (Sys.file_exists gemini_dir) then Unix.mkdir gemini_dir 0o755
    with _ -> ());
-  let settings_path = Filename.concat gemini_dir "settings.json" in
-  let render existing =
-    match resolved with
-    | Some _ -> merge_gemini_settings existing
-    (* Unresolved: withdraw our entry rather than leave one naming a
-       command that is no longer there. Control and project channel
-       sessions run in persistent directories, not throwaway worktrees,
-       so a settings.json written while a build tree existed outlives
-       it. *)
-    | None -> gemini_settings_without_our_entry existing
-  in
   (match read_file_result settings_path with
    | File_read_error exn -> log_file_read_failure ~path:settings_path exn
-   (* Nothing to withdraw from, and nothing to register: don't create a
-      settings.json at all in the unresolved case. *)
-   | File_missing when Option.is_none resolved -> ()
-   | File_missing -> write_file_safely ~path:settings_path (render None)
+   | File_missing ->
+     write_file_safely ~path:settings_path (merge_gemini_settings None)
    | File_contents existing ->
-     write_file_safely ~path:settings_path (render (Some existing)));
+     write_file_safely ~path:settings_path
+       (merge_gemini_settings (Some existing)));
   match resolve_git_info_exclude ~working_dir with
   | None -> ()
   | Some exclude_path ->
@@ -1786,7 +1828,7 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
       codex_args ~model ~reasoning_effort
         ~session_id ~session_id_confirmed ~prompt
     | Config.Gemini ->
-      setup_gemini_mcp ~working_dir;
+      setup_gemini_mcp ~working_dir ();
       gemini_args ~model ~session_id ~session_id_confirmed ~prompt
   in
   let args = [setsid_command (); "--wait"] @ args in
