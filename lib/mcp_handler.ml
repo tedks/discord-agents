@@ -86,6 +86,41 @@ let handle_stop_session control_client params =
     Control_api.Stop_session_id
     Mcp_formatter.format_stop_session
 
+let handle_default_agent control_client params =
+  request_and_format ~params control_client
+    Control_api.Default_agent_id
+    (Mcp_formatter.format_default_agent ~arguments:params)
+
+let handle_rescue_agent control_client params =
+  request_and_format ~params control_client
+    Control_api.Rescue_agent_id
+    (Mcp_formatter.format_rescue_agent ~arguments:params)
+
+let handle_get_agent_config control_client params =
+  request_and_format ~params control_client
+    Control_api.Get_agent_config_id
+    Mcp_formatter.format_get_agent_config
+
+let handle_set_model control_client params =
+  request_and_format ~params control_client
+    Control_api.Set_model_id
+    Mcp_formatter.format_set_model
+
+let handle_set_effort control_client params =
+  request_and_format ~params control_client
+    Control_api.Set_effort_id
+    Mcp_formatter.format_set_effort
+
+let handle_set_goal control_client params =
+  request_and_format ~params control_client
+    Control_api.Set_goal_id
+    Mcp_formatter.format_set_goal
+
+let handle_start_login_flow control_client params =
+  request_and_format ~params control_client
+    Control_api.Start_login_flow_id
+    Mcp_formatter.format_start_login_flow
+
 let handle_tool_call ~control_client (call : Mcp_server.tool_call) =
   match call.name with
   | "start_session" -> handle_start_session control_client call.arguments
@@ -99,5 +134,14 @@ let handle_tool_call ~control_client (call : Mcp_server.tool_call) =
     handle_list_codex_sessions control_client call.arguments
   | "list_gemini_sessions" ->
     handle_list_gemini_sessions control_client call.arguments
+  | "default_agent" -> handle_default_agent control_client call.arguments
+  | "rescue_agent" -> handle_rescue_agent control_client call.arguments
+  | "get_agent_config" ->
+    handle_get_agent_config control_client call.arguments
+  | "set_model" -> handle_set_model control_client call.arguments
+  | "set_effort" -> handle_set_effort control_client call.arguments
+  | "set_goal" -> handle_set_goal control_client call.arguments
+  | "start_login_flow" ->
+    handle_start_login_flow control_client call.arguments
   | "resume_session" -> handle_resume_session control_client call.arguments
   | name -> unsupported_tool name
