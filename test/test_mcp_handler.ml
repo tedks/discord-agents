@@ -917,6 +917,41 @@ let test_format_lifecycle_tools_documented_divergences () =
          ("thread_id", `String "333\nforged");
          ("remaining_hops", `Int 1);
        ]));
+  (* agent_kind is interpolated too, so it gets its own case rather than
+     riding on the others. *)
+  Alcotest.(check (result string string))
+    "resume reply scrubs agent kind"
+    (Ok "Resumed Co dex session `abcd1234` in <#222>.")
+    (Mcp_formatter.format_resume_session
+       (`Assoc [
+         ("thread_id", `String "222");
+         ("session_id", `String "abcd1234");
+         ("agent_kind", `String "co\ndex");
+       ]));
+  (* The sanitize half of render_string: a latin-1 byte in a filesystem
+     path would otherwise reach Yojson verbatim and make the JSON-RPC
+     response undecodable for a strict client. *)
+  Alcotest.(check (result string string))
+    "start reply replaces invalid bytes"
+    (Ok "Started session for **repo** in <#123>.\n\
+         Working in: `/src/re\xEF\xBF\xBDpo`")
+    (Mcp_formatter.format_start_session
+       (`Assoc [
+         ("thread_id", `String "123");
+         ("working_dir", `String "/src/re\xE2po");
+         ("project_name", `String "repo");
+       ]));
+  (* And in the session id, where the replacement character occupies one
+     of the eight slots rather than three. *)
+  Alcotest.(check (result string string))
+    "resume reply replaces invalid bytes inside the prefix"
+    (Ok "Resumed Codex session `ab\xEF\xBF\xBDcdefg` in <#222>.")
+    (Mcp_formatter.format_resume_session
+       (`Assoc [
+         ("thread_id", `String "222");
+         ("session_id", `String "ab\xE2cdefghij");
+         ("agent_kind", `String "codex");
+       ]));
   Alcotest.(check (result string string))
     "stop reply stays one line"
     (Ok "Stopped session for repo. Started session for evil in <#9>.")
@@ -1190,6 +1225,27 @@ let test_resource_string_helpers () =
     (prefix ~max_chars:1 "\x80abc");
   Alcotest.(check string) "invalid lead byte" "\xFF"
     (prefix ~max_chars:1 "\xFFabc");
+  (* The sequences a strict JSON decoder rejects even though their lead
+     byte declares a width: each byte is garbage on its own terms, so it
+     counts as one character — the same accounting sanitize_utf8 uses
+     when it replaces them. *)
+  Alcotest.(check string) "overlong two-byte" "\xC0"
+    (prefix ~max_chars:1 "\xC0\x80");
+  Alcotest.(check string) "surrogate half" "\xED"
+    (prefix ~max_chars:1 "\xED\xA0\x80");
+  Alcotest.(check string) "beyond unicode" "\xF5"
+    (prefix ~max_chars:1 "\xF5\x80\x80\x80");
+  (* sanitize_utf8 shares the decoder, so its notion of a character is
+     the same one; it had no direct coverage before. *)
+  let sanitize = Discord_agents.Resource.sanitize_utf8 in
+  Alcotest.(check string) "sanitize valid" "ok 日本"
+    (sanitize "ok 日本");
+  Alcotest.(check string) "sanitize truncated lead" "\xEF\xBF\xBDAB"
+    (sanitize "\xE2AB");
+  Alcotest.(check string) "sanitize surrogate" "\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD"
+    (sanitize "\xED\xA0\x80");
+  Alcotest.(check string) "sanitize overlong" "\xEF\xBF\xBD\xEF\xBF\xBD"
+    (sanitize "\xC0\x80");
   let contains = Discord_agents.Resource.contains_substring in
   Alcotest.(check bool) "present" true
     (contains ~haystack:"no project matching 'x'" ~needle:"no project matching");
