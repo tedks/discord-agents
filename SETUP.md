@@ -123,6 +123,7 @@ Create a wrapper script (`nix-run.sh`):
 
 ```bash
 #!/bin/bash
+nix develop --command dune build
 exec nix develop --command dune exec discord-agents
 ```
 

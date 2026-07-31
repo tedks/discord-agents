@@ -322,10 +322,9 @@ let handle_list_sessions (bot : Bot.t) =
   let entries = Session_store.bindings bot.sessions in
   let sessions = List.map (fun (_tid, (s : Session_store.session)) ->
     (* single_line on project_name: MCP clients format this back into
-       Discord markdown bullets (scripts/mcp-server.py list_sessions and
-       Mcp_formatter.session_line), so a literal newline in a project name
-       would split the bullet just like it did for session summaries before
-       25d3546. *)
+       Discord markdown bullets (Mcp_formatter.session_line), so a literal
+       newline in a project name would split the bullet just like it did for
+       session summaries before 25d3546. *)
     `Assoc [
       ("project_name", `String (Resource.single_line s.project_name));
       ("agent_kind", `String (Config.string_of_agent_kind s.agent_kind));

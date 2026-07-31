@@ -2159,8 +2159,196 @@ let test_merge_gemini_settings_overwrites_our_entry () =
   let open Yojson.Safe.Util in
   let our_cmd = json |> member "mcpServers" |> member "discord-agents"
                 |> member "command" |> to_string in
-  Alcotest.(check string) "stale entry replaced with current python3"
-    "python3" our_cmd
+  let our_args = json |> member "mcpServers" |> member "discord-agents"
+                 |> member "args" |> to_list in
+  Alcotest.(check string) "stale entry replaced with current MCP command"
+    (Discord_agents.Agent_process.mcp_command ()) our_cmd;
+  Alcotest.(check int) "OCaml MCP server has no wrapper args"
+    0 (List.length our_args)
+
+(* The resolver decides where all three agents look for the MCP server,
+   and every wrong answer fails the same silent way: the agent starts
+   with no discord-agents tools and nothing says so. The assertions
+   above compare generated config against [mcp_command ()] itself, so
+   they'd pass just as well if it returned nonsense — these don't. *)
+let with_resolver_temp_dir f =
+  (* Filename.temp_file for the same reason the gemini helper below uses
+     it: a predictable /tmp/<name>-<pid> path is guessable, and a
+     pre-planted symlink there would send the cleanup walk somewhere
+     else entirely. *)
+  let tmp = Filename.temp_file "test_mcp_resolve" "" in
+  Sys.remove tmp;
+  Unix.mkdir tmp 0o755;
+  let rec rm_rf path =
+    if (try Sys.is_directory path with Sys_error _ -> false) then begin
+      (try
+         Array.iter (fun entry -> rm_rf (Filename.concat path entry))
+           (Sys.readdir path)
+       with Sys_error _ -> ());
+      (try Unix.rmdir path with _ -> ())
+    end else (try Sys.remove path with _ -> ())
+  in
+  Fun.protect ~finally:(fun () -> rm_rf tmp) (fun () -> f tmp)
+
+let touch ?(perms=0o755) path =
+  let oc = open_out path in
+  close_out oc;
+  Unix.chmod path perms
+
+let describe_resolution_failure = function
+  | Discord_agents.Agent_process.Override_not_executable path ->
+    Printf.sprintf "override %s not executable" path
+  | Discord_agents.Agent_process.No_candidate_found candidates ->
+    Printf.sprintf "no candidate among [%s]" (String.concat "; " candidates)
+
+let check_resolves label expected actual =
+  match actual with
+  | Ok path -> Alcotest.(check string) label expected path
+  | Error failure ->
+    Alcotest.failf "%s: expected %s, got Error (%s)"
+      label expected (describe_resolution_failure failure)
+
+(* The two failures are reported differently — one advises `dune build`,
+   the other names the operator's own override — so which one comes back
+   is part of the contract. *)
+let check_override_failure label = function
+  | Ok path -> Alcotest.failf "%s: expected Error, resolved to %s" label path
+  | Error (Discord_agents.Agent_process.Override_not_executable _) -> ()
+  | Error other ->
+    Alcotest.failf "%s: expected an override failure, got %s"
+      label (describe_resolution_failure other)
+
+let check_search_failure label = function
+  | Ok path -> Alcotest.failf "%s: expected Error, resolved to %s" label path
+  | Error (Discord_agents.Agent_process.No_candidate_found candidates) ->
+    (* Every ancestor the walk visited must be named, not just the
+       first: a diagnostic listing one of eight paths sends the reader
+       looking in the wrong place. *)
+    Alcotest.(check bool)
+      (label ^ ": names more than the starting directory")
+      true (List.length candidates > 3)
+  | Error other ->
+    Alcotest.failf "%s: expected a search failure, got %s"
+      label (describe_resolution_failure other)
+
+let test_mcp_command_resolution () =
+  let resolve = Discord_agents.Agent_process.resolve_mcp_command in
+  with_resolver_temp_dir (fun dir ->
+    let exe = Filename.concat dir "custom-mcp" in
+    touch exe;
+    check_resolves "env override wins"
+      exe
+      (resolve ~env_override:(Some exe) ~exe_dir:dir ~cwd:dir);
+    (* The guard used to trim while the value returned did not, so a
+       stray space produced a command that could never run. *)
+    check_resolves "env override is trimmed"
+      exe
+      (resolve ~env_override:(Some ("  " ^ exe ^ "  ")) ~exe_dir:dir ~cwd:dir);
+    check_override_failure "env override pointing nowhere"
+      (resolve ~env_override:(Some (Filename.concat dir "missing"))
+         ~exe_dir:dir ~cwd:dir);
+    let not_exec = Filename.concat dir "not-exec" in
+    touch ~perms:0o644 not_exec;
+    check_override_failure "env override not executable"
+      (resolve ~env_override:(Some not_exec) ~exe_dir:dir ~cwd:dir);
+    check_override_failure "env override is a directory"
+      (resolve ~env_override:(Some dir) ~exe_dir:dir ~cwd:dir));
+  with_resolver_temp_dir (fun dir ->
+    let installed = Filename.concat dir "discord-agents-mcp" in
+    touch installed;
+    check_resolves "installed name beside the bot"
+      installed
+      (resolve ~env_override:None ~exe_dir:dir ~cwd:dir);
+    check_resolves "empty override falls through to the search"
+      installed
+      (resolve ~env_override:(Some "   ") ~exe_dir:dir ~cwd:dir));
+  with_resolver_temp_dir (fun dir ->
+    let built = Filename.concat dir "mcp_server.exe" in
+    touch built;
+    check_resolves "dune executable name beside the bot"
+      built
+      (resolve ~env_override:None ~exe_dir:dir ~cwd:dir));
+  with_resolver_temp_dir (fun dir ->
+    let nested = Filename.concat dir "a/b/c" in
+    let build_bin = Filename.concat dir "_build/default/bin" in
+    List.iter (fun path ->
+      let rec mkdirs p =
+        if not (Sys.file_exists p) then begin
+          mkdirs (Filename.dirname p);
+          Unix.mkdir p 0o755
+        end
+      in
+      mkdirs path)
+      [nested; build_bin];
+    let built = Filename.concat build_bin "mcp_server.exe" in
+    touch built;
+    let empty = Filename.concat dir "empty-exe-dir" in
+    Unix.mkdir empty 0o755;
+    check_resolves "found by walking up from the working directory"
+      built
+      (resolve ~env_override:None ~exe_dir:empty ~cwd:nested);
+    (* A build tree that was never built: the file exists nowhere, and
+       the old resolver answered with a bare name that is on nobody's
+       PATH — the silent-no-tools case. *)
+    Sys.remove built;
+    check_search_failure "nothing built anywhere"
+      (resolve ~env_override:None ~exe_dir:empty ~cwd:nested))
+
+(* Gemini is the only agent whose MCP config is a file it reads on
+   every run, so "start without MCP" has to mean removing our entry, not
+   just declining to write one — a settings.json written while a build
+   tree existed keeps naming that path after the tree is gone.
+
+   Withdrawal only ever rewrites a file we can prove holds our entry.
+   The register path may discard a file it can't parse (it has to
+   install something, so a file that could never have held our entry
+   costs nothing to replace); withdrawal has nothing to install, so the
+   same clobber would be pure loss. *)
+let test_gemini_settings_withdraw_our_entry () =
+  let withdraw = Discord_agents.Agent_process.gemini_settings_without_our_entry in
+  let existing = {|{
+    "mcpServers": {
+      "discord-agents": { "command": "/gone/mcp_server.exe", "args": [] },
+      "user-tool": { "command": "their-cmd", "args": [] }
+    },
+    "theme": "dark"
+  }|} in
+  (match withdraw (Some existing) with
+   | None -> Alcotest.fail "expected our stale entry to be withdrawn"
+   | Some updated ->
+     let json = Yojson.Safe.from_string updated in
+     let open Yojson.Safe.Util in
+     let servers = json |> member "mcpServers" |> to_assoc in
+     Alcotest.(check bool) "our stale entry is gone"
+       false (List.mem_assoc "discord-agents" servers);
+     Alcotest.(check bool) "the user's server survives"
+       true (List.mem_assoc "user-tool" servers);
+     Alcotest.(check bool) "unrelated keys survive"
+       true (List.mem_assoc "theme" (json |> to_assoc)));
+  (* Every shape we can't prove holds our entry is left alone. Each of
+     these previously came back as {"mcpServers": {}}. *)
+  let untouched label input =
+    Alcotest.(check bool) label true (Option.is_none (withdraw input))
+  in
+  untouched "no file" None;
+  untouched "unparseable" (Some "not valid json {");
+  untouched "truncated" (Some {|{"theme":"dark","contextFileName":"GEM|});
+  untouched "not an object" (Some "[1, 2, 3]");
+  untouched "mcpServers is not an object"
+    (Some {|{"theme":"dark","mcpServers":[{"user":1}]}|});
+  untouched "no entry of ours"
+    (Some {|{"theme":"dark","mcpServers":{"user-tool":{"command":"x"}}}|});
+  untouched "no mcpServers at all" (Some {|{"theme":"dark"}|});
+  (* Duplicate top-level keys are legal JSON that readers disagree
+     about — Gemini's parser takes the last, List.assoc the first — and
+     any rewrite collapses them, dropping one block. Declining leaves a
+     stale entry, which is the lesser harm. *)
+  untouched "duplicate mcpServers, ours first"
+    (Some {|{"mcpServers":{"discord-agents":{"command":"/gone"}},
+             "mcpServers":{"user-tool":{"command":"x"}}}|});
+  untouched "duplicate mcpServers, ours second"
+    (Some {|{"mcpServers":{"user-tool":{"command":"x"}},
+             "mcpServers":{"discord-agents":{"command":"/gone"}}}|})
 
 let test_merge_gemini_settings_creates_when_absent () =
   let merged = Discord_agents.Agent_process.merge_gemini_settings None in
@@ -2698,7 +2886,7 @@ let test_setup_gemini_mcp_writes_settings_in_regular_repo () =
       "git init -q -b main %s 2>&1 >/dev/null"
       (Filename.quote dir)) in
     Alcotest.(check int) "git init succeeded" 0 rc;
-    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir;
+    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir ();
     let settings_path = Filename.concat dir ".gemini/settings.json" in
     Alcotest.(check bool) "settings.json created"
       true (Sys.file_exists settings_path);
@@ -2722,8 +2910,8 @@ let test_setup_gemini_mcp_idempotent () =
     (* Run twice. Second invocation must be a no-op shape: settings
        still has our entry, and the exclude has exactly one .gemini/
        line (not two). *)
-    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir;
-    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir;
+    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir ();
+    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir ();
     let settings = read_all (Filename.concat dir ".gemini/settings.json") in
     let json = Yojson.Safe.from_string settings in
     let open Yojson.Safe.Util in
@@ -2744,6 +2932,106 @@ let test_setup_gemini_mcp_idempotent () =
         1 (List.length gemini_lines);
       ignore (count_substr exclude ".gemini/"))
 
+(* The healthy Claude path, end to end. A read-back check with no test
+   is how the last round shipped a comparison that rejected every
+   correctly-written config: write_file_atomic appends a newline the
+   compared string doesn't have, so the bot silently ran every Claude
+   session with no MCP tools while the suite stayed green. *)
+let test_claude_mcp_config_path_round_trips () =
+  with_temp_dir (fun dir ->
+    (* Resolution comes from test/dune's %{exe:../bin/mcp_server.exe}
+       dep, not from anything set up here. *)
+    let config_home = Filename.concat dir "config" in
+    Unix.mkdir config_home 0o755;
+    let saved_xdg = Sys.getenv_opt "XDG_CONFIG_HOME" in
+    let saved_home = Sys.getenv_opt "HOME" in
+    Unix.putenv "XDG_CONFIG_HOME" config_home;
+    (* HOME too: app_config_dir prefers a legacy ~/.discord-agents when
+       the XDG one holds no state yet. *)
+    Unix.putenv "HOME" (Filename.concat dir "home");
+    Fun.protect
+      ~finally:(fun () ->
+        (match saved_xdg with
+         | Some v -> Unix.putenv "XDG_CONFIG_HOME" v
+         | None -> Unix.putenv "XDG_CONFIG_HOME" "");
+        match saved_home with
+        | Some v -> Unix.putenv "HOME" v
+        | None -> Unix.putenv "HOME" "")
+      (fun () ->
+        match Discord_agents.Agent_process.claude_mcp_config_path () with
+        | None ->
+          Alcotest.fail
+            "a writable config dir and a resolvable server must yield an MCP config path"
+        | Some path ->
+          Alcotest.(check bool) "config file exists" true (Sys.file_exists path);
+          let json = Yojson.Safe.from_string (read_all path) in
+          let open Yojson.Safe.Util in
+          Alcotest.(check bool) "names our server"
+            true
+            (List.mem_assoc "discord-agents"
+               (json |> member "mcpServers" |> to_assoc))))
+
+(* The caller, not just the helper. Both prior rounds were about
+   setup_gemini_mcp's behavior when no MCP server resolved, and neither
+   round's test could reach it — the real value is a memoized global, so
+   reverting the fix left the suite green. ?resolved is the seam. *)
+let test_setup_gemini_mcp_unresolved_withdraws_our_entry () =
+  with_temp_dir (fun dir ->
+    let rc = Sys.command (Printf.sprintf
+      "git init -q -b main %s 2>&1 >/dev/null" (Filename.quote dir)) in
+    Alcotest.(check int) "git init succeeded" 0 rc;
+    let gemini_dir = Filename.concat dir ".gemini" in
+    Unix.mkdir gemini_dir 0o755;
+    let settings_path = Filename.concat gemini_dir "settings.json" in
+    let write path contents =
+      let oc = open_out path in
+      output_string oc contents;
+      close_out oc
+    in
+    write settings_path {|{
+      "mcpServers": {
+        "discord-agents": { "command": "/gone/mcp_server.exe", "args": [] },
+        "user-tool": { "command": "their-cmd", "args": [] }
+      },
+      "theme": "dark"
+    }|};
+    Discord_agents.Agent_process.setup_gemini_mcp
+      ~resolved:None ~working_dir:dir ();
+    let json = Yojson.Safe.from_string (read_all settings_path) in
+    let open Yojson.Safe.Util in
+    let servers = json |> member "mcpServers" |> to_assoc in
+    Alcotest.(check bool) "stale entry removed by the caller"
+      false (List.mem_assoc "discord-agents" servers);
+    Alcotest.(check bool) "user's server survives"
+      true (List.mem_assoc "user-tool" servers);
+    (* A file we can't prove holds our entry is left byte-for-byte. *)
+    let garbage = "not valid json {" in
+    write settings_path garbage;
+    Discord_agents.Agent_process.setup_gemini_mcp
+      ~resolved:None ~working_dir:dir ();
+    Alcotest.(check string) "unparseable settings left untouched"
+      garbage (read_all settings_path))
+
+let test_setup_gemini_mcp_unresolved_touches_nothing_else () =
+  with_temp_dir (fun dir ->
+    let rc = Sys.command (Printf.sprintf
+      "git init -q -b main %s 2>&1 >/dev/null" (Filename.quote dir)) in
+    Alcotest.(check int) "git init succeeded" 0 rc;
+    Discord_agents.Agent_process.setup_gemini_mcp
+      ~resolved:None ~working_dir:dir ();
+    (* With no server to register, creating .gemini/ and adding a
+       .gemini/ line to the user's info/exclude are changes made on
+       their behalf for no benefit — the exclude line would hide their
+       own .gemini/ from git status. *)
+    Alcotest.(check bool) "no .gemini directory created"
+      false (Sys.file_exists (Filename.concat dir ".gemini"));
+    let exclude_path = Filename.concat dir ".git/info/exclude" in
+    let exclude =
+      if Sys.file_exists exclude_path then read_all exclude_path else ""
+    in
+    Alcotest.(check bool) "info/exclude not touched"
+      false (count_substr exclude ".gemini/" > 0))
+
 let test_setup_gemini_mcp_preserves_user_settings () =
   with_temp_dir (fun dir ->
     let rc = Sys.command (Printf.sprintf
@@ -2762,7 +3050,7 @@ let test_setup_gemini_mcp_preserves_user_settings () =
     let oc = open_out settings_path in
     output_string oc user_config;
     close_out oc;
-    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir;
+    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir ();
     let json = Yojson.Safe.from_string (read_all settings_path) in
     let open Yojson.Safe.Util in
     let servers = json |> member "mcpServers" |> to_assoc in
@@ -2786,7 +3074,7 @@ let test_setup_gemini_mcp_fails_closed_on_read_errors () =
     let exclude_path = Filename.concat dir ".git/info/exclude" in
     Sys.remove exclude_path;
     Unix.mkdir exclude_path 0o755;
-    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir;
+    Discord_agents.Agent_process.setup_gemini_mcp ~working_dir:dir ();
     Alcotest.(check bool) "settings path left untouched"
       true (Sys.is_directory settings_path);
     Alcotest.(check bool) "exclude path left untouched"
@@ -2938,6 +3226,16 @@ let resume_helpers_tests = [
     test_merge_gemini_settings_overwrites_our_entry;
   Alcotest.test_case "merge_gemini_settings creates when absent" `Quick
     test_merge_gemini_settings_creates_when_absent;
+  Alcotest.test_case "MCP command resolution" `Quick
+    test_mcp_command_resolution;
+  Alcotest.test_case "gemini settings withdraw our entry" `Quick
+    test_gemini_settings_withdraw_our_entry;
+  Alcotest.test_case "setup_gemini_mcp unresolved withdraws our entry" `Quick
+    test_setup_gemini_mcp_unresolved_withdraws_our_entry;
+  Alcotest.test_case "setup_gemini_mcp unresolved touches nothing else" `Quick
+    test_setup_gemini_mcp_unresolved_touches_nothing_else;
+  Alcotest.test_case "claude_mcp_config_path round trips" `Quick
+    test_claude_mcp_config_path_round_trips;
   Alcotest.test_case "merge_gemini_settings invalid input falls back" `Quick
     test_merge_gemini_settings_invalid_input_falls_back;
   Alcotest.test_case "merge_gemini_settings non-object falls back" `Quick
@@ -3062,22 +3360,27 @@ let test_codex_args_includes_mcp_overrides () =
      Two -c overrides register the discord-agents server. *)
   let args = codex_args ~session_id:"x" ~session_id_confirmed:false
     ~prompt:"hi" in
+  let command_override =
+    Printf.sprintf {|mcp_servers.discord_agents.command="%s"|}
+      (Discord_agents.Agent_process.escape_toml_string
+         (Discord_agents.Agent_process.mcp_command ()))
+  in
   Alcotest.(check bool) "registers discord_agents.command"
-    true (contains_pair args "-c"
-            {|mcp_servers.discord_agents.command="python3"|});
+    true (contains_pair args "-c" command_override);
   Alcotest.(check bool) "registers discord_agents.args" true
-    (List.exists (fun s ->
-      try ignore (Str.search_forward
-        (Str.regexp_string "mcp_servers.discord_agents.args=[") s 0); true
-      with Not_found -> false) args)
+    (contains_pair args "-c" {|mcp_servers.discord_agents.args=[]|})
 
 let test_codex_args_resume_keeps_mcp () =
   (* Resuming a Codex session should still expose MCP tools. *)
   let args = codex_args ~session_id:"x" ~session_id_confirmed:true
     ~prompt:"hi" in
+  let command_override =
+    Printf.sprintf {|mcp_servers.discord_agents.command="%s"|}
+      (Discord_agents.Agent_process.escape_toml_string
+         (Discord_agents.Agent_process.mcp_command ()))
+  in
   Alcotest.(check bool) "MCP override present on resume too"
-    true (contains_pair args "-c"
-            {|mcp_servers.discord_agents.command="python3"|})
+    true (contains_pair args "-c" command_override)
 
 let test_codex_args_model_and_effort_overrides () =
   let args = Discord_agents.Agent_process.codex_args

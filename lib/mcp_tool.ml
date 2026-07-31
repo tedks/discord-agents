@@ -1,7 +1,7 @@
 (** MCP tool descriptors for the discord-agents control surface.
 
-    The Python MCP shim is still the runtime entrypoint. This module is
-    the typed OCaml source of truth we can migrate that runtime toward. *)
+    This module is the typed OCaml source of truth for the MCP tools
+    exposed by the discord-agents-mcp stdio server. *)
 
 type id =
   | Start_session

@@ -13,7 +13,9 @@ nix develop --command dune build
 ```bash
 # Config at ~/.config/discord-agents/config.json
 # Or use DISCORD_BOT_TOKEN env var
-nix develop --command dune exec discord-agents
+# dune build first: `dune exec discord-agents` builds only the bot,
+# not the sibling MCP server executable the agents connect to.
+nix develop --command dune build && nix develop --command dune exec discord-agents
 
 # Smoke test
 nix develop --command dune exec discord-agents -- --test [CHANNEL_ID]
@@ -150,13 +152,31 @@ Gemini tool names (`run_shell_command`, `read_file`, `write_file`, `replace`, `s
 
 ## MCP configuration
 
-The bot exposes MCP tools (`start_session`, `stop_session`, `list_sessions`, etc.) via `scripts/mcp-server.py`. All three agents now pick it up — each through a different mechanism:
+The bot exposes MCP tools (`start_session`, `stop_session`, `list_sessions`, etc.) via the `discord-agents-mcp` OCaml stdio server. All three agents pick it up through a different mechanism:
 
 - **Claude** — `--mcp-config <path>` flag; we write the config to `~/.config/discord-agents/mcp-generated.json`.
-- **Codex** — TOML overrides via `-c key=value` per invocation: `mcp_servers.discord_agents.command="python3"` and `mcp_servers.discord_agents.args=["..."]`. Doesn't touch the user's `~/.codex/config.toml`.
+- **Codex** — TOML overrides via `-c key=value` per invocation: `mcp_servers.discord_agents.command="<resolved absolute path>"` and `mcp_servers.discord_agents.args=[]`. Doesn't touch the user's `~/.codex/config.toml`.
 - **Gemini** — has no `--mcp-config` flag; loads `mcpServers` from `<cwd>/.gemini/settings.json`. The bot merges its entry into any existing settings file (preserving the user's other MCP servers and unrelated keys) at session start and appends `.gemini/` to the worktree's `.git/info/exclude`.
 
-For non-default install layouts where the script doesn't live next to the executable, set `DISCORD_AGENTS_MCP_SCRIPT=/path/to/mcp-server.py` to override the heuristic search.
+All three regenerate their config on every spawn, so a stale `mcp-generated.json` or `.gemini/settings.json` from an older version heals itself on the next session.
+
+### Finding the server
+
+`Agent_process.resolve_mcp_command` looks, in order, at `DISCORD_AGENTS_MCP_COMMAND`, then `discord-agents-mcp` and `mcp_server.exe` beside the running bot, then `_build/default/bin/mcp_server.exe` walking up from the working directory. Each candidate must be an executable regular file, not merely present.
+
+**`dune exec discord-agents` does not build the MCP server** — it builds only the executable you named. Run `dune build` first (the documented run commands and `scripts/run-branch.sh` do). If nothing resolves, the bot logs an error naming every path it tried and starts sessions *without* MCP config rather than pointing an agent at a command that isn't there; the agent then simply has no `discord-agents` tools.
+
+The pre-cutover `DISCORD_AGENTS_MCP_SCRIPT` is no longer read. Setting it logs a warning telling you to use `DISCORD_AGENTS_MCP_COMMAND`.
+
+### Rolling back to the Python server
+
+`scripts/mcp-server.py` is still present, still executable, and still the parity oracle the test suite checks the OCaml implementation against. To fall back at runtime without reverting code:
+
+```bash
+DISCORD_AGENTS_MCP_COMMAND=/path/to/repo/scripts/mcp-server.py
+```
+
+Its shebang makes it work with the empty `args` list the config now emits. Restart the bot for it to take effect.
 
 ## System prompts
 

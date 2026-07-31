@@ -29,7 +29,7 @@ cat > ~/.config/discord-agents/config.json << 'EOF'
 EOF
 
 # Run
-nix develop --command dune exec discord-agents
+nix develop --command dune build && nix develop --command dune exec discord-agents
 ```
 
 Then in Discord:

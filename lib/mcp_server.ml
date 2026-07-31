@@ -1,8 +1,4 @@
-(** Minimal MCP JSON-RPC protocol handling.
-
-    The Python MCP server remains the runtime entrypoint for tool calls while
-    formatting is ported. This module owns the protocol surface that can be
-    tested against the typed OCaml tool descriptors. *)
+(** Minimal MCP JSON-RPC protocol handling for the OCaml stdio server. *)
 
 type tool_call = {
   name : string;
@@ -19,8 +15,6 @@ let protocol_version = "2024-11-05"
 
 let server_name = "discord-agents-mcp"
 
-(* Keep aligned with scripts/mcp-server.py while Python remains the runtime
-   MCP entrypoint. *)
 let server_version = "0.2.0"
 
 let raise_if_fatal exn =

@@ -3,6 +3,7 @@ module Control_client = Discord_agents.Control_client
 module Mcp_formatter = Discord_agents.Mcp_formatter
 module Mcp_handler = Discord_agents.Mcp_handler
 module Mcp_server = Discord_agents.Mcp_server
+module Mcp_tool = Discord_agents.Mcp_tool
 
 let failf fmt = Format.kasprintf (fun message -> Alcotest.fail message) fmt
 
@@ -76,7 +77,14 @@ let python_tool_command ?(arguments=`Assoc []) ?(merge_stderr=false)
     ^ "lambda method, params=None, timeout=60: response; "
     ^ "sys.stdout.write(ns['handle_tool_call'](sys.argv[3], arguments))"
   in
-  Printf.sprintf "python3 -c %s %s %s %s %s%s"
+  (* PYTHONIOENCODING pins the oracle's stdout codec to strict UTF-8.
+     Without it the ambient environment decides: under PYTHONUTF8=1 (or
+     no locale vars at all) CPython uses the surrogateescape error
+     handler, which round-trips raw invalid bytes back out instead of
+     refusing them — so a test asserting "Python cannot encode this"
+     passes in one shell and fails in another. Strict is also what a
+     real JSON-RPC peer does. *)
+  Printf.sprintf "PYTHONIOENCODING=utf-8 python3 -c %s %s %s %s %s%s"
     (Filename.quote program)
     (Filename.quote script)
     (Filename.quote (Yojson.Safe.to_string response))
@@ -1836,10 +1844,12 @@ let test_handler_recent_sessions_request_control_api () =
     ])
     ~expected_output:"- `abcd1234` 2h ago — /src/repo — checked stack\n\nUse resume_session with kind=gemini to attach."
 
-(* The no-argument call is the common case, and the one place our wire
-   format differs from Python's: we forward an empty params object where
-   [control_request] omits "params" entirely. [Control_api.hours_param]
-   collapses both to the 24h default (pinned in test_control_api). *)
+(* The no-argument call is the common case. We drop the empty arguments
+   object rather than forwarding it, exactly as Python's control_request
+   drops falsy params — the runtime cutover made that difference matter:
+   handlers that read a required field with [to_string] see [{}] as a
+   present-but-empty object and raise a Yojson Type_error instead of
+   returning "missing params". *)
 let test_handler_recent_sessions_empty_arguments () =
   let calls = ref [] in
   let control_client =
@@ -1858,9 +1868,8 @@ let test_handler_recent_sessions_empty_arguments () =
   | [request] ->
     Alcotest.(check string) "method"
       "list_codex_sessions" request.method_name;
-    (match request.params with
-     | Some params -> check_json "params" (`Assoc []) params
-     | None -> failf "expected params")
+    Alcotest.(check bool) "params omitted like Python" true
+      (Option.is_none request.params)
   | calls -> failf "expected one control request, got %d" (List.length calls)
 
 let test_handler_lifecycle_tools_request_control_api () =
@@ -2193,6 +2202,25 @@ let test_handler_unsupported_tool () =
     "unsupported"
     (Error "OCaml MCP tools/call is not wired yet for tool: not_a_tool")
     (Mcp_handler.handle_tool_call ~control_client call)
+
+let test_all_mcp_tools_are_wired () =
+  Mcp_tool.all_specs
+  |> List.iter (fun spec ->
+    let tool_name = Mcp_tool.tool_name spec in
+    let calls = ref 0 in
+    let control_client =
+      Control_client.make ~request:(fun _request ->
+        incr calls;
+        Error "wired")
+    in
+    let call = { Mcp_server.name = tool_name; arguments = `Assoc [] } in
+    Alcotest.(check (result string string))
+      (tool_name ^ " dispatch")
+      (Error "wired")
+      (Mcp_handler.handle_tool_call ~control_client call);
+    Alcotest.(check bool)
+      (tool_name ^ " called control API")
+      true (!calls > 0))
 
 let test_server_wraps_list_projects_result () =
   let control_client =
@@ -2620,6 +2648,8 @@ let () =
         test_handler_covers_every_advertised_tool;
       Alcotest.test_case "unsupported tool" `Quick
         test_handler_unsupported_tool;
+      Alcotest.test_case "all MCP tools are wired" `Quick
+        test_all_mcp_tools_are_wired;
       Alcotest.test_case "server wraps list_projects result" `Quick
         test_server_wraps_list_projects_result;
       Alcotest.test_case "server wraps list_projects control error" `Quick
