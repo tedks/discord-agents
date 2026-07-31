@@ -175,23 +175,27 @@ let recent_working_dir fields =
    empty messages are the only other difference.
 
    Null policy inside a session object is deliberately split, because
-   the two fields are not alike: [working_dir] null is reachable and
+   the fields are not alike: [working_dir] null is reachable and
    meaningful (Python's [or] makes it "(unknown project)", so we match),
-   while a null [session_id_short] or [summary] is malformed — Python
-   interpolates the literal "None" there, and we fail closed instead.
-   Both are pinned by tests.
+   while a null [session_id_short], [summary] or [age_minutes] is
+   malformed — Python interpolates the literal "None" for the first two
+   and raises TypeError on the third ([None < 60]), where we return a
+   field-specific error for all three. Each case is pinned by a test.
 
-   [working_dir] and [summary] are forced single-line before
-   interpolation: [summary] arrives normalized from the discoverers, but
-   [working_dir] does not (Control_api emits [s.working_dir] verbatim,
-   and Codex reads it straight out of a rollout file). A literal newline
-   there would land the rest of the entry at column 0, where Discord
-   parses it as a sibling bullet — a forged entry the calling agent
-   cannot tell from a real one and may feed back to [resume_session].
-   [Bot.format_recent_sessions] sanitizes the Discord-side listing for
-   exactly this reason; Python does not, so this is a deliberate
-   divergence for pathological input only. [session_id_short] is
-   [Resource.short_id] output (lowercase hex) and needs no scrubbing. *)
+   Every interpolated string field is forced single-line first. A
+   literal newline in any of them lands the rest of the entry at column
+   0, where Discord parses it as a sibling bullet — a forged entry the
+   calling agent cannot tell from a real one and may feed back to
+   [resume_session]. [summary] already arrives normalized from the
+   discoverers and [session_id_short] is usually an 8-char hex prefix,
+   but neither is guaranteed: [Resource.short_id] is a [String.sub] that
+   validates nothing, and all three fields have the same provenance —
+   Codex reads [session_id] and [cwd] out of the same rollout record,
+   Claude takes its id from a filename. So scrub all three rather than
+   rest the invariant on the shape of upstream data.
+   [Bot.format_session_listing] (lib/bot.ml) does the same for the
+   Discord-side listing. Python does not, so this is a deliberate
+   divergence, visible only for pathological input. *)
 let recent_session_line ~with_working_dir = function
   | `Assoc fields ->
     let working_dir =
@@ -206,6 +210,7 @@ let recent_session_line ~with_working_dir = function
            string_field_default "(no summary)"
              "recent_session" "summary" fields with
      | Ok session_id_short, Ok age_minutes, Ok working_dir, Ok summary ->
+       let session_id_short = Resource.single_line session_id_short in
        let age = age_minutes_text age_minutes in
        let summary = Resource.single_line summary in
        Ok (
