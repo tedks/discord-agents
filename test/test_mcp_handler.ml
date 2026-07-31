@@ -1347,6 +1347,39 @@ let test_format_config_tools_documented_divergences () =
            ("status", `String "active");
          ]);
        ]));
+  (* The one config input where Python has no output to be at parity
+     with: a null token_budget object makes it call .get on None. We map
+     the null to an empty object and print the documented default. *)
+  let null_token_budget =
+    agent_config_response
+      ~options:(`Assoc [
+        ("goal", `Assoc [
+          ("supported", `Bool true);
+          ("objective", `Assoc [("values", `String "any non-empty string")]);
+          ("status_values", `List [`String "active"]);
+          ("token_budget", `Null);
+          ("clear_values", `String "clear=true");
+        ]);
+      ]) ()
+  in
+  (match
+     python_tool_call_failure
+       ~arguments:(`Assoc [("thread_id", `String "123")])
+       "get_agent_config" null_token_budget
+   with
+   | None -> failf "expected the Python handler to raise on a null token_budget"
+   | Some traceback ->
+     Alcotest.(check bool)
+       "python raises on a null token_budget"
+       true
+       (contains_substring traceback "AttributeError"));
+  (match Mcp_formatter.format_get_agent_config null_token_budget with
+   | Error message -> failf "expected a rendered listing, got: %s" message
+   | Ok text ->
+     Alcotest.(check bool)
+       "we render the documented default instead"
+       true
+       (contains_substring text "token_budget positive integer or null"));
   (* Invalid UTF-8 in a stored objective (a Yojson-decoded lone
      surrogate) is replaced rather than re-emitted. *)
   Alcotest.(check (result string string))

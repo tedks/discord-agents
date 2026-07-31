@@ -215,7 +215,13 @@ let field_truthy name fields =
    different contract than the one the control API sent, in prose that
    reads just as authoritative. The sibling [render_values] on the same
    output line already renders null as "None", so this also keeps one
-   line internally consistent. *)
+   line internally consistent.
+
+   Deliberately unlike [string_field_default] above, which *errors* on
+   an explicit null. That one reads fields we interpolate as facts (a
+   status, a thread id) where a null is a malformed response worth
+   refusing; this one reads fields that describe what values are
+   allowed, where Python's rendering is the contract being reported. *)
 let string_of_json_field_default default object_name name fields =
   match field name fields with
   | None -> Ok default
@@ -532,6 +538,12 @@ let format_default_agent ~arguments response =
             [Printf.sprintf "Rescue agent: `%s`%s." rescue suffix]
         in
         let parts =
+          (* Compares scrubbed values, so two agent names differing only
+             in whitespace would collapse and drop this sentence, where
+             Python would print it. Both sides come from
+             Config.string_of_agent_kind's three-value enum, so the
+             inputs can't differ that way — but it is the one place the
+             render boundary is more than cosmetic. *)
           if not (String.equal effective "")
              && not (String.equal effective agent)
           then
