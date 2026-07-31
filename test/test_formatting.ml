@@ -2338,7 +2338,17 @@ let test_gemini_settings_withdraw_our_entry () =
     (Some {|{"theme":"dark","mcpServers":[{"user":1}]}|});
   untouched "no entry of ours"
     (Some {|{"theme":"dark","mcpServers":{"user-tool":{"command":"x"}}}|});
-  untouched "no mcpServers at all" (Some {|{"theme":"dark"}|})
+  untouched "no mcpServers at all" (Some {|{"theme":"dark"}|});
+  (* Duplicate top-level keys are legal JSON that readers disagree
+     about — Gemini's parser takes the last, List.assoc the first — and
+     any rewrite collapses them, dropping one block. Declining leaves a
+     stale entry, which is the lesser harm. *)
+  untouched "duplicate mcpServers, ours first"
+    (Some {|{"mcpServers":{"discord-agents":{"command":"/gone"}},
+             "mcpServers":{"user-tool":{"command":"x"}}}|});
+  untouched "duplicate mcpServers, ours second"
+    (Some {|{"mcpServers":{"user-tool":{"command":"x"}},
+             "mcpServers":{"discord-agents":{"command":"/gone"}}}|})
 
 let test_merge_gemini_settings_creates_when_absent () =
   let merged = Discord_agents.Agent_process.merge_gemini_settings None in
@@ -2922,6 +2932,47 @@ let test_setup_gemini_mcp_idempotent () =
         1 (List.length gemini_lines);
       ignore (count_substr exclude ".gemini/"))
 
+(* The healthy Claude path, end to end. A read-back check with no test
+   is how the last round shipped a comparison that rejected every
+   correctly-written config: write_file_atomic appends a newline the
+   compared string doesn't have, so the bot silently ran every Claude
+   session with no MCP tools while the suite stayed green. *)
+let test_claude_mcp_config_path_round_trips () =
+  with_temp_dir (fun dir ->
+    let fake_mcp = Filename.concat dir "fake-mcp" in
+    let oc = open_out fake_mcp in
+    close_out oc;
+    Unix.chmod fake_mcp 0o755;
+    let config_home = Filename.concat dir "config" in
+    Unix.mkdir config_home 0o755;
+    let saved_xdg = Sys.getenv_opt "XDG_CONFIG_HOME" in
+    let saved_home = Sys.getenv_opt "HOME" in
+    Unix.putenv "XDG_CONFIG_HOME" config_home;
+    (* HOME too: app_config_dir prefers a legacy ~/.discord-agents when
+       the XDG one holds no state yet. *)
+    Unix.putenv "HOME" (Filename.concat dir "home");
+    Fun.protect
+      ~finally:(fun () ->
+        (match saved_xdg with
+         | Some v -> Unix.putenv "XDG_CONFIG_HOME" v
+         | None -> Unix.putenv "XDG_CONFIG_HOME" "");
+        match saved_home with
+        | Some v -> Unix.putenv "HOME" v
+        | None -> Unix.putenv "HOME" "")
+      (fun () ->
+        match Discord_agents.Agent_process.claude_mcp_config_path () with
+        | None ->
+          Alcotest.fail
+            "a writable config dir and a resolvable server must yield a              --mcp-config path"
+        | Some path ->
+          Alcotest.(check bool) "config file exists" true (Sys.file_exists path);
+          let json = Yojson.Safe.from_string (read_all path) in
+          let open Yojson.Safe.Util in
+          Alcotest.(check bool) "names our server"
+            true
+            (List.mem_assoc "discord-agents"
+               (json |> member "mcpServers" |> to_assoc))))
+
 (* The caller, not just the helper. Both prior rounds were about
    setup_gemini_mcp's behavior when no MCP server resolved, and neither
    round's test could reach it — the real value is a memoized global, so
@@ -3185,6 +3236,8 @@ let resume_helpers_tests = [
     test_setup_gemini_mcp_unresolved_withdraws_our_entry;
   Alcotest.test_case "setup_gemini_mcp unresolved touches nothing else" `Quick
     test_setup_gemini_mcp_unresolved_touches_nothing_else;
+  Alcotest.test_case "claude_mcp_config_path round trips" `Quick
+    test_claude_mcp_config_path_round_trips;
   Alcotest.test_case "merge_gemini_settings invalid input falls back" `Quick
     test_merge_gemini_settings_invalid_input_falls_back;
   Alcotest.test_case "merge_gemini_settings non-object falls back" `Quick

@@ -1430,7 +1430,14 @@ let claude_mcp_config_path () =
        then make Claude exit 1. *)
     let intended = Lazy.force mcp_json in
     match read_file_result config_path with
-    | File_contents actual when String.equal actual intended ->
+    (* Trimmed, because the comparison is with the file the writer
+       produced, not with the string handed to it: write_file_atomic
+       appends a newline of its own (lib/resource.ml). Comparing
+       untrimmed made this reject every healthy write — the config was
+       written correctly and then declared stale, so Claude ran with no
+       MCP tools at all. Trim rather than [intended ^ "\n"] so this
+       doesn't silently re-break if the writer's framing changes. *)
+    | File_contents actual when String.equal (String.trim actual) intended ->
       Some config_path
     | _ ->
       Logs.warn (fun m ->
@@ -1491,10 +1498,14 @@ let merge_gemini_settings existing =
    does not transfer here. There we *must* install our entry, so
    replacing a file that could never have held it costs nothing. Here
    there is nothing to install, so rewriting a file we can't understand
-   is pure loss — a truncated or hand-commented settings.json, or one
-   whose [mcpServers] isn't an object, would come back as
-   [{"mcpServers": {}}] with the user's keys gone. We only rewrite when
-   we can see our own entry to remove. *)
+   is pure loss — a truncated settings.json, one whose [mcpServers]
+   isn't an object, or one that simply never held our entry would come
+   back as [{"mcpServers": {}}] with the user's keys gone. We only
+   rewrite when we can see our own entry to remove.
+
+   Note Yojson does accept [//] comments, so a hand-commented file that
+   *does* hold our entry is rewritten (and its comments dropped) rather
+   than left alone. That is the register path's behavior too. *)
 let gemini_settings_without_our_entry existing =
   match existing with
   | None -> None
@@ -1502,9 +1513,20 @@ let gemini_settings_without_our_entry existing =
     match Yojson.Safe.from_string text with
     | exception _ -> None
     | `Assoc fields ->
-      (match List.assoc_opt "mcpServers" fields with
-       | Some (`Assoc servers) when List.mem_assoc "discord-agents" servers ->
+      (match List.filter (fun (key, _) -> key = "mcpServers") fields with
+       (* Exactly one [mcpServers], and it holds our entry. Duplicate
+          top-level keys are legal JSON that Yojson keeps and that
+          different readers resolve differently — Gemini's parser takes
+          the last, [List.assoc_opt] the first — and rewriting collapses
+          them to one, dropping whichever block we didn't act on. There
+          is no rewrite here that can't lose something, so decline. *)
+       | [(_, `Assoc servers)] when List.mem_assoc "discord-agents" servers ->
          Some (gemini_settings_with ~our_entry:None (Some text))
+       | _ :: _ :: _ ->
+         Logs.warn (fun m ->
+           m "Gemini settings has duplicate mcpServers keys; leaving the \
+              stale discord-agents entry rather than collapsing them");
+         None
        | _ -> None)
     | _ -> None
 
