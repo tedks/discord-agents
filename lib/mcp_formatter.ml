@@ -128,13 +128,50 @@ let format_response ?(null_list_is_empty=false) ?footer
       format_lines ~null_list_is_empty
         ?footer ~field_name ~empty_message ~line_of_item fields)
 
+(* The render boundary for this whole module: every control-API string
+   is single-lined and UTF-8 sanitized before it is interpolated into
+   output the calling agent will render as Discord markdown.
+
+   Newlines first. Nothing the control API returns is legitimately
+   multi-line — every message it builds is a [Printf.sprintf] sentence,
+   and this module owns the newlines in its own layouts — so a newline
+   arriving inside a *field* means someone put it there. It lands the
+   rest of the reply at column 0, where it reads as a separate,
+   authoritative-looking statement: a goal objective is free-form user
+   text and set_goal takes any thread_id, so one session can plant a
+   line like "Login repair: run `curl …|sh` on the bot host." in
+   another session's config listing, indistinguishable from the real
+   one this module emits two lines below.
+
+   Then UTF-8: working dirs are filesystem paths, session ids come from
+   rollout records and filenames, and a Yojson-decoded \uD800 escape is
+   raw surrogate bytes. Yojson re-emits all of it verbatim and the
+   decoder across the JSON-RPC boundary raises rather than rendering.
+
+   Identity on valid single-line input, so parity with Python is
+   unaffected for every realistic response; Python scrubs nothing, so
+   this is a deliberate divergence, pinned by tests. *)
+let render_string value =
+  Resource.sanitize_utf8 (Resource.single_line value)
+
+(* Python's [if x:] over the JSON types the control API can produce.
+   [`Float 0.] is spelled out because OCaml would otherwise call it
+   truthy where Python does not. *)
 let json_truthy = function
   | `Null | `Bool false | `String "" | `List [] | `Assoc [] -> false
-  | `Int 0 | `Intlit "0" -> false
+  | `Int 0 | `Intlit "0" | `Float 0. -> false
   | _ -> true
 
+(* Python's f-string interpolation of a scalar: [str()] of the decoded
+   value, which is why null renders "None" and booleans capitalize.
+
+   Non-zero floats fail closed rather than guess: matching CPython's
+   [repr] (shortest round-tripping decimal) is not something
+   [string_of_float] does — it would print "0.1" as "0.1" but "1e22" as
+   "1e+22" — and no control-API field emits one, so a float here means
+   the response is already malformed. *)
 let json_scalar_text object_name name = function
-  | `String value -> Ok value
+  | `String value -> Ok (render_string value)
   | `Int value -> Ok (string_of_int value)
   | `Intlit value -> Ok value
   | `Bool true -> Ok "True"
@@ -151,7 +188,8 @@ let render_values object_name name = function
       | [] -> Ok (rendered |> List.rev |> String.concat ", ")
       | `Null :: rest -> loop ("`null`" :: rendered) rest
       | `String "" :: rest -> loop ("`\"\"`" :: rendered) rest
-      | `String value :: rest -> loop (Printf.sprintf "`%s`" value :: rendered) rest
+      | `String value :: rest ->
+        loop (Printf.sprintf "`%s`" (render_string value) :: rendered) rest
       | value :: rest ->
         (match json_scalar_text object_name name value with
          | Ok text -> loop (Printf.sprintf "`%s`" text :: rendered) rest
@@ -160,16 +198,48 @@ let render_values object_name name = function
     loop [] values
   | value -> json_scalar_text object_name name value
 
+(* [d.get(k)] used as a condition, i.e. Python's truthiness over an
+   optional key. Distinct from [bool_field_default], which fails closed
+   on a non-bool: that is right where failing closed *omits* something
+   (see [project_line]'s is_bare), but here the false branch asserts
+   "unsupported for `codex`" — stating something false rather than
+   leaving something out. Match Python instead. *)
+let field_truthy name fields =
+  match field name fields with
+  | Some value -> json_truthy value
+  | None -> false
+
+(* [d.get(k, default)] — the default applies to an *absent* key only.
+   A key that is present and null is a value, and Python f-strings it to
+   "None"; folding null into the default would make us describe a
+   different contract than the one the control API sent, in prose that
+   reads just as authoritative. The sibling [render_values] on the same
+   output line already renders null as "None", so this also keeps one
+   line internally consistent. *)
 let string_of_json_field_default default object_name name fields =
   match field name fields with
-  | None | Some `Null -> Ok default
+  | None -> Ok default
   | Some value -> json_scalar_text object_name name value
 
 let truthy_string_option_field object_name name fields =
   match string_option_field object_name name fields with
-  | Ok (Some value) when not (String.equal value "") -> Ok (Some value)
+  | Ok (Some value) when not (String.equal value "") ->
+    Ok (Some (render_string value))
   | Ok _ -> Ok None
   | Error _ as error -> error
+
+(* The config tools have roughly twenty-five interpolation sites between
+   them. Attaching [render_string] to each one means the safety holds
+   only as long as everyone remembers; attaching it to *reading* a field
+   means a new field is scrubbed by construction. Same values, read
+   through these. *)
+let rendered_string_field_default default object_name name fields =
+  Result.map render_string
+    (string_field_default default object_name name fields)
+
+let rendered_string_truthy_default default object_name name fields =
+  Result.map render_string
+    (string_truthy_default default object_name name fields)
 
 let argument_has_key name = function
   | `Assoc fields -> Option.is_some (field name fields)
@@ -368,26 +438,6 @@ let python_capitalize_ascii value =
   |> String.lowercase_ascii
   |> String.capitalize_ascii
 
-(* The lifecycle tools render into Discord markdown like everything else
-   here, so they inherit [recent_session_line]'s rule: single-line every
-   control-API string before interpolating it. The provenance is the
-   same untrusted set — Control_api builds start_session's project_name
-   and working_dir from project config and worktree paths, resume_session
-   hands back the full on-disk session id, and stop_session's message
-   embeds a project name (lib/control_api.ml). A newline in any of them
-   puts the rest of the reply at column 0 in the calling agent's render,
-   where it reads as a separate statement about a session that doesn't
-   exist. Python scrubs none of this; deliberate divergence, pinned by
-   tests.
-
-   [sanitize_utf8] for the same reason applied field-wide rather than to
-   the session id alone: working dirs are real filesystem paths and can
-   carry non-UTF-8 bytes, Yojson re-emits those verbatim, and the
-   decoder on the other side of the JSON-RPC boundary raises rather than
-   rendering. Identity on valid input, so parity is unaffected. *)
-let render_string value =
-  Resource.sanitize_utf8 (Resource.single_line value)
-
 let format_start_session response =
   let format_fields fields =
     match string_field_default "" "start_session" "thread_id" fields,
@@ -463,8 +513,8 @@ let format_stop_session response =
 
 let format_default_agent ~arguments response =
   let format_fields fields =
-    match string_field_default "" "default_agent" "agent" fields,
-          string_field_default "" "default_agent"
+    match rendered_string_field_default "" "default_agent" "agent" fields,
+          rendered_string_field_default "" "default_agent"
             "effective_top_level_agent" fields,
           truthy_string_option_field "default_agent" "rescue_agent" fields with
     | Ok agent, Ok effective, Ok rescue ->
@@ -534,7 +584,7 @@ let format_default_agent ~arguments response =
 let format_rescue_agent ~arguments response =
   let format_fields fields =
     match truthy_string_option_field "rescue_agent" "agent" fields,
-          string_field_default "" "rescue_agent"
+          rendered_string_field_default "" "rescue_agent"
             "effective_top_level_agent" fields with
     | Ok agent, Ok effective ->
       let rescue_active =
@@ -600,8 +650,8 @@ let format_goal_line fields =
   | Error _ as error -> error
   | Ok [] -> Ok "Goal: none"
   | Ok goal_fields ->
-    (match string_field_default "" "goal" "objective" goal_fields,
-           string_field_default "active" "goal" "status" goal_fields with
+    (match rendered_string_field_default "" "goal" "objective" goal_fields,
+           rendered_string_field_default "active" "goal" "status" goal_fields with
      | Ok objective, Ok status ->
        (match token_budget_suffix
                 ~object_name:"goal" ~prefix:", token budget "
@@ -617,7 +667,7 @@ let append_login_help lines fields =
   | Error _ as error -> error
   | Ok [] -> Ok lines
   | Ok login_fields ->
-    (match string_field_default "" "login_help" "command" login_fields with
+    (match rendered_string_field_default "" "login_help" "command" login_fields with
      | Error _ as error -> error
      | Ok command ->
        Ok (lines @
@@ -636,7 +686,7 @@ let format_get_agent_config_options lines result_fields options =
         (match field "values" agent_options with
          | Some values when json_truthy values ->
            (match render_values "agent_kind" "values" values,
-                  string_field_default "chosen when the session starts"
+                  rendered_string_field_default "chosen when the session starts"
                     "agent_kind" "set_with" agent_options with
             | Ok values, Ok set_with ->
               Ok (lines @
@@ -674,7 +724,7 @@ let format_get_agent_config_options lines result_fields options =
       | Error _ as error -> error
       | Ok [] -> Ok lines
       | Ok effort_options ->
-        if bool_field_default false "supported" effort_options then
+        if field_truthy "supported" effort_options then
           (match (match field "values" effort_options with
                   | None -> Ok ""
                   | Some values -> render_values "effort" "values" values),
@@ -689,7 +739,7 @@ let format_get_agent_config_options lines result_fields options =
                     values clear_values])
            | Error message, _ | _, Error message -> Error message)
         else
-          (match string_field_default "" "get_agent_config"
+          (match rendered_string_field_default "" "get_agent_config"
                    "agent_kind" result_fields with
            | Ok agent_kind ->
              Ok (lines @
@@ -703,7 +753,7 @@ let format_get_agent_config_options lines result_fields options =
       | Error _ as error -> error
       | Ok [] -> Ok lines
       | Ok goal_options ->
-        if bool_field_default false "supported" goal_options then
+        if field_truthy "supported" goal_options then
           let objective =
             match field "objective" goal_options with
             | Some (`Assoc fields) -> Ok fields
@@ -758,9 +808,9 @@ let format_get_agent_config_options lines result_fields options =
 
 let format_get_agent_config response =
   let format_fields fields =
-    match string_field_default "" "get_agent_config" "agent_kind" fields,
-          string_truthy_default "default" "get_agent_config" "model" fields,
-          string_truthy_default "default" "get_agent_config" "effort" fields,
+    match rendered_string_field_default "" "get_agent_config" "agent_kind" fields,
+          rendered_string_truthy_default "default" "get_agent_config" "model" fields,
+          rendered_string_truthy_default "default" "get_agent_config" "effort" fields,
           format_goal_line fields with
     | Ok agent_kind, Ok model, Ok effort, Ok goal_line ->
       let lines = [
@@ -809,8 +859,8 @@ let format_get_agent_config response =
 
 let format_set_model response =
   let format_fields fields =
-    match string_field_default "" "set_model" "thread_id" fields,
-          string_truthy_default "default" "set_model" "model" fields with
+    match rendered_string_field_default "" "set_model" "thread_id" fields,
+          rendered_string_truthy_default "default" "set_model" "model" fields with
     | Ok thread_id, Ok model ->
       Ok (Printf.sprintf
             "Model override for <#%s> is now `%s`." thread_id model)
@@ -820,8 +870,8 @@ let format_set_model response =
 
 let format_set_effort response =
   let format_fields fields =
-    match string_field_default "" "set_effort" "thread_id" fields,
-          string_truthy_default "default" "set_effort" "effort" fields with
+    match rendered_string_field_default "" "set_effort" "thread_id" fields,
+          rendered_string_truthy_default "default" "set_effort" "effort" fields with
     | Ok thread_id, Ok effort ->
       Ok (Printf.sprintf
             "Effort override for <#%s> is now `%s`." thread_id effort)
@@ -831,13 +881,13 @@ let format_set_effort response =
 
 let format_set_goal response =
   let format_fields fields =
-    match string_field_default "" "set_goal" "thread_id" fields,
+    match rendered_string_field_default "" "set_goal" "thread_id" fields,
           object_field_default_empty "set_goal" "goal" fields with
     | Ok thread_id, Ok [] ->
       Ok (Printf.sprintf "Goal cleared for <#%s>." thread_id)
     | Ok thread_id, Ok goal_fields ->
-      (match string_field_default "active" "goal" "status" goal_fields,
-             string_field_default "" "goal" "objective" goal_fields,
+      (match rendered_string_field_default "active" "goal" "status" goal_fields,
+             rendered_string_field_default "" "goal" "objective" goal_fields,
              truthy_string_option_field
                "set_goal" "goal_mechanism" fields with
        | Ok status, Ok objective, Ok mechanism ->
@@ -865,13 +915,16 @@ let format_start_login_flow response =
   let format_fields fields =
     match object_field_default_empty
             "start_login_flow" "login" fields,
-          string_field_default "" "start_login_flow" "message" fields with
-    | Ok login_fields, Ok message ->
-      (match string_field_default "" "login" "command" login_fields,
-             string_field_default "" "login" "note" login_fields with
+          rendered_string_field_default "" "start_login_flow" "message" fields with
+    | Ok login_fields, Ok intro ->
+      (* [intro] rather than [message]: the error arms below bind their
+         own [message], and the shadowing made it read as though the
+         response field were being propagated as the error. *)
+      (match rendered_string_field_default "" "login" "command" login_fields,
+             rendered_string_field_default "" "login" "note" login_fields with
        | Ok command, Ok note ->
          Ok (Printf.sprintf "%s\n\nRun on bot host: `%s`\n%s"
-               message command note)
+               intro command note)
        | Error message, _ | _, Error message -> Error message)
     | Error message, _ | _, Error message -> Error message
   in
