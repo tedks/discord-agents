@@ -286,8 +286,15 @@ let python_capitalize_ascii value =
    puts the rest of the reply at column 0 in the calling agent's render,
    where it reads as a separate statement about a session that doesn't
    exist. Python scrubs none of this; deliberate divergence, pinned by
-   tests. *)
-let render_string value = Resource.single_line value
+   tests.
+
+   [sanitize_utf8] for the same reason applied field-wide rather than to
+   the session id alone: working dirs are real filesystem paths and can
+   carry non-UTF-8 bytes, Yojson re-emits those verbatim, and the
+   decoder on the other side of the JSON-RPC boundary raises rather than
+   rendering. Identity on valid input, so parity is unaffected. *)
+let render_string value =
+  Resource.sanitize_utf8 (Resource.single_line value)
 
 let format_start_session response =
   let format_fields fields =
@@ -315,11 +322,11 @@ let format_resume_session response =
         (* Python slices the decoded str, so its [:8] is 8 codepoints.
            A byte-counting [String.sub] would cut a multibyte id in half
            and emit a half-encoded character into the JSON-RPC response,
-           which a strict client fails to decode. [sanitize_utf8] covers
-           ids that were already invalid on disk — Codex reads the id
-           out of a rollout record, Claude from a filename. *)
-        Resource.utf8_prefix ~max_chars:8
-          (Resource.sanitize_utf8 (render_string session_id))
+           which a strict client fails to decode. Ids arrive from a
+           rollout record (Codex) or a filename (Claude), so
+           [render_string]'s sanitize pass matters here even more than
+           elsewhere. *)
+        Resource.utf8_prefix ~max_chars:8 (render_string session_id)
       in
       let kind_label =
         if String.equal agent_kind "" then ""

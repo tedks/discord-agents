@@ -268,24 +268,37 @@ let contains_substring ~haystack ~needle =
     character would go straight into the JSON we serialize, where a
     strict decoder on the other side raises rather than renders.
 
-    A malformed lead or lone continuation byte counts as one character,
-    so the walk always advances and the result never exceeds
-    [max_chars] characters. Well-formed input never ends mid-sequence.
-    Use [truncate_utf8] instead when the budget is in bytes. *)
+    A lead byte's declared width is only trusted when the continuation
+    bytes are actually present; anything malformed — lone continuation,
+    truncated sequence, 0xF8..0xFF — advances a single byte and counts
+    as one character. So the walk always advances, the result is never
+    more than [max_chars] characters, and a valid sequence is never cut
+    in half. Use [truncate_utf8] instead when the budget is in bytes. *)
 let utf8_prefix ~max_chars s =
   let length = String.length s in
+  let is_continuation index =
+    index < length && Char.code s.[index] land 0xC0 = 0x80
+  in
   let rec loop pos chars =
     if chars >= max_chars || pos >= length then pos
     else
       let lead = Char.code s.[pos] in
-      let width =
+      let declared =
         if lead < 0x80 then 1
         else if lead < 0xC0 then 1   (* lone continuation byte *)
         else if lead < 0xE0 then 2
         else if lead < 0xF0 then 3
-        else 4
+        else if lead < 0xF8 then 4
+        else 1                       (* 0xF8..0xFF: never a lead *)
       in
-      loop (min length (pos + width)) (chars + 1)
+      let rec complete index =
+        index >= declared || (is_continuation (pos + index)
+                              && complete (index + 1))
+      in
+      (* Without this check "\xE2AB" would swallow two ASCII characters
+         into one, returning more characters than asked for. *)
+      let width = if declared = 1 || complete 1 then declared else 1 in
+      loop (pos + width) (chars + 1)
   in
   String.sub s 0 (loop 0 0)
 

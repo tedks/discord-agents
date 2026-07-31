@@ -887,14 +887,27 @@ let test_format_lifecycle_tools_documented_divergences () =
     (Ok "Started session for **repo Stopped session for repo.** in <#123>.\n\
          Working in: `/src/repo`")
     (Mcp_formatter.format_start_session forged_start);
+  (* The newline has to land inside the 8-character prefix, or the slice
+     would drop it and the test would pass with no scrubbing at all. *)
   Alcotest.(check (result string string))
     "resume reply stays one line"
-    (Ok "Resumed Codex session `abcd1234` in <#222>.")
+    (Ok "Resumed Codex session `ab cd123` in <#222 x>.")
     (Mcp_formatter.format_resume_session
        (`Assoc [
-         ("thread_id", `String "222");
-         ("session_id", `String "abcd1234\nefgh5678");
+         ("thread_id", `String "222\nx");
+         ("session_id", `String "ab\ncd1234efgh");
          ("agent_kind", `String "codex");
+       ]));
+  (* start_session's other two fields, so each is pinned independently. *)
+  Alcotest.(check (result string string))
+    "start reply scrubs thread id and working dir"
+    (Ok "Started session for **repo** in <#123 forged>.\n\
+         Working in: `/src/repo - forged`")
+    (Mcp_formatter.format_start_session
+       (`Assoc [
+         ("thread_id", `String "123\nforged");
+         ("working_dir", `String "/src/repo\n- forged");
+         ("project_name", `String "repo");
        ]));
   Alcotest.(check (result string string))
     "send reply stays one line"
@@ -1129,6 +1142,64 @@ let test_handler_start_session_refreshes_missing_project () =
      | Some params -> check_json "second params" arguments params
      | None -> failf "expected second params")
   | calls -> failf "expected three control requests, got %d" (List.length calls)
+
+(* The retry only fires for the one error Python matches on. Without a
+   negative case, a substring helper that regressed to always-true would
+   go unnoticed here and in the assertions that use it as an oracle. *)
+let test_handler_start_session_does_not_retry_other_errors () =
+  let calls = ref [] in
+  let control_client =
+    Control_client.make ~request:(fun request ->
+      calls := request :: !calls;
+      Ok (`Assoc [("error", `String "Disk is read-only; refusing to start.")]))
+  in
+  let call =
+    { Mcp_server.name = "start_session";
+      arguments = `Assoc [("project", `String "repo")] }
+  in
+  Alcotest.(check (result string string))
+    "handler output"
+    (Error "Disk is read-only; refusing to start.")
+    (Mcp_handler.handle_tool_call ~control_client call);
+  match !calls with
+  | [request] ->
+    Alcotest.(check string) "method" "start_session" request.method_name
+  | calls ->
+    failf "expected exactly one control request, got %d" (List.length calls)
+
+(* Direct coverage for the two Resource helpers this port introduced.
+   test_mcp_handler leans on contains_substring as an assertion
+   primitive, so it needs pinning somewhere that doesn't use it. *)
+let test_resource_string_helpers () =
+  let prefix = Discord_agents.Resource.utf8_prefix in
+  Alcotest.(check string) "ascii" "abcd" (prefix ~max_chars:4 "abcdefgh");
+  Alcotest.(check string) "shorter than budget" "ab" (prefix ~max_chars:8 "ab");
+  Alcotest.(check string) "empty" "" (prefix ~max_chars:8 "");
+  Alcotest.(check string) "zero budget" "" (prefix ~max_chars:0 "abc");
+  (* Codepoints, not bytes: 2 characters of a 3-byte-per-character
+     string is 6 bytes, and the cut never lands mid-character. *)
+  Alcotest.(check string) "multibyte" "日本" (prefix ~max_chars:2 "日本語");
+  Alcotest.(check string) "astral" "\xF0\x9F\x98\x80"
+    (prefix ~max_chars:1 "\xF0\x9F\x98\x80\xF0\x9F\x98\x81");
+  (* A lead byte whose continuation bytes are missing must advance one
+     byte, not swallow the ASCII that follows it. *)
+  Alcotest.(check string) "truncated lead" "\xE2" (prefix ~max_chars:1 "\xE2AB");
+  Alcotest.(check string) "truncated lead then ascii" "\xE2A"
+    (prefix ~max_chars:2 "\xE2AB");
+  Alcotest.(check string) "lone continuation" "\x80"
+    (prefix ~max_chars:1 "\x80abc");
+  Alcotest.(check string) "invalid lead byte" "\xFF"
+    (prefix ~max_chars:1 "\xFFabc");
+  let contains = Discord_agents.Resource.contains_substring in
+  Alcotest.(check bool) "present" true
+    (contains ~haystack:"no project matching 'x'" ~needle:"no project matching");
+  Alcotest.(check bool) "absent" false
+    (contains ~haystack:"disk is read-only" ~needle:"no project matching");
+  Alcotest.(check bool) "empty needle" true (contains ~haystack:"" ~needle:"");
+  Alcotest.(check bool) "needle longer" false
+    (contains ~haystack:"ab" ~needle:"abc");
+  Alcotest.(check bool) "match at end" true
+    (contains ~haystack:"abcd" ~needle:"cd")
 
 let test_handler_unsupported_tool () =
   let control_client =
@@ -1475,6 +1546,10 @@ let () =
         test_handler_lifecycle_tools_request_control_api;
       Alcotest.test_case "start_session refreshes missing project" `Quick
         test_handler_start_session_refreshes_missing_project;
+      Alcotest.test_case "start_session does not retry other errors" `Quick
+        test_handler_start_session_does_not_retry_other_errors;
+      Alcotest.test_case "resource string helpers" `Quick
+        test_resource_string_helpers;
       Alcotest.test_case "unsupported tool" `Quick
         test_handler_unsupported_tool;
       Alcotest.test_case "server wraps list_projects result" `Quick
