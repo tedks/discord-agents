@@ -944,12 +944,18 @@ let format_start_login_flow response =
 
 let format_import_project response =
   let format_fields fields =
-    match string_field_default "" "import_project" "project_name" fields,
-          string_field_default "" "import_project" "channel_id" fields,
-          string_field_default "" "import_project" "working_dir" fields with
+    match
+      rendered_string_field_default "" "import_project" "project_name" fields,
+      rendered_string_field_default "" "import_project" "channel_id" fields,
+      rendered_string_field_default "" "import_project" "working_dir" fields
+    with
     | Ok project_name, Ok channel_id, Ok working_dir ->
       let action =
-        if bool_field_default false "existing" fields then
+        (* Python's [if result.get("existing"):] — truthiness, and the
+           false branch asserts "imported" for a project that already
+           existed, so this is a [field_truthy] case rather than a
+           [bool_field_default] one (see the note on both). *)
+        if field_truthy "existing" fields then
           "already existed"
         else
           "imported"
@@ -963,9 +969,14 @@ let format_import_project response =
   in
   format_object ~format_fields response
 
+(* [rename_thread]'s message is the reachable one: Control_api builds it
+   as "Renamed to %s." from the caller-supplied name (lib/control_api.ml),
+   which Discord accepts with newlines in it. So any caller that can
+   rename a thread would otherwise control the text of a second line the
+   calling agent renders as bot-authored. *)
 let format_message_response object_name default_message response =
   let format_fields fields =
-    string_field_default default_message object_name "message" fields
+    rendered_string_field_default default_message object_name "message" fields
   in
   format_object ~format_fields response
 
