@@ -22,6 +22,12 @@ let handle_list_sessions control_client =
     Control_api.List_sessions_id
     Mcp_formatter.format_list_sessions
 
+(* Wire-format note: Python's [control_request] drops falsy params, so a
+   no-argument call goes out with no "params" key at all, while we always
+   forward the arguments object — [{}] for the common no-argument case.
+   [Control_api.hours_param] maps absent, empty and non-integer alike to
+   the 24h default, so the two are equivalent; pinned by
+   test_control_api's hours_param cases. *)
 let handle_list_claude_sessions control_client params =
   request_and_format ~params control_client
     Control_api.List_claude_sessions_id

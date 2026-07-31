@@ -270,8 +270,27 @@ let test_mutability_metadata_is_stable () =
       (expected_mutability id)
       (Control_api.method_spec_mutability spec))
 
+(* The OCaml MCP handler forwards an empty params object for a
+   no-argument recent-session call, where Python's control_request omits
+   "params" entirely. Both must land on the same 24h default, or the two
+   MCP implementations would disagree on the most common call there is. *)
+let test_hours_param_defaults () =
+  Alcotest.(check int) "absent params" 24 (Control_api.hours_param None);
+  Alcotest.(check int) "empty params" 24
+    (Control_api.hours_param (Some (`Assoc [])));
+  Alcotest.(check int) "explicit hours" 6
+    (Control_api.hours_param (Some (`Assoc [("hours", `Int 6)])));
+  Alcotest.(check int) "non-integer hours" 24
+    (Control_api.hours_param (Some (`Assoc [("hours", `String "6")])));
+  Alcotest.(check int) "non-object params" 24
+    (Control_api.hours_param (Some (`List [])))
+
 let () =
   Alcotest.run "control_api" [
+    ("params", [
+      Alcotest.test_case "hours_param defaults" `Quick
+        test_hours_param_defaults;
+    ]);
     ("metadata", [
       Alcotest.test_case "specs cover method ids" `Quick
         test_specs_cover_method_ids;
