@@ -2939,10 +2939,8 @@ let test_setup_gemini_mcp_idempotent () =
    session with no MCP tools while the suite stayed green. *)
 let test_claude_mcp_config_path_round_trips () =
   with_temp_dir (fun dir ->
-    let fake_mcp = Filename.concat dir "fake-mcp" in
-    let oc = open_out fake_mcp in
-    close_out oc;
-    Unix.chmod fake_mcp 0o755;
+    (* Resolution comes from test/dune's %{exe:../bin/mcp_server.exe}
+       dep, not from anything set up here. *)
     let config_home = Filename.concat dir "config" in
     Unix.mkdir config_home 0o755;
     let saved_xdg = Sys.getenv_opt "XDG_CONFIG_HOME" in
@@ -2963,7 +2961,7 @@ let test_claude_mcp_config_path_round_trips () =
         match Discord_agents.Agent_process.claude_mcp_config_path () with
         | None ->
           Alcotest.fail
-            "a writable config dir and a resolvable server must yield a              --mcp-config path"
+            "a writable config dir and a resolvable server must yield an MCP config path"
         | Some path ->
           Alcotest.(check bool) "config file exists" true (Sys.file_exists path);
           let json = Yojson.Safe.from_string (read_all path) in

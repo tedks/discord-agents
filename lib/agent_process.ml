@@ -1524,8 +1524,8 @@ let gemini_settings_without_our_entry existing =
          Some (gemini_settings_with ~our_entry:None (Some text))
        | _ :: _ :: _ ->
          Logs.warn (fun m ->
-           m "Gemini settings has duplicate mcpServers keys; leaving the \
-              stale discord-agents entry rather than collapsing them");
+           m "Gemini settings has duplicate mcpServers keys; declining to \
+              rewrite rather than collapsing them");
          None
        | _ -> None)
     | _ -> None
