@@ -2171,43 +2171,69 @@ let test_merge_gemini_settings_overwrites_our_entry () =
    with no discord-agents tools and nothing says so. The assertions
    above compare generated config against [mcp_command ()] itself, so
    they'd pass just as well if it returned nonsense — these don't. *)
-let with_temp_dir name f =
-  let dir =
-    Filename.concat (Filename.get_temp_dir_name ())
-      (Printf.sprintf "mcp-resolve-%s-%d" name (Unix.getpid ()))
+let with_resolver_temp_dir f =
+  (* Filename.temp_file for the same reason the gemini helper below uses
+     it: a predictable /tmp/<name>-<pid> path is guessable, and a
+     pre-planted symlink there would send the cleanup walk somewhere
+     else entirely. *)
+  let tmp = Filename.temp_file "test_mcp_resolve" "" in
+  Sys.remove tmp;
+  Unix.mkdir tmp 0o755;
+  let rec rm_rf path =
+    if (try Sys.is_directory path with Sys_error _ -> false) then begin
+      (try
+         Array.iter (fun entry -> rm_rf (Filename.concat path entry))
+           (Sys.readdir path)
+       with Sys_error _ -> ());
+      (try Unix.rmdir path with _ -> ())
+    end else (try Sys.remove path with _ -> ())
   in
-  let rec rm path =
-    match Unix.stat path with
-    | { Unix.st_kind = Unix.S_DIR; _ } ->
-      Sys.readdir path
-      |> Array.iter (fun entry -> rm (Filename.concat path entry));
-      Unix.rmdir path
-    | _ -> Sys.remove path
-    | exception Unix.Unix_error _ -> ()
-  in
-  rm dir;
-  Unix.mkdir dir 0o755;
-  Fun.protect ~finally:(fun () -> rm dir) (fun () -> f dir)
+  Fun.protect ~finally:(fun () -> rm_rf tmp) (fun () -> f tmp)
 
 let touch ?(perms=0o755) path =
   let oc = open_out path in
   close_out oc;
   Unix.chmod path perms
 
+let describe_resolution_failure = function
+  | Discord_agents.Agent_process.Override_not_executable path ->
+    Printf.sprintf "override %s not executable" path
+  | Discord_agents.Agent_process.No_candidate_found candidates ->
+    Printf.sprintf "no candidate among [%s]" (String.concat "; " candidates)
+
 let check_resolves label expected actual =
   match actual with
   | Ok path -> Alcotest.(check string) label expected path
-  | Error candidates ->
-    Alcotest.failf "%s: expected %s, got Error [%s]"
-      label expected (String.concat "; " candidates)
+  | Error failure ->
+    Alcotest.failf "%s: expected %s, got Error (%s)"
+      label expected (describe_resolution_failure failure)
 
-let check_unresolved label = function
+(* The two failures are reported differently — one advises `dune build`,
+   the other names the operator's own override — so which one comes back
+   is part of the contract. *)
+let check_override_failure label = function
   | Ok path -> Alcotest.failf "%s: expected Error, resolved to %s" label path
-  | Error _ -> ()
+  | Error (Discord_agents.Agent_process.Override_not_executable _) -> ()
+  | Error other ->
+    Alcotest.failf "%s: expected an override failure, got %s"
+      label (describe_resolution_failure other)
+
+let check_search_failure label = function
+  | Ok path -> Alcotest.failf "%s: expected Error, resolved to %s" label path
+  | Error (Discord_agents.Agent_process.No_candidate_found candidates) ->
+    (* Every ancestor the walk visited must be named, not just the
+       first: a diagnostic listing one of eight paths sends the reader
+       looking in the wrong place. *)
+    Alcotest.(check bool)
+      (label ^ ": names more than the starting directory")
+      true (List.length candidates > 3)
+  | Error other ->
+    Alcotest.failf "%s: expected a search failure, got %s"
+      label (describe_resolution_failure other)
 
 let test_mcp_command_resolution () =
   let resolve = Discord_agents.Agent_process.resolve_mcp_command in
-  with_temp_dir "env" (fun dir ->
+  with_resolver_temp_dir (fun dir ->
     let exe = Filename.concat dir "custom-mcp" in
     touch exe;
     check_resolves "env override wins"
@@ -2218,16 +2244,16 @@ let test_mcp_command_resolution () =
     check_resolves "env override is trimmed"
       exe
       (resolve ~env_override:(Some ("  " ^ exe ^ "  ")) ~exe_dir:dir ~cwd:dir);
-    check_unresolved "env override pointing nowhere"
+    check_override_failure "env override pointing nowhere"
       (resolve ~env_override:(Some (Filename.concat dir "missing"))
          ~exe_dir:dir ~cwd:dir);
     let not_exec = Filename.concat dir "not-exec" in
     touch ~perms:0o644 not_exec;
-    check_unresolved "env override not executable"
+    check_override_failure "env override not executable"
       (resolve ~env_override:(Some not_exec) ~exe_dir:dir ~cwd:dir);
-    check_unresolved "env override is a directory"
+    check_override_failure "env override is a directory"
       (resolve ~env_override:(Some dir) ~exe_dir:dir ~cwd:dir));
-  with_temp_dir "installed" (fun dir ->
+  with_resolver_temp_dir (fun dir ->
     let installed = Filename.concat dir "discord-agents-mcp" in
     touch installed;
     check_resolves "installed name beside the bot"
@@ -2236,13 +2262,13 @@ let test_mcp_command_resolution () =
     check_resolves "empty override falls through to the search"
       installed
       (resolve ~env_override:(Some "   ") ~exe_dir:dir ~cwd:dir));
-  with_temp_dir "dune" (fun dir ->
+  with_resolver_temp_dir (fun dir ->
     let built = Filename.concat dir "mcp_server.exe" in
     touch built;
     check_resolves "dune executable name beside the bot"
       built
       (resolve ~env_override:None ~exe_dir:dir ~cwd:dir));
-  with_temp_dir "upwards" (fun dir ->
+  with_resolver_temp_dir (fun dir ->
     let nested = Filename.concat dir "a/b/c" in
     let build_bin = Filename.concat dir "_build/default/bin" in
     List.iter (fun path ->
@@ -2265,8 +2291,43 @@ let test_mcp_command_resolution () =
        the old resolver answered with a bare name that is on nobody's
        PATH — the silent-no-tools case. *)
     Sys.remove built;
-    check_unresolved "nothing built anywhere"
+    check_search_failure "nothing built anywhere"
       (resolve ~env_override:None ~exe_dir:empty ~cwd:nested))
+
+(* Gemini is the only agent whose MCP config is a file it reads on
+   every run, so "start without MCP" has to mean removing our entry, not
+   just declining to write one — a settings.json written while a build
+   tree existed keeps naming that path after the tree is gone. *)
+let test_gemini_settings_withdraw_our_entry () =
+  let existing = {|{
+    "mcpServers": {
+      "discord-agents": { "command": "/gone/mcp_server.exe", "args": [] },
+      "user-tool": { "command": "their-cmd", "args": [] }
+    },
+    "theme": "dark"
+  }|} in
+  let withdrawn =
+    Discord_agents.Agent_process.gemini_settings_without_our_entry
+      (Some existing)
+  in
+  let json = Yojson.Safe.from_string withdrawn in
+  let open Yojson.Safe.Util in
+  let servers = json |> member "mcpServers" |> to_assoc in
+  Alcotest.(check bool) "our stale entry is gone"
+    false (List.mem_assoc "discord-agents" servers);
+  Alcotest.(check bool) "the user's server survives"
+    true (List.mem_assoc "user-tool" servers);
+  Alcotest.(check bool) "unrelated keys survive"
+    true (List.mem_assoc "theme" (json |> to_assoc));
+  (* Withdrawing from a file that never had our entry is a no-op, and
+     from nothing at all leaves an empty server map rather than an
+     entry pointing nowhere. *)
+  let fresh =
+    Discord_agents.Agent_process.gemini_settings_without_our_entry None
+  in
+  Alcotest.(check int) "nothing registered when starting from nothing"
+    0 (List.length
+         (Yojson.Safe.from_string fresh |> member "mcpServers" |> to_assoc))
 
 let test_merge_gemini_settings_creates_when_absent () =
   let merged = Discord_agents.Agent_process.merge_gemini_settings None in
@@ -3046,6 +3107,8 @@ let resume_helpers_tests = [
     test_merge_gemini_settings_creates_when_absent;
   Alcotest.test_case "MCP command resolution" `Quick
     test_mcp_command_resolution;
+  Alcotest.test_case "gemini settings withdraw our entry" `Quick
+    test_gemini_settings_withdraw_our_entry;
   Alcotest.test_case "merge_gemini_settings invalid input falls back" `Quick
     test_merge_gemini_settings_invalid_input_falls_back;
   Alcotest.test_case "merge_gemini_settings non-object falls back" `Quick

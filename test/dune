@@ -2,6 +2,12 @@
  (names test_command test_control_api test_mcp_tool test_mcp_server test_mcp_handler test_formatting test_project test_agent_contracts test_discord_rest test_gateway
  test_runtime_settings test_bot_defaults test_session_store test_disk_health test_config
   test_runtime_limits test_stream_interrupt)
- (deps ../scripts/mcp-server.py)
+ ; mcp-server.py is the parity oracle the MCP tests shell out to.
+ ; mcp_server.exe is what the agent-wiring tests resolve to: `dune
+ ; runtest` does not build sibling executables, so without this dep a
+ ; fresh clone runs the suite against an unbuilt path and the codex /
+ ; gemini MCP-config tests fail for a reason that has nothing to do with
+ ; the code under test.
+ (deps ../scripts/mcp-server.py %{exe:../bin/mcp_server.exe})
  (libraries discord_agents alcotest str unix yojson eio.mock eio_main cohttp-eio
   uri mirage-crypto-rng.unix))

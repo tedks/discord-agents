@@ -1245,6 +1245,10 @@ let rec find_upwards ~from ~relative =
    no tools.
 
    [Error] carries the candidates tried, for an operator-readable log. *)
+type mcp_resolution_failure =
+  | Override_not_executable of string
+  | No_candidate_found of string list
+
 let resolve_mcp_command ~env_override ~exe_dir ~cwd =
   match env_override with
   | Some path when String.trim path <> "" ->
@@ -1252,7 +1256,7 @@ let resolve_mcp_command ~env_override ~exe_dir ~cwd =
        untrimmed one, so " /usr/bin/foo" passed and then never ran. *)
     let path = String.trim path in
     if is_executable_file path then Ok path
-    else Error [path]
+    else Error (Override_not_executable path)
   | _ ->
     let siblings = [
       Filename.concat exe_dir "discord-agents-mcp";
@@ -1264,7 +1268,17 @@ let resolve_mcp_command ~env_override ~exe_dir ~cwd =
        let relative = "_build/default/bin/mcp_server.exe" in
        (match find_upwards ~from:cwd ~relative with
         | Some path -> Ok path
-        | None -> Error (siblings @ [Filename.concat cwd relative])))
+        | None ->
+          (* Name every directory the walk actually looked in, not just
+             the first: "we tried X" listing one of eight paths sends
+             the operator looking in the wrong place. *)
+          let rec ancestors dir acc =
+            let acc = Filename.concat dir relative :: acc in
+            let parent = Filename.dirname dir in
+            if String.equal parent dir then List.rev acc
+            else ancestors parent acc
+          in
+          Error (No_candidate_found (siblings @ ancestors cwd []))))
 
 let mcp_command_result = lazy (
   let exe_dir =
@@ -1279,7 +1293,13 @@ let mcp_command_result = lazy (
   in
   (match result with
    | Ok _ -> ()
-   | Error candidates ->
+   | Error (Override_not_executable path) ->
+     (* Don't advise `dune build` at someone who told us exactly where
+        to look; the problem is that path, not a missing build. *)
+     Logs.err (fun m ->
+       m "DISCORD_AGENTS_MCP_COMMAND=%s is not an executable file; \
+          agents will start with no discord-agents tools." path)
+   | Error (No_candidate_found candidates) ->
      Logs.err (fun m ->
        m "MCP server executable not found; agents will start with no \
           discord-agents tools. Tried: %s. Build it with `dune build` \
@@ -1395,7 +1415,20 @@ let claude_mcp_config_path () =
     let config_dir = Resource.app_config_dir () in
     let config_path = Filename.concat config_dir "mcp-generated.json" in
     write_file_safely ~path:config_path (Lazy.force mcp_json);
-    Some config_path
+    (* [write_file_safely] swallows both a disk-preflight refusal and a
+       write exception, so "we tried" is not "there is a file". Claude
+       does not degrade when --mcp-config names a missing file, it exits
+       1 — so promising a path we didn't write would turn a no-tools
+       session into no session at all, exactly when read-only-disk
+       handling is trying to keep sessions alive. *)
+    if Sys.file_exists config_path then Some config_path
+    else begin
+      Logs.warn (fun m ->
+        m "MCP config %s could not be written; starting Claude without \
+           --mcp-config rather than pointing it at a missing file"
+          config_path);
+      None
+    end
 
 (** Inject our [discord-agents] entry into a Gemini settings JSON
     string (preserving any other [mcpServers] and unrelated
@@ -1404,11 +1437,24 @@ let claude_mcp_config_path () =
     not an object — in any of those cases the existing content
     couldn't have meaningfully held our entry, so we'd lose nothing
     by replacing it. *)
-let merge_gemini_settings existing =
-  let our_entry = mcp_server_entry () in
+(* [~entry:None] withdraws our server instead of registering it, for the
+   case where no MCP executable resolved. Gemini is the only agent whose
+   config is a file it reads unconditionally on every run — Claude's
+   flag and Codex's overrides simply aren't passed — so for Gemini
+   "don't write the config" is not the same as "run without it". A
+   settings.json written while a build tree existed keeps naming that
+   vanished path afterwards. Removing our entry leaves the user's other
+   servers and unrelated keys exactly where they were. *)
+let gemini_settings_with ~our_entry existing =
+  let set_our_server servers =
+    let others = List.filter (fun (k, _) -> k <> "discord-agents") servers in
+    match our_entry with
+    | Some entry -> ("discord-agents", entry) :: others
+    | None -> others
+  in
   let render_fresh () =
     Yojson.Safe.pretty_to_string
-      (`Assoc [("mcpServers", `Assoc [("discord-agents", our_entry)])])
+      (`Assoc [("mcpServers", `Assoc (set_our_server []))])
   in
   match existing with
   | None -> render_fresh ()
@@ -1419,17 +1465,19 @@ let merge_gemini_settings existing =
         let prior_servers = match List.assoc_opt "mcpServers" fields with
           | Some (`Assoc servers) -> servers
           | _ -> [] in
-        let new_servers =
-          ("discord-agents", our_entry)
-          :: List.filter (fun (k, _) -> k <> "discord-agents") prior_servers
-        in
         let new_fields =
-          ("mcpServers", `Assoc new_servers)
+          ("mcpServers", `Assoc (set_our_server prior_servers))
           :: List.filter (fun (k, _) -> k <> "mcpServers") fields
         in
         Yojson.Safe.pretty_to_string (`Assoc new_fields)
       | _ -> render_fresh ()  (* parseable but non-object: discard *)
     with _ -> render_fresh ()
+
+let merge_gemini_settings existing =
+  gemini_settings_with ~our_entry:(Some (mcp_server_entry ())) existing
+
+let gemini_settings_without_our_entry existing =
+  gemini_settings_with ~our_entry:None existing
 
 (** Resolve the [info/exclude] file Git actually reads for
     [working_dir]. Uses [git rev-parse --git-path info/exclude],
@@ -1485,12 +1533,8 @@ let merge_gemini_exclude existing =
     against a worktree we've already configured leaves the file and
     the exclude line unchanged in shape. *)
 let setup_gemini_mcp ~working_dir =
-  if Option.is_none (mcp_command_opt ()) then ()
-    (* Same call as the other two agents: writing a settings.json that
-       names a missing command would leave the worktree configured for
-       a server that can't start, and Gemini reads that file on every
-       later run. Error already logged at resolution. *)
-  else if working_dir = "" then ()
+  let resolved = mcp_command_opt () in
+  if working_dir = "" then ()
     (* Defense-in-depth: the resume handlers reject empty working_dir
        before we get here, but a future caller shouldn't write
        .gemini/ into the bot's own directory by accident. *)
@@ -1500,14 +1544,24 @@ let setup_gemini_mcp ~working_dir =
      if not (Sys.file_exists gemini_dir) then Unix.mkdir gemini_dir 0o755
    with _ -> ());
   let settings_path = Filename.concat gemini_dir "settings.json" in
+  let render existing =
+    match resolved with
+    | Some _ -> merge_gemini_settings existing
+    (* Unresolved: withdraw our entry rather than leave one naming a
+       command that is no longer there. Control and project channel
+       sessions run in persistent directories, not throwaway worktrees,
+       so a settings.json written while a build tree existed outlives
+       it. *)
+    | None -> gemini_settings_without_our_entry existing
+  in
   (match read_file_result settings_path with
    | File_read_error exn -> log_file_read_failure ~path:settings_path exn
-   | File_missing ->
-     write_file_safely ~path:settings_path
-       (merge_gemini_settings None)
+   (* Nothing to withdraw from, and nothing to register: don't create a
+      settings.json at all in the unresolved case. *)
+   | File_missing when Option.is_none resolved -> ()
+   | File_missing -> write_file_safely ~path:settings_path (render None)
    | File_contents existing ->
-     write_file_safely ~path:settings_path
-       (merge_gemini_settings (Some existing)));
+     write_file_safely ~path:settings_path (render (Some existing)));
   match resolve_git_info_exclude ~working_dir with
   | None -> ()
   | Some exclude_path ->
@@ -1718,6 +1772,13 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
         | Some path -> base @ ["--mcp-config"; path]
         | None -> base
       in
+      (* --mcp-config is variadic in the Claude CLI: it keeps eating
+         following arguments as additional config paths until it hits
+         one starting with `-`. That is safe here only because the
+         prompt positional is already in [base] and the sole thing
+         appended after is another flag. Anything non-flag appended
+         below would silently become a second config file, and Claude
+         hard-fails on a config path that doesn't exist. *)
       (match system_prompt with
        | Some sp -> base @ ["--append-system-prompt"; sp]
        | None -> base)
