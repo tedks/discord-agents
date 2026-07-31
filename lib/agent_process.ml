@@ -1216,38 +1216,102 @@ let absolute_path path =
   if Filename.is_relative path then Filename.concat (Sys.getcwd ()) path
   else path
 
-let first_existing paths =
-  List.find_opt Sys.file_exists paths
+(* Executable, not merely present: [Sys.file_exists] is true of
+   directories and of a non-executable file, either of which would be
+   accepted here and then fail at spawn time inside the agent, where we
+   never see it. *)
+let is_executable_file path =
+  match Unix.stat path with
+  | { Unix.st_kind = Unix.S_REG; _ } ->
+    (try Unix.access path [Unix.X_OK]; true with Unix.Unix_error _ -> false)
+  | _ -> false
+  | exception Unix.Unix_error _ -> false
+
+let first_executable paths =
+  List.find_opt is_executable_file paths
 
 let rec find_upwards ~from ~relative =
   let candidate = Filename.concat from relative in
-  if Sys.file_exists candidate then Some candidate
+  if is_executable_file candidate then Some candidate
   else
     let parent = Filename.dirname from in
     if String.equal parent from then None
     else find_upwards ~from:parent ~relative
 
-let mcp_command_path = lazy (
-  match Sys.getenv_opt "DISCORD_AGENTS_MCP_COMMAND" with
-  | Some path when String.trim path <> "" -> path
+(* Resolve the MCP server command, or explain why we couldn't.
+   Parameterized rather than reading the environment directly so the
+   branches are testable: this is the riskiest logic in the cutover and
+   every branch fails in a way nobody sees until an agent silently has
+   no tools.
+
+   [Error] carries the candidates tried, for an operator-readable log. *)
+let resolve_mcp_command ~env_override ~exe_dir ~cwd =
+  match env_override with
+  | Some path when String.trim path <> "" ->
+    (* Trim: the guard used to test the trimmed value and return the
+       untrimmed one, so " /usr/bin/foo" passed and then never ran. *)
+    let path = String.trim path in
+    if is_executable_file path then Ok path
+    else Error [path]
   | _ ->
-    try
-      let exe_dir = Sys.executable_name |> absolute_path |> Filename.dirname in
-      match first_existing [
-        Filename.concat exe_dir "discord-agents-mcp";
-        Filename.concat exe_dir "mcp_server.exe";
-      ] with
-      | Some path -> path
-      | None ->
-        (match find_upwards ~from:(Sys.getcwd ())
-                 ~relative:"_build/default/bin/mcp_server.exe" with
-         | Some path -> path
-         | None -> "discord-agents-mcp")
-    with _ -> "discord-agents-mcp"
+    let siblings = [
+      Filename.concat exe_dir "discord-agents-mcp";
+      Filename.concat exe_dir "mcp_server.exe";
+    ] in
+    (match first_executable siblings with
+     | Some path -> Ok path
+     | None ->
+       let relative = "_build/default/bin/mcp_server.exe" in
+       (match find_upwards ~from:cwd ~relative with
+        | Some path -> Ok path
+        | None -> Error (siblings @ [Filename.concat cwd relative])))
+
+let mcp_command_result = lazy (
+  let exe_dir =
+    try Sys.executable_name |> absolute_path |> Filename.dirname
+    with _ -> Filename.current_dir_name
+  in
+  let cwd = try Sys.getcwd () with _ -> Filename.current_dir_name in
+  let result =
+    resolve_mcp_command
+      ~env_override:(Sys.getenv_opt "DISCORD_AGENTS_MCP_COMMAND")
+      ~exe_dir ~cwd
+  in
+  (match result with
+   | Ok _ -> ()
+   | Error candidates ->
+     Logs.err (fun m ->
+       m "MCP server executable not found; agents will start with no \
+          discord-agents tools. Tried: %s. Build it with `dune build` \
+          (plain `dune exec discord-agents` does not build sibling \
+          executables), or set DISCORD_AGENTS_MCP_COMMAND to its path."
+         (String.concat ", " candidates)));
+  (* The old override named a Python script and was silently ignored
+     after the cutover, which lands the operator in exactly the
+     no-tools state above. Say so rather than let them find out from an
+     agent that quietly has no tools. *)
+  (match Sys.getenv_opt "DISCORD_AGENTS_MCP_SCRIPT" with
+   | Some value when String.trim value <> "" ->
+     Logs.warn (fun m ->
+       m "DISCORD_AGENTS_MCP_SCRIPT=%s is no longer used; the MCP server \
+          is now a native executable. Set DISCORD_AGENTS_MCP_COMMAND \
+          instead — it accepts scripts/mcp-server.py directly if you \
+          need to roll back to the Python server." value)
+   | _ -> ());
+  result
 )
 
+let mcp_command_opt () =
+  match Lazy.force mcp_command_result with
+  | Ok path -> Some path
+  | Error _ -> None
+
+(* Kept for the config writers that already ran the [mcp_command_opt]
+   check; never reached with an unresolved command. *)
 let mcp_command () =
-  Lazy.force mcp_command_path
+  match Lazy.force mcp_command_result with
+  | Ok path -> path
+  | Error _ -> "discord-agents-mcp"
 
 let mcp_server_entry () =
   `Assoc [
@@ -1325,10 +1389,13 @@ let contains_substring text needle =
 (** Claude: write the MCP config to a well-known location and return
     the path for [--mcp-config]. *)
 let claude_mcp_config_path () =
-  let config_dir = Resource.app_config_dir () in
-  let config_path = Filename.concat config_dir "mcp-generated.json" in
-  write_file_safely ~path:config_path (Lazy.force mcp_json);
-  config_path
+  match mcp_command_opt () with
+  | None -> None
+  | Some _ ->
+    let config_dir = Resource.app_config_dir () in
+    let config_path = Filename.concat config_dir "mcp-generated.json" in
+    write_file_safely ~path:config_path (Lazy.force mcp_json);
+    Some config_path
 
 (** Inject our [discord-agents] entry into a Gemini settings JSON
     string (preserving any other [mcpServers] and unrelated
@@ -1418,7 +1485,12 @@ let merge_gemini_exclude existing =
     against a worktree we've already configured leaves the file and
     the exclude line unchanged in shape. *)
 let setup_gemini_mcp ~working_dir =
-  if working_dir = "" then ()
+  if Option.is_none (mcp_command_opt ()) then ()
+    (* Same call as the other two agents: writing a settings.json that
+       names a missing command would leave the worktree configured for
+       a server that can't start, and Gemini reads that file on every
+       later run. Error already logged at resolution. *)
+  else if working_dir = "" then ()
     (* Defense-in-depth: the resume handlers reject empty working_dir
        before we get here, but a future caller shouldn't write
        .gemini/ into the bot's own directory by accident. *)
@@ -1472,10 +1544,13 @@ let escape_toml_string s =
     Codex invocation, without touching the user's ~/.codex/config.toml.
     Two key=value pairs because Codex parses each [-c] independently. *)
 let codex_mcp_overrides () =
-  let command = escape_toml_string (mcp_command ()) in
-  [ "-c"; Printf.sprintf
-      {|mcp_servers.discord_agents.command="%s"|} command;
-    "-c"; {|mcp_servers.discord_agents.args=[]|} ]
+  match mcp_command_opt () with
+  | None -> []
+  | Some path ->
+    let command = escape_toml_string path in
+    [ "-c"; Printf.sprintf
+        {|mcp_servers.discord_agents.command="%s"|} command;
+      "-c"; {|mcp_servers.discord_agents.args=[]|} ]
 
 (** Codex allocates its session id server-side in the thread.started
     event, so the UUID the bot pre-generated is invalid for resume on
@@ -1635,7 +1710,14 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
       let base = claude_args ~model ~reasoning_effort
           ~fork_from_session_id ~session_id ~message_count ~prompt
       in
-      let base = base @ ["--mcp-config"; claude_mcp_config_path ()] in
+      let base =
+        (* No resolvable server: start without the flag rather than
+           point Claude at a config naming a command that isn't there.
+           The error is already logged once at resolution. *)
+        match claude_mcp_config_path () with
+        | Some path -> base @ ["--mcp-config"; path]
+        | None -> base
+      in
       (match system_prompt with
        | Some sp -> base @ ["--append-system-prompt"; sp]
        | None -> base)

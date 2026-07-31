@@ -7,7 +7,21 @@ let unsupported_tool name =
       name
   )
 
+(* An empty arguments object is dropped rather than forwarded, matching
+   Python's [if params:] in control_request. This is not cosmetic: the
+   handlers for get_agent_config, set_model, set_effort, set_goal,
+   stop_session, rename_thread and resume_session read required fields
+   with [to_string], so [{}] reaches them as a present-but-empty object
+   and Yojson raises Type_error — the agent gets
+   `Type_error("Expected string, got null", 870828711)` where Python
+   returns the actionable `missing params`. An LLM that forgot an
+   argument should be told which one, not handed a hash. *)
+let drop_empty_params = function
+  | Some (`Assoc []) -> None
+  | params -> params
+
 let request_and_format ?params control_client method_id formatter =
+  let params = drop_empty_params params in
   match Control_client.request_method ?params control_client method_id with
   | Error _ as error -> error
   | Ok response -> formatter response
@@ -35,12 +49,10 @@ let handle_list_sessions control_client =
     Control_api.List_sessions_id
     Mcp_formatter.format_list_sessions
 
-(* Wire-format note: Python's [control_request] drops falsy params, so a
-   no-argument call goes out with no "params" key at all, while we always
-   forward the arguments object — [{}] for the common no-argument case.
-   [Control_api.hours_param] maps absent, empty and non-integer alike to
-   the 24h default, so the two are equivalent; pinned by
-   test_control_api's hours_param cases. *)
+(* The recent-session tools take an optional [hours]; with none given,
+   [drop_empty_params] makes the request identical to Python's, and
+   [Control_api.hours_param] defaults to 24 either way (pinned by
+   test_control_api's hours_param cases). *)
 let handle_list_claude_sessions control_client params =
   request_and_format ~params control_client
     Control_api.List_claude_sessions_id
@@ -57,8 +69,9 @@ let handle_list_gemini_sessions control_client params =
     Mcp_formatter.format_list_gemini_sessions
 
 let handle_start_session control_client params =
+  let params = drop_empty_params (Some params) in
   let request_start () =
-    Control_client.request_method ~params control_client
+    Control_client.request_method ?params control_client
       Control_api.Start_session_id
   in
   match request_start () with

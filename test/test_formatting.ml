@@ -2166,6 +2166,108 @@ let test_merge_gemini_settings_overwrites_our_entry () =
   Alcotest.(check int) "OCaml MCP server has no wrapper args"
     0 (List.length our_args)
 
+(* The resolver decides where all three agents look for the MCP server,
+   and every wrong answer fails the same silent way: the agent starts
+   with no discord-agents tools and nothing says so. The assertions
+   above compare generated config against [mcp_command ()] itself, so
+   they'd pass just as well if it returned nonsense — these don't. *)
+let with_temp_dir name f =
+  let dir =
+    Filename.concat (Filename.get_temp_dir_name ())
+      (Printf.sprintf "mcp-resolve-%s-%d" name (Unix.getpid ()))
+  in
+  let rec rm path =
+    match Unix.stat path with
+    | { Unix.st_kind = Unix.S_DIR; _ } ->
+      Sys.readdir path
+      |> Array.iter (fun entry -> rm (Filename.concat path entry));
+      Unix.rmdir path
+    | _ -> Sys.remove path
+    | exception Unix.Unix_error _ -> ()
+  in
+  rm dir;
+  Unix.mkdir dir 0o755;
+  Fun.protect ~finally:(fun () -> rm dir) (fun () -> f dir)
+
+let touch ?(perms=0o755) path =
+  let oc = open_out path in
+  close_out oc;
+  Unix.chmod path perms
+
+let check_resolves label expected actual =
+  match actual with
+  | Ok path -> Alcotest.(check string) label expected path
+  | Error candidates ->
+    Alcotest.failf "%s: expected %s, got Error [%s]"
+      label expected (String.concat "; " candidates)
+
+let check_unresolved label = function
+  | Ok path -> Alcotest.failf "%s: expected Error, resolved to %s" label path
+  | Error _ -> ()
+
+let test_mcp_command_resolution () =
+  let resolve = Discord_agents.Agent_process.resolve_mcp_command in
+  with_temp_dir "env" (fun dir ->
+    let exe = Filename.concat dir "custom-mcp" in
+    touch exe;
+    check_resolves "env override wins"
+      exe
+      (resolve ~env_override:(Some exe) ~exe_dir:dir ~cwd:dir);
+    (* The guard used to trim while the value returned did not, so a
+       stray space produced a command that could never run. *)
+    check_resolves "env override is trimmed"
+      exe
+      (resolve ~env_override:(Some ("  " ^ exe ^ "  ")) ~exe_dir:dir ~cwd:dir);
+    check_unresolved "env override pointing nowhere"
+      (resolve ~env_override:(Some (Filename.concat dir "missing"))
+         ~exe_dir:dir ~cwd:dir);
+    let not_exec = Filename.concat dir "not-exec" in
+    touch ~perms:0o644 not_exec;
+    check_unresolved "env override not executable"
+      (resolve ~env_override:(Some not_exec) ~exe_dir:dir ~cwd:dir);
+    check_unresolved "env override is a directory"
+      (resolve ~env_override:(Some dir) ~exe_dir:dir ~cwd:dir));
+  with_temp_dir "installed" (fun dir ->
+    let installed = Filename.concat dir "discord-agents-mcp" in
+    touch installed;
+    check_resolves "installed name beside the bot"
+      installed
+      (resolve ~env_override:None ~exe_dir:dir ~cwd:dir);
+    check_resolves "empty override falls through to the search"
+      installed
+      (resolve ~env_override:(Some "   ") ~exe_dir:dir ~cwd:dir));
+  with_temp_dir "dune" (fun dir ->
+    let built = Filename.concat dir "mcp_server.exe" in
+    touch built;
+    check_resolves "dune executable name beside the bot"
+      built
+      (resolve ~env_override:None ~exe_dir:dir ~cwd:dir));
+  with_temp_dir "upwards" (fun dir ->
+    let nested = Filename.concat dir "a/b/c" in
+    let build_bin = Filename.concat dir "_build/default/bin" in
+    List.iter (fun path ->
+      let rec mkdirs p =
+        if not (Sys.file_exists p) then begin
+          mkdirs (Filename.dirname p);
+          Unix.mkdir p 0o755
+        end
+      in
+      mkdirs path)
+      [nested; build_bin];
+    let built = Filename.concat build_bin "mcp_server.exe" in
+    touch built;
+    let empty = Filename.concat dir "empty-exe-dir" in
+    Unix.mkdir empty 0o755;
+    check_resolves "found by walking up from the working directory"
+      built
+      (resolve ~env_override:None ~exe_dir:empty ~cwd:nested);
+    (* A build tree that was never built: the file exists nowhere, and
+       the old resolver answered with a bare name that is on nobody's
+       PATH — the silent-no-tools case. *)
+    Sys.remove built;
+    check_unresolved "nothing built anywhere"
+      (resolve ~env_override:None ~exe_dir:empty ~cwd:nested))
+
 let test_merge_gemini_settings_creates_when_absent () =
   let merged = Discord_agents.Agent_process.merge_gemini_settings None in
   let json = Yojson.Safe.from_string merged in
@@ -2942,6 +3044,8 @@ let resume_helpers_tests = [
     test_merge_gemini_settings_overwrites_our_entry;
   Alcotest.test_case "merge_gemini_settings creates when absent" `Quick
     test_merge_gemini_settings_creates_when_absent;
+  Alcotest.test_case "MCP command resolution" `Quick
+    test_mcp_command_resolution;
   Alcotest.test_case "merge_gemini_settings invalid input falls back" `Quick
     test_merge_gemini_settings_invalid_input_falls_back;
   Alcotest.test_case "merge_gemini_settings non-object falls back" `Quick

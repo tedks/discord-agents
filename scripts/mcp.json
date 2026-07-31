@@ -1,4 +1,5 @@
 {
+  "_comment": "Sample for registering the bot's MCP server with an agent by hand — the bot generates its own config per session, so you only need this to attach an agent the bot didn't spawn. Replace the command with an absolute path: nothing installs discord-agents-mcp onto PATH, so the bare name below resolves only if you put it there yourself. `dune build` leaves the executable at _build/default/bin/mcp_server.exe.",
   "mcpServers": {
     "discord-agents": {
       "command": "discord-agents-mcp",
