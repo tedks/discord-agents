@@ -12,6 +12,19 @@ let request_and_format ?params control_client method_id formatter =
   | Error _ as error -> error
   | Ok response -> formatter response
 
+(* Python matches the retry trigger with [in] on a lowercased message
+   (scripts/mcp-server.py), so the comparison is case-insensitive on
+   both sides. *)
+let response_error_contains fragment = function
+  | `Assoc fields ->
+    (match List.assoc_opt "error" fields with
+     | Some (`String message) ->
+       Resource.contains_substring
+         ~haystack:(String.lowercase_ascii message)
+         ~needle:(String.lowercase_ascii fragment)
+     | _ -> false)
+  | _ -> false
+
 let handle_list_projects control_client =
   request_and_format control_client
     Control_api.List_projects_id
@@ -43,14 +56,48 @@ let handle_list_gemini_sessions control_client params =
     Control_api.List_gemini_sessions_id
     Mcp_formatter.format_list_gemini_sessions
 
+let handle_start_session control_client params =
+  let request_start () =
+    Control_client.request_method ~params control_client
+      Control_api.Start_session_id
+  in
+  match request_start () with
+  | Error _ as error -> error
+  | Ok response when response_error_contains "no project matching" response ->
+    ignore (Control_client.request_method control_client
+              Control_api.Refresh_projects_id);
+    (match request_start () with
+     | Error _ as error -> error
+     | Ok response -> Mcp_formatter.format_start_session response)
+  | Ok response -> Mcp_formatter.format_start_session response
+
+let handle_resume_session control_client params =
+  request_and_format ~params control_client
+    Control_api.Resume_session_id
+    Mcp_formatter.format_resume_session
+
+let handle_send_message control_client params =
+  request_and_format ~params control_client
+    Control_api.Send_message_id
+    Mcp_formatter.format_send_message
+
+let handle_stop_session control_client params =
+  request_and_format ~params control_client
+    Control_api.Stop_session_id
+    Mcp_formatter.format_stop_session
+
 let handle_tool_call ~control_client (call : Mcp_server.tool_call) =
   match call.name with
+  | "start_session" -> handle_start_session control_client call.arguments
   | "list_projects" -> handle_list_projects control_client
   | "list_sessions" -> handle_list_sessions control_client
+  | "send_message" -> handle_send_message control_client call.arguments
+  | "stop_session" -> handle_stop_session control_client call.arguments
   | "list_claude_sessions" ->
     handle_list_claude_sessions control_client call.arguments
   | "list_codex_sessions" ->
     handle_list_codex_sessions control_client call.arguments
   | "list_gemini_sessions" ->
     handle_list_gemini_sessions control_client call.arguments
+  | "resume_session" -> handle_resume_session control_client call.arguments
   | name -> unsupported_tool name

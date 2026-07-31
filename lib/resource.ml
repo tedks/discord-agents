@@ -246,6 +246,102 @@ let generate_uuid () =
     listing and resume reply uses. Safe on shorter inputs. *)
 let short_id sid = String.sub sid 0 (min 8 (String.length sid))
 
+(** Whether [needle] occurs anywhere in [haystack]. The empty needle is
+    present in everything, matching the substring conventions of both
+    [str.__contains__] and [String.starts_with]. Naive scan: callers
+    match short needles against short strings. *)
+let contains_substring ~haystack ~needle =
+  let haystack_length = String.length haystack in
+  let needle_length = String.length needle in
+  let rec loop index =
+    if needle_length = 0 then true
+    else if index + needle_length > haystack_length then false
+    else if String.equal (String.sub haystack index needle_length) needle then
+      true
+    else loop (index + 1)
+  in
+  loop 0
+
+(** Length in bytes of the UTF-8 sequence starting at [index] in [s],
+    or [None] if no valid sequence starts there.
+
+    Strict per RFC 3629: a lead byte's declared width counts only when
+    its continuation bytes are actually present, and overlong
+    encodings, surrogate halves and codepoints beyond U+10FFFF are
+    rejected — they are exactly what a strict JSON decoder refuses.
+    [None] means "this single byte is garbage"; callers advance by one
+    and decide what to do with it.
+
+    Shared by [sanitize_utf8] and [utf8_prefix] so the two can't drift
+    into disagreeing about what a character is. *)
+let utf8_sequence_length s index =
+  let n = String.length s in
+  let is_cont b = b land 0xC0 = 0x80 in
+  let c = Char.code s.[index] in
+  if c < 0x80 then Some 1
+  else if c < 0xC2 then None  (* lone continuation, or overlong lead *)
+  else if c < 0xE0 then begin
+    if index + 1 < n && is_cont (Char.code s.[index + 1]) then Some 2
+    else None
+  end else if c < 0xF0 then begin
+    if index + 2 < n
+    && is_cont (Char.code s.[index + 1])
+    && is_cont (Char.code s.[index + 2]) then begin
+      let cp = ((c land 0x0F) lsl 12)
+            lor ((Char.code s.[index + 1] land 0x3F) lsl 6)
+            lor (Char.code s.[index + 2] land 0x3F) in
+      if cp < 0x800 then None                        (* overlong *)
+      else if cp >= 0xD800 && cp <= 0xDFFF then None  (* surrogate *)
+      else Some 3
+    end else None
+  end else if c < 0xF5 then begin
+    if index + 3 < n
+    && is_cont (Char.code s.[index + 1])
+    && is_cont (Char.code s.[index + 2])
+    && is_cont (Char.code s.[index + 3]) then begin
+      let cp = ((c land 0x07) lsl 18)
+            lor ((Char.code s.[index + 1] land 0x3F) lsl 12)
+            lor ((Char.code s.[index + 2] land 0x3F) lsl 6)
+            lor (Char.code s.[index + 3] land 0x3F) in
+      if cp < 0x10000 then None            (* overlong *)
+      else if cp > 0x10FFFF then None      (* beyond Unicode *)
+      else Some 4
+    end else None
+  end else None  (* 0xF5..0xFF: not a valid lead byte *)
+
+(** First [max_chars] Unicode codepoints of [s] — what Python's [s[:n]]
+    does to a decoded str, as opposed to [String.sub], which counts
+    bytes and can cut a multibyte character in half. A half-encoded
+    character would go straight into the JSON we serialize, where a
+    strict decoder on the other side raises rather than renders.
+
+    Counting follows [utf8_sequence_length], so one valid sequence is
+    one character and every byte that isn't part of one counts as a
+    character by itself — the same accounting [sanitize_utf8] uses when
+    it swaps such a byte for U+FFFD. The walk therefore always
+    advances, the result is never more than [max_chars] characters, and
+    a valid sequence is never cut in half.
+
+    The Python correspondence is exact for valid UTF-8 only. On invalid
+    input CPython's decoder replaces each maximal subpart, so it sees
+    one character in "\xE2\x82" where the per-byte accounting here sees
+    two; sanitize first (as the formatter does) and the question
+    doesn't arise. Use [truncate_utf8] instead when the budget is in
+    bytes. *)
+let utf8_prefix ~max_chars s =
+  let length = String.length s in
+  let rec loop pos chars =
+    if chars >= max_chars || pos >= length then pos
+    else
+      let width =
+        match utf8_sequence_length s pos with
+        | Some width -> width
+        | None -> 1   (* garbage byte: advance one, count one *)
+      in
+      loop (pos + width) (chars + 1)
+  in
+  String.sub s 0 (loop 0 0)
+
 (** Replace each \n / \r / \t in [s] with a single space. The
     replacement is 1:1 (a run of three newlines becomes three
     spaces, not one) — visually equivalent in Discord and simpler
@@ -287,43 +383,9 @@ let sanitize_utf8 s =
   let n = String.length s in
   let buf = Buffer.create n in
   let replacement = "\xEF\xBF\xBD" in
-  let is_cont b = b land 0xC0 = 0x80 in
   let i = ref 0 in
   while !i < n do
-    let c = Char.code s.[!i] in
-    let valid_len =
-      if c < 0x80 then Some 1
-      else if c < 0xC2 then None  (* lone continuation, or overlong lead *)
-      else if c < 0xE0 then begin
-        if !i + 1 < n && is_cont (Char.code s.[!i + 1]) then Some 2
-        else None
-      end else if c < 0xF0 then begin
-        if !i + 2 < n
-        && is_cont (Char.code s.[!i + 1])
-        && is_cont (Char.code s.[!i + 2]) then begin
-          let cp = ((c land 0x0F) lsl 12)
-                lor ((Char.code s.[!i + 1] land 0x3F) lsl 6)
-                lor (Char.code s.[!i + 2] land 0x3F) in
-          if cp < 0x800 then None              (* overlong *)
-          else if cp >= 0xD800 && cp <= 0xDFFF then None  (* surrogate *)
-          else Some 3
-        end else None
-      end else if c < 0xF5 then begin
-        if !i + 3 < n
-        && is_cont (Char.code s.[!i + 1])
-        && is_cont (Char.code s.[!i + 2])
-        && is_cont (Char.code s.[!i + 3]) then begin
-          let cp = ((c land 0x07) lsl 18)
-                lor ((Char.code s.[!i + 1] land 0x3F) lsl 12)
-                lor ((Char.code s.[!i + 2] land 0x3F) lsl 6)
-                lor (Char.code s.[!i + 3] land 0x3F) in
-          if cp < 0x10000 then None            (* overlong *)
-          else if cp > 0x10FFFF then None      (* beyond Unicode *)
-          else Some 4
-        end else None
-      end else None  (* 0xF5..0xFF: not a valid lead byte *)
-    in
-    match valid_len with
+    match utf8_sequence_length s !i with
     | Some k -> Buffer.add_substring buf s !i k; i := !i + k
     | None -> Buffer.add_string buf replacement; incr i
   done;

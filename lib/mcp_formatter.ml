@@ -86,16 +86,23 @@ let format_lines ?(null_list_is_empty=false) ?footer
     in
     loop 0 [] items
 
-let format_response ?(null_list_is_empty=false) ?footer
-    ~field_name ~empty_message ~line_of_item = function
+(* Every tool result comes through here: an [error] string short-circuits
+   to Error (Python returns [result["error"]] the same way), anything
+   else is handed to the tool's own renderer. *)
+let format_object ~format_fields = function
   | `Assoc fields ->
     (match field "error" fields with
      | Some (`String message) -> Error message
      | Some _ -> Error "Control API error field must be a string"
-     | None ->
-       format_lines ~null_list_is_empty
-         ?footer ~field_name ~empty_message ~line_of_item fields)
+     | None -> format_fields fields)
   | _ -> Error "Control API response must be an object"
+
+let format_response ?(null_list_is_empty=false) ?footer
+    ~field_name ~empty_message ~line_of_item response =
+  format_object response
+    ~format_fields:(fun fields ->
+      format_lines ~null_list_is_empty
+        ?footer ~field_name ~empty_message ~line_of_item fields)
 
 let project_line index = function
   | `Assoc fields ->
@@ -258,3 +265,106 @@ let format_list_gemini_sessions response =
     ~footer:"Use resume_session with kind=gemini to attach."
     ~with_working_dir:true
     response
+
+(* [Config.string_of_agent_kind] is the only real source of [agent_kind],
+   so ASCII case mapping is enough — but Python's [str.capitalize()] is
+   Unicode-aware, so a non-ASCII kind would diverge. The [lowercase]
+   pass is not redundant: it reproduces [capitalize()]'s down-casing of
+   the tail, which turns "CODEX" into "Codex", not "CODEX". *)
+let python_capitalize_ascii value =
+  value
+  |> String.lowercase_ascii
+  |> String.capitalize_ascii
+
+(* The lifecycle tools render into Discord markdown like everything else
+   here, so they inherit [recent_session_line]'s rule: single-line every
+   control-API string before interpolating it. The provenance is the
+   same untrusted set — Control_api builds start_session's project_name
+   and working_dir from project config and worktree paths, resume_session
+   hands back the full on-disk session id, and stop_session's message
+   embeds a project name (lib/control_api.ml). A newline in any of them
+   puts the rest of the reply at column 0 in the calling agent's render,
+   where it reads as a separate statement about a session that doesn't
+   exist. Python scrubs none of this; deliberate divergence, pinned by
+   tests.
+
+   [sanitize_utf8] for the same reason applied field-wide rather than to
+   the session id alone: working dirs are real filesystem paths and can
+   carry non-UTF-8 bytes, Yojson re-emits those verbatim, and the
+   decoder on the other side of the JSON-RPC boundary raises rather than
+   rendering. Identity on valid input, so parity is unaffected. *)
+let render_string value =
+  Resource.sanitize_utf8 (Resource.single_line value)
+
+let format_start_session response =
+  let format_fields fields =
+    match string_field_default "" "start_session" "thread_id" fields,
+          string_field_default "" "start_session" "working_dir" fields,
+          string_field_default "" "start_session" "project_name" fields with
+    | Ok thread_id, Ok working_dir, Ok project_name ->
+      Ok (Printf.sprintf
+            "Started session for **%s** in <#%s>.\nWorking in: `%s`"
+            (render_string project_name) (render_string thread_id)
+            (render_string working_dir))
+    | Error message, _, _
+    | _, Error message, _
+    | _, _, Error message -> Error message
+  in
+  format_object ~format_fields response
+
+let format_resume_session response =
+  let format_fields fields =
+    match string_field_default "" "resume_session" "thread_id" fields,
+          string_field_default "" "resume_session" "session_id" fields,
+          string_field_default "" "resume_session" "agent_kind" fields with
+    | Ok thread_id, Ok session_id, Ok agent_kind ->
+      let sid_short =
+        (* Python slices the decoded str, so its [:8] is 8 codepoints.
+           A byte-counting [String.sub] would cut a multibyte id in half
+           and emit a half-encoded character into the JSON-RPC response,
+           which a strict client fails to decode. Ids arrive from a
+           rollout record (Codex) or a filename (Claude), so
+           [render_string]'s sanitize pass matters here even more than
+           elsewhere. *)
+        Resource.utf8_prefix ~max_chars:8 (render_string session_id)
+      in
+      let kind_label =
+        if String.equal agent_kind "" then ""
+        else Printf.sprintf "%s " (python_capitalize_ascii
+                                     (render_string agent_kind))
+      in
+      Ok (Printf.sprintf "Resumed %ssession `%s` in <#%s>."
+            kind_label sid_short (render_string thread_id))
+    | Error message, _, _
+    | _, Error message, _
+    | _, _, Error message -> Error message
+  in
+  format_object ~format_fields response
+
+let format_send_message response =
+  let format_fields fields =
+    match string_field_default "" "send_message" "thread_id" fields,
+          int_field_default 0 "send_message" "remaining_hops" fields,
+          string_field_default "sent" "send_message" "state" fields with
+    | Ok thread_id, Ok remaining_hops, Ok "posted_not_routed" ->
+      Ok (Printf.sprintf
+            "Posted message to <#%s>, but the target session disappeared before routing. remaining_hops=%d."
+            (render_string thread_id) remaining_hops)
+    | Ok thread_id, Ok remaining_hops, Ok _ ->
+      Ok (Printf.sprintf "Sent message to <#%s>. remaining_hops=%d."
+            (render_string thread_id) remaining_hops)
+    | Error message, _, _
+    | _, Error message, _
+    | _, _, Error message -> Error message
+  in
+  format_object ~format_fields response
+
+let format_stop_session response =
+  let format_fields fields =
+    match
+      string_field_default "Stop requested." "stop_session" "message" fields
+    with
+    | Ok message -> Ok (render_string message)
+    | Error _ as error -> error
+  in
+  format_object ~format_fields response
