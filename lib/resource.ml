@@ -320,8 +320,14 @@ let utf8_sequence_length s index =
     character by itself — the same accounting [sanitize_utf8] uses when
     it swaps such a byte for U+FFFD. The walk therefore always
     advances, the result is never more than [max_chars] characters, and
-    a valid sequence is never cut in half. Use [truncate_utf8] instead
-    when the budget is in bytes. *)
+    a valid sequence is never cut in half.
+
+    The Python correspondence is exact for valid UTF-8 only. On invalid
+    input CPython's decoder replaces each maximal subpart, so it sees
+    one character in "\xE2\x82" where the per-byte accounting here sees
+    two; sanitize first (as the formatter does) and the question
+    doesn't arise. Use [truncate_utf8] instead when the budget is in
+    bytes. *)
 let utf8_prefix ~max_chars s =
   let length = String.length s in
   let rec loop pos chars =
