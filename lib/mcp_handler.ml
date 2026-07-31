@@ -121,10 +121,36 @@ let handle_start_login_flow control_client params =
     Control_api.Start_login_flow_id
     Mcp_formatter.format_start_login_flow
 
+let handle_import_project control_client params =
+  request_and_format ~params control_client
+    Control_api.Import_project_id
+    Mcp_formatter.format_import_project
+
+let handle_restart_bot control_client =
+  request_and_format control_client
+    Control_api.Restart_id
+    Mcp_formatter.format_restart_bot
+
+let handle_rename_thread control_client params =
+  request_and_format ~params control_client
+    Control_api.Rename_thread_id
+    Mcp_formatter.format_rename_thread
+
+let handle_cleanup_channels control_client =
+  request_and_format control_client
+    Control_api.Cleanup_channels_id
+    Mcp_formatter.format_cleanup_channels
+
+let handle_refresh_projects control_client =
+  request_and_format control_client
+    Control_api.Refresh_projects_id
+    Mcp_formatter.format_refresh_projects
+
 let handle_tool_call ~control_client (call : Mcp_server.tool_call) =
   match call.name with
   | "start_session" -> handle_start_session control_client call.arguments
   | "list_projects" -> handle_list_projects control_client
+  | "import_project" -> handle_import_project control_client call.arguments
   | "list_sessions" -> handle_list_sessions control_client
   | "send_message" -> handle_send_message control_client call.arguments
   | "stop_session" -> handle_stop_session control_client call.arguments
@@ -144,4 +170,8 @@ let handle_tool_call ~control_client (call : Mcp_server.tool_call) =
   | "start_login_flow" ->
     handle_start_login_flow control_client call.arguments
   | "resume_session" -> handle_resume_session control_client call.arguments
+  | "restart_bot" -> handle_restart_bot control_client
+  | "rename_thread" -> handle_rename_thread control_client call.arguments
+  | "cleanup_channels" -> handle_cleanup_channels control_client
+  | "refresh_projects" -> handle_refresh_projects control_client
   | name -> unsupported_tool name

@@ -941,3 +941,73 @@ let format_start_login_flow response =
     | Error message, _ | _, Error message -> Error message
   in
   format_object ~format_fields response
+
+let format_import_project response =
+  let format_fields fields =
+    match
+      rendered_string_field_default "" "import_project" "project_name" fields,
+      rendered_string_field_default "" "import_project" "channel_id" fields,
+      rendered_string_field_default "" "import_project" "working_dir" fields
+    with
+    | Ok project_name, Ok channel_id, Ok working_dir ->
+      let action =
+        (* Python's [if result.get("existing"):] — truthiness, and the
+           false branch asserts "imported" for a project that already
+           existed, so this is a [field_truthy] case rather than a
+           [bool_field_default] one (see the note on both). *)
+        if field_truthy "existing" fields then
+          "already existed"
+        else
+          "imported"
+      in
+      Ok (Printf.sprintf
+            "Project **%s** %s in <#%s>.\nWorking in: `%s`"
+            project_name action channel_id working_dir)
+    | Error message, _, _
+    | _, Error message, _
+    | _, _, Error message -> Error message
+  in
+  format_object ~format_fields response
+
+(* [rename_thread] is the reachable case on the success path:
+   Control_api builds its message as "Renamed to %s." from the
+   caller-supplied name (lib/control_api.ml), which Discord accepts with
+   newlines in it, so any caller that can rename a thread would
+   otherwise control the text of a second line the calling agent renders
+   as bot-authored.
+
+   Not the only route into a forged line, though: [format_object]
+   returns a control-API [error] string verbatim, and import_project's
+   failure path wraps multi-line git stderr. That one is module-wide and
+   predates these tools — issue #107. *)
+let format_message_response object_name default_message response =
+  let format_fields fields =
+    rendered_string_field_default default_message object_name "message" fields
+  in
+  format_object ~format_fields response
+
+let format_restart_bot response =
+  format_message_response "restart_bot" "Restart initiated." response
+
+let format_rename_thread response =
+  format_message_response "rename_thread" "Renamed." response
+
+let format_cleanup_channels response =
+  format_message_response "cleanup_channels" "Done." response
+
+let format_refresh_projects response =
+  let format_fields fields =
+    match int_field_default 0 "refresh_projects" "total" fields,
+          int_field_default 0 "refresh_projects" "delta" fields with
+    | Ok total, Ok delta ->
+      if delta > 0 then
+        let plural = if delta = 1 then "" else "s" in
+        Ok (Printf.sprintf
+              "Refreshed: found %d new project%s (%d total)."
+              delta plural total)
+      else
+        Ok (Printf.sprintf
+              "Refreshed: no new projects (%d total)." total)
+    | Error message, _ | _, Error message -> Error message
+  in
+  format_object ~format_fields response
