@@ -1280,7 +1280,56 @@ let resolve_mcp_command ~env_override ~exe_dir ~cwd =
           in
           Error (No_candidate_found (siblings @ ancestors cwd []))))
 
-let mcp_command_result = lazy (
+(* Last resolution we logged about, so steady state stays quiet while
+   every transition gets one line. [None] before the first resolve. *)
+let last_logged_mcp_resolution :
+  (string, mcp_resolution_failure) result option ref = ref None
+
+let log_mcp_resolution result =
+  let same =
+    match !last_logged_mcp_resolution, result with
+    | Some (Ok previous), Ok current -> String.equal previous current
+    | Some (Error (Override_not_executable a)),
+      Error (Override_not_executable b) -> String.equal a b
+    | Some (Error (No_candidate_found _)), Error (No_candidate_found _) -> true
+    | _ -> false
+  in
+  if not same then begin
+    last_logged_mcp_resolution := Some result;
+    match result with
+    | Ok path -> Logs.info (fun m -> m "MCP server: %s" path)
+    | Error (Override_not_executable path) ->
+      (* Don't advise `dune build` at someone who told us exactly where
+         to look; the problem is that path, not a missing build. *)
+      Logs.err (fun m ->
+        m "DISCORD_AGENTS_MCP_COMMAND=%s is not an executable file; \
+           agents will start with no discord-agents tools." path)
+    | Error (No_candidate_found candidates) ->
+      Logs.err (fun m ->
+        m "MCP server executable not found; agents will start with no \
+           discord-agents tools. Tried: %s. Build it with `dune build` \
+           (plain `dune exec discord-agents` does not build sibling \
+           executables), or set DISCORD_AGENTS_MCP_COMMAND to its path."
+          (String.concat ", " candidates))
+  end
+
+(* Resolved fresh on every session spawn rather than memoized at boot.
+   The path normally lives in _build, so a `dune clean`, a removed
+   worktree, or a deleted _build under a running bot would otherwise
+   leave a cached [Ok path] naming a command that no longer exists —
+   agents spawn with a config pointing at nothing, the failure happens
+   inside the agent where we never see it, and none of the degrade
+   paths below can fire. It reads the other way too: build the server
+   after starting the bot and the next session picks it up, instead of
+   the boot-time failure persisting until restart.
+
+   Cost is a handful of [stat] calls per agent spawn — which is per
+   turn, not per session, since every message spawns a fresh agent
+   process. Still a few local-disk syscalls beside the PATH walk and
+   process spawn every turn already pays for. Logging is
+   suppressed unless the answer changed, so steady state is silent and
+   each transition gets exactly one line. *)
+let current_mcp_command () =
   let exe_dir =
     try Sys.executable_name |> absolute_path |> Filename.dirname
     with _ -> Filename.current_dir_name
@@ -1291,62 +1340,45 @@ let mcp_command_result = lazy (
       ~env_override:(Sys.getenv_opt "DISCORD_AGENTS_MCP_COMMAND")
       ~exe_dir ~cwd
   in
-  (match result with
-   | Ok _ -> ()
-   | Error (Override_not_executable path) ->
-     (* Don't advise `dune build` at someone who told us exactly where
-        to look; the problem is that path, not a missing build. *)
-     Logs.err (fun m ->
-       m "DISCORD_AGENTS_MCP_COMMAND=%s is not an executable file; \
-          agents will start with no discord-agents tools." path)
-   | Error (No_candidate_found candidates) ->
-     Logs.err (fun m ->
-       m "MCP server executable not found; agents will start with no \
-          discord-agents tools. Tried: %s. Build it with `dune build` \
-          (plain `dune exec discord-agents` does not build sibling \
-          executables), or set DISCORD_AGENTS_MCP_COMMAND to its path."
-         (String.concat ", " candidates)));
-  (* The old override named a Python script and was silently ignored
-     after the cutover, which lands the operator in exactly the
-     no-tools state above. Say so rather than let them find out from an
-     agent that quietly has no tools. *)
-  (match Sys.getenv_opt "DISCORD_AGENTS_MCP_SCRIPT" with
-   | Some value when String.trim value <> "" ->
-     Logs.warn (fun m ->
-       m "DISCORD_AGENTS_MCP_SCRIPT=%s is no longer used; the MCP server \
-          is now a native executable. Set DISCORD_AGENTS_MCP_COMMAND \
-          instead — it accepts scripts/mcp-server.py directly if you \
-          need to roll back to the Python server." value)
-   | _ -> ());
+  log_mcp_resolution result;
   result
-)
 
 let mcp_command_opt () =
-  match Lazy.force mcp_command_result with
+  match current_mcp_command () with
   | Ok path -> Some path
   | Error _ -> None
 
-(* Kept for the config writers that already ran the [mcp_command_opt]
-   check; never reached with an unresolved command. *)
-let mcp_command () =
-  match Lazy.force mcp_command_result with
-  | Ok path -> path
-  | Error _ -> "discord-agents-mcp"
+(* The old override named a Python script and is silently ignored after
+   the cutover, which lands the operator in the no-tools state above.
+   Startup-only: it describes the environment, not the build, so
+   repeating it per spawn would be noise. *)
+let warn_if_deprecated_mcp_script_env () =
+  match Sys.getenv_opt "DISCORD_AGENTS_MCP_SCRIPT" with
+  | Some value when String.trim value <> "" ->
+    Logs.warn (fun m ->
+      m "DISCORD_AGENTS_MCP_SCRIPT=%s is no longer used; the MCP server \
+         is now a native executable. Set DISCORD_AGENTS_MCP_COMMAND \
+         instead — it accepts scripts/mcp-server.py directly if you \
+         need to roll back to the Python server." value)
+  | _ -> ()
 
-let mcp_server_entry () =
+(* [~command] rather than a second lookup: with resolution no longer
+   memoized, a writer that re-resolved could disagree with the check
+   that let it run, and the disagreement would be written into a
+   config file. Passing the resolved path makes that unrepresentable. *)
+let mcp_server_entry ~command =
   `Assoc [
-    ("command", `String (mcp_command ()));
+    ("command", `String command);
     ("args", `List []);
   ]
 
-let mcp_json = lazy (
+let mcp_json ~command =
   Yojson.Safe.to_string
     (`Assoc [
       ("mcpServers", `Assoc [
-        ("discord-agents", mcp_server_entry ());
+        ("discord-agents", mcp_server_entry ~command);
       ]);
     ])
-)
 
 let write_file_safely ~path contents =
   match Disk_health.preflight_write path with
@@ -1411,10 +1443,10 @@ let contains_substring text needle =
 let claude_mcp_config_path () =
   match mcp_command_opt () with
   | None -> None
-  | Some _ ->
+  | Some command ->
     let config_dir = Resource.app_config_dir () in
     let config_path = Filename.concat config_dir "mcp-generated.json" in
-    write_file_safely ~path:config_path (Lazy.force mcp_json);
+    write_file_safely ~path:config_path (mcp_json ~command);
     (* [write_file_safely] swallows both a disk-preflight refusal and a
        write exception, so "we tried" is not "there is a file". Claude
        does not degrade when --mcp-config names a missing file, it exits
@@ -1428,7 +1460,7 @@ let claude_mcp_config_path () =
        which is the silent-no-tools failure this PR is closing. A
        directory at that path would also satisfy [Sys.file_exists] and
        then make Claude exit 1. *)
-    let intended = Lazy.force mcp_json in
+    let intended = mcp_json ~command in
     match read_file_result config_path with
     (* Trimmed, because the comparison is with the file the writer
        produced, not with the string handed to it: write_file_atomic
@@ -1489,8 +1521,8 @@ let gemini_settings_with ~our_entry existing =
       | _ -> render_fresh ()  (* parseable but non-object: discard *)
     with _ -> render_fresh ()
 
-let merge_gemini_settings existing =
-  gemini_settings_with ~our_entry:(Some (mcp_server_entry ())) existing
+let merge_gemini_settings ~command existing =
+  gemini_settings_with ~our_entry:(Some (mcp_server_entry ~command)) existing
 
 (* [None] means "leave the file exactly as it is".
 
@@ -1583,10 +1615,11 @@ let merge_gemini_exclude existing =
     repo's [info/exclude]. Both writes are idempotent — re-running
     against a worktree we've already configured leaves the file and
     the exclude line unchanged in shape. *)
-(* [?resolved] exists so the unresolved branch is reachable from a
-   test: the real value is a process-global memoized lazy, so without a
-   seam here nothing could exercise the very path the last two review
-   rounds were about. *)
+(* [?resolved] exists so the unresolved branch is reachable from a test
+   without arranging for the real resolution to fail. It also pins the
+   answer for the duration of one call: resolving once here and using
+   that value throughout means the withdraw/register decision and the
+   command written into the file can't come from two different lookups. *)
 let setup_gemini_mcp ?resolved ~working_dir () =
   let resolved =
     match resolved with Some r -> r | None -> mcp_command_opt ()
@@ -1615,17 +1648,18 @@ let setup_gemini_mcp ?resolved ~working_dir () =
        (match gemini_settings_without_our_entry (Some existing) with
         | None -> ()
         | Some updated -> write_file_safely ~path:settings_path updated))
-  | Some _ ->
+  | Some command ->
   (try
      if not (Sys.file_exists gemini_dir) then Unix.mkdir gemini_dir 0o755
    with _ -> ());
   (match read_file_result settings_path with
    | File_read_error exn -> log_file_read_failure ~path:settings_path exn
    | File_missing ->
-     write_file_safely ~path:settings_path (merge_gemini_settings None)
+     write_file_safely ~path:settings_path
+       (merge_gemini_settings ~command None)
    | File_contents existing ->
      write_file_safely ~path:settings_path
-       (merge_gemini_settings (Some existing)));
+       (merge_gemini_settings ~command (Some existing)));
   match resolve_git_info_exclude ~working_dir with
   | None -> ()
   | Some exclude_path ->

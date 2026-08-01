@@ -126,14 +126,14 @@ let () =
     | _ -> None
   in
   Logs.info (fun m -> m "discord-agents starting%s" (if test_mode then " (test mode)" else ""));
-  (* Resolve the MCP server now rather than lazily at the first session
-     spawn: an operator who launched without building wants to hear it
-     at boot, in the log they are already looking at, not one line
-     buried in a session's output an hour later. Memoized, so the spawn
-     path reuses this. *)
-  (match Discord_agents.Agent_process.mcp_command_opt () with
-   | Some path -> Logs.info (fun m -> m "MCP server: %s" path)
-   | None -> ()  (* resolution already logged the error and why *));
+  (* Resolve once at boot so an operator who launched without building
+     hears it in the log they are already looking at, rather than one
+     line buried in a session's output an hour later. Resolution is
+     repeated per spawn, so this is a report, not a decision — and it
+     primes the change-detection that keeps the per-spawn logging quiet
+     while the answer stays the same. *)
+  ignore (Discord_agents.Agent_process.mcp_command_opt ());
+  Discord_agents.Agent_process.warn_if_deprecated_mcp_script_env ();
   Random.self_init ();  (* Seed PRNG for heartbeat jitter *)
   let config =
     match Discord_agents.Config.load_result () with
