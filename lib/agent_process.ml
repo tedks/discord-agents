@@ -1323,7 +1323,10 @@ let log_mcp_resolution result =
    after starting the bot and the next session picks it up, instead of
    the boot-time failure persisting until restart.
 
-   Cost is a handful of [stat] calls per session start. Logging is
+   Cost is a handful of [stat] calls per agent spawn — which is per
+   turn, not per session, since every message spawns a fresh agent
+   process. Still a few syscalls against the local disk, next to a
+   [git] subprocess already forked on the same path. Logging is
    suppressed unless the answer changed, so steady state is silent and
    each transition gets exactly one line. *)
 let current_mcp_command () =

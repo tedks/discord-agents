@@ -2173,9 +2173,7 @@ let test_merge_gemini_settings_overwrites_our_entry () =
 
 (* The resolver decides where all three agents look for the MCP server,
    and every wrong answer fails the same silent way: the agent starts
-   with no discord-agents tools and nothing says so. The assertions
-   above compare generated config against [mcp_command ()] itself, so
-   they'd pass just as well if it returned nonsense — these don't. *)
+   with no discord-agents tools and nothing says so. *)
 let with_resolver_temp_dir f =
   (* Filename.temp_file for the same reason the gemini helper below uses
      it: a predictable /tmp/<name>-<pid> path is guessable, and a
@@ -2355,6 +2353,25 @@ let test_gemini_settings_withdraw_our_entry () =
     (Some {|{"mcpServers":{"user-tool":{"command":"x"}},
              "mcpServers":{"discord-agents":{"command":"/gone"}}}|})
 
+(* Two properties, both needed. That the command is a real executable —
+   comparing it against the same function that produced it would pass
+   even if that function returned nonsense. And that it is preceded by
+   its own -c: Codex parses each -c independently, so an override that
+   loses its flag becomes a stray positional Codex ignores, and the
+   session starts with no discord-agents tools with nothing failing. *)
+let codex_mcp_command_override args =
+  let prefix = {|mcp_servers.discord_agents.command="|} in
+  let rec scan = function
+    | "-c" :: value :: rest when String.starts_with ~prefix value ->
+      let start = String.length prefix in
+      String.sub value start (String.length value - start - 1) :: scan rest
+    | value :: _ when String.starts_with ~prefix value ->
+      Alcotest.failf "MCP command override is not preceded by -c: %s" value
+    | _ :: rest -> scan rest
+    | [] -> []
+  in
+  scan args
+
 (* The point of #112: resolution is re-run per spawn, not memoized at
    boot. A `dune clean` or a removed worktree under a running bot used
    to leave a cached Ok path naming a command that no longer exists,
@@ -2369,6 +2386,12 @@ let test_mcp_command_is_not_memoized () =
     let restore () =
       match saved with
       | Some v -> Unix.putenv "DISCORD_AGENTS_MCP_COMMAND" v
+      (* OCaml has no unsetenv, so an originally-unset variable comes
+         back blank rather than absent. Safe only because
+         resolve_mcp_command trims and falls through on a blank
+         override — the later setup_gemini_mcp_e2e cases do real
+         resolution and would resolve nothing if that changed. If blank
+         ever becomes an Error, those break, and this is why. *)
       | None -> Unix.putenv "DISCORD_AGENTS_MCP_COMMAND" ""
     in
     Unix.putenv "DISCORD_AGENTS_MCP_COMMAND" exe;
@@ -2390,7 +2413,23 @@ let test_mcp_command_is_not_memoized () =
       Alcotest.(check (option string))
         "resolves again once it is rebuilt"
         (Some exe)
-        (Discord_agents.Agent_process.mcp_command_opt ())))
+        (Discord_agents.Agent_process.mcp_command_opt ());
+      (* And at a spawn path, not only at the entry point: a cache
+         reintroduced at any individual call site would be invisible to
+         the assertions above. *)
+      let overrides_now () =
+        codex_mcp_command_override
+          (Discord_agents.Agent_process.codex_args
+             ~model:None ~reasoning_effort:None
+             ~session_id:"x" ~session_id_confirmed:false ~prompt:"hi")
+      in
+      Alcotest.(check (list string))
+        "codex is told the command while it exists"
+        [exe] (overrides_now ());
+      Sys.remove exe;
+      Alcotest.(check (list string))
+        "codex is told nothing once it is gone"
+        [] (overrides_now ())))
 
 let test_merge_gemini_settings_creates_when_absent () =
   let merged = Discord_agents.Agent_process.merge_gemini_settings ~command:test_mcp_command None in
@@ -3398,24 +3437,18 @@ let test_codex_args_dash_prompt_safe () =
   Alcotest.(check (option (pair string string)))
     "prompt sits after --" (Some ("--", "--help me")) (last_two args)
 
-(* Assert Codex is pointed at a command that actually exists, rather
-   than at whatever the resolver just returned — comparing the argument
-   against the same function that produced it would pass even if that
-   function returned nonsense. *)
 let check_codex_mcp_command_is_real args =
-  let prefix = {|mcp_servers.discord_agents.command="|} in
-  let overrides =
-    List.filter (fun arg -> String.starts_with ~prefix arg) args
-  in
-  match overrides with
-  | [override] ->
-    let start = String.length prefix in
-    let path =
-      String.sub override start (String.length override - start - 1)
-    in
+  match codex_mcp_command_override args with
+  | [path] ->
     Alcotest.(check bool)
-      (Printf.sprintf "codex MCP command exists: %s" path)
-      true (Sys.file_exists path)
+      (Printf.sprintf "codex MCP command is executable: %s" path)
+      true
+      (match Unix.stat path with
+       | { Unix.st_kind = Unix.S_REG; _ } ->
+         (try Unix.access path [Unix.X_OK]; true
+          with Unix.Unix_error _ -> false)
+       | _ -> false
+       | exception Unix.Unix_error _ -> false)
   | overrides ->
     Alcotest.failf "expected exactly one MCP command override, got %d"
       (List.length overrides)

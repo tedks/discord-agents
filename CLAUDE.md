@@ -164,6 +164,8 @@ All three regenerate their config on every spawn, so a stale `mcp-generated.json
 
 `Agent_process.resolve_mcp_command` looks, in order, at `DISCORD_AGENTS_MCP_COMMAND`, then `discord-agents-mcp` and `mcp_server.exe` beside the running bot, then `_build/default/bin/mcp_server.exe` walking up from the working directory. Each candidate must be an executable regular file, not merely present.
 
+Resolution runs on every session spawn, not once at startup, so building the server under a running bot takes effect on the next session — and deleting it (a `dune clean`, a removed worktree) is noticed rather than cached. The log stays quiet unless the answer changes.
+
 **`dune exec discord-agents` does not build the MCP server** — it builds only the executable you named. Run `dune build` first (the documented run commands and `scripts/run-branch.sh` do). If nothing resolves, the bot logs an error naming every path it tried and starts sessions *without* MCP config rather than pointing an agent at a command that isn't there; the agent then simply has no `discord-agents` tools.
 
 The pre-cutover `DISCORD_AGENTS_MCP_SCRIPT` is no longer read. Setting it logs a warning telling you to use `DISCORD_AGENTS_MCP_COMMAND`.
