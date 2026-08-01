@@ -2353,18 +2353,23 @@ let test_gemini_settings_withdraw_our_entry () =
     (Some {|{"mcpServers":{"user-tool":{"command":"x"}},
              "mcpServers":{"discord-agents":{"command":"/gone"}}}|})
 
-(* Two properties, both needed. That the command is a real executable —
-   comparing it against the same function that produced it would pass
-   even if that function returned nonsense. And that it is preceded by
-   its own -c: Codex parses each -c independently, so an override that
-   loses its flag becomes a stray positional Codex ignores, and the
-   session starts with no discord-agents tools with nothing failing. *)
+(* Extract the MCP command Codex is actually told, insisting it is
+   preceded by its own -c. Codex parses each -c independently, so an
+   override that loses its flag becomes a stray positional it ignores,
+   and the session starts with no discord-agents tools with nothing
+   failing. [check_codex_mcp_command_is_real] below adds the other half
+   — that the extracted path is a real executable. *)
 let codex_mcp_command_override args =
   let prefix = {|mcp_servers.discord_agents.command="|} in
   let rec scan = function
     | "-c" :: value :: rest when String.starts_with ~prefix value ->
       let start = String.length prefix in
-      String.sub value start (String.length value - start - 1) :: scan rest
+      (* A value that is the bare prefix with no closing quote would
+         make String.sub raise; say what happened instead. *)
+      if String.length value <= start then
+        Alcotest.failf "malformed MCP command override: %s" value
+      else
+        String.sub value start (String.length value - start - 1) :: scan rest
     | value :: _ when String.starts_with ~prefix value ->
       Alcotest.failf "MCP command override is not preceded by -c: %s" value
     | _ :: rest -> scan rest

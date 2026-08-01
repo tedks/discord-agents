@@ -1325,8 +1325,8 @@ let log_mcp_resolution result =
 
    Cost is a handful of [stat] calls per agent spawn — which is per
    turn, not per session, since every message spawns a fresh agent
-   process. Still a few syscalls against the local disk, next to a
-   [git] subprocess already forked on the same path. Logging is
+   process. Still a few local-disk syscalls beside the PATH walk and
+   process spawn every turn already pays for. Logging is
    suppressed unless the answer changed, so steady state is silent and
    each transition gets exactly one line. *)
 let current_mcp_command () =
