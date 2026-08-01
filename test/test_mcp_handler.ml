@@ -461,13 +461,14 @@ let test_format_list_projects_malformed_response () =
       ];
     ])])
 
-(* Three listing formatters predate render_string. list_projects
+(* The listing formatters predate render_string. list_projects
    interpolated raw and is reachable by any session with a shell — a
    project name is a directory basename straight from readdir, so mkdir
    a name containing a newline and every other agent's list_projects
-   grows a forged entry. list_sessions was raw but safe by an invariant
-   held in Control_api. The recent-session listings had the newline half
-   only, not the UTF-8 half.
+   grows a forged entry. list_sessions interpolated raw too; only its
+   project_name was safe, by an invariant held in Control_api, while
+   agent_kind and thread_id rested on nothing. The recent-session
+   listings had the newline half only, not the UTF-8 half.
 
    Every site wrapped by that change is pinned below, so reverting any
    one of them fails a test rather than passing quietly. *)
