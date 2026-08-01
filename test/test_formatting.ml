@@ -2134,12 +2134,17 @@ let test_resume_not_found_codex_uniform () =
 let test_resume_not_found_gemini_includes_sid () =
   test_resume_not_found_names_kind_and_sid Discord_agents.Config.Gemini "gemini"
 
+(* A command the test supplies rather than one it looks up: these
+   assertions are about the merge, not about where the executable
+   happens to live in this build. *)
+let test_mcp_command = "/opt/discord-agents/bin/discord-agents-mcp"
+
 let test_merge_gemini_settings_preserves_other_servers () =
   let existing = Some {|{
     "mcpServers": { "user-tool": { "command": "foo", "args": [] } },
     "theme": "dark"
   }|} in
-  let merged = Discord_agents.Agent_process.merge_gemini_settings existing in
+  let merged = Discord_agents.Agent_process.merge_gemini_settings ~command:test_mcp_command existing in
   let json = Yojson.Safe.from_string merged in
   let open Yojson.Safe.Util in
   let servers = json |> member "mcpServers" |> to_assoc in
@@ -2154,7 +2159,7 @@ let test_merge_gemini_settings_overwrites_our_entry () =
   let existing = Some {|{
     "mcpServers": { "discord-agents": { "command": "stale", "args": [] } }
   }|} in
-  let merged = Discord_agents.Agent_process.merge_gemini_settings existing in
+  let merged = Discord_agents.Agent_process.merge_gemini_settings ~command:test_mcp_command existing in
   let json = Yojson.Safe.from_string merged in
   let open Yojson.Safe.Util in
   let our_cmd = json |> member "mcpServers" |> member "discord-agents"
@@ -2162,7 +2167,7 @@ let test_merge_gemini_settings_overwrites_our_entry () =
   let our_args = json |> member "mcpServers" |> member "discord-agents"
                  |> member "args" |> to_list in
   Alcotest.(check string) "stale entry replaced with current MCP command"
-    (Discord_agents.Agent_process.mcp_command ()) our_cmd;
+    test_mcp_command our_cmd;
   Alcotest.(check int) "OCaml MCP server has no wrapper args"
     0 (List.length our_args)
 
@@ -2350,8 +2355,45 @@ let test_gemini_settings_withdraw_our_entry () =
     (Some {|{"mcpServers":{"user-tool":{"command":"x"}},
              "mcpServers":{"discord-agents":{"command":"/gone"}}}|})
 
+(* The point of #112: resolution is re-run per spawn, not memoized at
+   boot. A `dune clean` or a removed worktree under a running bot used
+   to leave a cached Ok path naming a command that no longer exists,
+   with every degrade path unreachable because nothing re-checked. This
+   drives the real entry point (mcp_command_opt) through the
+   DISCORD_AGENTS_MCP_COMMAND override, which is the one branch a test
+   can control. *)
+let test_mcp_command_is_not_memoized () =
+  with_resolver_temp_dir (fun dir ->
+    let exe = Filename.concat dir "mcp-probe" in
+    let saved = Sys.getenv_opt "DISCORD_AGENTS_MCP_COMMAND" in
+    let restore () =
+      match saved with
+      | Some v -> Unix.putenv "DISCORD_AGENTS_MCP_COMMAND" v
+      | None -> Unix.putenv "DISCORD_AGENTS_MCP_COMMAND" ""
+    in
+    Unix.putenv "DISCORD_AGENTS_MCP_COMMAND" exe;
+    Fun.protect ~finally:restore (fun () ->
+      touch exe;
+      Alcotest.(check (option string))
+        "resolves while the executable is there"
+        (Some exe)
+        (Discord_agents.Agent_process.mcp_command_opt ());
+      (* The dune clean case. *)
+      Sys.remove exe;
+      Alcotest.(check (option string))
+        "stops resolving once it is gone"
+        None
+        (Discord_agents.Agent_process.mcp_command_opt ());
+      (* And back again — building the server after the bot started
+         should not require a restart. *)
+      touch exe;
+      Alcotest.(check (option string))
+        "resolves again once it is rebuilt"
+        (Some exe)
+        (Discord_agents.Agent_process.mcp_command_opt ())))
+
 let test_merge_gemini_settings_creates_when_absent () =
-  let merged = Discord_agents.Agent_process.merge_gemini_settings None in
+  let merged = Discord_agents.Agent_process.merge_gemini_settings ~command:test_mcp_command None in
   let json = Yojson.Safe.from_string merged in
   let open Yojson.Safe.Util in
   Alcotest.(check bool) "creates mcpServers with our entry"
@@ -2359,7 +2401,7 @@ let test_merge_gemini_settings_creates_when_absent () =
             (json |> member "mcpServers" |> to_assoc))
 
 let test_merge_gemini_settings_invalid_input_falls_back () =
-  let merged = Discord_agents.Agent_process.merge_gemini_settings
+  let merged = Discord_agents.Agent_process.merge_gemini_settings ~command:test_mcp_command
     (Some "not valid json {") in
   let json = Yojson.Safe.from_string merged in
   let open Yojson.Safe.Util in
@@ -3205,7 +3247,7 @@ let test_merge_gemini_settings_non_object_falls_back () =
   (* Parseable JSON that isn't an object — list, scalar — would
      round-trip unchanged under naive logic, dropping our MCP entry. *)
   List.iter (fun text ->
-    let merged = Discord_agents.Agent_process.merge_gemini_settings
+    let merged = Discord_agents.Agent_process.merge_gemini_settings ~command:test_mcp_command
       (Some text) in
     let json = Yojson.Safe.from_string merged in
     let open Yojson.Safe.Util in
@@ -3228,6 +3270,8 @@ let resume_helpers_tests = [
     test_merge_gemini_settings_creates_when_absent;
   Alcotest.test_case "MCP command resolution" `Quick
     test_mcp_command_resolution;
+  Alcotest.test_case "MCP command is not memoized" `Quick
+    test_mcp_command_is_not_memoized;
   Alcotest.test_case "gemini settings withdraw our entry" `Quick
     test_gemini_settings_withdraw_our_entry;
   Alcotest.test_case "setup_gemini_mcp unresolved withdraws our entry" `Quick
@@ -3354,19 +3398,35 @@ let test_codex_args_dash_prompt_safe () =
   Alcotest.(check (option (pair string string)))
     "prompt sits after --" (Some ("--", "--help me")) (last_two args)
 
+(* Assert Codex is pointed at a command that actually exists, rather
+   than at whatever the resolver just returned — comparing the argument
+   against the same function that produced it would pass even if that
+   function returned nonsense. *)
+let check_codex_mcp_command_is_real args =
+  let prefix = {|mcp_servers.discord_agents.command="|} in
+  let overrides =
+    List.filter (fun arg -> String.starts_with ~prefix arg) args
+  in
+  match overrides with
+  | [override] ->
+    let start = String.length prefix in
+    let path =
+      String.sub override start (String.length override - start - 1)
+    in
+    Alcotest.(check bool)
+      (Printf.sprintf "codex MCP command exists: %s" path)
+      true (Sys.file_exists path)
+  | overrides ->
+    Alcotest.failf "expected exactly one MCP command override, got %d"
+      (List.length overrides)
+
 let test_codex_args_includes_mcp_overrides () =
   (* Codex sessions should expose the bot's MCP tools the same way
      Claude (--mcp-config) and Gemini (.gemini/settings.json) do.
      Two -c overrides register the discord-agents server. *)
   let args = codex_args ~session_id:"x" ~session_id_confirmed:false
     ~prompt:"hi" in
-  let command_override =
-    Printf.sprintf {|mcp_servers.discord_agents.command="%s"|}
-      (Discord_agents.Agent_process.escape_toml_string
-         (Discord_agents.Agent_process.mcp_command ()))
-  in
-  Alcotest.(check bool) "registers discord_agents.command"
-    true (contains_pair args "-c" command_override);
+  check_codex_mcp_command_is_real args;
   Alcotest.(check bool) "registers discord_agents.args" true
     (contains_pair args "-c" {|mcp_servers.discord_agents.args=[]|})
 
@@ -3374,13 +3434,7 @@ let test_codex_args_resume_keeps_mcp () =
   (* Resuming a Codex session should still expose MCP tools. *)
   let args = codex_args ~session_id:"x" ~session_id_confirmed:true
     ~prompt:"hi" in
-  let command_override =
-    Printf.sprintf {|mcp_servers.discord_agents.command="%s"|}
-      (Discord_agents.Agent_process.escape_toml_string
-         (Discord_agents.Agent_process.mcp_command ()))
-  in
-  Alcotest.(check bool) "MCP override present on resume too"
-    true (contains_pair args "-c" command_override)
+  check_codex_mcp_command_is_real args
 
 let test_codex_args_model_and_effort_overrides () =
   let args = Discord_agents.Agent_process.codex_args
