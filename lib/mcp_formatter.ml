@@ -272,6 +272,14 @@ let token_budget_suffix ~object_name ~prefix ~suffix fields =
      | Error _ as error -> error)
   | _ -> Ok ""
 
+(* A project name is a directory basename, taken verbatim from readdir
+   (Project.discover_in_directory) with no character filtering — so any
+   session with a shell can create one containing a newline. Without
+   scrubbing, `mkdir $'x\n2. **prod-infra** — `/srv/prod`'` puts a
+   forged numbered entry in every other agent's list_projects output,
+   indistinguishable from a real project. The import route is closed
+   (Project.validate_import_name allows [A-Za-z0-9._-] only); this one
+   isn't. *)
 let project_line index = function
   | `Assoc fields ->
     (match string_field "project" "name" fields,
@@ -283,7 +291,8 @@ let project_line index = function
          if bool_field_default false "is_bare" fields then " [bare]" else ""
        in
        Ok (Printf.sprintf "%d. **%s** — `%s`%s"
-             (index + 1) name path bare_suffix)
+             (index + 1) (render_string name) (render_string path)
+             bare_suffix)
      | Error message, _ | _, Error message -> Error message)
   | _ -> Error "project entry must be an object"
 
@@ -294,9 +303,9 @@ let format_list_projects response =
     ~line_of_item:project_line
     response
 
-(* [Control_api.handle_list_sessions] applies [Resource.single_line] to
-   [project_name] before this formatter interpolates it into a Discord
-   markdown bullet. *)
+(* [Control_api.handle_list_sessions] already single-lines
+   [project_name]; scrubbing again here is idempotent and means this
+   formatter doesn't depend on a property enforced in another module. *)
 let session_line = function
   | `Assoc fields ->
     (match string_field "session" "project_name" fields,
@@ -305,7 +314,8 @@ let session_line = function
            string_field "session" "thread_id" fields with
      | Ok project_name, Ok agent_kind, Ok message_count, Ok thread_id ->
        Ok (Printf.sprintf "- **%s** / %s — %d messages (thread: <#%s>)"
-             project_name agent_kind message_count thread_id)
+             (render_string project_name) (render_string agent_kind)
+             message_count (render_string thread_id))
      | Error message, _, _, _
      | _, Error message, _, _
      | _, _, Error message, _
@@ -387,13 +397,20 @@ let recent_session_line ~with_working_dir = function
            string_field_default "(no summary)"
              "recent_session" "summary" fields with
      | Ok session_id_short, Ok age_minutes, Ok working_dir, Ok summary ->
-       let session_id_short = Resource.single_line session_id_short in
+       (* [render_string], not bare [single_line]: these three tools were
+          ported before render_string existed and kept only the newline
+          half. The module comment above motivates the UTF-8 half with
+          literally these fields — working dirs are filesystem paths,
+          session ids come from rollout records and filenames — and
+          Control_api emits both verbatim, so the boundary this module
+          documents was the one place not applying it. *)
+       let session_id_short = render_string session_id_short in
        let age = age_minutes_text age_minutes in
-       let summary = Resource.single_line summary in
+       let summary = render_string summary in
        Ok (
          if with_working_dir then
            Printf.sprintf "- `%s` %s — %s — %s"
-             session_id_short age (Resource.single_line working_dir) summary
+             session_id_short age (render_string working_dir) summary
          else
            Printf.sprintf "- `%s` %s — %s" session_id_short age summary
        )
