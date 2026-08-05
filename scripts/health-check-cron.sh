@@ -155,7 +155,8 @@ if (cd "$REPO_ROOT" && nix develop --profile "$GCROOT_PROFILE" --command true) >
   # directories, not this custom path — so without this, old generations
   # (and the closures they root) would accumulate forever every time the
   # devShell's inputs change. Keep only the current one.
-  nix-env --delete-generations --profile "$GCROOT_PROFILE" old >/dev/null 2>&1
+  nix-env --delete-generations --profile "$GCROOT_PROFILE" old >/dev/null 2>&1 \
+    || log "WARNING: pruning old $GCROOT_PROFILE generations failed"
   GCROOT_OK=1
 else
   log "GC-root refresh FAILED — skipping this cycle's nix-collect-garbage"
