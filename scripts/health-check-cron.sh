@@ -97,7 +97,7 @@ finally:
 PY
 }
 
-mkdir -p "$DAEMON_LOG_DIR"
+mkdir -p "$DAEMON_LOG_DIR" || log "WARNING: mkdir $DAEMON_LOG_DIR failed — daemon launch output won't be captured"
 
 PID=$(cat "$PIDFILE" 2>/dev/null || true)
 
@@ -129,19 +129,45 @@ else
   else
     log "RESTART FAILED new_pid=${NEWPID:-none} — check $DAEMON_LOGFILE for build/launch errors"
   fi
-  # Keep only the most recent attempts; each is a fresh file so pruning
-  # old ones is never touching something still open.
-  ls -1t "$DAEMON_LOG_DIR"/launch-*.log 2>/dev/null | tail -n "+$((MAX_DAEMON_LOGS + 1))" | xargs -r rm -f
+  # Keep only the most recent attempts, but never prune one a process still
+  # has open — a restart attempt long past MAX_DAEMON_LOGS ago may still be
+  # the file the currently-running (if unhealthy-but-alive) daemon is
+  # writing into during a long outage.
+  ls -1t "$DAEMON_LOG_DIR"/launch-*.log 2>/dev/null \
+    | tail -n "+$((MAX_DAEMON_LOGS + 1))" \
+    | while IFS= read -r old_log; do
+        fuser "$old_log" >/dev/null 2>&1 || rm -f "$old_log"
+      done
 fi
 
 # Refresh the devShell GC root before collecting garbage, so
 # nix-collect-garbage can never evict what run-branch.sh needs to rebuild —
-# see the top-of-file comment on GCROOT_PROFILE for why this matters.
+# see the top-of-file comment on GCROOT_PROFILE for why this matters. Nix
+# profile updates are atomic (the new generation only swaps in on success),
+# so a failed refresh leaves the previous generation — still a valid root —
+# in place; but a *chronically* failing refresh needs to be visible rather
+# than silently doing nothing, and skipping the GC pass on failure avoids
+# collecting anything on the strength of a root we just failed to confirm.
 mkdir -p "$(dirname "$GCROOT_PROFILE")"
-(cd "$REPO_ROOT" && nix develop --profile "$GCROOT_PROFILE" --command true) >/dev/null 2>&1
+if (cd "$REPO_ROOT" && nix develop --profile "$GCROOT_PROFILE" --command true) >/dev/null 2>&1; then
+  # Profile generations are themselves GC roots and nix-collect-garbage -d
+  # only prunes generations of profiles under its own well-known
+  # directories, not this custom path — so without this, old generations
+  # (and the closures they root) would accumulate forever every time the
+  # devShell's inputs change. Keep only the current one.
+  nix-env --delete-generations --profile "$GCROOT_PROFILE" old >/dev/null 2>&1
+  GCROOT_OK=1
+else
+  log "GC-root refresh FAILED — skipping this cycle's nix-collect-garbage"
+  GCROOT_OK=0
+fi
 
 BEFORE=$(df -h / | awk 'NR==2')
-GC_SUMMARY=$(nix-collect-garbage -d 2>&1 | tail -1)
+if [[ "$GCROOT_OK" -eq 1 ]]; then
+  GC_SUMMARY=$(nix-collect-garbage -d 2>&1 | tail -1)
+else
+  GC_SUMMARY="skipped (GC-root refresh failed)"
+fi
 docker image prune -f > /dev/null 2>&1
 docker builder prune -f > /dev/null 2>&1
 AFTER=$(df -h / | awk 'NR==2')
