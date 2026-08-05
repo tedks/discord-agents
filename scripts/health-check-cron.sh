@@ -17,10 +17,11 @@
 # the long-running daemon, which then holds the flock forever and every
 # subsequent cron tick silently no-ops.
 #
-# The daemon's own launch/runtime output goes to a separate, unrotated
-# file (DAEMON_LOGFILE) that this script never rotates — rotating a file
-# a long-lived process still has open (via tail+mv) makes it keep writing
-# to the old unlinked inode, silently losing output and disk space.
+# The daemon's own launch/runtime output goes to a freshly timestamped
+# file per restart attempt under DAEMON_LOG_DIR, never a shared path this
+# script rewrites — truncating/rotating a file a long-lived process still
+# has open makes it keep writing to the old unlinked inode, silently
+# losing output and disk space. Old attempt logs are pruned by count.
 #
 # Also runs the same safe, bounded disk cleanup used interactively:
 # nix-collect-garbage -d, docker image/builder prune (dangling/untagged
@@ -28,6 +29,20 @@
 # project data). Does NOT do any forced recursive deletion of files on
 # its own; stale /tmp cruft is left for a human to review, matching the
 # safety-hook constraint on that class of command.
+#
+# Before GC'ing, refresh a persistent GC root for the repo's nix devShell
+# (GCROOT_PROFILE). Without this, nix-collect-garbage is free to evict the
+# devShell's own dependency closure between cron ticks (nothing else roots
+# it once the shell that fetched it has exited), so run-branch.sh's build
+# step has to re-fetch those paths from the network on the next restart —
+# exactly when disk is tightest and least able to spare room for a fetch.
+# This is what actually happened on 2026-08-04: the daemon went unhealthy
+# at 21:20, and every restart attempt for the next ~9.5 hours failed with
+# "No space left on device" inside `nix develop`, because the paths it
+# needed to build weren't in the store anymore and there was no room to
+# refetch them (see also DAEMON_LOG_DIR below, without which this was
+# hard to diagnose after the fact). Freeing space by hand (a stale ~12GB
+# npm cache) broke the loop, and this GC root prevents it recurring.
 
 set -uo pipefail
 # No -e: failures are handled explicitly throughout (restart/cleanup are
@@ -43,9 +58,11 @@ CONFIG_DIR="$HOME/.config/discord-agents"
 PIDFILE="$CONFIG_DIR/discord-agents.pid"
 CONTROL_SOCK="$CONFIG_DIR/control.sock"
 LOGFILE="$CONFIG_DIR/health-check.log"
-DAEMON_LOGFILE="$CONFIG_DIR/daemon-launch.log"
+DAEMON_LOG_DIR="$CONFIG_DIR/daemon-logs"
 LOCKFILE="$CONFIG_DIR/health-check.lock"
+GCROOT_PROFILE="$HOME/.local/state/discord-agents/devshell-gcroot"
 MAX_LOG_LINES=2000
+MAX_DAEMON_LOGS=10
 
 exec 200>"$LOCKFILE"
 flock -n 200 || exit 0
@@ -80,12 +97,22 @@ finally:
 PY
 }
 
+mkdir -p "$DAEMON_LOG_DIR" || log "WARNING: mkdir $DAEMON_LOG_DIR failed — daemon launch output won't be captured"
+
 PID=$(cat "$PIDFILE" 2>/dev/null || true)
 
 if is_healthy; then
   log "OK pid=${PID:-unknown} healthy (gateway_connected)"
 else
   log "UNHEALTHY pid=${PID:-none} — restarting"
+  # Each attempt gets its own file — never reuse one path across attempts.
+  # A prior version redirected every attempt into one fixed path with `>`
+  # (truncate); if an earlier attempt's daemon was still alive and holding
+  # that path open (as happened during the 2026-08-04 outage, where every
+  # 20-minute retry re-truncated the file the still-running old daemon had
+  # open since its last real launch), each new truncate silently orphaned
+  # the running daemon's own log output onto an unlinked/sparse file.
+  DAEMON_LOGFILE="$DAEMON_LOG_DIR/launch-$(date '+%Y%m%d-%H%M%S').log"
   if cd "$REPO_ROOT"; then
     (
       exec 200>&-
@@ -102,10 +129,46 @@ else
   else
     log "RESTART FAILED new_pid=${NEWPID:-none} — check $DAEMON_LOGFILE for build/launch errors"
   fi
+  # Keep only the most recent attempts, but never prune one a process still
+  # has open — a restart attempt long past MAX_DAEMON_LOGS ago may still be
+  # the file the currently-running (if unhealthy-but-alive) daemon is
+  # writing into during a long outage.
+  ls -1t "$DAEMON_LOG_DIR"/launch-*.log 2>/dev/null \
+    | tail -n "+$((MAX_DAEMON_LOGS + 1))" \
+    | while IFS= read -r old_log; do
+        fuser "$old_log" >/dev/null 2>&1 || rm -f "$old_log"
+      done
+fi
+
+# Refresh the devShell GC root before collecting garbage, so
+# nix-collect-garbage can never evict what run-branch.sh needs to rebuild —
+# see the top-of-file comment on GCROOT_PROFILE for why this matters. Nix
+# profile updates are atomic (the new generation only swaps in on success),
+# so a failed refresh leaves the previous generation — still a valid root —
+# in place; but a *chronically* failing refresh needs to be visible rather
+# than silently doing nothing, and skipping the GC pass on failure avoids
+# collecting anything on the strength of a root we just failed to confirm.
+mkdir -p "$(dirname "$GCROOT_PROFILE")"
+if (cd "$REPO_ROOT" && nix develop --profile "$GCROOT_PROFILE" --command true) >/dev/null 2>&1; then
+  # Profile generations are themselves GC roots and nix-collect-garbage -d
+  # only prunes generations of profiles under its own well-known
+  # directories, not this custom path — so without this, old generations
+  # (and the closures they root) would accumulate forever every time the
+  # devShell's inputs change. Keep only the current one.
+  nix-env --delete-generations --profile "$GCROOT_PROFILE" old >/dev/null 2>&1 \
+    || log "WARNING: pruning old $GCROOT_PROFILE generations failed"
+  GCROOT_OK=1
+else
+  log "GC-root refresh FAILED — skipping this cycle's nix-collect-garbage"
+  GCROOT_OK=0
 fi
 
 BEFORE=$(df -h / | awk 'NR==2')
-GC_SUMMARY=$(nix-collect-garbage -d 2>&1 | tail -1)
+if [[ "$GCROOT_OK" -eq 1 ]]; then
+  GC_SUMMARY=$(nix-collect-garbage -d 2>&1 | tail -1)
+else
+  GC_SUMMARY="skipped (GC-root refresh failed)"
+fi
 docker image prune -f > /dev/null 2>&1
 docker builder prune -f > /dev/null 2>&1
 AFTER=$(df -h / | awk 'NR==2')
