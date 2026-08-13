@@ -179,8 +179,23 @@ if [[ "$GCROOT_OK" -eq 1 ]]; then
 else
   GC_SUMMARY="skipped (GC-root refresh failed)"
 fi
-IMAGE_RECLAIMED=$(docker image prune -f 2>&1 | grep "^Total reclaimed space:" || echo "Total reclaimed space: unknown")
-BUILDER_RECLAIMED=$(docker builder prune -f 2>&1 | grep "^Total:" || echo "Total: unknown")
+# Capture output and exit status separately from the summary-line match,
+# so a real docker failure (daemon down, permission denied) is logged as
+# a failure with its actual error text -- not collapsed into the same
+# "unknown" fallback used when docker succeeds but its output format
+# doesn't match what we expect.
+docker_prune_summary() {
+  local output status
+  output=$("$@" 2>&1)
+  status=$?
+  if [[ $status -ne 0 ]]; then
+    printf 'FAILED (exit %d): %s' "$status" "$(printf '%s' "$output" | tail -1)"
+  else
+    printf '%s' "$output" | grep "^Total" || printf 'unknown (unrecognized output format)'
+  fi
+}
+IMAGE_RECLAIMED=$(docker_prune_summary docker image prune -f)
+BUILDER_RECLAIMED=$(docker_prune_summary docker builder prune -f)
 # npm re-fetches whatever it needs on the next install; nothing here is
 # durable state, so this is safe to clear unconditionally every cycle.
 NPM_BEFORE=$(du -sh "$HOME/.npm" 2>/dev/null | awk '{print $1}')
