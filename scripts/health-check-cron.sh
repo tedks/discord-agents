@@ -26,9 +26,19 @@
 # Also runs the same safe, bounded disk cleanup used interactively:
 # nix-collect-garbage -d, docker image/builder prune (dangling/untagged
 # only — never touches named/tagged images or volumes, which hold live
-# project data). Does NOT do any forced recursive deletion of files on
-# its own; stale /tmp cruft is left for a human to review, matching the
+# project data), and npm cache clean (npm re-fetches on demand; nothing
+# is lost). Does NOT do any forced recursive deletion of files on its
+# own; stale /tmp cruft is left for a human to review, matching the
 # safety-hook constraint on that class of command.
+#
+# What this cleanup deliberately does NOT cover, because it needs a human
+# decision or root: journald (needs root to vacuum; ask the operator to
+# run `journalctl --vacuum-size=...` or cap SystemMaxUse in
+# journald.conf), docker images/volumes that are tagged but unused (may
+# be kept deliberately — e.g. a postgres image for occasional local dev),
+# and general project-directory growth under the user's home directory
+# (the actual largest consumer on this box; not this script's call to
+# make).
 #
 # Before GC'ing, refresh a persistent GC root for the repo's nix devShell
 # (GCROOT_PROFILE). Without this, nix-collect-garbage is free to evict the
@@ -169,10 +179,32 @@ if [[ "$GCROOT_OK" -eq 1 ]]; then
 else
   GC_SUMMARY="skipped (GC-root refresh failed)"
 fi
-docker image prune -f > /dev/null 2>&1
-docker builder prune -f > /dev/null 2>&1
+# Capture output and exit status separately from the summary-line match,
+# so a real docker failure (daemon down, permission denied) is logged as
+# a failure with its actual error text -- not collapsed into the same
+# "unknown" fallback used when docker succeeds but its output format
+# doesn't match what we expect.
+docker_prune_summary() {
+  local output status
+  output=$("$@" 2>&1)
+  status=$?
+  if [[ $status -ne 0 ]]; then
+    printf 'FAILED (exit %d): %s' "$status" "$(printf '%s' "$output" | tail -1)"
+  else
+    printf '%s' "$output" | grep "^Total" || printf 'unknown (unrecognized output format)'
+  fi
+}
+IMAGE_RECLAIMED=$(docker_prune_summary docker image prune -f)
+BUILDER_RECLAIMED=$(docker_prune_summary docker builder prune -f)
+# npm re-fetches whatever it needs on the next install; nothing here is
+# durable state, so this is safe to clear unconditionally every cycle.
+NPM_BEFORE=$(du -sh "$HOME/.npm" 2>/dev/null | awk '{print $1}')
+npm cache clean --force > /dev/null 2>&1
+NPM_AFTER=$(du -sh "$HOME/.npm" 2>/dev/null | awk '{print $1}')
 AFTER=$(df -h / | awk 'NR==2')
 log "gc: $GC_SUMMARY"
+log "docker: images $IMAGE_RECLAIMED | builder $BUILDER_RECLAIMED"
+log "npm cache: ${NPM_BEFORE:-0} -> ${NPM_AFTER:-0}"
 log "disk before: $BEFORE | after: $AFTER"
 
 if [[ -f "$LOGFILE" ]]; then
