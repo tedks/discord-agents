@@ -90,7 +90,7 @@ Commands require a `!` prefix:
 - `wrapping [n]` — show or set line wrap width
 - `status` — bot status and running processes
 - `refresh` — re-scan for new projects without restarting
-- `cleanup` — delete stale project channels
+- `cleanup` — delete stale project channels and prune fully-merged agent worktrees
 - `restart` — rebuild and restart the bot
 - `help` — command reference
 
@@ -106,7 +106,7 @@ Non-command messages in control/project channels are routed to the channel's cur
 - **Message queue**: Queued messages drain sequentially via tail-recursive `process_message`. No depth limit.
 - **Tool display**: Tool use events show as emoji status lines with syntax-highlighted detail blocks (diffs, commands, file content).
 - **Channel reordering**: Active project channels float to the top of the category.
-- **Worktrees**: Each `start` command creates an isolated git worktree (`agent/<kind>-<uuid>`).
+- **Worktrees**: Each `start` command creates an isolated git worktree (`agent/<kind>-<uuid>`). On `!stop`, that worktree is fully removed if its branch is already merged into the project's default branch (nothing to lose — the commits live on in mainline), otherwise just its regenerable build artifacts (`node_modules`, `dist`, `_build`, etc. — see `Project.reclaimable_artifact_names`) are cleaned, leaving the worktree and branch intact for a later resume, PR, or review. `!cleanup` additionally sweeps every project for agent worktrees that were stopped before their branch was merged and have since been merged.
 - **Graceful restart**: `!restart` drains active sessions, rebuilds, and respawns.
 - **Codex sandbox**: Codex sessions run with `--dangerously-bypass-approvals-and-sandbox` (no filesystem sandbox, no approval prompts). The bot is single-tenant on a personal machine and the lighter `--full-auto` blocks edits the user routinely makes; see issue #35 for plumbing this through configuration so the sandboxed mode can be opted into.
 
