@@ -45,6 +45,22 @@ let with_tmpdir f =
   Unix.mkdir base 0o755;
   Fun.protect ~finally:(fun () -> rm_rf base) (fun () -> f base)
 
+let run cmd =
+  let exit_code = Sys.command (Printf.sprintf "%s 2>/dev/null" cmd) in
+  if exit_code <> 0 then
+    Alcotest.failf "setup command failed (%d): %s" exit_code cmd
+
+let write_file path contents =
+  mkdir_p (Filename.dirname path);
+  let oc = open_out path in
+  output_string oc contents;
+  close_out oc
+
+let commit_all repo message =
+  run (Printf.sprintf "git -C %s add -A" (Filename.quote repo));
+  run (Printf.sprintf "git -C %s commit -q -m %s"
+    (Filename.quote repo) (Filename.quote message))
+
 let names_of projects =
   List.map (fun (p : P.t) -> p.name) projects
   |> List.sort String.compare
@@ -297,6 +313,133 @@ let test_remove_worktree_prunes_missing_worktree_registration () =
       in
       Alcotest.(check bool) "stale registration pruned" false registered)
 
+let test_agent_branch_of_worktree_recognizes_agent_worktree () =
+  with_tmpdir (fun base ->
+    let repo = Filename.concat base "repo" in
+    make_git_repo_with_commit repo;
+    let project =
+      P.{ name = "repo"; path = repo; is_bare = false; remote_url = None }
+    in
+    let branch_name = "agent/claude-abcd1234" in
+    match P.create_worktree project ~branch_name with
+    | Error err -> Alcotest.failf "create_worktree failed: %s" err
+    | Ok worktree_path ->
+      Alcotest.(check (option string)) "recognized as agent worktree"
+        (Some branch_name)
+        (P.agent_branch_of_worktree project worktree_path))
+
+let test_agent_branch_of_worktree_none_for_shared_worktree () =
+  with_tmpdir (fun base ->
+    let repo = Filename.concat base "repo" in
+    make_git_repo_with_commit repo;
+    let project =
+      P.{ name = "repo"; path = repo; is_bare = false; remote_url = None }
+    in
+    (* The project's own root (a stand-in for a shared default worktree,
+       e.g. what working_dir_of_project returns) must never be treated as
+       a disposable per-session worktree. *)
+    Alcotest.(check (option string)) "not an agent worktree"
+      None (P.agent_branch_of_worktree project repo);
+    Alcotest.(check (option string)) "unrelated path not an agent worktree"
+      None (P.agent_branch_of_worktree project "/tmp/somewhere/else"))
+
+let test_clean_worktree_build_artifacts_removes_allowlisted_only () =
+  with_tmpdir (fun base ->
+    let repo = Filename.concat base "repo" in
+    make_git_repo_with_commit repo;
+    write_file (Filename.concat repo ".gitignore") "node_modules/\n.env\n";
+    commit_all repo "add gitignore";
+    let project =
+      P.{ name = "repo"; path = repo; is_bare = false; remote_url = None }
+    in
+    let branch_name = "agent/claude-cleanme" in
+    match P.create_worktree project ~branch_name with
+    | Error err -> Alcotest.failf "create_worktree failed: %s" err
+    | Ok worktree_path ->
+      write_file
+        (Filename.concat worktree_path "node_modules/pkg/index.js")
+        "module.exports = {};\n";
+      write_file (Filename.concat worktree_path ".env") "SECRET=1\n";
+      let removed = P.clean_worktree_build_artifacts project worktree_path in
+      Alcotest.(check (list string)) "removed only node_modules"
+        ["node_modules"] removed;
+      Alcotest.(check bool) "node_modules gone"
+        false (Sys.file_exists (Filename.concat worktree_path "node_modules"));
+      Alcotest.(check bool) ".env left alone -- gitignored but not a build artifact"
+        true (Sys.file_exists (Filename.concat worktree_path ".env")))
+
+let test_clean_worktree_build_artifacts_noop_on_shared_worktree () =
+  with_tmpdir (fun base ->
+    let repo = Filename.concat base "repo" in
+    make_git_repo_with_commit repo;
+    write_file (Filename.concat repo ".gitignore") "node_modules/\n";
+    commit_all repo "add gitignore";
+    write_file (Filename.concat repo "node_modules/pkg/index.js") "x";
+    let project =
+      P.{ name = "repo"; path = repo; is_bare = false; remote_url = None }
+    in
+    let removed = P.clean_worktree_build_artifacts project repo in
+    Alcotest.(check (list string)) "nothing removed from shared worktree"
+      [] removed;
+    Alcotest.(check bool) "node_modules untouched"
+      true (Sys.file_exists (Filename.concat repo "node_modules")))
+
+let test_is_branch_merged_reflects_merge_state () =
+  with_tmpdir (fun base ->
+    let repo = Filename.concat base "repo" in
+    make_git_repo_with_commit repo;
+    let project =
+      P.{ name = "repo"; path = repo; is_bare = false; remote_url = None }
+    in
+    let branch_name = "agent/claude-mergeme" in
+    match P.create_worktree project ~branch_name with
+    | Error err -> Alcotest.failf "create_worktree failed: %s" err
+    | Ok worktree_path ->
+      write_file (Filename.concat worktree_path "feature.txt") "feature\n";
+      commit_all worktree_path "add feature";
+      Alcotest.(check bool) "not yet merged"
+        false (P.is_branch_merged project ~branch_name);
+      run (Printf.sprintf "git -C %s merge -q --no-edit %s"
+        (Filename.quote repo) (Filename.quote branch_name));
+      Alcotest.(check bool) "merged after merging into default branch"
+        true (P.is_branch_merged project ~branch_name))
+
+let test_prune_merged_worktrees_respects_merge_state_and_in_use () =
+  with_tmpdir (fun base ->
+    let repo = Filename.concat base "repo" in
+    make_git_repo_with_commit repo;
+    let project =
+      P.{ name = "repo"; path = repo; is_bare = false; remote_url = None }
+    in
+    let make_branch_worktree name =
+      let branch_name = "agent/claude-" ^ name in
+      match P.create_worktree project ~branch_name with
+      | Error err -> Alcotest.failf "create_worktree failed: %s" err
+      | Ok worktree_path ->
+        write_file (Filename.concat worktree_path (name ^ ".txt")) name;
+        commit_all worktree_path ("add " ^ name);
+        (branch_name, worktree_path)
+    in
+    let merged_branch, merged_path = make_branch_worktree "merged" in
+    let _unmerged_branch, unmerged_path = make_branch_worktree "unmerged" in
+    let in_use_branch, in_use_path = make_branch_worktree "still-in-use" in
+    (* Merge two of the three branches; leave "unmerged" alone. *)
+    run (Printf.sprintf "git -C %s merge -q --no-edit %s"
+      (Filename.quote repo) (Filename.quote merged_branch));
+    run (Printf.sprintf "git -C %s merge -q --no-edit %s"
+      (Filename.quote repo) (Filename.quote in_use_branch));
+    let pruned =
+      P.prune_merged_worktrees project ~in_use:[in_use_path]
+    in
+    Alcotest.(check (list string)) "only the merged, not-in-use branch is pruned"
+      [merged_branch] pruned;
+    Alcotest.(check bool) "merged worktree removed"
+      false (Sys.file_exists merged_path);
+    Alcotest.(check bool) "unmerged worktree kept"
+      true (Sys.file_exists unmerged_path);
+    Alcotest.(check bool) "merged-but-in-use worktree kept"
+      true (Sys.file_exists in_use_path))
+
 let test_validate_github_url_accepts_supported_forms () =
   let urls = [
     "https://github.com/tedks/discord-agents.git";
@@ -465,5 +608,17 @@ let () =
         test_default_branch_for_non_bare_ignores_current_branch;
       Alcotest.test_case "non-bare default branch can use origin HEAD" `Quick
         test_default_branch_uses_remote_tracking_when_local_missing;
+      Alcotest.test_case "agent_branch_of_worktree recognizes agent worktree" `Quick
+        test_agent_branch_of_worktree_recognizes_agent_worktree;
+      Alcotest.test_case "agent_branch_of_worktree none for shared worktree" `Quick
+        test_agent_branch_of_worktree_none_for_shared_worktree;
+      Alcotest.test_case "clean_worktree_build_artifacts removes allowlisted only" `Quick
+        test_clean_worktree_build_artifacts_removes_allowlisted_only;
+      Alcotest.test_case "clean_worktree_build_artifacts no-ops on shared worktree" `Quick
+        test_clean_worktree_build_artifacts_noop_on_shared_worktree;
+      Alcotest.test_case "is_branch_merged reflects merge state" `Quick
+        test_is_branch_merged_reflects_merge_state;
+      Alcotest.test_case "prune_merged_worktrees respects merge state and in-use" `Quick
+        test_prune_merged_worktrees_respects_merge_state_and_in_use;
     ];
   ]

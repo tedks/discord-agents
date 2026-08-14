@@ -621,10 +621,64 @@ let request_session_process_stop t (session : Session_store.session) =
     in
     request_tracked_child_stop t ~reason:"session stop" ~pid ~expected_start_ticks
 
+(* "As we go" worktree lifecycle: a session's throwaway agent worktree
+   (agent/<kind>-<uuid>, per Project.create_worktree) is exclusively its
+   own, so there's never a reason to keep it around once the session is
+   gone. If the branch is already merged, the whole worktree is removed —
+   nothing to lose, the commits live on in the default branch. Otherwise
+   only its regenerable build artifacts (node_modules, dist, etc. — see
+   Project.reclaimable_artifact_names) are cleaned, leaving the worktree
+   and branch intact for a later resume, PR, or review. Best-effort: never
+   lets a cleanup failure block the session actually being removed. *)
+let prune_or_clean_session_worktree t (session : Session_store.session) =
+  match List.find_opt (fun (p : Project.t) -> p.name = session.project_name)
+          (projects t) with
+  | None -> ()
+  | Some project ->
+    match Project.agent_branch_of_worktree project session.working_dir with
+    | None -> ()
+    | Some branch_name ->
+      let still_in_use =
+        Session_store.bindings t.sessions
+        |> List.exists (fun (_, (s : Session_store.session)) ->
+          s.working_dir = session.working_dir)
+      in
+      if still_in_use then ()
+      else if Project.is_branch_merged project ~branch_name then
+        match Project.remove_worktree project ~branch_name
+                ~worktree_path:session.working_dir with
+        | Ok () -> ()
+        | Error err ->
+          Logs.warn (fun m ->
+            m "bot: failed to remove merged worktree %s: %s" branch_name err)
+      else
+        ignore (Project.clean_worktree_build_artifacts project
+          session.working_dir)
+
+(* Residual sweep for [prune_or_clean_session_worktree]'s one gap: a
+   session stopped (and had its build artifacts cleaned) before its branch
+   was merged, and the branch has since been merged. Also catches any
+   worktree that predates this feature. Local-only merge check per
+   project, no fetch -- see Project.is_branch_merged. *)
+let prune_merged_worktrees_all_projects t =
+  let in_use =
+    Session_store.bindings t.sessions
+    |> List.map (fun (_, (s : Session_store.session)) -> s.working_dir)
+  in
+  projects t
+  |> List.concat_map (fun (p : Project.t) ->
+    Project.prune_merged_worktrees p ~in_use
+    |> List.map (fun branch -> (p.name, branch)))
+
 let remove_session_now t (session : Session_store.session) =
   try
     Session_store.remove t.sessions ~thread_id:session.thread_id;
     Hashtbl.remove t.scroll_states session.thread_id;
+    (try prune_or_clean_session_worktree t session
+     with exn ->
+       Logs.warn (fun m ->
+         m "bot: worktree cleanup for %s raised: %s"
+           session.thread_id (Printexc.to_string exn)));
     Ok ()
   with exn ->
     Error (Printexc.to_string exn)
@@ -748,7 +802,7 @@ You have MCP tools available:
 - rescue_agent: Show or set the rescue agent automatically used for new top-level sessions under disk pressure
 - restart_bot: Rebuild and restart the bot
 - rename_thread: Rename a Discord thread
-- cleanup_channels: Delete stale Discord channels
+- cleanup_channels: Delete stale Discord channels and prune fully-merged agent worktrees
 - refresh_projects: Re-scan for new projects without restarting
 
 USE THESE TOOLS. When the user asks to work on a project, start a session, etc., \
@@ -790,7 +844,7 @@ You have MCP tools available:
 - rescue_agent: Show or set the rescue agent automatically used for new top-level sessions under disk pressure
 - rename_thread: Rename a Discord thread
 - restart_bot: Rebuild and restart the bot
-- cleanup_channels: Delete stale Discord channels
+- cleanup_channels: Delete stale Discord channels and prune fully-merged agent worktrees
 - refresh_projects: Re-scan for new projects without restarting
 
 WHEN TO CREATE THREADS vs CHAT IN-CHANNEL:
@@ -2277,21 +2331,31 @@ let handle_command t msg cmd =
        ))
   | Command.Cleanup_channels ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
+      let worktrees_pruned = prune_merged_worktrees_all_projects t in
+      let worktree_text =
+        match worktrees_pruned with
+        | [] -> ""
+        | pruned ->
+          Printf.sprintf " Removed %d merged agent worktree(s)."
+            (List.length pruned)
+      in
       match Channel_manager.cleanup ~rest:t.rest
               ~guild_id:t.config.guild_id ~projects:(projects t) (channels t) with
       | Error e -> reply (Printf.sprintf "Cleanup failed: %s" e)
       | Ok 0 ->
         let pruned = prune_stale_scroll_states t in
-        reply (Printf.sprintf "No stale channels to clean up.%s"
+        reply (Printf.sprintf "No stale channels to clean up.%s%s"
           (if pruned > 0
            then Printf.sprintf " Pruned %d orphaned scroll state(s)." pruned
-           else ""))
+           else "")
+          worktree_text)
       | Ok n ->
         let pruned = prune_stale_scroll_states t in
-        reply (Printf.sprintf "Cleaned up %d stale channels.%s" n
+        reply (Printf.sprintf "Cleaned up %d stale channels.%s%s" n
           (if pruned > 0
            then Printf.sprintf " Pruned %d orphaned scroll state(s)." pruned
-           else "")))
+           else "")
+          worktree_text))
   | Command.Restart ->
     trigger_restart t ~notify:reply
   | Command.Refresh ->

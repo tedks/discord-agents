@@ -1314,11 +1314,14 @@ let handle_refresh_projects (bot : Bot.t) =
     ]
 
 let handle_cleanup_channels (bot : Bot.t) =
+  let worktrees_pruned = Bot.prune_merged_worktrees_all_projects bot in
+  let worktrees_field = ("worktrees_pruned", `Int (List.length worktrees_pruned)) in
   match Channel_manager.cleanup ~rest:bot.rest
           ~guild_id:bot.config.guild_id ~projects:(Bot.projects bot) (Bot.channels bot) with
   | Error e -> error_response (Printf.sprintf "Cleanup failed: %s" e)
-  | Ok 0 -> ok_response [("deleted", `Int 0); ("message", `String "No stale channels.")]
-  | Ok n -> ok_response [("deleted", `Int n);
+  | Ok 0 -> ok_response [("deleted", `Int 0); worktrees_field;
+      ("message", `String "No stale channels.")]
+  | Ok n -> ok_response [("deleted", `Int n); worktrees_field;
       ("message", `String (Printf.sprintf "Cleaned up %d stale channels." n))]
 
 (* ── Router ────────────────────────────────────────────────────── *)

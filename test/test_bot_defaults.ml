@@ -1294,6 +1294,90 @@ let test_stop_idle_session_removes_it () =
            (Discord_agents.Session_store.find_opt bot.sessions ~thread_id:"control"))
     | _ -> Alcotest.fail "expected idle session to stop immediately")
 
+(* Integration coverage for the bot.ml <-> Project wiring; Project's own
+   test suite covers the underlying git mechanics in isolation. *)
+let run_git cmd =
+  let exit_code = Sys.command (Printf.sprintf "%s 2>/dev/null" cmd) in
+  if exit_code <> 0 then Alcotest.failf "setup command failed (%d): %s" exit_code cmd
+
+let with_agent_worktree_project f =
+  let repo = make_tmp_dir "discord_agents_worktree_repo_" in
+  Fun.protect ~finally:(fun () -> rm_rf repo) (fun () ->
+    run_git (Printf.sprintf "git -C %s init -q --initial-branch=main"
+      (Filename.quote repo));
+    run_git (Printf.sprintf "git -C %s config user.email test@example.invalid"
+      (Filename.quote repo));
+    run_git (Printf.sprintf "git -C %s config user.name 'Discord Agents Test'"
+      (Filename.quote repo));
+    let write path contents =
+      let oc = open_out (Filename.concat repo path) in
+      output_string oc contents;
+      close_out oc
+    in
+    write "README.md" "test repo\n";
+    write ".gitignore" "node_modules/\n";
+    run_git (Printf.sprintf "git -C %s add -A" (Filename.quote repo));
+    run_git (Printf.sprintf "git -C %s commit -q -m initial" (Filename.quote repo));
+    let project =
+      Discord_agents.Project.{
+        name = "worktree-proj"; path = repo; is_bare = false; remote_url = None;
+      }
+    in
+    match Discord_agents.Project.create_worktree project
+            ~branch_name:"agent/claude-teststop" with
+    | Error err -> Alcotest.failf "create_worktree failed: %s" err
+    | Ok worktree_path ->
+      let node_modules = Filename.concat worktree_path "node_modules/pkg" in
+      Discord_agents.Project.mkdir_p node_modules;
+      let oc = open_out (Filename.concat node_modules "index.js") in
+      output_string oc "module.exports = {};\n";
+      close_out oc;
+      (* A real, tracked commit so the branch actually diverges from
+         main -- otherwise it's trivially "merged" (its tip is already an
+         ancestor of main's tip) with nothing to test. *)
+      let feature_oc = open_out (Filename.concat worktree_path "feature.txt") in
+      output_string feature_oc "feature\n";
+      close_out feature_oc;
+      run_git (Printf.sprintf "git -C %s add feature.txt"
+        (Filename.quote worktree_path));
+      run_git (Printf.sprintf "git -C %s commit -q -m feature"
+        (Filename.quote worktree_path));
+      f ~repo ~project ~worktree_path)
+
+let test_stop_session_cleans_artifacts_in_unmerged_agent_worktree () =
+  with_agent_worktree_project (fun ~repo:_ ~project ~worktree_path ->
+    with_test_bot (fun bot ->
+      bot.project_state <- { bot.project_state with projects = [project] };
+      let session =
+        make_session ~project_name:project.name ~working_dir:worktree_path
+          Discord_agents.Config.Claude
+      in
+      Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+      match Discord_agents.Bot.stop_session bot ~thread_id:"control" with
+      | Discord_agents.Bot.Session_stopped _ ->
+        Alcotest.(check bool) "unmerged worktree kept"
+          true (Sys.file_exists worktree_path);
+        Alcotest.(check bool) "node_modules cleaned"
+          false (Sys.file_exists (Filename.concat worktree_path "node_modules"))
+      | _ -> Alcotest.fail "expected idle session to stop immediately"))
+
+let test_stop_session_removes_fully_merged_agent_worktree () =
+  with_agent_worktree_project (fun ~repo ~project ~worktree_path ->
+    run_git (Printf.sprintf "git -C %s merge -q --no-edit agent/claude-teststop"
+      (Filename.quote repo));
+    with_test_bot (fun bot ->
+      bot.project_state <- { bot.project_state with projects = [project] };
+      let session =
+        make_session ~project_name:project.name ~working_dir:worktree_path
+          Discord_agents.Config.Claude
+      in
+      Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+      match Discord_agents.Bot.stop_session bot ~thread_id:"control" with
+      | Discord_agents.Bot.Session_stopped _ ->
+        Alcotest.(check bool) "merged worktree removed"
+          false (Sys.file_exists worktree_path)
+      | _ -> Alcotest.fail "expected idle session to stop immediately"))
+
 let test_stop_idle_queued_session_clears_and_removes_it () =
   with_test_bot (fun bot ->
     let session = make_session Discord_agents.Config.Claude in
@@ -2032,6 +2116,10 @@ let () =
         test_reconcile_rotates_idle_session_to_rescue_agent_under_pressure;
       Alcotest.test_case "stop idle session removes it" `Quick
         test_stop_idle_session_removes_it;
+      Alcotest.test_case "stop cleans build artifacts in unmerged agent worktree" `Quick
+        test_stop_session_cleans_artifacts_in_unmerged_agent_worktree;
+      Alcotest.test_case "stop removes fully-merged agent worktree" `Quick
+        test_stop_session_removes_fully_merged_agent_worktree;
       Alcotest.test_case "stop idle queued session clears and removes it" `Quick
         test_stop_idle_queued_session_clears_and_removes_it;
       Alcotest.test_case "stop busy session requests stop" `Quick

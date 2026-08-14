@@ -218,7 +218,7 @@ let all_specs = [
     ~no_arg_command:Refresh ();
   mutating ~id:Cleanup_channels_id ~primary:"cleanup"
     ~aliases:["cleanup-channels"]
-    ~help:["`!cleanup` — delete stale channels"]
+    ~help:["`!cleanup` — delete stale channels and prune fully-merged agent worktrees"]
     ~no_arg_command:Cleanup_channels ();
   mutating ~id:Restart_id ~primary:"restart"
     ~help:["`!restart` — rebuild and restart (warns but doesn't block active sessions)"]
