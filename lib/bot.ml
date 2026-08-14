@@ -649,52 +649,61 @@ let prune_or_clean_session_worktree t (session : Session_store.session) =
       in
       if still_in_use then ()
       else
-        (* Offload to a systhread like the codebase's other git-heavy
-           calls (e.g. Project.import_github) so a slow `git clean`/
-           `worktree remove` doesn't stall the gateway heartbeat or other
-           sessions' message processing. working_dir is unique per session
-           (fresh UUID per Project.create_worktree call), so no other
-           session can ever come to share it after the still_in_use check
-           above -- yielding here doesn't reopen the TOCTOU that check
-           guards against. *)
-        Eio_unix.run_in_systhread (fun () ->
-          (* is_branch_merged alone is not sufficient -- see
-             Project.worktree_is_clean's docstring for why both are
-             required before a force-removal is safe. *)
-          if Project.is_branch_merged project ~branch_name
-             && Project.worktree_is_clean session.working_dir
-          then
-            match Project.remove_worktree project ~branch_name
-                    ~worktree_path:session.working_dir with
-            | Ok () -> ()
-            | Error err ->
-              Logs.warn (fun m ->
-                m "bot: failed to remove merged worktree %s: %s"
-                  branch_name err)
-          else
-            ignore (Project.clean_worktree_build_artifacts project
-              session.working_dir))
+        (* Deliberately synchronous, NOT offloaded to a systhread. A
+           systhread call yields this fiber for its whole duration, and
+           `!resume` can bind a new session to a working_dir it discovers
+           from an on-disk agent session transcript (lib/bot.ml's
+           resolve_resume_target) -- unlike `!start`, that path does NOT
+           always mint a fresh path, so `still_in_use` above is not
+           guaranteed to stay valid across a yield. Keeping this whole
+           check-then-act sequence synchronous means no other fiber can
+           run between the check and the delete, closing that race by
+           construction rather than by (fragile) reasoning about which
+           code paths currently reuse a working_dir. A previous version of
+           this comment claimed working_dir uniqueness made a systhread
+           offload safe here; that was true for !start but not !resume,
+           and was caught in review before shipping. *)
+        (* is_branch_merged alone is not sufficient -- see
+           Project.worktree_is_clean's docstring for why both are
+           required before a force-removal is safe. *)
+        if Project.is_branch_merged project ~branch_name
+           && Project.worktree_is_clean session.working_dir
+        then
+          match Project.remove_worktree project ~branch_name
+                  ~worktree_path:session.working_dir with
+          | Ok () -> ()
+          | Error err ->
+            Logs.warn (fun m ->
+              m "bot: failed to remove merged worktree %s: %s"
+                branch_name err)
+        else
+          ignore (Project.clean_worktree_build_artifacts project
+            session.working_dir)
 
 (* Residual sweep for [prune_or_clean_session_worktree]'s one gap: a
    session stopped (and had its build artifacts cleaned) before its branch
    was merged, and the branch has since been merged. Also catches any
    worktree that predates this feature. Local-only merge check per
    project, no fetch -- see Project.is_branch_merged. *)
+(* Deliberately synchronous, NOT offloaded to a systhread -- see the
+   longer comment in prune_or_clean_session_worktree on why yielding
+   partway through a check-then-delete sequence is unsafe here (a
+   concurrent !resume can bind a new session to a working_dir this sweep
+   is about to remove). Kept as one synchronous pass specifically so the
+   [in_use] snapshot below stays valid for the sweep's entire duration --
+   nothing else can run and change t.sessions until this returns. The
+   tradeoff is that a !cleanup sweeping many projects' worth of stale
+   worktrees blocks the bot for its whole duration; correctness beats
+   responsiveness for an operation that deletes branches. *)
 let prune_merged_worktrees_all_projects t =
   let in_use =
     Session_store.bindings t.sessions
     |> List.map (fun (_, (s : Session_store.session)) -> s.working_dir)
   in
-  let all_projects = projects t in
-  (* Sweeps every project's worktrees -- potentially many git subprocess
-     calls back to back -- so this runs on a systhread like other
-     git-heavy work in this module, rather than blocking the Eio domain
-     for however long the full sweep takes. *)
-  Eio_unix.run_in_systhread (fun () ->
-    all_projects
-    |> List.concat_map (fun (p : Project.t) ->
-      Project.prune_merged_worktrees p ~in_use
-      |> List.map (fun branch -> (p.name, branch))))
+  projects t
+  |> List.concat_map (fun (p : Project.t) ->
+    Project.prune_merged_worktrees p ~in_use
+    |> List.map (fun branch -> (p.name, branch)))
 
 let remove_session_now t (session : Session_store.session) =
   try
