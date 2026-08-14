@@ -624,8 +624,12 @@ let request_session_process_stop t (session : Session_store.session) =
 (* "As we go" worktree lifecycle: a session's throwaway agent worktree
    (agent/<kind>-<uuid>, per Project.create_worktree) is exclusively its
    own, so there's never a reason to keep it around once the session is
-   gone. If the branch is already merged, the whole worktree is removed —
-   nothing to lose, the commits live on in the default branch. Otherwise
+   gone. If the branch is already merged AND the worktree has no
+   uncommitted/untracked changes, the whole worktree is removed — nothing
+   to lose, the commits live on in the default branch (both conditions
+   matter: a branch that was merged but had its worktree stopped
+   mid-edit, before committing, would otherwise get force-deleted along
+   with that uncommitted work — see Project.worktree_is_clean). Otherwise
    only its regenerable build artifacts (node_modules, dist, etc. — see
    Project.reclaimable_artifact_names) are cleaned, leaving the worktree
    and branch intact for a later resume, PR, or review. Best-effort: never
@@ -644,16 +648,32 @@ let prune_or_clean_session_worktree t (session : Session_store.session) =
           s.working_dir = session.working_dir)
       in
       if still_in_use then ()
-      else if Project.is_branch_merged project ~branch_name then
-        match Project.remove_worktree project ~branch_name
-                ~worktree_path:session.working_dir with
-        | Ok () -> ()
-        | Error err ->
-          Logs.warn (fun m ->
-            m "bot: failed to remove merged worktree %s: %s" branch_name err)
       else
-        ignore (Project.clean_worktree_build_artifacts project
-          session.working_dir)
+        (* Offload to a systhread like the codebase's other git-heavy
+           calls (e.g. Project.import_github) so a slow `git clean`/
+           `worktree remove` doesn't stall the gateway heartbeat or other
+           sessions' message processing. working_dir is unique per session
+           (fresh UUID per Project.create_worktree call), so no other
+           session can ever come to share it after the still_in_use check
+           above -- yielding here doesn't reopen the TOCTOU that check
+           guards against. *)
+        Eio_unix.run_in_systhread (fun () ->
+          (* is_branch_merged alone is not sufficient -- see
+             Project.worktree_is_clean's docstring for why both are
+             required before a force-removal is safe. *)
+          if Project.is_branch_merged project ~branch_name
+             && Project.worktree_is_clean session.working_dir
+          then
+            match Project.remove_worktree project ~branch_name
+                    ~worktree_path:session.working_dir with
+            | Ok () -> ()
+            | Error err ->
+              Logs.warn (fun m ->
+                m "bot: failed to remove merged worktree %s: %s"
+                  branch_name err)
+          else
+            ignore (Project.clean_worktree_build_artifacts project
+              session.working_dir))
 
 (* Residual sweep for [prune_or_clean_session_worktree]'s one gap: a
    session stopped (and had its build artifacts cleaned) before its branch
@@ -665,10 +685,16 @@ let prune_merged_worktrees_all_projects t =
     Session_store.bindings t.sessions
     |> List.map (fun (_, (s : Session_store.session)) -> s.working_dir)
   in
-  projects t
-  |> List.concat_map (fun (p : Project.t) ->
-    Project.prune_merged_worktrees p ~in_use
-    |> List.map (fun branch -> (p.name, branch)))
+  let all_projects = projects t in
+  (* Sweeps every project's worktrees -- potentially many git subprocess
+     calls back to back -- so this runs on a systhread like other
+     git-heavy work in this module, rather than blocking the Eio domain
+     for however long the full sweep takes. *)
+  Eio_unix.run_in_systhread (fun () ->
+    all_projects
+    |> List.concat_map (fun (p : Project.t) ->
+      Project.prune_merged_worktrees p ~in_use
+      |> List.map (fun branch -> (p.name, branch))))
 
 let remove_session_now t (session : Session_store.session) =
   try

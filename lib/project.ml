@@ -654,13 +654,31 @@ let is_branch_merged project ~branch_name =
   | Ok () -> true
   | Error _ -> false
 
+(** Whether [worktree_path] has no uncommitted or untracked changes.
+    [is_branch_merged] only inspects committed history: a branch that was
+    just created and never committed to sits at the exact same commit as
+    the default branch, so it trivially satisfies "is an ancestor" with
+    nothing having actually been merged. [remove_worktree] uses `git
+    worktree remove --force`, which -- unlike a plain `remove` -- happily
+    overrides git's own refusal to discard a dirty working tree. Combining
+    a merged-but-never-committed-to branch with `--force` would silently
+    and permanently destroy any uncommitted or untracked work in it, so
+    callers must require this to be [true] before ever treating a branch
+    as safe to force-remove, regardless of [is_branch_merged]'s answer. *)
+let worktree_is_clean worktree_path =
+  match run_capture ~cwd:worktree_path ["git"; "status"; "--porcelain"] with
+  | Ok "" -> true
+  | Ok _ | Error _ -> false
+
 (** Fully removes agent worktrees (and their branches) already merged into
-    the project's default branch. Skips anything in [in_use] (a working
-    directory some other still-active session is backing) and, via
-    [agent_branch_of_worktree], the project's own shared default worktree.
-    Merge state is only as fresh as this bare repo's local default-branch
-    ref -- callers wanting an up-to-date sweep should `git fetch` first.
-    Returns the branch names actually removed. *)
+    the project's default branch AND with a clean working tree
+    ([worktree_is_clean] -- see its docstring for why this is required
+    alongside [is_branch_merged], not instead of it). Skips anything in
+    [in_use] (a working directory some other still-active session is
+    backing) and, via [agent_branch_of_worktree], the project's own shared
+    default worktree. Merge state is only as fresh as this bare repo's
+    local default-branch ref -- callers wanting an up-to-date sweep should
+    `git fetch` first. Returns the branch names actually removed. *)
 let prune_merged_worktrees project ~in_use =
   list_worktrees project
   |> List.filter_map (fun (branch_name, worktree_path) ->
@@ -669,6 +687,7 @@ let prune_merged_worktrees project ~in_use =
     | Some _ ->
       if List.mem worktree_path in_use then None
       else if not (is_branch_merged project ~branch_name) then None
+      else if not (worktree_is_clean worktree_path) then None
       else
         match remove_worktree project ~branch_name ~worktree_path with
         | Ok () -> Some branch_name

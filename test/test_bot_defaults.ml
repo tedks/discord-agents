@@ -1378,6 +1378,33 @@ let test_stop_session_removes_fully_merged_agent_worktree () =
           false (Sys.file_exists worktree_path)
       | _ -> Alcotest.fail "expected idle session to stop immediately"))
 
+(* Regression coverage (bot-level) for the same bug the Project-level test
+   suite covers directly: a merged-but-dirty worktree must never be
+   force-removed by !stop, or uncommitted work left at the moment a
+   session stopped would be silently destroyed. *)
+let test_stop_session_does_not_force_remove_dirty_merged_worktree () =
+  with_agent_worktree_project (fun ~repo ~project ~worktree_path ->
+    run_git (Printf.sprintf "git -C %s merge -q --no-edit agent/claude-teststop"
+      (Filename.quote repo));
+    let scratch = Filename.concat worktree_path "scratch.txt" in
+    let oc = open_out scratch in
+    output_string oc "irreplaceable uncommitted work\n";
+    close_out oc;
+    with_test_bot (fun bot ->
+      bot.project_state <- { bot.project_state with projects = [project] };
+      let session =
+        make_session ~project_name:project.name ~working_dir:worktree_path
+          Discord_agents.Config.Claude
+      in
+      Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+      match Discord_agents.Bot.stop_session bot ~thread_id:"control" with
+      | Discord_agents.Bot.Session_stopped _ ->
+        Alcotest.(check bool) "dirty merged worktree survives"
+          true (Sys.file_exists worktree_path);
+        Alcotest.(check bool) "uncommitted file survives"
+          true (Sys.file_exists scratch)
+      | _ -> Alcotest.fail "expected idle session to stop immediately"))
+
 let test_stop_idle_queued_session_clears_and_removes_it () =
   with_test_bot (fun bot ->
     let session = make_session Discord_agents.Config.Claude in
@@ -2120,6 +2147,8 @@ let () =
         test_stop_session_cleans_artifacts_in_unmerged_agent_worktree;
       Alcotest.test_case "stop removes fully-merged agent worktree" `Quick
         test_stop_session_removes_fully_merged_agent_worktree;
+      Alcotest.test_case "stop never force-removes a dirty merged worktree" `Quick
+        test_stop_session_does_not_force_remove_dirty_merged_worktree;
       Alcotest.test_case "stop idle queued session clears and removes it" `Quick
         test_stop_idle_queued_session_clears_and_removes_it;
       Alcotest.test_case "stop busy session requests stop" `Quick

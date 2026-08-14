@@ -404,6 +404,61 @@ let test_is_branch_merged_reflects_merge_state () =
       Alcotest.(check bool) "merged after merging into default branch"
         true (P.is_branch_merged project ~branch_name))
 
+let test_worktree_is_clean_detects_uncommitted_and_untracked_changes () =
+  with_tmpdir (fun base ->
+    let repo = Filename.concat base "repo" in
+    make_git_repo_with_commit repo;
+    let project =
+      P.{ name = "repo"; path = repo; is_bare = false; remote_url = None }
+    in
+    match P.create_worktree project ~branch_name:"agent/claude-dirty" with
+    | Error err -> Alcotest.failf "create_worktree failed: %s" err
+    | Ok worktree_path ->
+      Alcotest.(check bool) "freshly created worktree is clean"
+        true (P.worktree_is_clean worktree_path);
+      write_file (Filename.concat worktree_path "README.md") "edited\n";
+      Alcotest.(check bool) "uncommitted change to a tracked file is dirty"
+        false (P.worktree_is_clean worktree_path);
+      run (Printf.sprintf "git -C %s checkout -- README.md"
+        (Filename.quote worktree_path));
+      Alcotest.(check bool) "reverting the edit is clean again"
+        true (P.worktree_is_clean worktree_path);
+      write_file (Filename.concat worktree_path "scratch.txt") "untracked\n";
+      Alcotest.(check bool) "an untracked file is dirty"
+        false (P.worktree_is_clean worktree_path))
+
+(* Regression coverage for a real bug caught in council review: a branch
+   that was never committed to sits at the exact same commit as the
+   default branch, so [is_branch_merged] trivially reports [true] (a
+   commit is its own ancestor) even though nothing was actually merged.
+   [remove_worktree] uses `git worktree remove --force`, which overrides
+   git's own refusal to discard a dirty working tree -- so relying on
+   [is_branch_merged] alone here would silently and permanently destroy
+   uncommitted/untracked work the moment a session stopped before its
+   first commit. [prune_merged_worktrees] must never do this. *)
+let test_prune_merged_worktrees_never_force_removes_dirty_worktree () =
+  with_tmpdir (fun base ->
+    let repo = Filename.concat base "repo" in
+    make_git_repo_with_commit repo;
+    let project =
+      P.{ name = "repo"; path = repo; is_bare = false; remote_url = None }
+    in
+    let branch_name = "agent/claude-neverccommitted" in
+    match P.create_worktree project ~branch_name with
+    | Error err -> Alcotest.failf "create_worktree failed: %s" err
+    | Ok worktree_path ->
+      (* No commits made in the worktree -- branch tip == default branch
+         tip, so is_branch_merged is trivially true here. *)
+      Alcotest.(check bool) "sanity: trivially merged with zero real commits"
+        true (P.is_branch_merged project ~branch_name);
+      let scratch = Filename.concat worktree_path "scratch.txt" in
+      write_file scratch "irreplaceable uncommitted work\n";
+      let pruned = P.prune_merged_worktrees project ~in_use:[] in
+      Alcotest.(check (list string)) "nothing pruned -- worktree is dirty"
+        [] pruned;
+      Alcotest.(check bool) "worktree survives" true (Sys.file_exists worktree_path);
+      Alcotest.(check bool) "uncommitted file survives" true (Sys.file_exists scratch))
+
 let test_prune_merged_worktrees_respects_merge_state_and_in_use () =
   with_tmpdir (fun base ->
     let repo = Filename.concat base "repo" in
@@ -618,6 +673,10 @@ let () =
         test_clean_worktree_build_artifacts_noop_on_shared_worktree;
       Alcotest.test_case "is_branch_merged reflects merge state" `Quick
         test_is_branch_merged_reflects_merge_state;
+      Alcotest.test_case "worktree_is_clean detects uncommitted/untracked changes" `Quick
+        test_worktree_is_clean_detects_uncommitted_and_untracked_changes;
+      Alcotest.test_case "prune_merged_worktrees never force-removes a dirty worktree" `Quick
+        test_prune_merged_worktrees_never_force_removes_dirty_worktree;
       Alcotest.test_case "prune_merged_worktrees respects merge state and in-use" `Quick
         test_prune_merged_worktrees_respects_merge_state_and_in_use;
     ];
