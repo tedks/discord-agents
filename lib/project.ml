@@ -709,7 +709,21 @@ let worktree_is_clean worktree_path =
    nothing to clean, so it could delete a worktree a command is still in
    the middle of handing off. A worktree that's been sitting for minutes
    is never mid-handoff; the sweep isn't time-sensitive enough for this
-   grace period to cost anything real. *)
+   grace period to cost anything real.
+
+   Known residual gap (tracked on #117, not fixed here -- the worst case
+   below is an operational error, not data loss, so it wasn't judged worth
+   further complexity after three rounds closing the actual data-loss
+   paths): this only protects *newly created* worktrees. `!resume` can
+   also bind a session to an *existing*, already-old worktree, with the
+   same yield-before-persisting-to-Session_store window `!start` has. If
+   `!cleanup` lands in that window and the resumed worktree happens to
+   already be merged-and-clean, it can still be pruned out from under the
+   resume -- but "merged and clean" is exactly the condition under which
+   full removal is safe in the first place, so there's nothing
+   irreplaceable to lose; the resumed session would just find its cwd
+   gone. A real fix needs a reservation mechanism spanning the whole
+   start/resume flow, not just an age check. *)
 let min_worktree_age_before_pruning_s = 300.0
 
 let worktree_age_seconds worktree_path =
