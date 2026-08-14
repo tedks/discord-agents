@@ -560,9 +560,22 @@ let remove_worktree project ~branch_name ~worktree_path =
     (returned by [default_worktree_path] when a fresh worktree couldn't be
     created) or anything else outside that convention -- callers use this
     to make sure automatic cleanup only ever touches a worktree exclusively
-    owned by one session, never a checkout other sessions might share. *)
+    owned by one session, never a checkout other sessions might share.
+
+    Resolves both paths with [Unix.realpath] before comparing, when
+    possible: a raw string-prefix check alone would treat e.g.
+    "<project.path>/agent/../master" as being under ".../agent/" even
+    though it resolves to the shared default worktree -- a path shape a
+    resumed session (working_dir sourced from an on-disk session
+    transcript, not always freshly minted by [create_worktree]) could in
+    principle carry. Falls back to the raw path if [realpath] fails (most
+    likely because the path doesn't exist); a nonexistent path can't be
+    pruned or cleaned by anything downstream anyway. *)
 let agent_branch_of_worktree project worktree_path =
-  let prefix = project.path ^ Filename.dir_sep in
+  let real path = try Unix.realpath path with Unix.Unix_error _ -> path in
+  let project_path = real project.path in
+  let worktree_path = real worktree_path in
+  let prefix = project_path ^ Filename.dir_sep in
   let prefix_len = String.length prefix in
   if String.length worktree_path <= prefix_len
      || String.sub worktree_path 0 prefix_len <> prefix
@@ -654,45 +667,95 @@ let is_branch_merged project ~branch_name =
   | Ok () -> true
   | Error _ -> false
 
-(** Whether [worktree_path] has no uncommitted or untracked changes.
-    [is_branch_merged] only inspects committed history: a branch that was
-    just created and never committed to sits at the exact same commit as
-    the default branch, so it trivially satisfies "is an ancestor" with
-    nothing having actually been merged. [remove_worktree] uses `git
-    worktree remove --force`, which -- unlike a plain `remove` -- happily
-    overrides git's own refusal to discard a dirty working tree. Combining
-    a merged-but-never-committed-to branch with `--force` would silently
-    and permanently destroy any uncommitted or untracked work in it, so
-    callers must require this to be [true] before ever treating a branch
-    as safe to force-remove, regardless of [is_branch_merged]'s answer. *)
+(** Whether [worktree_path] has no uncommitted, untracked, OR ignored
+    changes. [is_branch_merged] only inspects committed history: a branch
+    that was just created and never committed to sits at the exact same
+    commit as the default branch, so it trivially satisfies "is an
+    ancestor" with nothing having actually been merged. [remove_worktree]
+    uses `git worktree remove --force`, which -- unlike a plain `remove`
+    -- happily overrides git's own refusal to discard a dirty working
+    tree. Combining a merged-but-never-committed-to branch with `--force`
+    would silently and permanently destroy any uncommitted or untracked
+    work in it, so callers must require this to be [true] before ever
+    treating a branch as safe to force-remove, regardless of
+    [is_branch_merged]'s answer.
+
+    Uses `--ignored` deliberately, unlike a plain `git status
+    --porcelain`: plain `--porcelain` hides gitignored files entirely
+    (verified: a gitignored `.env` produces zero output without
+    `--ignored`), so a merged worktree holding a real, non-regenerable
+    gitignored file -- `.env`, a `.beads` issue-tracker database, deploy
+    logs, anything [reclaimable_artifact_names] doesn't cover -- would
+    otherwise read as "clean" and get force-deleted along with it. This
+    does mean a worktree still holding *regenerable* ignored artifacts
+    (an uncleaned `node_modules`) also reads as dirty; callers that want
+    full removal should run [clean_worktree_build_artifacts] first and
+    check this afterward, so only genuinely-not-regenerable leftovers can
+    still trip it. *)
 let worktree_is_clean worktree_path =
-  match run_capture ~cwd:worktree_path ["git"; "status"; "--porcelain"] with
+  match run_capture ~cwd:worktree_path
+    ["git"; "status"; "--porcelain"; "--ignored"]
+  with
   | Ok "" -> true
   | Ok _ | Error _ -> false
 
+(* Worktrees younger than this are never touched by [prune_merged_worktrees],
+   regardless of merge/clean state. `!start`/`!resume` create a worktree
+   (or bind a session to one discovered on disk) before that session is
+   necessarily persisted to Session_store -- e.g. thread creation, a
+   Discord REST call, happens in between and yields the fiber. A `!cleanup`
+   sweep landing in that window wouldn't see the in-flight session in its
+   [in_use] snapshot, and a just-created branch is trivially "merged" with
+   nothing to clean, so it could delete a worktree a command is still in
+   the middle of handing off. A worktree that's been sitting for minutes
+   is never mid-handoff; the sweep isn't time-sensitive enough for this
+   grace period to cost anything real. *)
+let min_worktree_age_before_pruning_s = 300.0
+
+let worktree_age_seconds worktree_path =
+  try
+    let git_marker = Filename.concat worktree_path ".git" in
+    Some (Unix.gettimeofday () -. (Unix.lstat git_marker).Unix.st_ctime)
+  with Unix.Unix_error _ -> None
+
 (** Fully removes agent worktrees (and their branches) already merged into
-    the project's default branch AND with a clean working tree
-    ([worktree_is_clean] -- see its docstring for why this is required
-    alongside [is_branch_merged], not instead of it). Skips anything in
-    [in_use] (a working directory some other still-active session is
-    backing) and, via [agent_branch_of_worktree], the project's own shared
-    default worktree. Merge state is only as fresh as this bare repo's
-    local default-branch ref -- callers wanting an up-to-date sweep should
+    the project's default branch AND with no non-regenerable leftovers
+    ([worktree_is_clean], checked *after* [clean_worktree_build_artifacts]
+    has removed anything purely regenerable -- see both docstrings for why
+    this ordering matters: checking [worktree_is_clean] before cleaning
+    would see an unremoved `node_modules` as "dirty" and skip worktrees
+    that are actually safe to fully remove; checking it without cleaning
+    first, or skipping it, would let a leftover `.env`/`.beads`/deploy-log
+    ride along into a force-delete). Skips anything younger than
+    [min_age_s] (defaults to [min_worktree_age_before_pruning_s]; the
+    parameter exists so tests don't need to sleep for real) or in [in_use]
+    (a working directory some other still-active session is backing), and,
+    via [agent_branch_of_worktree], the project's own shared default
+    worktree. Merge state is only as fresh as this bare repo's local
+    default-branch ref -- callers wanting an up-to-date sweep should
     `git fetch` first. Returns the branch names actually removed. *)
-let prune_merged_worktrees project ~in_use =
+let prune_merged_worktrees ?(min_age_s = min_worktree_age_before_pruning_s)
+    project ~in_use =
   list_worktrees project
   |> List.filter_map (fun (branch_name, worktree_path) ->
     match agent_branch_of_worktree project worktree_path with
     | None -> None
     | Some _ ->
       if List.mem worktree_path in_use then None
+      else if (match worktree_age_seconds worktree_path with
+                | Some age -> age < min_age_s
+                | None -> true (* can't determine age -- don't touch it *))
+      then None
       else if not (is_branch_merged project ~branch_name) then None
-      else if not (worktree_is_clean worktree_path) then None
-      else
-        match remove_worktree project ~branch_name ~worktree_path with
-        | Ok () -> Some branch_name
-        | Error err ->
-          Logs.warn (fun m ->
-            m "project: failed to prune merged worktree %s: %s"
-              branch_name err);
-          None)
+      else begin
+        ignore (clean_worktree_build_artifacts project worktree_path);
+        if not (worktree_is_clean worktree_path) then None
+        else
+          match remove_worktree project ~branch_name ~worktree_path with
+          | Ok () -> Some branch_name
+          | Error err ->
+            Logs.warn (fun m ->
+              m "project: failed to prune merged worktree %s: %s"
+                branch_name err);
+            None
+      end)

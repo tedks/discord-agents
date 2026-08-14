@@ -663,9 +663,20 @@ let prune_or_clean_session_worktree t (session : Session_store.session) =
            this comment claimed working_dir uniqueness made a systhread
            offload safe here; that was true for !start but not !resume,
            and was caught in review before shipping. *)
-        (* is_branch_merged alone is not sufficient -- see
-           Project.worktree_is_clean's docstring for why both are
-           required before a force-removal is safe. *)
+        (* Always clean regenerable artifacts first, unconditionally --
+           this is always safe (allowlist-filtered, see
+           Project.reclaimable_artifact_names) regardless of merge state,
+           and it's a prerequisite for the merged check below:
+           Project.worktree_is_clean now also treats any leftover
+           gitignored file as dirty (not just uncommitted/untracked
+           tracked-file changes -- see its docstring), specifically so a
+           real, non-regenerable gitignored file (.env, a .beads database,
+           deploy logs) can't ride along into a force-delete. Checking
+           worktree_is_clean before removing the regenerable stuff would
+           incorrectly read an unremoved node_modules as "dirty" too and
+           skip worktrees that are actually safe to fully remove. *)
+        ignore (Project.clean_worktree_build_artifacts project
+          session.working_dir);
         if Project.is_branch_merged project ~branch_name
            && Project.worktree_is_clean session.working_dir
         then
@@ -676,9 +687,6 @@ let prune_or_clean_session_worktree t (session : Session_store.session) =
             Logs.warn (fun m ->
               m "bot: failed to remove merged worktree %s: %s"
                 branch_name err)
-        else
-          ignore (Project.clean_worktree_build_artifacts project
-            session.working_dir)
 
 (* Residual sweep for [prune_or_clean_session_worktree]'s one gap: a
    session stopped (and had its build artifacts cleaned) before its branch

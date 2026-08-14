@@ -453,11 +453,91 @@ let test_prune_merged_worktrees_never_force_removes_dirty_worktree () =
         true (P.is_branch_merged project ~branch_name);
       let scratch = Filename.concat worktree_path "scratch.txt" in
       write_file scratch "irreplaceable uncommitted work\n";
-      let pruned = P.prune_merged_worktrees project ~in_use:[] in
+      let pruned = P.prune_merged_worktrees ~min_age_s:0.0 project ~in_use:[] in
       Alcotest.(check (list string)) "nothing pruned -- worktree is dirty"
         [] pruned;
       Alcotest.(check bool) "worktree survives" true (Sys.file_exists worktree_path);
       Alcotest.(check bool) "uncommitted file survives" true (Sys.file_exists scratch))
+
+(* Regression coverage for a second bug caught in the same council review:
+   git status --porcelain (no --ignored) hides gitignored files entirely
+   -- verified directly: a gitignored .env produces zero output without
+   --ignored. worktree_is_clean must catch a leftover, non-regenerable
+   gitignored file (like this one) even after regenerable artifacts have
+   been cleaned, or a merged worktree holding it would get force-deleted
+   along with it. *)
+let test_prune_merged_worktrees_never_removes_worktree_with_ignored_secret () =
+  with_tmpdir (fun base ->
+    let repo = Filename.concat base "repo" in
+    make_git_repo_with_commit repo;
+    write_file (Filename.concat repo ".gitignore") ".env\n";
+    commit_all repo "add gitignore";
+    let project =
+      P.{ name = "repo"; path = repo; is_bare = false; remote_url = None }
+    in
+    let branch_name = "agent/claude-hassecret" in
+    match P.create_worktree project ~branch_name with
+    | Error err -> Alcotest.failf "create_worktree failed: %s" err
+    | Ok worktree_path ->
+      write_file (Filename.concat worktree_path "feature.txt") "feature\n";
+      commit_all worktree_path "add feature";
+      run (Printf.sprintf "git -C %s merge -q --no-edit %s"
+        (Filename.quote repo) (Filename.quote branch_name));
+      let env_file = Filename.concat worktree_path ".env" in
+      write_file env_file "SECRET=irreplaceable\n";
+      let pruned = P.prune_merged_worktrees ~min_age_s:0.0 project ~in_use:[] in
+      Alcotest.(check (list string))
+        "nothing pruned -- an ignored, non-regenerable file remains"
+        [] pruned;
+      Alcotest.(check bool) "worktree survives" true (Sys.file_exists worktree_path);
+      Alcotest.(check bool) ".env survives" true (Sys.file_exists env_file))
+
+(* Regression coverage for a third finding from the same review: a
+   just-created merged-and-clean worktree must not be pruned immediately
+   -- !start/!resume create a worktree (or bind a session to one) before
+   that session is necessarily persisted to Session_store, so a sweep
+   landing in that window wouldn't see it in its in_use snapshot. *)
+let test_prune_merged_worktrees_skips_recently_created_worktree () =
+  with_tmpdir (fun base ->
+    let repo = Filename.concat base "repo" in
+    make_git_repo_with_commit repo;
+    let project =
+      P.{ name = "repo"; path = repo; is_bare = false; remote_url = None }
+    in
+    let branch_name = "agent/claude-fresh" in
+    match P.create_worktree project ~branch_name with
+    | Error err -> Alcotest.failf "create_worktree failed: %s" err
+    | Ok worktree_path ->
+      (* Trivially merged (zero commits) and clean -- the only thing
+         standing between it and removal is its age. *)
+      let pruned_with_default_age = P.prune_merged_worktrees project ~in_use:[] in
+      Alcotest.(check (list string)) "not pruned -- too young"
+        [] pruned_with_default_age;
+      Alcotest.(check bool) "worktree survives" true (Sys.file_exists worktree_path);
+      let pruned_with_no_age_floor =
+        P.prune_merged_worktrees ~min_age_s:0.0 project ~in_use:[]
+      in
+      Alcotest.(check (list string)) "pruned once the age floor is waived"
+        [branch_name] pruned_with_no_age_floor)
+
+(* Regression coverage for the fourth finding: a raw string-prefix check
+   would treat "<project>/agent/../master" as living under ".../agent/"
+   even though it resolves to the shared default worktree. *)
+let test_agent_branch_of_worktree_resolves_dot_dot_traversal () =
+  with_tmpdir (fun base ->
+    let repo = Filename.concat base "repo" in
+    make_git_repo_with_commit repo;
+    let project =
+      P.{ name = "repo"; path = repo; is_bare = false; remote_url = None }
+    in
+    (* repo/agent/ must exist for ".." to resolve back to repo/ itself. *)
+    (match P.create_worktree project ~branch_name:"agent/claude-anchor" with
+     | Error err -> Alcotest.failf "create_worktree failed: %s" err
+     | Ok _ -> ());
+    let traversal_path = Filename.concat repo "agent/../." in
+    Alcotest.(check (option string))
+      "dot-dot traversal back to the project root is not an agent worktree"
+      None (P.agent_branch_of_worktree project traversal_path))
 
 let test_prune_merged_worktrees_respects_merge_state_and_in_use () =
   with_tmpdir (fun base ->
@@ -484,7 +564,7 @@ let test_prune_merged_worktrees_respects_merge_state_and_in_use () =
     run (Printf.sprintf "git -C %s merge -q --no-edit %s"
       (Filename.quote repo) (Filename.quote in_use_branch));
     let pruned =
-      P.prune_merged_worktrees project ~in_use:[in_use_path]
+      P.prune_merged_worktrees ~min_age_s:0.0 project ~in_use:[in_use_path]
     in
     Alcotest.(check (list string)) "only the merged, not-in-use branch is pruned"
       [merged_branch] pruned;
@@ -677,6 +757,12 @@ let () =
         test_worktree_is_clean_detects_uncommitted_and_untracked_changes;
       Alcotest.test_case "prune_merged_worktrees never force-removes a dirty worktree" `Quick
         test_prune_merged_worktrees_never_force_removes_dirty_worktree;
+      Alcotest.test_case "prune_merged_worktrees never removes worktree with ignored secret" `Quick
+        test_prune_merged_worktrees_never_removes_worktree_with_ignored_secret;
+      Alcotest.test_case "prune_merged_worktrees skips recently created worktree" `Quick
+        test_prune_merged_worktrees_skips_recently_created_worktree;
+      Alcotest.test_case "agent_branch_of_worktree resolves dot-dot traversal" `Quick
+        test_agent_branch_of_worktree_resolves_dot_dot_traversal;
       Alcotest.test_case "prune_merged_worktrees respects merge state and in-use" `Quick
         test_prune_merged_worktrees_respects_merge_state_and_in_use;
     ];
