@@ -3531,6 +3531,18 @@ let test_escape_toml_string_control_chars () =
       (Str.regexp_string "\\n") escaped 0); true
     with Not_found -> false)
 
+let test_child_environment_sets_thread_id_once () =
+  let key = Discord_agents.Agent_process.session_thread_id_env in
+  let expected = key ^ "=discord-thread-123" in
+  let matches =
+    Discord_agents.Agent_process.child_environment
+      ~thread_id:"discord-thread-123"
+    |> Array.to_list
+    |> List.filter (String.starts_with ~prefix:(key ^ "="))
+  in
+  Alcotest.(check (list string)) "one authoritative thread id"
+    [expected] matches
+
 let compose ~agent_kind ~system_prompt ~message_count ~user_prompt =
   Discord_agents.Agent_process.compose_session_prompt
     ~agent_kind ~system_prompt ~message_count ~goal_context:None ~user_prompt
@@ -3624,6 +3636,8 @@ let prompt_helpers_tests = [
     test_escape_toml_string_backslash;
   Alcotest.test_case "escape_toml_string control chars" `Quick
     test_escape_toml_string_control_chars;
+  Alcotest.test_case "child environment sets thread id once" `Quick
+    test_child_environment_sets_thread_id_once;
   Alcotest.test_case "compose: Claude unchanged (uses --append flag)" `Quick
     test_compose_claude_no_prepend;
   Alcotest.test_case "compose: Codex first turn prepends bot-context" `Quick

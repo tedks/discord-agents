@@ -1799,6 +1799,21 @@ let setsid_command () =
     failwith
       "agent_process: required command `setsid` was not found in PATH; install util-linux or start discord-agents with setsid available"
 
+let session_thread_id_env = "DISCORD_AGENTS_THREAD_ID"
+
+(** Build the child environment with caller identity supplied by the bot.
+    Remove any inherited value first so restarting the bot from inside an
+    agent session cannot leak that session's thread id into later children. *)
+let child_environment ~thread_id =
+  let prefix = session_thread_id_env ^ "=" in
+  let inherited =
+    Unix.environment ()
+    |> Array.to_list
+    |> List.filter (fun entry -> not (String.starts_with ~prefix entry))
+  in
+  Array.of_list
+    (inherited @ [Printf.sprintf "%s=%s" session_thread_id_env thread_id])
+
 let escape_prompt_block text =
   let b = Buffer.create (String.length text) in
   String.iter (function
@@ -1841,13 +1856,14 @@ let compose_session_prompt ~agent_kind ~system_prompt ~message_count
     [?on_pid] is called with the child PID immediately after spawn,
     so the caller can track active subprocesses for cleanup.
     Returns when the process exits. *)
-let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
+let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~thread_id ~message_count
     ?fork_from_session_id ?(session_id_confirmed=true) ?system_prompt
     ?(model=None) ?(reasoning_effort=None) ?(goal_context=None)
     ~prompt ~on_event ?on_pid () =
   let mgr = Eio.Stdenv.process_mgr env in
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
+  let child_env = child_environment ~thread_id in
   (* Codex/Gemini get the system prompt prepended to the first user
      turn (compose_session_prompt); Claude gets it via the dedicated
      [--append-system-prompt] flag instead. *)
@@ -1892,7 +1908,7 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~message_count
   try
     let stderr_r, stderr_w = Eio.Process.pipe ~sw mgr in
     try
-      let proc = Eio.Process.spawn ~sw mgr ~cwd
+      let proc = Eio.Process.spawn ~sw mgr ~cwd ~env:child_env
         ~stdout:stdout_w ~stderr:stderr_w args in
       (* Close write ends so reads get EOF when process exits. Do this before
          callbacks so callback failures cannot strand pipe writers on [sw]. *)
