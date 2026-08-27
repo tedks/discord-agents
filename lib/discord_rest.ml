@@ -2,7 +2,7 @@
 
     Assumptions:
     - Bot token auth only
-    - No file uploads yet (will add for agent output sharing)
+    - Message attachment uploads use multipart/form-data
     - Transient transport failures are retried only for operations we can
       safely repeat (idempotent calls, or create_message with Discord
       nonce dedupe). *)
@@ -531,10 +531,10 @@ let create_with_api_base ~api_base ~sw:_ ~(env : Eio_unix.Stdenv.base) ~token =
 let create ~sw ~env ~token =
   create_with_api_base ~api_base ~sw ~env ~token
 
-let make_headers t =
+let make_headers ?(content_type="application/json") t =
   Http.Header.of_list [
     ("Authorization", "Bot " ^ t.token);
-    ("Content-Type", "application/json");
+    ("Content-Type", content_type);
     ("User-Agent", "DiscordBot (discord-agents/0.1.0, OCaml)");
   ]
 
@@ -603,18 +603,18 @@ let decode_json_body body_str =
     callers that [ignore] the Result still surface failures. 404s log at
     debug level (expected for typing/reactions on deleted channels); other
     errors log at warn. *)
-let request ?(retry_mode = No_retry) t ~meth ~path ?body () =
+let request_raw ?(retry_mode = No_retry) t ~meth ~path ~content_type
+    ?body ?request_body_log () =
   let uri = Uri.of_string (t.api_base ^ path) in
   let host = Uri.host uri |> Option.value ~default:"discord.com" in
   let retry_limit = match retry_mode with
     | No_retry -> 1
     | Retry_transient n -> max 1 n
   in
-  let headers = make_headers t in
-  let body_str = Option.map (fun j -> Yojson.Safe.to_string j) body in
+  let headers = make_headers ~content_type t in
   let meth_str = Http.Method.to_string meth in
   let do_call () =
-    let cohttp_body = Option.map Cohttp_eio.Body.of_string body_str in
+    let cohttp_body = Option.map Cohttp_eio.Body.of_string body in
     let (resp, body_str, _truncated) =
       t.call ~headers ?body:cohttp_body meth uri
     in
@@ -644,7 +644,7 @@ let request ?(retry_mode = No_retry) t ~meth ~path ?body () =
       Option.iter (fun b ->
         Logs.warn (fun m -> m "REST %s %s: 400 request body: %s"
           meth_str path (truncate_for_log b))
-      ) body_str
+      ) request_body_log
   in
   let handle_response code body_str =
     if code >= 200 && code < 300 then begin
@@ -748,6 +748,155 @@ let request ?(retry_mode = No_retry) t ~meth ~path ?body () =
       end
   in
   loop 1 0
+
+(** JSON request wrapper retained as the default REST interface. *)
+let request ?(retry_mode = No_retry) t ~meth ~path ?body () =
+  let request_body = Option.map Yojson.Safe.to_string body in
+  request_raw ~retry_mode t ~meth ~path
+    ~content_type:"application/json"
+    ?body:request_body ?request_body_log:request_body ()
+
+type attachment_upload = {
+  filename : string;
+  content_type : string;
+  contents : string;
+}
+
+let max_attachment_count = 10
+let max_attachment_file_bytes = 10 * 1024 * 1024
+let max_attachment_request_bytes = 25 * 1024 * 1024
+
+let content_type_of_filename filename =
+  let extension =
+    match String.rindex_opt filename '.' with
+    | None -> ""
+    | Some index ->
+      String.sub filename index (String.length filename - index)
+      |> String.lowercase_ascii
+  in
+  match extension with
+  | ".txt" | ".log" -> "text/plain"
+  | ".md" | ".markdown" -> "text/markdown"
+  | ".csv" -> "text/csv"
+  | ".json" -> "application/json"
+  | ".pdf" -> "application/pdf"
+  | ".png" -> "image/png"
+  | ".jpg" | ".jpeg" -> "image/jpeg"
+  | ".gif" -> "image/gif"
+  | ".webp" -> "image/webp"
+  | ".svg" -> "image/svg+xml"
+  | ".zip" -> "application/zip"
+  | ".gz" -> "application/gzip"
+  | ".tar" -> "application/x-tar"
+  | _ -> "application/octet-stream"
+
+let sanitize_attachment_filename filename =
+  let basename =
+    filename
+    |> Filename.basename
+    |> Resource.sanitize_utf8
+  in
+  let basename = if basename = "" || basename = "." then "attachment" else basename in
+  String.map (fun char ->
+    let code = Char.code char in
+    if code < 0x20 || code = 0x7f || char = '"' || char = '\\'
+    then '_'
+    else char
+  ) basename
+
+let multipart_payload_json ~content ~nonce files =
+  let attachments =
+    List.mapi (fun id file ->
+      `Assoc [
+        ("id", `Int id);
+        ("filename", `String file.filename);
+      ]
+    ) files
+  in
+  `Assoc [
+    ("content", `String content);
+    ("nonce", `String nonce);
+    ("enforce_nonce", `Bool true);
+    ("attachments", `List attachments);
+  ]
+
+let multipart_body ~boundary ~payload_json files =
+  let buffer = Buffer.create 4096 in
+  let boundary_line () =
+    Buffer.add_string buffer "--";
+    Buffer.add_string buffer boundary;
+    Buffer.add_string buffer "\r\n"
+  in
+  boundary_line ();
+  Buffer.add_string buffer
+    "Content-Disposition: form-data; name=\"payload_json\"\r\n";
+  Buffer.add_string buffer "Content-Type: application/json\r\n\r\n";
+  Buffer.add_string buffer (Yojson.Safe.to_string payload_json);
+  Buffer.add_string buffer "\r\n";
+  List.iteri (fun index file ->
+    boundary_line ();
+    Buffer.add_string buffer (Printf.sprintf
+      "Content-Disposition: form-data; name=\"files[%d]\"; filename=\"%s\"\r\n"
+      index file.filename);
+    Buffer.add_string buffer ("Content-Type: " ^ file.content_type ^ "\r\n\r\n");
+    Buffer.add_string buffer file.contents;
+    Buffer.add_string buffer "\r\n"
+  ) files;
+  Buffer.add_string buffer "--";
+  Buffer.add_string buffer boundary;
+  Buffer.add_string buffer "--\r\n";
+  Buffer.contents buffer
+
+(** Send one Discord message with one or more file attachments. Unlike
+    [create_message], content is not split because attachments belong to a
+    single message. The nonce makes transient retries safe to repeat. *)
+let create_message_with_attachments t
+    ~(channel_id : Discord_types.channel_id) ~content ~files () =
+  let content = Resource.sanitize_utf8 content in
+  let files = List.map (fun file ->
+    { file with filename = sanitize_attachment_filename file.filename }
+  ) files in
+  if files = [] then
+    Error "create_message_with_attachments: at least one file is required"
+  else if List.length files > max_attachment_count then
+    Error (Printf.sprintf
+      "create_message_with_attachments: at most %d files are allowed"
+      max_attachment_count)
+  else if String.length content > Agent_process.discord_max_len then
+    Error (Printf.sprintf
+      "create_message_with_attachments: message exceeds Discord's %d-byte limit"
+      Agent_process.discord_max_len)
+  else
+    match List.find_opt (fun file ->
+      String.length file.contents > max_attachment_file_bytes) files with
+    | Some file ->
+      Error (Printf.sprintf
+        "create_message_with_attachments: %s exceeds the %d-byte file limit"
+        file.filename max_attachment_file_bytes)
+    | None ->
+      let nonce = message_nonce () in
+      let boundary = "discord-agents-" ^ Resource.random_hex 18 in
+      let payload_json = multipart_payload_json ~content ~nonce files in
+      let body = multipart_body ~boundary ~payload_json files in
+      if String.length body > max_attachment_request_bytes then
+        Error (Printf.sprintf
+          "create_message_with_attachments: multipart body exceeds the %d-byte request limit"
+          max_attachment_request_bytes)
+      else
+        let content_type = "multipart/form-data; boundary=" ^ boundary in
+        let request_body_log = Printf.sprintf
+          "<multipart/form-data: %d files, %d bytes>"
+          (List.length files) (String.length body)
+        in
+        match request_raw ~retry_mode:default_retry_mode t ~meth:`POST
+          ~path:(Printf.sprintf "/channels/%s/messages" channel_id)
+          ~content_type ~body ~request_body_log () with
+        | Ok json ->
+          (try Ok (message_of_yojson json)
+           with exn -> Error (Printf.sprintf
+             "create_message_with_attachments: parse error: %s"
+             (Printexc.to_string exn)))
+        | Error error -> Error error
 
 (** Plan the chunks for a [create_message] call. Pure function, separated
     from I/O so it can be unit-tested. Content fitting in a single Discord

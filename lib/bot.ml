@@ -836,6 +836,7 @@ You have MCP tools available:
 - list_projects: List all discovered projects
 - list_sessions: List active bot sessions
 - send_message: Send a visible user-style message to another active session thread
+- send_attachments: Upload files from this session's worktree to this Discord thread
 - stop_session: Stop an active bot session by Discord thread ID
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume
@@ -878,6 +879,7 @@ You have MCP tools available:
 - list_projects: List all discovered projects
 - list_sessions: List active bot sessions
 - send_message: Send a visible user-style message to another active session thread
+- send_attachments: Upload files from this session's worktree to this Discord thread
 - stop_session: Stop an active bot session by Discord thread ID
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume

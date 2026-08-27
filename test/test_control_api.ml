@@ -108,6 +108,7 @@ let expected_method_ids = [
   Resume_session_id;
   Stop_session_id;
   Send_message_id;
+  Send_attachments_id;
   Default_agent_id;
   Rescue_agent_id;
   Get_agent_config_id;
@@ -174,6 +175,7 @@ let expected_mcp_exposed_method_ids = [
   Resume_session_id;
   Stop_session_id;
   Send_message_id;
+  Send_attachments_id;
   Default_agent_id;
   Rescue_agent_id;
   Get_agent_config_id;
@@ -258,6 +260,7 @@ let expected_mutability = function
   | Import_project_id
   | Refresh_projects_id -> Mutates_projects
   | Rename_thread_id
+  | Send_attachments_id
   | Cleanup_channels_id -> Mutates_discord
   | Restart_id -> Restarts_process
 
@@ -285,9 +288,64 @@ let test_hours_param_defaults () =
   Alcotest.(check int) "non-object params" 24
     (Control_api.hours_param (Some (`List [])))
 
+let test_attachment_paths_are_confined_to_worktree () =
+  let root = Filename.temp_dir "discord_agents_attachments_" "" in
+  let inside = Filename.concat root "report.log" in
+  let directory = Filename.concat root "directory" in
+  let symlink = Filename.concat root "escape.log" in
+  let outside = Filename.temp_file "discord_agents_outside_" ".log" in
+  let write path contents =
+    let channel = open_out_bin path in
+    Fun.protect ~finally:(fun () -> close_out channel) (fun () ->
+      output_string channel contents)
+  in
+  write inside "session log";
+  write outside "outside";
+  Unix.mkdir directory 0o700;
+  Unix.symlink outside symlink;
+  Fun.protect
+    ~finally:(fun () ->
+      Sys.remove symlink;
+      Sys.remove inside;
+      Unix.rmdir directory;
+      Unix.rmdir root;
+      Sys.remove outside)
+    (fun () ->
+      (match Control_api.load_attachment_uploads
+               ~working_dir:root ["report.log"] with
+       | Error error -> Alcotest.fail ("valid attachment rejected: " ^ error)
+       | Ok [file] ->
+         Alcotest.(check string) "filename" "report.log" file.filename;
+         Alcotest.(check string) "content type" "text/plain"
+           file.content_type;
+         Alcotest.(check string) "contents" "session log" file.contents
+       | Ok _ -> Alcotest.fail "expected exactly one loaded attachment");
+      let expect_error label path fragment =
+        match Control_api.load_attachment_uploads
+                ~working_dir:root [path] with
+        | Ok _ -> Alcotest.fail (label ^ ": expected rejection")
+        | Error error ->
+          Alcotest.(check bool) label true
+            (Discord_agents.Resource.contains_substring
+              ~haystack:error ~needle:fragment)
+      in
+      expect_error "absolute escape" outside "outside the session worktree";
+      expect_error "symlink escape" symlink "outside the session worktree";
+      expect_error "directory" directory "not a regular file";
+      expect_error "NUL path" "bad\x00path" "Attachment path";
+      match Control_api.load_attachment_uploads ~working_dir:root
+        (List.init 11 (fun _ -> "report.log")) with
+      | Ok _ -> Alcotest.fail "expected file count rejection"
+      | Error error ->
+        Alcotest.(check bool) "file count" true
+          (Discord_agents.Resource.contains_substring
+            ~haystack:error ~needle:"At most 10"))
+
 let () =
   Alcotest.run "control_api" [
     ("params", [
+      Alcotest.test_case "attachment paths stay in worktree" `Quick
+        test_attachment_paths_are_confined_to_worktree;
       Alcotest.test_case "hours_param defaults" `Quick
         test_hours_param_defaults;
     ]);

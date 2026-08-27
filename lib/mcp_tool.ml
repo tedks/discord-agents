@@ -9,6 +9,7 @@ type id =
   | Import_project
   | List_sessions
   | Send_message
+  | Send_attachments
   | Stop_session
   | List_claude_sessions
   | List_codex_sessions
@@ -40,6 +41,7 @@ let string_of_id = function
   | Import_project -> "import_project"
   | List_sessions -> "list_sessions"
   | Send_message -> "send_message"
+  | Send_attachments -> "send_attachments"
   | Stop_session -> "stop_session"
   | List_claude_sessions -> "list_claude_sessions"
   | List_codex_sessions -> "list_codex_sessions"
@@ -73,13 +75,16 @@ let field key value fields =
   | None -> fields
   | Some value -> (key, value) :: fields
 
-let property ?description ?enum ?max_length ?minimum ?maximum ?default
-    ~type_ () =
+let property ?description ?enum ?items ?max_length ?min_items ?max_items
+    ?minimum ?maximum ?default ~type_ () =
   `Assoc (
     [("type", type_)]
     |> field "description" (Option.map (fun s -> `String s) description)
     |> field "enum" (Option.map string_list_json enum)
+    |> field "items" items
     |> field "maxLength" (Option.map (fun n -> `Int n) max_length)
+    |> field "minItems" (Option.map (fun n -> `Int n) min_items)
+    |> field "maxItems" (Option.map (fun n -> `Int n) max_items)
     |> field "minimum" (Option.map (fun n -> `Int n) minimum)
     |> field "maximum" (Option.map (fun n -> `Int n) maximum)
     |> field "default" default
@@ -161,6 +166,18 @@ let all_specs = [
       ("remaining_hops", property ~type_:integer_type
         ~description:"Loop guard. Defaults to 3 for a new chain. If replying to an inter-agent message, pass the remaining_hops value shown in that message."
         ~minimum:1 ~maximum:5 ~default:(`Int 3) ());
+    ]);
+  spec ~id:Send_attachments
+    ~description:"Upload one or more files from the calling session's worktree to its own Discord thread. Paths may be relative to the worktree or absolute within it; paths outside the worktree are rejected."
+    ~control_method:Control_api.Send_attachments_id
+    ~input_schema:(object_schema ~required:["paths"] [
+      ("paths", property ~type_:(`String "array")
+        ~description:"Local file paths to attach. Each resolved path must be a regular file inside the calling session's worktree. At most 10 files, 10 MiB each, and 25 MiB for the multipart request."
+        ~items:(property ~type_:string_type ())
+        ~min_items:1 ~max_items:10 ());
+      ("message", property ~type_:string_type
+        ~description:"Optional text for the attachment message. Must fit in one Discord message (2000 bytes); it is not split."
+        ~max_length:2000 ());
     ]);
   spec ~id:Stop_session
     ~description:"Stop an active bot session by Discord thread ID. Idle sessions stop immediately; busy sessions terminate the active agent run and then clean up the session."

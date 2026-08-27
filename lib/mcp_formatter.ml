@@ -524,6 +524,19 @@ let format_send_message response =
   in
   format_object ~format_fields response
 
+let format_send_attachments response =
+  let format_fields fields =
+    match string_field_default "" "send_attachments" "thread_id" fields,
+          int_field_default 0 "send_attachments" "file_count" fields with
+    | Ok thread_id, Ok file_count ->
+      Ok (Printf.sprintf "Sent %d attachment%s to <#%s>."
+        file_count (if file_count = 1 then "" else "s")
+        (render_string thread_id))
+    | Error message, _
+    | _, Error message -> Error message
+  in
+  format_object ~format_fields response
+
 let format_stop_session response =
   let format_fields fields =
     match

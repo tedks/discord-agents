@@ -51,6 +51,8 @@ def app_config_dir():
 
 CONFIG_DIR = app_config_dir()
 CONTROL_SOCKET = CONFIG_DIR / "control.sock"
+CALLER_THREAD_ID_ENV = "DISCORD_AGENTS_THREAD_ID"
+CALLER_THREAD_ID_PARAM = "_discord_agents_caller_thread_id"
 
 # --- Bot control API client ---
 
@@ -180,6 +182,28 @@ TOOLS = [
                 }
             },
             "required": ["thread_id", "message"]
+        }
+    },
+    {
+        "name": "send_attachments",
+        "description": "Upload one or more files from the calling session's worktree to its own Discord thread. Paths may be relative to the worktree or absolute within it; paths outside the worktree are rejected.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "description": "Local file paths to attach. Each resolved path must be a regular file inside the calling session's worktree. At most 10 files, 10 MiB each, and 25 MiB for the multipart request.",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 10
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Optional text for the attachment message. Must fit in one Discord message (2000 bytes); it is not split.",
+                    "maxLength": 2000
+                }
+            },
+            "required": ["paths"]
         }
     },
     {
@@ -475,6 +499,20 @@ def handle_tool_call(name, arguments):
         if state == "posted_not_routed":
             return f"Posted message to <#{tid}>, but the target session disappeared before routing. remaining_hops={hops}."
         return f"Sent message to <#{tid}>. remaining_hops={hops}."
+
+    elif name == "send_attachments":
+        params = dict(arguments)
+        params.pop(CALLER_THREAD_ID_PARAM, None)
+        caller_thread_id = os.environ.get(CALLER_THREAD_ID_ENV)
+        if caller_thread_id:
+            params[CALLER_THREAD_ID_PARAM] = caller_thread_id
+        result = control_request("send_attachments", params)
+        if "error" in result:
+            return result["error"]
+        tid = result.get("thread_id", "")
+        count = result.get("file_count", 0)
+        suffix = "" if count == 1 else "s"
+        return f"Sent {count} attachment{suffix} to <#{tid}>."
 
     elif name == "stop_session":
         result = control_request("stop_session", arguments)

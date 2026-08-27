@@ -1,8 +1,12 @@
 let control_client =
   Discord_agents.Control_client.unix ()
 
+let caller_thread_id =
+  Sys.getenv_opt Discord_agents.Agent_process.session_thread_id_env
+
 let handle_tool_call call =
-  Discord_agents.Mcp_handler.handle_tool_call ~control_client call
+  Discord_agents.Mcp_handler.handle_tool_call
+    ~control_client ?caller_thread_id call
 
 let write_response json =
   print_endline (Yojson.Safe.to_string json);
