@@ -2020,6 +2020,52 @@ let test_handler_lifecycle_tools_request_control_api () =
     ~response:(stop_session_response ~message:"Stopped session for repo." ())
     ~expected_output:"Stopped session for repo."
 
+let test_handler_send_attachments_uses_caller_context () =
+  let calls = ref [] in
+  let control_client =
+    Control_client.make ~request:(fun request ->
+      calls := request :: !calls;
+      Ok (`Assoc [
+        ("ok", `Bool true);
+        ("thread_id", `String "555");
+        ("file_count", `Int 1);
+      ]))
+  in
+  let call = {
+    Mcp_server.name = "send_attachments";
+    arguments = `Assoc [
+      ("paths", `List [`String "chart.png"]);
+      (Control_api.caller_thread_id_param, `String "forged");
+      (Control_api.caller_thread_id_param, `String "also-forged");
+    ];
+  } in
+  Alcotest.(check (result string string)) "handler output"
+    (Ok "Sent 1 attachment to <#555>.")
+    (Mcp_handler.handle_tool_call ~control_client
+      ~caller_thread_id:"555" call);
+  match !calls with
+  | [request] ->
+    Alcotest.(check string) "method" "send_attachments" request.method_name;
+    Alcotest.(check int) "timeout" 60 request.timeout_s;
+    (match request.params with
+     | Some params -> check_json "trusted caller overrides tool argument"
+         (`Assoc [
+           (Control_api.caller_thread_id_param, `String "555");
+           ("paths", `List [`String "chart.png"]);
+         ]) params
+     | None -> Alcotest.fail "expected attachment params")
+  | calls -> failf "expected one control request, got %d" (List.length calls)
+
+let test_handler_send_attachments_drops_untrusted_context () =
+  let params = `Assoc [
+    (Control_api.caller_thread_id_param, `String "forged");
+    ("paths", `List [`String "chart.png"]);
+    (Control_api.caller_thread_id_param, `String "also-forged");
+  ] in
+  check_json "all untrusted caller fields removed"
+    (`Assoc [("paths", `List [`String "chart.png"])])
+    (Mcp_handler.params_with_caller_thread_id None params)
+
 let test_handler_start_session_refreshes_missing_project () =
   let calls = ref [] in
   let arguments = `Assoc [("project", `String "new-repo")] in
@@ -2741,6 +2787,10 @@ let () =
         test_handler_recent_sessions_empty_arguments;
       Alcotest.test_case "lifecycle tools request control API" `Quick
         test_handler_lifecycle_tools_request_control_api;
+      Alcotest.test_case "attachment caller context overrides arguments" `Quick
+        test_handler_send_attachments_uses_caller_context;
+      Alcotest.test_case "attachment caller context cannot be forged" `Quick
+        test_handler_send_attachments_drops_untrusted_context;
       Alcotest.test_case "start_session refreshes missing project" `Quick
         test_handler_start_session_refreshes_missing_project;
       Alcotest.test_case "start_session does not retry other errors" `Quick

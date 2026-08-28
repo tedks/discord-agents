@@ -435,6 +435,72 @@ let test_create_message_reuses_nonce_across_5xx_retry () =
         true (json |> member "enforce_nonce" |> to_bool)
     | _ -> Alcotest.fail "unexpected attempt shape"
 
+let test_attachment_filename_and_content_type () =
+  Alcotest.(check string) "header characters sanitized"
+    "bad___.log"
+    (Rest.sanitize_attachment_filename "../bad\"\r\n.log");
+  Alcotest.(check string) "parent path fallback"
+    "attachment" (Rest.sanitize_attachment_filename "..");
+  Alcotest.(check string) "root path fallback"
+    "attachment" (Rest.sanitize_attachment_filename Filename.dir_sep);
+  Alcotest.(check string) "known extension"
+    "image/png" (Rest.content_type_of_filename "CHART.PNG");
+  Alcotest.(check string) "unknown extension"
+    "application/octet-stream"
+    (Rest.content_type_of_filename "artifact.unknown")
+
+let test_create_message_with_attachments_multipart_retry () =
+  let attempts = ref [] in
+  let call ~headers ?body _meth _uri =
+    let content_type =
+      Http.Header.get headers "content-type" |> Option.value ~default:""
+    in
+    let body = body |> Option.map Rest.read_body |> Option.value ~default:"" in
+    attempts := (content_type, body) :: !attempts;
+    match List.length !attempts with
+    | 1 ->
+      response
+        ~headers:(Http.Header.of_list [("retry-after", "0")])
+        500 {|{"message":"server unavailable"}|}
+    | _ ->
+      response 200
+        {|{"id":"m1","channel_id":"c1","author":{"id":"u1","username":"bot"},"content":"see chart","timestamp":"2026-06-05T00:00:00.000000+00:00"}|}
+  in
+  let file : Rest.attachment_upload = {
+    filename = "chart.png";
+    content_type = "image/png";
+    contents = "PNG\x00DATA";
+  } in
+  with_fake_rest call @@ fun t ->
+  match Rest.create_message_with_attachments t ~channel_id:"c1"
+    ~content:"see chart" ~files:[file] () with
+  | Error error -> Alcotest.fail ("expected upload success: " ^ error)
+  | Ok message ->
+    Alcotest.(check string) "message id" "m1" message.id;
+    let attempts = List.rev !attempts in
+    Alcotest.(check int) "retried once" 2 (List.length attempts);
+    match attempts with
+    | [(content_type_1, body_1); (content_type_2, body_2)] ->
+      Alcotest.(check string) "content type reused"
+        content_type_1 content_type_2;
+      Alcotest.(check bool) "multipart content type"
+        true (String.starts_with ~prefix:"multipart/form-data; boundary="
+          content_type_1);
+      Alcotest.(check string) "serialized body reused" body_1 body_2;
+      let contains needle =
+        Discord_agents.Resource.contains_substring
+          ~haystack:body_1 ~needle
+      in
+      Alcotest.(check bool) "payload_json part" true
+        (contains "name=\"payload_json\"");
+      Alcotest.(check bool) "indexed file part" true
+        (contains "name=\"files[0]\"; filename=\"chart.png\"");
+      Alcotest.(check bool) "attachment metadata" true
+        (contains {|"attachments":[{"id":0,"filename":"chart.png"}]|});
+      Alcotest.(check bool) "binary contents preserved" true
+        (contains "PNG\x00DATA")
+    | _ -> Alcotest.fail "unexpected multipart attempts"
+
 let test_create_channel_does_not_retry_5xx () =
   let attempts = ref 0 in
   let call ~headers:_ ?body:_ _meth _uri =
@@ -573,6 +639,10 @@ let () =
         test_read_body_reports_truncation;
       Alcotest.test_case "create_message reuses nonce across 5xx retry" `Quick
         test_create_message_reuses_nonce_across_5xx_retry;
+      Alcotest.test_case "attachment filename and content type" `Quick
+        test_attachment_filename_and_content_type;
+      Alcotest.test_case "attachment multipart retries stable body" `Quick
+        test_create_message_with_attachments_multipart_retry;
       Alcotest.test_case "create_channel does not retry 5xx" `Quick
         test_create_channel_does_not_retry_5xx;
       Alcotest.test_case "401 marks rest health without transport backoff" `Quick

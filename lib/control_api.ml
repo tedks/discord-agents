@@ -67,6 +67,7 @@ type method_id =
   | Resume_session_id
   | Stop_session_id
   | Send_message_id
+  | Send_attachments_id
   | Default_agent_id
   | Rescue_agent_id
   | Get_agent_config_id
@@ -108,6 +109,7 @@ let string_of_method_id = function
   | Resume_session_id -> "resume_session"
   | Stop_session_id -> "stop_session"
   | Send_message_id -> "send_message"
+  | Send_attachments_id -> "send_attachments"
   | Default_agent_id -> "default_agent"
   | Rescue_agent_id -> "rescue_agent"
   | Get_agent_config_id -> "get_agent_config"
@@ -127,6 +129,119 @@ let string_of_mutability = function
   | Mutates_projects -> "mutates_projects"
   | Mutates_discord -> "mutates_discord"
   | Restarts_process -> "restarts_process"
+
+let caller_thread_id_param = "_discord_agents_caller_thread_id"
+
+let path_is_within ~root path =
+  String.equal root Filename.dir_sep
+  || String.equal path root
+  || String.starts_with ~prefix:(root ^ Filename.dir_sep) path
+
+let attachment_error path message =
+  let path =
+    path
+    |> Resource.sanitize_utf8
+    |> Resource.single_line
+  in
+  Error (Printf.sprintf "Attachment path '%s': %s" path message)
+
+(** Resolve, validate, and read attachment paths relative to one session's
+    worktree. Canonicalization rejects symlink and [..] escapes. File
+    descriptors are checked after opening so a replaced path cannot turn a
+    regular file into a directory or pipe unnoticed. *)
+let load_attachment_uploads ~working_dir paths =
+  if paths = [] then Error "At least one attachment path is required."
+  else if List.length paths > Discord_rest.max_attachment_count then
+    Error (Printf.sprintf "At most %d attachment paths are allowed."
+      Discord_rest.max_attachment_count)
+  else
+    match Unix.realpath working_dir with
+    | exception Unix.Unix_error (error, _, _) ->
+      Error (Printf.sprintf "Session worktree is unavailable: %s"
+        (Unix.error_message error))
+    | exception (Sys_error message | Invalid_argument message) ->
+      Error (Printf.sprintf "Session worktree is unavailable: %s" message)
+    | root ->
+      let rec loop total uploads = function
+        | [] -> Ok (List.rev uploads)
+        | raw_path :: _ when String.trim raw_path = "" ->
+          attachment_error raw_path "path must not be empty"
+        | raw_path :: rest ->
+          let candidate =
+            if Filename.is_relative raw_path then Filename.concat root raw_path
+            else raw_path
+          in
+          (match Unix.realpath candidate with
+           | exception Unix.Unix_error (error, _, _) ->
+             attachment_error raw_path (Unix.error_message error)
+           | exception (Sys_error message | Invalid_argument message) ->
+             attachment_error raw_path message
+           | path when not (path_is_within ~root path) ->
+             attachment_error raw_path "resolves outside the session worktree"
+           | path ->
+             match Unix.openfile path [Unix.O_RDONLY; Unix.O_CLOEXEC] 0 with
+             | exception Unix.Unix_error (error, _, _) ->
+               attachment_error raw_path (Unix.error_message error)
+             | exception (Sys_error message | Invalid_argument message) ->
+               attachment_error raw_path message
+             | fd ->
+               let close_fd () =
+                 try Unix.close fd with Unix.Unix_error _ -> ()
+               in
+               (match Unix.LargeFile.fstat fd with
+                | exception Unix.Unix_error (error, _, _) ->
+                  close_fd ();
+                  attachment_error raw_path (Unix.error_message error)
+                | stat when stat.Unix.LargeFile.st_kind <> Unix.S_REG ->
+                  close_fd ();
+                  attachment_error raw_path "is not a regular file"
+                | stat when stat.Unix.LargeFile.st_size >
+                    Int64.of_int Discord_rest.max_attachment_file_bytes ->
+                  close_fd ();
+                  attachment_error raw_path (Printf.sprintf
+                    "exceeds the %d-byte file limit"
+                    Discord_rest.max_attachment_file_bytes)
+                | stat ->
+                  match Unix.in_channel_of_descr fd with
+                  | exception (Sys_error message | Invalid_argument message) ->
+                    close_fd ();
+                    attachment_error raw_path message
+                  | channel ->
+                    let loaded = Fun.protect
+                      ~finally:(fun () -> close_in_noerr channel)
+                      (fun () ->
+                        let size = Int64.to_int stat.Unix.LargeFile.st_size in
+                        let next_total = total + size in
+                        if next_total >
+                            Discord_rest.max_attachment_request_bytes then
+                          Error (Printf.sprintf
+                            "Attachment files exceed the %d-byte request limit."
+                            Discord_rest.max_attachment_request_bytes)
+                        else
+                          match really_input_string channel size with
+                          | exception End_of_file ->
+                            attachment_error raw_path
+                              "changed while it was being read"
+                          | exception Sys_error message ->
+                            attachment_error raw_path message
+                          | contents ->
+                            let filename =
+                              Discord_rest.sanitize_attachment_filename path
+                            in
+                            let upload : Discord_rest.attachment_upload = {
+                              filename;
+                              content_type =
+                                Discord_rest.content_type_of_filename filename;
+                              contents;
+                            } in
+                            Ok (next_total, upload))
+                    in
+                    match loaded with
+                    | Error _ as error -> error
+                    | Ok (next_total, upload) ->
+                      loop next_total (upload :: uploads) rest))
+      in
+      loop 0 [] paths
 
 let cleanup_orphan_thread rest ~thread_id ~context =
   match Discord_rest.delete_channel rest ~channel_id:thread_id () with
@@ -1289,6 +1404,70 @@ let handle_send_message (bot : Bot.t) params =
   | Bot.Inter_agent_message_rejected err ->
     error_response err
 
+let handle_send_attachments (bot : Bot.t) params =
+  let open Yojson.Safe.Util in
+  let params = match params with Some params -> params | None ->
+    failwith "missing params" in
+  let caller_thread_id =
+    params |> member caller_thread_id_param |> to_string_option
+  in
+  let paths =
+    match params |> member "paths" with
+    | `List values ->
+      let rec strings acc = function
+        | [] -> Ok (List.rev acc)
+        | `String path :: rest -> strings (path :: acc) rest
+        | _ -> Error "Attachment paths must all be strings."
+      in
+      strings [] values
+    | _ -> Error "Attachment paths must be an array."
+  in
+  let content =
+    match params |> member "message" with
+    | `Null -> Ok ""
+    | `String message -> Ok (Resource.sanitize_utf8 message)
+    | _ -> Error "Attachment message must be a string."
+  in
+  match caller_thread_id, paths, content with
+  | None, _, _ ->
+    error_response
+      "send_attachments is only available from an active Discord agent session."
+  | _, Error error, _
+  | _, _, Error error -> error_response error
+  | Some thread_id, Ok paths, Ok content ->
+    if String.length content > Agent_process.discord_max_len then
+      error_response (Printf.sprintf
+        "Attachment message exceeds Discord's %d-byte limit."
+        Agent_process.discord_max_len)
+    else
+      match Session_store.find_opt bot.sessions ~thread_id with
+      | None ->
+        error_response
+          "The calling Discord session is no longer active; retry from an active thread."
+      | Some session ->
+        match Eio_unix.run_in_systhread (fun () ->
+          load_attachment_uploads ~working_dir:session.working_dir paths
+        ) with
+        | Error error -> error_response error
+        | Ok files ->
+          match Discord_rest.create_message_with_attachments bot.rest
+            ~channel_id:thread_id ~content ~files () with
+          | Error error ->
+            error_response (Printf.sprintf
+              "Failed to send attachments: %s" error)
+          | Ok message ->
+            let file_count = List.length files in
+            ok_response [
+              ("thread_id", `String thread_id);
+              ("message_id", `String message.id);
+              ("file_count", `Int file_count);
+              ("filenames", `List (List.map (fun file ->
+                `String file.Discord_rest.filename) files));
+              ("message", `String (Printf.sprintf
+                "Sent %d attachment%s to <#%s>."
+                file_count (if file_count = 1 then "" else "s") thread_id));
+            ]
+
 let handle_restart (bot : Bot.t) =
   Bot.trigger_restart bot ~notify:(fun msg ->
     Logs.info (fun m -> m "control_api restart: %s" msg));
@@ -1359,6 +1538,9 @@ let all_method_specs = [
     ~handler:(fun bot params -> handle_stop_session bot params) ();
   method_spec ~id:Send_message_id ~mutability:Mutates_session ~mcp_exposed:true
     ~handler:(fun bot params -> handle_send_message bot params) ();
+  method_spec ~id:Send_attachments_id ~mutability:Mutates_discord
+    ~mcp_exposed:true
+    ~handler:(fun bot params -> handle_send_attachments bot params) ();
   method_spec ~id:Default_agent_id ~mutability:Mutates_runtime ~mcp_exposed:true
     ~handler:(fun bot params -> handle_default_agent bot params) ();
   method_spec ~id:Rescue_agent_id ~mutability:Mutates_runtime ~mcp_exposed:true

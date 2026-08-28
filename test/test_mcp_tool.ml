@@ -141,6 +141,7 @@ let expected_tool_ids = [
   Import_project;
   List_sessions;
   Send_message;
+  Send_attachments;
   Stop_session;
   List_claude_sessions;
   List_codex_sessions;

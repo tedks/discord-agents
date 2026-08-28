@@ -94,6 +94,23 @@ let handle_send_message control_client params =
     Control_api.Send_message_id
     Mcp_formatter.format_send_message
 
+let params_with_caller_thread_id caller_thread_id = function
+  | `Assoc fields ->
+    let fields = List.filter (fun (key, _) ->
+      not (String.equal key Control_api.caller_thread_id_param)
+    ) fields in
+    `Assoc (match caller_thread_id with
+      | Some thread_id ->
+        (Control_api.caller_thread_id_param, `String thread_id) :: fields
+      | None -> fields)
+  | params -> params
+
+let handle_send_attachments control_client ~caller_thread_id params =
+  let params = params_with_caller_thread_id caller_thread_id params in
+  request_and_format ~params control_client
+    Control_api.Send_attachments_id
+    Mcp_formatter.format_send_attachments
+
 let handle_stop_session control_client params =
   request_and_format ~params control_client
     Control_api.Stop_session_id
@@ -159,13 +176,16 @@ let handle_refresh_projects control_client =
     Control_api.Refresh_projects_id
     Mcp_formatter.format_refresh_projects
 
-let handle_tool_call ~control_client (call : Mcp_server.tool_call) =
+let handle_tool_call ~control_client ?caller_thread_id
+    (call : Mcp_server.tool_call) =
   match call.name with
   | "start_session" -> handle_start_session control_client call.arguments
   | "list_projects" -> handle_list_projects control_client
   | "import_project" -> handle_import_project control_client call.arguments
   | "list_sessions" -> handle_list_sessions control_client
   | "send_message" -> handle_send_message control_client call.arguments
+  | "send_attachments" ->
+    handle_send_attachments control_client ~caller_thread_id call.arguments
   | "stop_session" -> handle_stop_session control_client call.arguments
   | "list_claude_sessions" ->
     handle_list_claude_sessions control_client call.arguments
