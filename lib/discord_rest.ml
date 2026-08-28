@@ -796,7 +796,12 @@ let sanitize_attachment_filename filename =
     |> Filename.basename
     |> Resource.sanitize_utf8
   in
-  let basename = if basename = "" || basename = "." then "attachment" else basename in
+  let basename =
+    if basename = "" || basename = "." || basename = ".."
+       || basename = Filename.dir_sep
+    then "attachment"
+    else basename
+  in
   String.map (fun char ->
     let code = Char.code char in
     if code < 0x20 || code = 0x7f || char = '"' || char = '\\'

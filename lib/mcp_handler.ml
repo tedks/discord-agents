@@ -96,7 +96,9 @@ let handle_send_message control_client params =
 
 let params_with_caller_thread_id caller_thread_id = function
   | `Assoc fields ->
-    let fields = List.remove_assoc Control_api.caller_thread_id_param fields in
+    let fields = List.filter (fun (key, _) ->
+      not (String.equal key Control_api.caller_thread_id_param)
+    ) fields in
     `Assoc (match caller_thread_id with
       | Some thread_id ->
         (Control_api.caller_thread_id_param, `String thread_id) :: fields

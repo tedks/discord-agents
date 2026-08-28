@@ -207,7 +207,7 @@ let load_attachment_uploads ~working_dir paths =
                     close_fd ();
                     attachment_error raw_path message
                   | channel ->
-                    Fun.protect
+                    let loaded = Fun.protect
                       ~finally:(fun () -> close_in_noerr channel)
                       (fun () ->
                         let size = Int64.to_int stat.Unix.LargeFile.st_size in
@@ -234,7 +234,12 @@ let load_attachment_uploads ~working_dir paths =
                                 Discord_rest.content_type_of_filename filename;
                               contents;
                             } in
-                            loop next_total (upload :: uploads) rest)))
+                            Ok (next_total, upload))
+                    in
+                    match loaded with
+                    | Error _ as error -> error
+                    | Ok (next_total, upload) ->
+                      loop next_total (upload :: uploads) rest))
       in
       loop 0 [] paths
 
@@ -1440,8 +1445,9 @@ let handle_send_attachments (bot : Bot.t) params =
         error_response
           "The calling Discord session is no longer active; retry from an active thread."
       | Some session ->
-        match load_attachment_uploads
-          ~working_dir:session.working_dir paths with
+        match Eio_unix.run_in_systhread (fun () ->
+          load_attachment_uploads ~working_dir:session.working_dir paths
+        ) with
         | Error error -> error_response error
         | Ok files ->
           match Discord_rest.create_message_with_attachments bot.rest

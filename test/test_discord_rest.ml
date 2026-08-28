@@ -439,6 +439,10 @@ let test_attachment_filename_and_content_type () =
   Alcotest.(check string) "header characters sanitized"
     "bad___.log"
     (Rest.sanitize_attachment_filename "../bad\"\r\n.log");
+  Alcotest.(check string) "parent path fallback"
+    "attachment" (Rest.sanitize_attachment_filename "..");
+  Alcotest.(check string) "root path fallback"
+    "attachment" (Rest.sanitize_attachment_filename Filename.dir_sep);
   Alcotest.(check string) "known extension"
     "image/png" (Rest.content_type_of_filename "CHART.PNG");
   Alcotest.(check string) "unknown extension"

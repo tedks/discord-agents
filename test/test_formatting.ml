@@ -3534,14 +3534,29 @@ let test_escape_toml_string_control_chars () =
 let test_child_environment_sets_thread_id_once () =
   let key = Discord_agents.Agent_process.session_thread_id_env in
   let expected = key ^ "=discord-thread-123" in
+  let environment = [|
+    "PATH=/bin";
+    key ^ "=stale-thread";
+    "HOME=/tmp";
+    key ^ "=duplicate-stale-thread";
+  |] in
   let matches =
     Discord_agents.Agent_process.child_environment
+      ~environment
       ~thread_id:"discord-thread-123"
+      ()
     |> Array.to_list
     |> List.filter (String.starts_with ~prefix:(key ^ "="))
   in
   Alcotest.(check (list string)) "one authoritative thread id"
-    [expected] matches
+    [expected] matches;
+  Alcotest.(check (list string)) "unrelated entries preserved"
+    ["PATH=/bin"; "HOME=/tmp"]
+    (Discord_agents.Agent_process.child_environment
+       ~environment ~thread_id:"discord-thread-123" ()
+     |> Array.to_list
+     |> List.filter (fun entry ->
+       not (String.starts_with ~prefix:(key ^ "=") entry)))
 
 let compose ~agent_kind ~system_prompt ~message_count ~user_prompt =
   Discord_agents.Agent_process.compose_session_prompt

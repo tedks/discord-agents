@@ -1804,10 +1804,10 @@ let session_thread_id_env = "DISCORD_AGENTS_THREAD_ID"
 (** Build the child environment with caller identity supplied by the bot.
     Remove any inherited value first so restarting the bot from inside an
     agent session cannot leak that session's thread id into later children. *)
-let child_environment ~thread_id =
+let child_environment ?(environment = Unix.environment ()) ~thread_id () =
   let prefix = session_thread_id_env ^ "=" in
   let inherited =
-    Unix.environment ()
+    environment
     |> Array.to_list
     |> List.filter (fun entry -> not (String.starts_with ~prefix entry))
   in
@@ -1863,7 +1863,7 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~thread_id ~message_co
   let mgr = Eio.Stdenv.process_mgr env in
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
-  let child_env = child_environment ~thread_id in
+  let child_env = child_environment ~thread_id () in
   (* Codex/Gemini get the system prompt prepended to the first user
      turn (compose_session_prompt); Claude gets it via the dedicated
      [--append-system-prompt] flag instead. *)
