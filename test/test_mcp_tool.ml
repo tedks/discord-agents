@@ -183,6 +183,26 @@ let test_tool_definitions_match_python () =
     (python_tools_json ())
     Mcp_tool.tool_definitions_json
 
+let test_start_session_model_schema_is_optional_and_nullable () =
+  let start_session =
+    Mcp_tool.all_specs
+    |> List.find (fun spec -> Mcp_tool.spec_id spec = Mcp_tool.Start_session)
+  in
+  let schema = Mcp_tool.input_schema start_session in
+  let open Yojson.Safe.Util in
+  let model = schema |> member "properties" |> member "model" in
+  check_json "model type"
+    (`List [`String "string"; `String "null"])
+    (model |> member "type");
+  Alcotest.(check int) "model maxLength" 200
+    (model |> member "maxLength" |> to_int);
+  let required =
+    schema |> member "required" |> to_list
+    |> List.map to_string
+  in
+  Alcotest.(check bool) "model is optional" false
+    (List.mem "model" required)
+
 let test_control_methods_are_exposed () =
   let tool_methods =
     Mcp_tool.all_specs
@@ -259,6 +279,8 @@ let () =
         test_tool_names_are_unique;
       Alcotest.test_case "tool definitions match Python" `Quick
         test_tool_definitions_match_python;
+      Alcotest.test_case "start_session model is optional and nullable" `Quick
+        test_start_session_model_schema_is_optional_and_nullable;
       Alcotest.test_case "tool names match Python order" `Quick
         test_tool_names_match_python_order;
       Alcotest.test_case "control methods are exposed" `Quick

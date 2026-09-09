@@ -288,6 +288,29 @@ let test_hours_param_defaults () =
   Alcotest.(check int) "non-object params" 24
     (Control_api.hours_param (Some (`List [])))
 
+let test_model_override_normalization () =
+  Alcotest.(check (option string)) "trimmed model"
+    (Some "claude-sonnet-4-5")
+    (Control_api.model_override_of_json
+      (`String "  claude-sonnet-4-5  "));
+  Alcotest.(check (option string)) "blank uses default" None
+    (Control_api.model_override_of_json (`String "  "));
+  Alcotest.(check (option string)) "default keyword clears" None
+    (Control_api.model_override_of_json (`String "DEFAULT"));
+  Alcotest.(check (option string)) "null clears" None
+    (Control_api.model_override_of_json `Null);
+  let long_model = String.make 201 'm' in
+  let truncated = Control_api.model_override_of_json (`String long_model) in
+  Alcotest.(check int) "model capped at 200 bytes" 200
+    (Option.fold ~none:0 ~some:String.length truncated);
+  let split_codepoint = String.make 199 'm' ^ "\u{00e9}" in
+  Alcotest.(check (option string)) "model cap preserves UTF-8"
+    (Some (String.make 199 'm'))
+    (Control_api.model_override_of_json (`String split_codepoint));
+  Alcotest.check_raises "non-string model rejected"
+    (Failure "model must be a string or null")
+    (fun () -> ignore (Control_api.model_override_of_json (`Int 1)))
+
 let test_attachment_paths_are_confined_to_worktree () =
   let root = Filename.temp_dir "discord_agents_attachments_" "" in
   let inside = Filename.concat root "report.log" in
@@ -348,6 +371,8 @@ let () =
         test_attachment_paths_are_confined_to_worktree;
       Alcotest.test_case "hours_param defaults" `Quick
         test_hours_param_defaults;
+      Alcotest.test_case "model override normalization" `Quick
+        test_model_override_normalization;
     ]);
     ("metadata", [
       Alcotest.test_case "specs cover method ids" `Quick

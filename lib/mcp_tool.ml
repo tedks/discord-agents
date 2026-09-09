@@ -130,6 +130,9 @@ let all_specs = [
       ("thread_name", property ~type_:string_type
         ~description:"Short descriptive name for the thread (max 80 chars). If omitted, uses a default name."
         ~max_length:80 ());
+      ("model", property ~type_:(`List [string_type; null_type])
+        ~description:"Model name to pass to the agent CLI from the first invocation onward. Omit it or pass default/null to use the agent's configured default. Capped at 200 bytes on the server."
+        ~max_length:200 ());
       ("initial_prompt", property ~type_:string_type
         ~description:"First message to send to the new agent. Posted visibly in the thread, then the agent starts working on it immediately \u{2014} the user does not need to send a follow-up. Keep it concise: describe the goal and any key context, not step-by-step instructions. Capped at 1900 *bytes* on the server (UTF-8 codepoint-aware truncation, so multi-byte characters can shorten the effective char count); the maxLength below is the worst case (all-ASCII)."
         ~max_length:1900 ());
