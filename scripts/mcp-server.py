@@ -110,6 +110,11 @@ TOOLS = [
                     "description": "Short descriptive name for the thread (max 80 chars). If omitted, uses a default name.",
                     "maxLength": 80
                 },
+                "model": {
+                    "type": "string",
+                    "description": "Model name to pass to the agent CLI from the first invocation onward. If omitted, uses the agent's configured default. Capped at 200 bytes on the server.",
+                    "maxLength": 200
+                },
                 "initial_prompt": {
                     "type": "string",
                     "description": "First message to send to the new agent. Posted visibly in the thread, then the agent starts working on it immediately — the user does not need to send a follow-up. Keep it concise: describe the goal and any key context, not step-by-step instructions. Capped at 1900 *bytes* on the server (UTF-8 codepoint-aware truncation, so multi-byte characters can shorten the effective char count); the maxLength below is the worst case (all-ASCII).",

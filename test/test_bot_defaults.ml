@@ -1662,6 +1662,108 @@ let record_process_hooks ?set_session_id ?capture_child_process ?run_agent
          effects := Message_sent content :: !effects);
   }
 
+let test_start_session_model_reaches_first_agent_invocation () =
+  let repo = make_tmp_dir "discord_agents_start_model_repo_" in
+  Fun.protect ~finally:(fun () -> rm_rf repo) (fun () ->
+    run_git (Printf.sprintf "git -C %s init -q --initial-branch=main"
+      (Filename.quote repo));
+    run_git (Printf.sprintf "git -C %s config user.email test@example.invalid"
+      (Filename.quote repo));
+    run_git (Printf.sprintf "git -C %s config user.name 'Discord Agents Test'"
+      (Filename.quote repo));
+    let readme = open_out (Filename.concat repo "README.md") in
+    output_string readme "test repo\n";
+    close_out readme;
+    run_git (Printf.sprintf "git -C %s add README.md" (Filename.quote repo));
+    run_git (Printf.sprintf "git -C %s commit -q -m initial"
+      (Filename.quote repo));
+    let project = Discord_agents.Project.{
+      name = "model-project";
+      path = repo;
+      is_bare = false;
+      remote_url = None;
+    } in
+    let thread : Discord_agents.Discord_types.channel = {
+      id = "model-thread";
+      type_ = Guild_public_thread;
+      guild_id = Some "guild-1";
+      name = Some "model test";
+      topic = None;
+      parent_id = Some "project-channel";
+    } in
+    let initial_prompt = "verify the selected model" in
+    let thread_json =
+      Discord_agents.Discord_types.yojson_of_channel thread
+      |> Yojson.Safe.to_string
+    in
+    let rest_call ~headers:_ ?body meth uri =
+      let path = Uri.path uri in
+      if String.ends_with ~suffix:"/channels/project-channel/threads" path
+      then begin
+        Alcotest.(check string) "create thread method" "POST"
+          (Http.Method.to_string meth);
+        response 200 thread_json
+      end else if String.ends_with ~suffix:"/channels/model-thread/messages" path
+      then begin
+        Alcotest.(check string) "create message method" "POST"
+          (Http.Method.to_string meth);
+        let content = request_body_content body in
+        let message_id =
+          if String.equal content initial_prompt then "initial-prompt"
+          else "announcement"
+        in
+        response 200
+          (posted_message_json ~id:message_id ~channel_id:"model-thread"
+             ~content)
+      end else
+        Alcotest.failf "unexpected REST request: %s %s"
+          (Http.Method.to_string meth) path
+    in
+    with_test_bot ~rest_call (fun bot ->
+      set_projects bot [project];
+      Discord_agents.Channel_manager.add bot.project_state.channels
+        ~project_name:project.name ~channel_id:"project-channel";
+      let invocation = ref None in
+      let effects = ref [] in
+      let process_hooks = record_process_hooks effects
+        ~run_agent:(fun ~sw:_ ~env:_ ~rest:_ ~session ~channel_id:_ ~prompt
+                       ~attachments:_ ~author_name:_ ~channel_name:_
+                       ~channel_type:_ ~wrap_width:_ ~output_lines:_
+                       ~on_scroll_content:_ ~on_pid:_ ~on_session_id:_ () ->
+          invocation := Some (session.message_count, session.model, prompt);
+          Ok ())
+      in
+      let fork_initial_prompt_run bot ~session ~msg =
+        Fun.protect
+          ~finally:(fun () ->
+            Discord_agents.Bot.finalize_session_run
+              ~notify_stopped:false bot session)
+          (fun () ->
+            Discord_agents.Bot.process_session_message_with_hooks
+              process_hooks bot session msg (Some thread))
+      in
+      let response =
+        Discord_agents.Control_api.handle_start_session
+          ~fork_initial_prompt_run bot
+          (Some (`Assoc [
+            ("project", `String project.name);
+            ("agent", `String "claude");
+            ("model", `String "  claude-sonnet-4-5  ");
+            ("initial_prompt", `String initial_prompt);
+          ]))
+      in
+      Alcotest.(check bool) "start_session succeeded" true
+        (match response with
+         | `Assoc fields -> List.assoc_opt "ok" fields = Some (`Bool true)
+         | _ -> false);
+      match !invocation with
+      | None -> Alcotest.fail "expected the initial prompt to invoke the agent"
+      | Some (message_count, model, prompt) ->
+        Alcotest.(check int) "first invocation" 0 message_count;
+        Alcotest.(check (option string)) "selected model"
+          (Some "claude-sonnet-4-5") model;
+        Alcotest.(check string) "initial prompt" initial_prompt prompt))
+
 let checkpoint_failure_message =
   "Run aborted because the bot could not persist or confirm restart state for the spawned agent process. The agent may have exited before it could be tracked, or the bot may have hit a storage error. Try again; if it keeps happening, check bot logs and disk health."
 
@@ -2173,6 +2275,8 @@ let () =
         test_persist_completed_run_rolls_back_active_run_on_save_failure;
       Alcotest.test_case "process message aborts when child identity is unavailable" `Quick
         test_process_session_message_aborts_when_child_identity_is_missing;
+      Alcotest.test_case "start_session model reaches first agent invocation" `Quick
+        test_start_session_model_reaches_first_agent_invocation;
       Alcotest.test_case "process message aborts on session id persist failure" `Quick
         test_process_session_message_aborts_on_session_id_persist_failure;
       Alcotest.test_case "process message keeps run replayable on completion persist failure" `Quick

@@ -527,7 +527,23 @@ let handle_list_gemini_sessions _bot params =
   ) sessions in
   ok_response [("sessions", `List items)]
 
-let handle_start_session (bot : Bot.t) params =
+let json_field params name =
+  match params with
+  | `Assoc fields -> List.assoc_opt name fields
+  | _ -> None
+
+let model_override_of_json = function
+  | `Null -> None
+  | `String s ->
+    let s = String.trim s in
+    if s = "" || String.equal (String.lowercase_ascii s) "default"
+    then None
+    else Some (Resource.truncate_utf8 ~max_bytes:200 s)
+  | _ -> failwith "model must be a string or null"
+
+let handle_start_session
+    ?(fork_initial_prompt_run = Bot.fork_initial_prompt_run)
+    (bot : Bot.t) params =
   let open Yojson.Safe.Util in
   let params = match params with Some p -> p | None ->
     failwith "missing params" in
@@ -553,6 +569,10 @@ let handle_start_session (bot : Bot.t) params =
       let kind = match Config.agent_kind_of_string kind_str with
         | Ok k -> k | Error _ -> failwith ("unknown agent: " ^ kind_str) in
       let thread_name = params |> member "thread_name" |> to_string_option in
+      let model = match json_field params "model" with
+        | None -> None
+        | Some json -> model_override_of_json json
+      in
       let initial_prompt = params |> member "initial_prompt" |> to_string_option in
       let initial_prompt = match initial_prompt with
         | Some s ->
@@ -649,7 +669,7 @@ let handle_start_session (bot : Bot.t) params =
           let session = Session_store.make_session
             ~project_name:p.name ~working_dir ~agent_kind:kind
             ~session_id ~thread_id:thread_ch.Discord_types.id
-            ~system_prompt:None ~initial_prompt:None () in
+            ~system_prompt:None ~model ~initial_prompt:None () in
           (* Race-safe ordering for the auto-trigger.
 
              When an initial_prompt is set, we MUST publish the
@@ -732,7 +752,7 @@ let handle_start_session (bot : Bot.t) params =
                  error_response (Printf.sprintf
                    "Failed to post initial_prompt: %s%s" e suffix)
                | Ok prompt_msg ->
-                 Bot.fork_initial_prompt_run bot
+                 fork_initial_prompt_run bot
                    ~session ~msg:prompt_msg;
                  ok_response [
                    ("thread_id", `String thread_ch.id);
@@ -1121,11 +1141,6 @@ let string_param_opt params name =
   | `Null -> None
   | json -> to_string_option json
 
-let json_field params name =
-  match params with
-  | `Assoc fields -> List.assoc_opt name fields
-  | _ -> None
-
 let handle_set_model (bot : Bot.t) params =
   let open Yojson.Safe.Util in
   let params = match params with Some p -> p | None ->
@@ -1138,13 +1153,7 @@ let handle_set_model (bot : Bot.t) params =
       match json_field params "model" with
       | None ->
         failwith "model is required; use null, empty string, or default to clear"
-      | Some `Null -> None
-      | Some (`String s) ->
-        let s = String.trim s in
-        if s = "" || String.equal (String.lowercase_ascii s) "default"
-        then None
-        else Some (Resource.truncate_utf8 ~max_bytes:200 s)
-      | Some _ -> failwith "model must be a string or null"
+      | Some json -> model_override_of_json json
     in
     (match Session_store.set_model bot.sessions session model with
      | Error err -> error_response err
