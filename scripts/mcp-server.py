@@ -111,8 +111,8 @@ TOOLS = [
                     "maxLength": 80
                 },
                 "model": {
-                    "type": "string",
-                    "description": "Model name to pass to the agent CLI from the first invocation onward. If omitted, uses the agent's configured default. Capped at 200 bytes on the server.",
+                    "type": ["string", "null"],
+                    "description": "Model name to pass to the agent CLI from the first invocation onward. Omit it or pass default/null to use the agent's configured default. Capped at 200 bytes on the server.",
                     "maxLength": 200
                 },
                 "initial_prompt": {
