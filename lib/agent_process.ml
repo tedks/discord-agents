@@ -1180,11 +1180,12 @@ let model_arg = function
   | _ -> []
 
 let claude_args ~model ~reasoning_effort
-    ~session_id ~message_count ~fork_from_session_id ~prompt =
+    ~session_id ~session_id_confirmed ~message_count:_
+    ~fork_from_session_id ~prompt =
   let session_flag =
     match fork_from_session_id with
     | Some fork_from -> ["--resume"; fork_from; "--fork-session"]
-    | None when message_count = 0 -> ["--session-id"; session_id]
+    | None when not session_id_confirmed -> ["--session-id"; session_id]
     | None ->
       ["--resume"; session_id]
   in
@@ -1876,7 +1877,8 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~thread_id ~message_co
   let args = match kind with
     | Config.Claude ->
       let base = claude_args ~model ~reasoning_effort
-          ~fork_from_session_id ~session_id ~message_count ~prompt
+          ~fork_from_session_id ~session_id ~session_id_confirmed
+          ~message_count ~prompt
       in
       let base =
         (* No resolvable server: start without the flag rather than

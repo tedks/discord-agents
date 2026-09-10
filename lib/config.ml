@@ -102,9 +102,10 @@ let find_with_preferred_agent preferred f =
     (Claude's [--session-id]) or allocates its own server-side and
     emits it on first run (Codex's [thread.started], Gemini's [init]).
 
-    [Session_store.session_id_confirmed] defaults from this:
-    caller-pinned ids are confirmed at creation; server-allocated ids
-    start unconfirmed until the parser sees the first event. *)
+    This remains the compatibility default for persisted sessions
+    written before [Session_store.session_id_confirmed] existed.
+    Fresh sessions of every kind start unconfirmed until their first
+    process spawn or server-side id event is durably recorded. *)
 let caller_pinned_session_id = function
   | Claude -> true
   | Codex | Gemini -> false
