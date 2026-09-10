@@ -1439,16 +1439,60 @@ let contains_substring text needle =
       else scan (i + 1)
     in scan 0
 
-let claude_session_id_in_use_error error =
-  let normalized = String.lowercase_ascii error in
-  contains_substring normalized "session id"
-  && contains_substring normalized "already in use"
+let error_has_diagnostic_line ~diagnostic error =
+  String.split_on_char '\n' error
+  |> List.exists (fun line ->
+       String.ends_with ~suffix:diagnostic (String.trim line))
 
-let should_retry_claude_with_resume
-    ~session_id_confirmed ~fork_from_session_id error =
-  not session_id_confirmed
-  && Option.is_none fork_from_session_id
-  && claude_session_id_in_use_error error
+let claude_session_id_in_use_error ~session_id error =
+  error_has_diagnostic_line error
+    ~diagnostic:(Printf.sprintf
+      "Error: Session ID %s is already in use." session_id)
+
+let claude_session_id_missing_error ~session_id error =
+  error_has_diagnostic_line error
+    ~diagnostic:(Printf.sprintf
+      "No conversation found with session ID: %s" session_id)
+
+let claude_retry_confirmation
+    ~session_id ~session_id_confirmed ~fork_from_session_id error =
+  if Option.is_some fork_from_session_id then
+    None
+  else if not session_id_confirmed
+          && claude_session_id_in_use_error ~session_id error then
+    Some true
+  else if session_id_confirmed
+          && claude_session_id_missing_error ~session_id error then
+    Some false
+  else
+    None
+
+let run_with_claude_session_recovery
+    ~kind ~session_id ~session_id_confirmed ~fork_from_session_id ~run =
+  match run session_id_confirmed with
+  | Result.Error error ->
+    (match kind with
+     | Config.Claude ->
+       (match claude_retry_confirmation
+                ~session_id ~session_id_confirmed
+                ~fork_from_session_id error with
+        | Some retry_confirmation ->
+          let retry_flag =
+            if retry_confirmation then "--resume" else "--session-id"
+          in
+          Logs.warn (fun m ->
+            m "agent_process: recovering Claude session id %s; retrying once with %s"
+              session_id retry_flag);
+          (match run retry_confirmation with
+           | Result.Ok () -> Result.Ok ()
+           | Result.Error retry_error ->
+             Result.Error (Printf.sprintf
+               "Claude %s recovery retry failed: %s"
+               retry_flag retry_error))
+        | None -> Result.Error error)
+     | Config.Codex
+     | Config.Gemini -> Result.Error error)
+  | Result.Ok () -> Result.Ok ()
 
 (** Claude: write the MCP config to a well-known location and return
     the path for [--mcp-config]. *)
@@ -1992,18 +2036,7 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~thread_id ~message_co
       close_noerr stdout_w;
       raise exn
   in
-  match run_once (command_args ~session_id_confirmed) with
-  | Error error when
-      Config.equal_agent_kind kind Config.Claude
-      && should_retry_claude_with_resume
-           ~session_id_confirmed ~fork_from_session_id error ->
-    Logs.warn (fun m ->
-      m "agent_process: Claude session id %s was already claimed; retrying once with --resume"
-        session_id);
-    (match run_once (command_args ~session_id_confirmed:true) with
-     | Ok () -> Ok ()
-     | Error retry_error ->
-       Error (Printf.sprintf
-         "resume retry after Claude session-id collision failed: %s"
-         retry_error))
-  | result -> result
+  run_with_claude_session_recovery
+    ~kind ~session_id ~session_id_confirmed ~fork_from_session_id
+    ~run:(fun confirmed ->
+      run_once (command_args ~session_id_confirmed:confirmed))
