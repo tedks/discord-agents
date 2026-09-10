@@ -1830,6 +1830,31 @@ let test_process_session_message_aborts_on_session_id_persist_failure () =
     Alcotest.(check bool) "active run cleared in memory"
       true (Option.is_none session.active_run))
 
+let test_process_session_message_replaces_retry_child_pid () =
+  with_test_bot (fun bot ->
+    let session = make_session Discord_agents.Config.Claude in
+    Discord_agents.Session_store.add bot.sessions ~thread_id:"control" session;
+    let effects = ref [] in
+    let hooks = record_process_hooks effects
+      ~capture_child_process:(fun pid ->
+        Some (Discord_agents.Agent_checkpoint.child_process_identity
+          ~pid ~start_ticks:(Int64.of_int pid)))
+      ~run_agent:(fun ~sw:_ ~env:_ ~rest:_ ~session:_ ~channel_id:_ ~prompt:_
+                     ~attachments:_ ~author_name:_ ~channel_name:_ ~channel_type:_
+                     ~wrap_width:_ ~output_lines:_ ~on_scroll_content:_
+                     ~on_pid ~on_session_id:_ () ->
+        on_pid 424242;
+        on_pid 424243;
+        Error "retry failed")
+    in
+    Discord_agents.Bot.process_session_message_with_hooks hooks bot session
+      (make_message "hello") None;
+    Alcotest.(check bool) "prior retry child unregistered" true
+      (Discord_agents.Bot.Pid_set.is_empty
+        (Discord_agents.Bot.get_child_pids bot));
+    Alcotest.(check (option int)) "current child cleared after cleanup"
+      None session.child_pid)
+
 let test_process_session_message_keeps_run_replayable_on_completion_persist_failure () =
   with_test_bot (fun bot ->
     let session = make_session Discord_agents.Config.Claude in
@@ -2279,6 +2304,8 @@ let () =
         test_start_session_model_reaches_first_agent_invocation;
       Alcotest.test_case "process message aborts on session id persist failure" `Quick
         test_process_session_message_aborts_on_session_id_persist_failure;
+      Alcotest.test_case "process message replaces retry child pid" `Quick
+        test_process_session_message_replaces_retry_child_pid;
       Alcotest.test_case "process message keeps run replayable on completion persist failure" `Quick
         test_process_session_message_keeps_run_replayable_on_completion_persist_failure;
       Alcotest.test_case "draining routes commands through command policy" `Quick

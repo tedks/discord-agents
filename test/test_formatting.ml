@@ -1932,7 +1932,7 @@ let test_make_session_default_gemini_unconfirmed () =
     "fresh Gemini default is unconfirmed (id is placeholder until init)"
     false s.session_id_confirmed
 
-let test_make_session_default_claude_confirmed () =
+let test_make_session_default_claude_unconfirmed () =
   let s = Discord_agents.Session_store.make_session
     ~project_name:"foo" ~working_dir:"/tmp/foo"
     ~agent_kind:Discord_agents.Config.Claude
@@ -1940,8 +1940,8 @@ let test_make_session_default_claude_confirmed () =
     ~thread_id:"123" ~system_prompt:None ~initial_prompt:None ()
   in
   Alcotest.(check bool)
-    "Claude default is confirmed (--session-id pins it)"
-    true s.session_id_confirmed
+    "fresh Claude default is unconfirmed until spawn"
+    false s.session_id_confirmed
 
 let test_fork_from_session_id_roundtrip_and_set_session_id_clears () =
   let session = Discord_agents.Session_store.make_session
@@ -2101,8 +2101,8 @@ let session_store_tests = [
     test_make_session_resume_override_gemini_confirms;
   Alcotest.test_case "fresh Gemini default unconfirmed" `Quick
     test_make_session_default_gemini_unconfirmed;
-  Alcotest.test_case "fresh Claude default confirmed" `Quick
-    test_make_session_default_claude_confirmed;
+  Alcotest.test_case "fresh Claude default unconfirmed" `Quick
+    test_make_session_default_claude_unconfirmed;
   Alcotest.test_case "fork source roundtrip and clear" `Quick
     test_fork_from_session_id_roundtrip_and_set_session_id_clears;
   Alcotest.test_case "pending agent kind roundtrip" `Quick
@@ -3351,10 +3351,14 @@ let resume_helpers_tests = [
 (* ── claude_args ───────────────────────────────────────────────────── *)
 
 let claude_args = Discord_agents.Agent_process.claude_args
+let claude_retry_confirmation =
+  Discord_agents.Agent_process.claude_retry_confirmation
+let run_with_claude_session_recovery =
+  Discord_agents.Agent_process.run_with_claude_session_recovery
 
 let test_claude_args_fresh () =
   let args = claude_args ~session_id:"new-id"
-    ~message_count:0 ~fork_from_session_id:None
+    ~session_id_confirmed:false ~message_count:0 ~fork_from_session_id:None
     ~model:None ~reasoning_effort:None ~prompt:"hello" in
   Alcotest.(check (list string)) "fresh pins caller id"
     ["claude"; "-p"; "--verbose"; "--output-format"; "stream-json";
@@ -3363,27 +3367,107 @@ let test_claude_args_fresh () =
 
 let test_claude_args_resume () =
   let args = claude_args ~session_id:"existing-id"
-    ~message_count:2 ~fork_from_session_id:None
+    ~session_id_confirmed:true ~message_count:2 ~fork_from_session_id:None
     ~model:None ~reasoning_effort:None ~prompt:"continue" in
   Alcotest.(check (list string)) "resume existing id"
     ["claude"; "-p"; "--verbose"; "--output-format"; "stream-json";
      "--resume"; "existing-id"; "continue"]
     args
 
+let test_claude_args_claimed_first_turn_failure_resumes () =
+  let args = claude_args ~session_id:"claimed-id"
+    ~session_id_confirmed:true ~message_count:0 ~fork_from_session_id:None
+    ~model:None ~reasoning_effort:None ~prompt:"retry" in
+  Alcotest.(check (list string)) "claimed id resumes despite zero messages"
+    ["claude"; "-p"; "--verbose"; "--output-format"; "stream-json";
+     "--resume"; "claimed-id"; "retry"]
+    args
+
 let test_claude_args_native_fork () =
   let args = claude_args ~fork_from_session_id:(Some "source-id")
-    ~session_id:"placeholder-new-id" ~message_count:0
+    ~session_id:"placeholder-new-id" ~session_id_confirmed:false
+    ~message_count:0
     ~model:None ~reasoning_effort:None ~prompt:"fork turn" in
   Alcotest.(check (list string)) "fork resumes source with --fork-session"
     ["claude"; "-p"; "--verbose"; "--output-format"; "stream-json";
      "--resume"; "source-id"; "--fork-session"; "fork turn"]
     args
 
+let test_claude_collision_retries_only_fresh_nonfork () =
+  let session_id = "abc" in
+  let collision =
+    "Error: Session ID abc is already in use."
+  in
+  Alcotest.(check (option bool)) "fresh invocation resumes" (Some true)
+    (claude_retry_confirmation ~session_id
+       ~session_id_confirmed:false ~message_count:0
+       ~fork_from_session_id:None collision);
+  Alcotest.(check (option bool)) "confirmed invocation does not retry" None
+    (claude_retry_confirmation ~session_id
+       ~session_id_confirmed:true ~message_count:0
+       ~fork_from_session_id:None collision);
+  Alcotest.(check (option bool)) "native fork does not retry" None
+    (claude_retry_confirmation ~session_id
+       ~session_id_confirmed:false ~message_count:0
+       ~fork_from_session_id:(Some "source-id") collision);
+  Alcotest.(check (option bool)) "wrong session id does not retry" None
+    (claude_retry_confirmation ~session_id:"different-id"
+       ~session_id_confirmed:false ~message_count:0
+       ~fork_from_session_id:None collision);
+  Alcotest.(check (option bool)) "unrelated error does not retry" None
+    (claude_retry_confirmation ~session_id
+       ~session_id_confirmed:false ~message_count:0
+       ~fork_from_session_id:None
+       "You're out of usage credits")
+
+let test_claude_missing_confirmed_session_retries_creation () =
+  let error =
+    "agent exited with code 1: No conversation found with session ID: abc"
+  in
+  Alcotest.(check (option bool)) "missing resume retries creation" (Some false)
+    (claude_retry_confirmation ~session_id:"abc"
+       ~session_id_confirmed:true ~message_count:0
+       ~fork_from_session_id:None error);
+  Alcotest.(check (option bool)) "established session is not recreated" None
+    (claude_retry_confirmation ~session_id:"abc"
+       ~session_id_confirmed:true ~message_count:1
+       ~fork_from_session_id:None error)
+
+let test_claude_collision_recovery_runs_once_with_resume () =
+  let attempts = ref [] in
+  let run confirmed =
+    attempts := confirmed :: !attempts;
+    match List.length !attempts with
+    | 1 -> Error "agent exited with code 1: Error: Session ID abc is already in use."
+    | _ -> Error "retry also failed"
+  in
+  let result = run_with_claude_session_recovery
+    ~kind:Discord_agents.Config.Claude
+    ~session_id:"abc" ~session_id_confirmed:false
+    ~message_count:0
+    ~fork_from_session_id:None ~run
+  in
+  Alcotest.(check (list bool)) "creation then resume, with no third attempt"
+    [false; true] (List.rev !attempts);
+  match result with
+  | Ok () -> Alcotest.fail "expected retry failure"
+  | Error error ->
+    Alcotest.(check bool) "retry failure identifies resume recovery" true
+      (contains_substring error "Claude --resume recovery retry failed")
+
 let claude_args_tests = [
   Alcotest.test_case "fresh invocation args" `Quick test_claude_args_fresh;
   Alcotest.test_case "resume invocation args" `Quick test_claude_args_resume;
+  Alcotest.test_case "claimed first-turn failure resumes" `Quick
+    test_claude_args_claimed_first_turn_failure_resumes;
   Alcotest.test_case "native fork invocation args" `Quick
     test_claude_args_native_fork;
+  Alcotest.test_case "collision retries only fresh nonfork" `Quick
+    test_claude_collision_retries_only_fresh_nonfork;
+  Alcotest.test_case "missing confirmed session retries creation" `Quick
+    test_claude_missing_confirmed_session_retries_creation;
+  Alcotest.test_case "collision recovery runs once with resume" `Quick
+    test_claude_collision_recovery_runs_once_with_resume;
 ]
 
 (* ── codex_args ────────────────────────────────────────────────────── *)

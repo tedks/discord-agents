@@ -1180,11 +1180,12 @@ let model_arg = function
   | _ -> []
 
 let claude_args ~model ~reasoning_effort
-    ~session_id ~message_count ~fork_from_session_id ~prompt =
+    ~session_id ~session_id_confirmed ~message_count:_
+    ~fork_from_session_id ~prompt =
   let session_flag =
     match fork_from_session_id with
     | Some fork_from -> ["--resume"; fork_from; "--fork-session"]
-    | None when message_count = 0 -> ["--session-id"; session_id]
+    | None when not session_id_confirmed -> ["--session-id"; session_id]
     | None ->
       ["--resume"; session_id]
   in
@@ -1437,6 +1438,63 @@ let contains_substring text needle =
       else if String.sub text i nlen = needle then true
       else scan (i + 1)
     in scan 0
+
+let error_has_diagnostic_line ~diagnostic error =
+  String.split_on_char '\n' error
+  |> List.exists (fun line ->
+       String.ends_with ~suffix:diagnostic (String.trim line))
+
+let claude_session_id_in_use_error ~session_id error =
+  error_has_diagnostic_line error
+    ~diagnostic:(Printf.sprintf
+      "Error: Session ID %s is already in use." session_id)
+
+let claude_session_id_missing_error ~session_id error =
+  error_has_diagnostic_line error
+    ~diagnostic:(Printf.sprintf
+      "No conversation found with session ID: %s" session_id)
+
+let claude_retry_confirmation
+    ~session_id ~session_id_confirmed ~message_count
+    ~fork_from_session_id error =
+  if Option.is_some fork_from_session_id then
+    None
+  else if not session_id_confirmed
+          && claude_session_id_in_use_error ~session_id error then
+    Some true
+  else if session_id_confirmed && message_count = 0
+          && claude_session_id_missing_error ~session_id error then
+    Some false
+  else
+    None
+
+let run_with_claude_session_recovery
+    ~kind ~session_id ~session_id_confirmed ~message_count
+    ~fork_from_session_id ~run =
+  match run session_id_confirmed with
+  | Result.Error error ->
+    (match kind with
+     | Config.Claude ->
+       (match claude_retry_confirmation
+                ~session_id ~session_id_confirmed ~message_count
+                ~fork_from_session_id error with
+        | Some retry_confirmation ->
+          let retry_flag =
+            if retry_confirmation then "--resume" else "--session-id"
+          in
+          Logs.warn (fun m ->
+            m "agent_process: recovering Claude session id %s; retrying once with %s"
+              session_id retry_flag);
+          (match run retry_confirmation with
+           | Result.Ok () -> Result.Ok ()
+           | Result.Error retry_error ->
+             Result.Error (Printf.sprintf
+               "Claude %s recovery retry failed: %s"
+               retry_flag retry_error))
+        | None -> Result.Error error)
+     | Config.Codex
+     | Config.Gemini -> Result.Error error)
+  | Result.Ok () -> Result.Ok ()
 
 (** Claude: write the MCP config to a well-known location and return
     the path for [--mcp-config]. *)
@@ -1857,7 +1915,7 @@ let compose_session_prompt ~agent_kind ~system_prompt ~message_count
     so the caller can track active subprocesses for cleanup.
     Returns when the process exits. *)
 let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~thread_id ~message_count
-    ?fork_from_session_id ?(session_id_confirmed=true) ?system_prompt
+    ?fork_from_session_id ?(session_id_confirmed=false) ?system_prompt
     ?(model=None) ?(reasoning_effort=None) ?(goal_context=None)
     ~prompt ~on_event ?on_pid () =
   let mgr = Eio.Stdenv.process_mgr env in
@@ -1873,98 +1931,115 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~thread_id ~message_co
   let close_noerr flow =
     try Eio.Resource.close flow with _ -> ()
   in
-  let args = match kind with
+  let claude_mcp_arg = match kind with
     | Config.Claude ->
-      let base = claude_args ~model ~reasoning_effort
-          ~fork_from_session_id ~session_id ~message_count ~prompt
-      in
-      let base =
-        (* No resolvable server: start without the flag rather than
-           point Claude at a config naming a command that isn't there.
-           The error is already logged once at resolution. *)
-        match claude_mcp_config_path () with
-        | Some path -> base @ ["--mcp-config"; path]
-        | None -> base
-      in
-      (* --mcp-config is variadic in the Claude CLI: it keeps eating
-         following arguments as additional config paths until it hits
-         one starting with `-`. That is safe here only because the
-         prompt positional is already in [base] and the sole thing
-         appended after is another flag. Anything non-flag appended
-         below would silently become a second config file, and Claude
-         hard-fails on a config path that doesn't exist. *)
-      (match system_prompt with
-       | Some sp -> base @ ["--append-system-prompt"; sp]
-       | None -> base)
-    | Config.Codex ->
-      codex_args ~model ~reasoning_effort
-        ~session_id ~session_id_confirmed ~prompt
-    | Config.Gemini ->
-      setup_gemini_mcp ~working_dir ();
-      gemini_args ~model ~session_id ~session_id_confirmed ~prompt
+      (* No resolvable server: start without the flag rather than
+         point Claude at a config naming a command that isn't there.
+         The error is already logged once at resolution. *)
+      (match claude_mcp_config_path () with
+       | Some path -> ["--mcp-config"; path]
+       | None -> [])
+    | Config.Codex
+    | Config.Gemini -> []
   in
-  let args = [setsid_command (); "--wait"] @ args in
-  let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in
-  try
-    let stderr_r, stderr_w = Eio.Process.pipe ~sw mgr in
+  (match kind with
+   | Config.Gemini -> setup_gemini_mcp ~working_dir ()
+   | Config.Claude
+   | Config.Codex -> ());
+  let command_args ~session_id_confirmed =
+    let agent_args = match kind with
+      | Config.Claude ->
+        let base = claude_args ~model ~reasoning_effort
+            ~fork_from_session_id ~session_id ~session_id_confirmed
+            ~message_count ~prompt
+          @ claude_mcp_arg
+        in
+        (* --mcp-config is variadic in the Claude CLI: it keeps eating
+           following arguments as additional config paths until it hits
+           one starting with `-`. That is safe here only because the
+           prompt positional is already in [base] and the sole thing
+           appended after is another flag. Anything non-flag appended
+           below would silently become a second config file, and Claude
+           hard-fails on a config path that doesn't exist. *)
+        (match system_prompt with
+         | Some sp -> base @ ["--append-system-prompt"; sp]
+         | None -> base)
+      | Config.Codex ->
+        codex_args ~model ~reasoning_effort
+          ~session_id ~session_id_confirmed ~prompt
+      | Config.Gemini ->
+        gemini_args ~model ~session_id ~session_id_confirmed ~prompt
+    in
+    [setsid_command (); "--wait"] @ agent_args
+  in
+  let run_once args =
+    let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in
     try
-      let proc = Eio.Process.spawn ~sw mgr ~cwd ~env:child_env
-        ~stdout:stdout_w ~stderr:stderr_w args in
-      (* Close write ends so reads get EOF when process exits. Do this before
-         callbacks so callback failures cannot strand pipe writers on [sw]. *)
-      Eio.Resource.close stdout_w;
-      Eio.Resource.close stderr_w;
-      (try
-         (match on_pid with Some f -> f (Eio.Process.pid proc) | None -> ())
-       with exn ->
-         close_noerr stdout_r;
-         close_noerr stderr_r;
-         raise exn);
-      (* Read stdout and stderr concurrently to avoid deadlock.
-         If the child fills the stderr pipe buffer (~64KB) before stdout
-         hits EOF, the child blocks on write and stdout never closes. *)
-      let stderr_buf = Buffer.create 1024 in
-      Eio.Fiber.both
-        (fun () ->
-          (* Drain stderr in parallel *)
-          (try
-             let sr = Eio.Buf_read.of_flow ~max_size:(64 * 1024) stderr_r in
-             Buffer.add_string stderr_buf (Eio.Buf_read.take_all sr)
-           with End_of_file -> ());
-          Eio.Resource.close stderr_r)
-        (fun () ->
-          (* Read stdout line by line and parse events *)
-          let reader = Eio.Buf_read.of_flow ~max_size:(1024 * 1024) stdout_r in
-          (try
-             while true do
-               let line = Eio.Buf_read.line reader in
-               if String.length line > 0 then begin
-                 let events = match kind with
-                   | Config.Claude -> parse_stream_json_line line
-                   | Config.Codex -> parse_codex_json_line line
-                   | Config.Gemini -> parse_gemini_stream_json_line line
-                 in
-                 List.iter on_event events
-               end
-             done
-           with End_of_file -> ());
-          Eio.Resource.close stdout_r);
-      let stderr_text = Buffer.contents stderr_buf in
-      (* Wait for process to finish *)
-      let status = Eio.Process.await proc in
-      match status with
-      | `Exited 0 -> Ok ()
-      | `Exited code ->
-        Error (Printf.sprintf "agent exited with code %d: %s" code stderr_text)
-      | `Signaled sig_ ->
-        Error (Printf.sprintf "agent killed by signal %d" sig_)
+      let stderr_r, stderr_w = Eio.Process.pipe ~sw mgr in
+      try
+        let proc = Eio.Process.spawn ~sw mgr ~cwd ~env:child_env
+          ~stdout:stdout_w ~stderr:stderr_w args in
+        (* Close write ends so reads get EOF when process exits. Do this before
+           callbacks so callback failures cannot strand pipe writers on [sw]. *)
+        Eio.Resource.close stdout_w;
+        Eio.Resource.close stderr_w;
+        (try
+           (match on_pid with Some f -> f (Eio.Process.pid proc) | None -> ())
+         with exn ->
+           close_noerr stdout_r;
+           close_noerr stderr_r;
+           raise exn);
+        (* Read stdout and stderr concurrently to avoid deadlock.
+           If the child fills the stderr pipe buffer (~64KB) before stdout
+           hits EOF, the child blocks on write and stdout never closes. *)
+        let stderr_buf = Buffer.create 1024 in
+        Eio.Fiber.both
+          (fun () ->
+            (* Drain stderr in parallel *)
+            (try
+               let sr = Eio.Buf_read.of_flow ~max_size:(64 * 1024) stderr_r in
+               Buffer.add_string stderr_buf (Eio.Buf_read.take_all sr)
+             with End_of_file -> ());
+            Eio.Resource.close stderr_r)
+          (fun () ->
+            (* Read stdout line by line and parse events *)
+            let reader = Eio.Buf_read.of_flow ~max_size:(1024 * 1024) stdout_r in
+            (try
+               while true do
+                 let line = Eio.Buf_read.line reader in
+                 if String.length line > 0 then begin
+                   let events = match kind with
+                     | Config.Claude -> parse_stream_json_line line
+                     | Config.Codex -> parse_codex_json_line line
+                     | Config.Gemini -> parse_gemini_stream_json_line line
+                   in
+                   List.iter on_event events
+                 end
+               done
+             with End_of_file -> ());
+            Eio.Resource.close stdout_r);
+        let stderr_text = Buffer.contents stderr_buf in
+        (* Wait for process to finish *)
+        let status = Eio.Process.await proc in
+        match status with
+        | `Exited 0 -> Ok ()
+        | `Exited code ->
+          Error (Printf.sprintf "agent exited with code %d: %s" code stderr_text)
+        | `Signaled sig_ ->
+          Error (Printf.sprintf "agent killed by signal %d" sig_)
+      with exn ->
+        close_noerr stdout_r;
+        close_noerr stdout_w;
+        close_noerr stderr_r;
+        close_noerr stderr_w;
+        raise exn
     with exn ->
       close_noerr stdout_r;
       close_noerr stdout_w;
-      close_noerr stderr_r;
-      close_noerr stderr_w;
       raise exn
-  with exn ->
-    close_noerr stdout_r;
-    close_noerr stdout_w;
-    raise exn
+  in
+  run_with_claude_session_recovery
+    ~kind ~session_id ~session_id_confirmed ~message_count
+    ~fork_from_session_id
+    ~run:(fun confirmed ->
+      run_once (command_args ~session_id_confirmed:confirmed))

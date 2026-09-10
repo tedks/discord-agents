@@ -2790,6 +2790,7 @@ let rec process_session_message_with_hooks hooks t session
           ~expected_start_ticks:(expected_start_ticks_for_pid pid))
       in
       let on_pid pid =
+        Option.iter (unregister_child_pid t session) !child_pid;
         child_pid := Some pid;
         register_child_pid t session pid;
         (match hooks.capture_child_process pid with

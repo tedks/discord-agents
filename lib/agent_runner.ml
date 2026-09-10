@@ -516,6 +516,18 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
         (Agent_process.truncate_inline ~max_chars:200 line))
   in
   let result =
+    let confirm_claude_id_on_spawn =
+      Config.equal_agent_kind session.agent_kind Config.Claude
+      && Option.is_none session.fork_from_session_id
+      && not session.session_id_confirmed
+    in
+    let on_process_spawned pid =
+      Option.iter (fun callback -> callback pid) on_pid;
+      if confirm_claude_id_on_spawn then
+        Option.iter
+          (fun callback -> callback session.session_id)
+          on_session_id
+    in
     Fun.protect ~finally:(fun () -> typing_active := false)
       (fun () -> Agent_process.run_streaming ~sw ~env
           ~working_dir:session.working_dir
@@ -529,7 +541,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
           ~model:session.model
           ~reasoning_effort:session.reasoning_effort
           ~goal_context:(goal_context session)
-          ~prompt:context_prompt ~on_event ?on_pid ()) in
+          ~prompt:context_prompt ~on_event ~on_pid:on_process_spawned ()) in
   (* All result-path messages route through here so they get split at
      Discord's 2000-char limit. Codex's turn.failed payloads can be
      very large JSON blobs; without splitting, Discord rejects the

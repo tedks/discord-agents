@@ -164,12 +164,11 @@ type session = {
      id through [set_session_id]. None for normal fresh/resumed runs
      and for agents without a non-interactive fork path. *)
   mutable fork_from_session_id : string option;
-  (* True once the agent has acknowledged [session_id] as resumable.
-     Always true for Claude (caller-supplied ids). For Codex and
-     Gemini, starts false and flips true when the first server-side
-     event echoes the id back. Used by the resume gate so a
-     first-turn failure that occurred before/after the id assignment
-     is handled correctly. *)
+  (* True once [session_id] is known to be resumable. For Claude this
+     flips when the first child is spawned with [--session-id]. For
+     Codex and Gemini it flips when the first server-side event echoes
+     the allocated id back. Used by the resume gate so a first-turn
+     failure cannot make later invocations reuse a creation path. *)
   mutable session_id_confirmed : bool;
   thread_id : Discord_types.channel_id;  (* threads are channels in Discord *)
   system_prompt : string option;
@@ -483,11 +482,9 @@ let load_from_disk () =
 let create () =
   { sessions = load_from_disk (); last_reload = Unix.gettimeofday () }
 
-(** Construct a session record with sensible defaults. The
-    [session_id_confirmed] default is derived from the agent: Claude
-    pins its own id (confirmed at creation), while Codex and Gemini
-    allocate server-side and start unconfirmed until the parser sees
-    the first event. Callers can override via the optional arg. *)
+(** Construct a session record with sensible defaults. Fresh sessions
+    start with [session_id_confirmed=false]. Callers resuming an id
+    discovered on disk override this with [true]. *)
 let make_session ~project_name ~working_dir ~agent_kind ~session_id
     ~thread_id ~system_prompt ~initial_prompt
     ?(message_count = 0)
@@ -499,10 +496,7 @@ let make_session ~project_name ~working_dir ~agent_kind ~session_id
     ?(active_run = None)
     ?fork_from_session_id
     ?session_id_confirmed () =
-  let session_id_confirmed = match session_id_confirmed with
-    | Some b -> b
-    | None -> Config.caller_pinned_session_id agent_kind
-  in
+  let session_id_confirmed = Option.value ~default:false session_id_confirmed in
   { project_name; working_dir; agent_kind; session_override_kind; session_id;
     fork_from_session_id; session_id_confirmed; thread_id; system_prompt;
     model; reasoning_effort; goal;
@@ -641,11 +635,10 @@ let set_override_and_pending_agent_change t session
   end
 
 (** Update a session's id and mark it confirmed for resume.
-    Used when an agent assigns its id server-side (Codex's
-    thread.started) so the pre-generated UUID is replaced before the
-    next resume. Persisting [session_id_confirmed] here is the
-    load-bearing bit: it tells the next invocation to issue
-    [codex exec resume] rather than start a fresh session. *)
+    Used both when Claude's caller-pinned id reaches a spawned child
+    and when an agent assigns its id server-side. Persisting
+    [session_id_confirmed] here is the load-bearing bit: it tells the
+    next invocation to resume rather than reuse a creation path. *)
 let set_session_id t session ~session_id =
   let already = session.session_id = session_id
                 && session.session_id_confirmed in
