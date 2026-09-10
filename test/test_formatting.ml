@@ -3351,6 +3351,8 @@ let resume_helpers_tests = [
 (* ── claude_args ───────────────────────────────────────────────────── *)
 
 let claude_args = Discord_agents.Agent_process.claude_args
+let should_retry_claude_with_resume =
+  Discord_agents.Agent_process.should_retry_claude_with_resume
 
 let test_claude_args_fresh () =
   let args = claude_args ~session_id:"new-id"
@@ -3389,6 +3391,25 @@ let test_claude_args_native_fork () =
      "--resume"; "source-id"; "--fork-session"; "fork turn"]
     args
 
+let test_claude_collision_retries_only_fresh_nonfork () =
+  let collision =
+    "Error: Session ID abc is already in use."
+  in
+  Alcotest.(check bool) "fresh invocation retries" true
+    (should_retry_claude_with_resume
+       ~session_id_confirmed:false ~fork_from_session_id:None collision);
+  Alcotest.(check bool) "confirmed invocation does not retry" false
+    (should_retry_claude_with_resume
+       ~session_id_confirmed:true ~fork_from_session_id:None collision);
+  Alcotest.(check bool) "native fork does not retry" false
+    (should_retry_claude_with_resume
+       ~session_id_confirmed:false
+       ~fork_from_session_id:(Some "source-id") collision);
+  Alcotest.(check bool) "unrelated error does not retry" false
+    (should_retry_claude_with_resume
+       ~session_id_confirmed:false ~fork_from_session_id:None
+       "You're out of usage credits")
+
 let claude_args_tests = [
   Alcotest.test_case "fresh invocation args" `Quick test_claude_args_fresh;
   Alcotest.test_case "resume invocation args" `Quick test_claude_args_resume;
@@ -3396,6 +3417,8 @@ let claude_args_tests = [
     test_claude_args_claimed_first_turn_failure_resumes;
   Alcotest.test_case "native fork invocation args" `Quick
     test_claude_args_native_fork;
+  Alcotest.test_case "collision retries only fresh nonfork" `Quick
+    test_claude_collision_retries_only_fresh_nonfork;
 ]
 
 (* ── codex_args ────────────────────────────────────────────────────── *)
