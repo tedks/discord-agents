@@ -3400,20 +3400,24 @@ let test_claude_collision_retries_only_fresh_nonfork () =
   in
   Alcotest.(check (option bool)) "fresh invocation resumes" (Some true)
     (claude_retry_confirmation ~session_id
-       ~session_id_confirmed:false ~fork_from_session_id:None collision);
+       ~session_id_confirmed:false ~message_count:0
+       ~fork_from_session_id:None collision);
   Alcotest.(check (option bool)) "confirmed invocation does not retry" None
     (claude_retry_confirmation ~session_id
-       ~session_id_confirmed:true ~fork_from_session_id:None collision);
+       ~session_id_confirmed:true ~message_count:0
+       ~fork_from_session_id:None collision);
   Alcotest.(check (option bool)) "native fork does not retry" None
     (claude_retry_confirmation ~session_id
-       ~session_id_confirmed:false
+       ~session_id_confirmed:false ~message_count:0
        ~fork_from_session_id:(Some "source-id") collision);
   Alcotest.(check (option bool)) "wrong session id does not retry" None
     (claude_retry_confirmation ~session_id:"different-id"
-       ~session_id_confirmed:false ~fork_from_session_id:None collision);
+       ~session_id_confirmed:false ~message_count:0
+       ~fork_from_session_id:None collision);
   Alcotest.(check (option bool)) "unrelated error does not retry" None
     (claude_retry_confirmation ~session_id
-       ~session_id_confirmed:false ~fork_from_session_id:None
+       ~session_id_confirmed:false ~message_count:0
+       ~fork_from_session_id:None
        "You're out of usage credits")
 
 let test_claude_missing_confirmed_session_retries_creation () =
@@ -3422,7 +3426,12 @@ let test_claude_missing_confirmed_session_retries_creation () =
   in
   Alcotest.(check (option bool)) "missing resume retries creation" (Some false)
     (claude_retry_confirmation ~session_id:"abc"
-       ~session_id_confirmed:true ~fork_from_session_id:None error)
+       ~session_id_confirmed:true ~message_count:0
+       ~fork_from_session_id:None error);
+  Alcotest.(check (option bool)) "established session is not recreated" None
+    (claude_retry_confirmation ~session_id:"abc"
+       ~session_id_confirmed:true ~message_count:1
+       ~fork_from_session_id:None error)
 
 let test_claude_collision_recovery_runs_once_with_resume () =
   let attempts = ref [] in
@@ -3435,6 +3444,7 @@ let test_claude_collision_recovery_runs_once_with_resume () =
   let result = run_with_claude_session_recovery
     ~kind:Discord_agents.Config.Claude
     ~session_id:"abc" ~session_id_confirmed:false
+    ~message_count:0
     ~fork_from_session_id:None ~run
   in
   Alcotest.(check (list bool)) "creation then resume, with no third attempt"

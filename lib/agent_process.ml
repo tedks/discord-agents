@@ -1455,26 +1455,28 @@ let claude_session_id_missing_error ~session_id error =
       "No conversation found with session ID: %s" session_id)
 
 let claude_retry_confirmation
-    ~session_id ~session_id_confirmed ~fork_from_session_id error =
+    ~session_id ~session_id_confirmed ~message_count
+    ~fork_from_session_id error =
   if Option.is_some fork_from_session_id then
     None
   else if not session_id_confirmed
           && claude_session_id_in_use_error ~session_id error then
     Some true
-  else if session_id_confirmed
+  else if session_id_confirmed && message_count = 0
           && claude_session_id_missing_error ~session_id error then
     Some false
   else
     None
 
 let run_with_claude_session_recovery
-    ~kind ~session_id ~session_id_confirmed ~fork_from_session_id ~run =
+    ~kind ~session_id ~session_id_confirmed ~message_count
+    ~fork_from_session_id ~run =
   match run session_id_confirmed with
   | Result.Error error ->
     (match kind with
      | Config.Claude ->
        (match claude_retry_confirmation
-                ~session_id ~session_id_confirmed
+                ~session_id ~session_id_confirmed ~message_count
                 ~fork_from_session_id error with
         | Some retry_confirmation ->
           let retry_flag =
@@ -2037,6 +2039,7 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~thread_id ~message_co
       raise exn
   in
   run_with_claude_session_recovery
-    ~kind ~session_id ~session_id_confirmed ~fork_from_session_id
+    ~kind ~session_id ~session_id_confirmed ~message_count
+    ~fork_from_session_id
     ~run:(fun confirmed ->
       run_once (command_args ~session_id_confirmed:confirmed))
