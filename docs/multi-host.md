@@ -547,14 +547,14 @@ start as soon as this design is accepted.
 
 Each one is filed with options, a recommendation, and what it blocks:
 
-- Q1 Default host for a bare `!start <project>`: #TBD
-- Q2 Host-targeting syntax and thread naming: #TBD
-- Q3 Project absent on the requested host (auto-clone or refuse): #TBD
-- Q4 Host inventory: static config or discovery: #TBD
-- Q5 Disk pressure scope and cross-host steering: #TBD
-- Q6 Model and auth mismatch handling per host: #TBD
-- Q7 Unreachable host with an active session (fail, queue or migrate): #TBD
-- Q8 Writer placement and writer failover: #TBD
+- Q1 Default host for a bare `!start <project>`: https://github.com/tedks/discord-agents/issues/128
+- Q2 Host-targeting syntax and thread naming: https://github.com/tedks/discord-agents/issues/129
+- Q3 Project absent on the requested host (auto-clone or refuse): https://github.com/tedks/discord-agents/issues/130
+- Q4 Host inventory: static config or discovery: https://github.com/tedks/discord-agents/issues/131
+- Q5 Disk pressure scope and cross-host steering: https://github.com/tedks/discord-agents/issues/132
+- Q6 Model and auth mismatch handling per host: https://github.com/tedks/discord-agents/issues/133
+- Q7 Unreachable host with an active session (fail, queue or migrate): https://github.com/tedks/discord-agents/issues/134
+- Q8 Writer placement and writer failover: https://github.com/tedks/discord-agents/issues/135
 
 ## Decision log
 
