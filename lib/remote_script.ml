@@ -145,8 +145,10 @@ let script ~nonce ~mode ~cwd ~env ~argv =
         (match mode with
          | Run { lock_key } ->
            line "lockfile=\"$lockdir\"/%s.lock" (quote lock_key);
-           (* Per wrapper ($$), so concurrent wrappers never share one. *)
-           line "donefile=\"$lockfile.$$.done\""
+           (* Per wrapper ($$), so concurrent wrappers never share one.
+              '+' cannot occur in a lock key, so no key's pattern below
+              can match another key's file (keys may contain dots). *)
+           line "donefile=\"$lockfile+$$.done\""
          | Capture -> ());
         List.iter (fun (k, v) -> line "export %s=%s" k (quote v)) env;
         line "set -- %s" (String.concat " " (List.map quote argv));
@@ -189,7 +191,7 @@ let script ~nonce ~mode ~cwd ~env ~argv =
               The watchdog's disarm signal must start absent, or a stop
               would be mistaken for a normal finish; refuse to run rather
               than run unguarded. *)
-           line "rm -f \"$lockfile\".*.done 2>/dev/null";
+           line "rm -f \"$lockfile\"+*.done 2>/dev/null";
            line "if [ -e \"$donefile\" ]; then %s; exit 1; fi" (err "lock_failed");
            (* The command prints its own started marker, with its own pid
               (setsid does not fork here: a background job is not a group
@@ -214,7 +216,11 @@ let script ~nonce ~mode ~cwd ~env ~argv =
               killing it: the shell may reap the watchdog early, and a
               later [kill $pid] could then hit an unrelated process that
               reused the pid. Disarmed or not, the watchdog ends at stdin
-              EOF, which comes as soon as sshd closes the channel.
+              EOF, which comes as soon as sshd closes the channel. After a
+              stop it waits (up to 3 s) for the wrapper ($$ in this
+              subshell) to exit, since the wrapper writes the done-file on
+              its way out, and then removes it, so stops leave nothing
+              behind; the sweep above catches any that outlive that.
 
               dash's kill only signals a group in the numeric form
               ([kill -15 -PGID], [kill -0 -PGID]). The KILL can in
@@ -225,7 +231,10 @@ let script ~nonce ~mode ~cwd ~env ~argv =
                  kill -15 \"-$child\" 2>/dev/null; i=0; \
                  while [ \"$i\" -lt 30 ] && kill -0 \"-$child\" 2>/dev/null; do \
                    sleep 0.1; i=$((i + 1)); done; \
-                 if kill -0 \"-$child\" 2>/dev/null; then kill -9 \"-$child\" 2>/dev/null; fi \
+                 if kill -0 \"-$child\" 2>/dev/null; then kill -9 \"-$child\" 2>/dev/null; fi; \
+                 i=0; while [ \"$i\" -lt 30 ] && kill -0 \"$$\" 2>/dev/null; do \
+                   sleep 0.1; i=$((i + 1)); done; \
+                 rm -f \"$donefile\" \
                  ) </dev/null >/dev/null 2>&1 &";
            line "exec 3<&-";
            line "wait \"$child\"";

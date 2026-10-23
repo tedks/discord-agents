@@ -473,6 +473,44 @@ let test_env_home_does_not_move_lock () =
             (stream ~sw ~mgr ~ssh ~lock_key:"same"
                ~env:["HOME", Filename.concat base "elsewhere"] ["true"]))))
 
+let done_files ~key =
+  let run_dir = Filename.concat (Sys.getenv "HOME") ".cache/discord-agents/run" in
+  let prefix = key ^ ".lock+" in
+  match Sys.readdir run_dir with
+  | entries ->
+    Array.to_list entries
+    |> List.filter (fun f -> String.starts_with ~prefix f
+                             && Filename.check_suffix f ".done")
+  | exception Sys_error _ -> []
+
+(* A stopped run that is never retried must not leave its file behind. *)
+let test_stop_leaves_no_done_file () =
+  with_env (fun ~base:_ ~ssh ->
+    with_eio (fun ~sw ~mgr ~clock ->
+      let local_pid = ref None and started = ref false in
+      Eio.Fiber.both
+        (fun () ->
+          ignore (stream ~sw ~mgr ~ssh ~lock_key:"once"
+                    ~on_spawn:(fun p -> local_pid := Some p)
+                    ~on_remote_pid:(fun _ -> started := true) ["sleep"; "300"]))
+        (fun () ->
+          wait_until ~clock "started" (fun () -> !started);
+          Unix.kill (Option.get !local_pid) Sys.sigterm);
+      wait_until ~clock ~timeout:6.0 "stopped run cleaned up its done-file"
+        (fun () -> done_files ~key:"once" = [])))
+
+(* A key's sweep must not touch another key's file: keys may contain dots,
+   so key "a" must not match key "a.lock.x". *)
+let test_sweep_is_scoped_to_its_key () =
+  Alcotest.(check bool) "separator cannot occur in keys" false
+    (Remote_script.is_lock_key "a+b");
+  match script ~mode:(Run { lock_key = "a" }) ["true"] with
+  | Error e -> Alcotest.fail e
+  | Ok text ->
+    Alcotest.(check bool) "sweep uses the + separator" true
+      (Discord_agents.Resource.contains_substring ~haystack:text
+         ~needle:{|rm -f "$lockfile"+*.done|})
+
 (* After a stop, a retry of the same session must not be refused as busy
    for a fixed grace period when the group died at TERM straight away. *)
 let test_lock_released_promptly_after_stop () =
@@ -499,13 +537,11 @@ let test_lock_released_promptly_after_stop () =
       Alcotest.(check bool)
         (Printf.sprintf "lock free after %.2fs, well before the 3 s grace" waited)
         true (waited < 1.5);
-      (* The stop's disarm file is swept by the next run of the key, and
-         that run's own is removed by its watchdog once the channel
-         closes, a moment after the call returns. *)
-      let run_dir = Filename.concat (Sys.getenv "HOME") ".cache/discord-agents/run" in
-      let leftovers () = Sys.readdir run_dir |> Array.to_list
-                         |> List.filter (fun f -> Filename.check_suffix f ".done") in
-      wait_until ~clock ~timeout:3.0 "no done-files left" (fun () -> leftovers () = [])))
+      (* Every disarm file of this key is cleaned up by its own run: the
+         retry's by its watchdog once the channel closes, and the stop's
+         by the stopped run's watchdog, without waiting for a later run. *)
+      wait_until ~clock ~timeout:5.0 "no done-files left for the key"
+        (fun () -> done_files ~key:"again" = [])))
 
 (* A normal exit disarms the watchdog: a properly detached background
    process outlives the turn, as it would locally. *)
@@ -561,5 +597,7 @@ let () =
         test_lock_released_promptly_after_stop;
       Alcotest.test_case "normal exit leaves detached process" `Quick
         test_normal_exit_leaves_detached_process;
+      Alcotest.test_case "stop leaves no done-file" `Quick test_stop_leaves_no_done_file;
+      Alcotest.test_case "sweep is scoped to its key" `Quick test_sweep_is_scoped_to_its_key;
     ];
   ]
