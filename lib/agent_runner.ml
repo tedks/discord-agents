@@ -147,10 +147,33 @@ let prompt_preview prompt =
 
 (** Download attachments to temp files in the working directory.
     Returns a list of (filename, local_path) for successfully downloaded files. *)
+let max_attachment_bytes = 25 * 1024 * 1024
+
+(** The on-disk name for an attachment: its Discord id, then the file
+    name reduced to [A-Za-z0-9._-] (anything else becomes '_'), with no
+    leading dot and a bounded length. A file name from Discord is not a
+    path: separators, [..], control characters or an overlong name must
+    not choose where the file lands or make it disappear. The prompt
+    still shows the original name. *)
+let attachment_storage_name ~id ~filename =
+  let safe = String.map (function
+    | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '.' | '_' | '-' as c -> c
+    | _ -> '_') filename in
+  let safe =
+    let n = String.length safe in
+    let rec skip i = if i < n && safe.[i] = '.' then skip (i + 1) else i in
+    let i = skip 0 in
+    String.sub safe i (n - i) in
+  let safe = if String.length safe > 120 then String.sub safe 0 120 else safe in
+  let safe = if safe = "" then "file" else safe in
+  let id = String.map (function '0' .. '9' as c -> c | _ -> '_') id in
+  id ^ "_" ^ safe
+
 (** Write a downloaded attachment where the agent will run. Locally,
     into [working_dir]/.discord-attachments as before; on an executor,
     the same relative path in its worktree, with the bytes on the remote
-    command's stdin. Returns the path the agent should read. *)
+    command's stdin. Returns the path the agent should read, which for a
+    remote session is a path on the executor. *)
 let save_attachment ?ssh ~(target : Agent_process.target) ~working_dir
     ~name data =
   let rel = Filename.concat ".discord-attachments" name in
@@ -168,7 +191,7 @@ let save_attachment ?ssh ~(target : Agent_process.target) ~working_dir
   | Agent_process.Remote { host; destination; _ } ->
     let h = { (Host.local_host host) with Host.transport = Host.Ssh destination } in
     Eio_unix.run_in_systhread (fun () ->
-      Host_exec.run_capture ?ssh ~cwd:working_dir ~input:data h
+      Host_exec.run_capture ?ssh ~timeout_s:300 ~cwd:working_dir ~input:data h
         ["sh"; "-c"; "mkdir -p .discord-attachments && cat > \"$1\""; "_"; rel])
     |> Result.map (fun _ -> Filename.concat working_dir rel)
     |> Result.map_error (Agent_process.remote_failure_message ~host)
@@ -177,13 +200,18 @@ let download_attachments ?ssh ?(target = Agent_process.Local) ~rest ~working_dir
     (attachments : Discord_types.attachment list) =
   List.filter_map (fun (a : Discord_types.attachment) ->
     (* Cap at 25MB to avoid huge downloads *)
-    if a.size > 25 * 1024 * 1024 then begin
+    if a.size > max_attachment_bytes then begin
       Logs.warn (fun m -> m "agent_runner: skipping large attachment %s (%d bytes)"
         a.filename a.size);
       None
     end else
-      let name = Printf.sprintf "%s_%s" a.id a.filename in
+      let name = attachment_storage_name ~id:a.id ~filename:a.filename in
       match Discord_rest.download_url rest ~url:a.url () with
+      | Ok data when String.length data > max_attachment_bytes ->
+        (* The size above is Discord's metadata; check what arrived. *)
+        Logs.warn (fun m -> m "agent_runner: skipping %s: download was %d bytes"
+          a.filename (String.length data));
+        None
       | Ok data ->
         (match save_attachment ?ssh ~target ~working_dir ~name data with
          | Ok path -> Some (a.filename, path)

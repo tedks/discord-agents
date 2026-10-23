@@ -43,11 +43,28 @@ let with_env f =
       let ssh = Filename.concat bin "fake-ssh" in
       write_exe ssh (Printf.sprintf "#!/bin/sh\nexec python3 -I %s \"$@\"\n"
                        (Filename.quote relay));
+      (* FAKE_CLAUDE_RECOVER=1: a --resume of an unknown session fails
+         the way Claude does, so the caller's recovery retry can be seen. *)
       write_exe (Filename.concat bin "claude") {|#!/bin/sh
 for a in "$@"; do printf '%s\n' "$a"; done > "$HOME/claude.argv"
 pwd > "$HOME/claude.cwd"
+printf '%s' "${DISCORD_AGENTS_THREAD_ID:-unset}" > "$HOME/claude.thread"
+echo x >> "$HOME/claude.calls"
+if [ "${FAKE_CLAUDE_RECOVER:-}" = 1 ]; then
+  for a in "$@"; do
+    if [ "$a" = --resume ]; then
+      echo "No conversation found with session ID: s-1" >&2; exit 1
+    fi
+  done
+fi
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"hello from remote"}]}}'
 echo '{"type":"result","result":"hello from remote","session_id":"s-1"}'
+|};
+      write_exe (Filename.concat bin "codex") {|#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done > "$HOME/codex.argv"
+echo '{"type":"thread.started","thread_id":"t-9"}'
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"codex says hi"}}'
+echo '{"type":"turn.completed","usage":{}}'
 |};
       (* A real executable for mcp_command_opt to resolve; never run. *)
       let mcp = Filename.concat bin "discord agents-mcp" in
@@ -65,27 +82,46 @@ let remote = Agent_process.Remote {
 
 (* ── Pure ────────────────────────────────────────────────────────── *)
 
-let test_remote_mcp_command () =
+(* Run the MCP command as the agent would, with an ssh stand-in that
+   prints its argv, to see exactly what reaches the writer. *)
+let run_mcp_command ~thread_id =
+  let dir = Filename.temp_dir "discord_agents_mcp_cmd_" "" in
+  Fun.protect ~finally:(fun () -> rm_rf dir) @@ fun () ->
+  write_exe (Filename.concat dir "ssh")
+    "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n";
   let command, args =
     Agent_process.remote_mcp_command ~writer_ssh:"tower0"
-      ~thread_id:"123" ~mcp_path:"/srv/my build/mcp_server.exe" in
-  Alcotest.(check string) "ssh" "ssh" command;
-  (match List.rev args with
+      ~mcp_path:"/srv/my build/mcp_server.exe" ~config_home:"/home/u/.config" in
+  let env = Array.append [| "PATH=" ^ dir ^ ":/usr/bin:/bin" |]
+      (match thread_id with
+       | Some id -> [| "DISCORD_AGENTS_THREAD_ID=" ^ id |]
+       | None -> [||]) in
+  let ((out, _, _) as proc) =
+    Unix.open_process_args_full "/bin/sh"
+      (Array.of_list ((if command = "sh" then "/bin/sh" else command) :: args)) env in
+  let output = In_channel.input_all out in
+  let status = Unix.close_process_full proc in
+  output, status
+
+let test_remote_mcp_command () =
+  let output, status = run_mcp_command ~thread_id:(Some "4242") in
+  Alcotest.(check bool) "ran" true (status = Unix.WEXITED 0);
+  (match List.rev (String.split_on_char '\n' (String.trim output)) with
    | remote_cmd :: dest :: "--" :: _ ->
      Alcotest.(check string) "writer destination" "tower0" dest;
-     Alcotest.(check string) "quoted remote command"
-       "env DISCORD_AGENTS_THREAD_ID='123' '/srv/my build/mcp_server.exe'"
+     (* The thread comes from the agent's environment at run time, so
+        the config itself is the same for every thread. *)
+     Alcotest.(check string) "remote command"
+       "env DISCORD_AGENTS_THREAD_ID=4242 XDG_CONFIG_HOME='/home/u/.config' '/srv/my build/mcp_server.exe'"
        remote_cmd
-   | _ -> Alcotest.fail "expected ... -- dest cmd");
-  Alcotest.(check bool) "batch mode" true (List.mem "BatchMode=yes" args);
-  (* The writer's login shell parses the command: a hostile thread id
-     must stay one word. *)
-  let _, args =
-    Agent_process.remote_mcp_command ~writer_ssh:"w"
-      ~thread_id:"1'; touch /tmp/x; '" ~mcp_path:"/m" in
-  Alcotest.(check string) "thread id quoted"
-    {|env DISCORD_AGENTS_THREAD_ID='1'\''; touch /tmp/x; '\''' '/m'|}
-    (List.nth args (List.length args - 1))
+   | _ -> Alcotest.failf "unexpected ssh argv: %s" output);
+  (* Anything but a Discord id is refused before ssh runs, so it can
+     never reach the writer's shell unquoted. *)
+  List.iter (fun bad ->
+    let output, status = run_mcp_command ~thread_id:bad in
+    Alcotest.(check bool) "refused" true (status <> Unix.WEXITED 0);
+    Alcotest.(check string) "ssh not run" "" output)
+    [None; Some ""; Some "1; touch /tmp/x"; Some "12a"]
 
 let test_codex_overrides_for_remote () =
   let o = Agent_process.codex_mcp_overrides_for ~command:"ssh"
@@ -96,7 +132,25 @@ let test_codex_overrides_for_remote () =
   Alcotest.(check (list string)) "local form unchanged"
     ["-c"; {|mcp_servers.discord_agents.command="/x"|};
      "-c"; {|mcp_servers.discord_agents.args=[]|}]
-    (Agent_process.codex_mcp_overrides_for ~command:"/x" ())
+    (Agent_process.codex_mcp_overrides_for ~command:"/x" ());
+  Alcotest.(check (list string)) "backslash and control characters"
+    ["-c"; {|mcp_servers.discord_agents.command="sh"|};
+     "-c"; {|mcp_servers.discord_agents.args=["a\\b", "tab\there", "nl\n", "bell\u0007"]|}]
+    (Agent_process.codex_mcp_overrides_for ~command:"sh"
+       ~args:["a\\b"; "tab\there"; "nl\n"; "bell\007"] ())
+
+let test_attachment_storage_name () =
+  let name = Agent_runner.attachment_storage_name in
+  Alcotest.(check string) "plain" "123_report.pdf" (name ~id:"123" ~filename:"report.pdf");
+  Alcotest.(check string) "separators and leading dots" "123__.._etc_passwd"
+    (name ~id:"123" ~filename:"../../etc/passwd");
+  Alcotest.(check string) "leading dots dropped" "123_bashrc"
+    (name ~id:"123" ~filename:"..bashrc");
+  Alcotest.(check string) "control and quotes" "123_a_b_c"
+    (name ~id:"123" ~filename:"a\nb'c");
+  Alcotest.(check string) "empty" "123_file" (name ~id:"123" ~filename:"");
+  Alcotest.(check int) "bounded" (4 + 120)
+    (String.length (name ~id:"123" ~filename:(String.make 500 'x')))
 
 let test_remote_failure_message () =
   let msg = Agent_process.remote_failure_message ~host:"framework0" in
@@ -111,21 +165,23 @@ let test_remote_failure_message () =
 
 (* ── A full remote turn ──────────────────────────────────────────── *)
 
-let run_turn ~ssh ~work ?(on_pid = ignore) () =
+let run_turn ~ssh ~work ?(on_pid = ignore) ?(kind = Discord_agents.Config.Claude)
+    ?(message_count = 1) ?system_prompt () =
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
   let events = ref [] in
   let r = Agent_process.run_streaming ~sw ~env ~target:remote ~ssh
-      ~working_dir:work ~kind:Discord_agents.Config.Claude
+      ~working_dir:work ~kind
       ~session_id:"s-1" ~session_id_confirmed:true ~thread_id:"4242"
-      ~message_count:1 ~prompt:"hi there"
+      ~message_count ?system_prompt ~prompt:"hi there"
       ~on_event:(fun e -> events := e :: !events) ~on_pid () in
   r, List.rev !events
 
 let test_claude_turn_over_ssh () =
   with_env (fun ~base ~ssh ~mcp ~work ->
     let pid = ref None in
-    let r, events = run_turn ~ssh ~work ~on_pid:(fun p -> pid := Some p) () in
+    let r, events = run_turn ~ssh ~work ~on_pid:(fun p -> pid := Some p)
+        ~system_prompt:"you are a test" () in
     (match r with
      | Ok () -> ()
      | Error e -> Alcotest.failf "turn failed: %s" e);
@@ -136,6 +192,9 @@ let test_claude_turn_over_ssh () =
     Alcotest.(check (list string)) "result event" ["hello from remote"] texts;
     Alcotest.(check string) "ran in the session's working dir"
       work (String.trim (read (Filename.concat base "claude.cwd")));
+    (* As locally, the agent carries the caller's thread id. *)
+    Alcotest.(check string) "thread id in the agent's environment"
+      "4242" (read (Filename.concat base "claude.thread"));
     let argv = String.split_on_char '\n' (read (Filename.concat base "claude.argv")) in
     (* Inline MCP config naming ssh back to the writer, with the thread id,
        and no local setsid in the remote argv. *)
@@ -146,18 +205,49 @@ let test_claude_turn_over_ssh () =
     in
     Alcotest.(check bool) "no setsid in remote argv" false
       (List.exists (fun a -> Filename.basename a = "setsid") argv);
+    Alcotest.(check bool) "system prompt passed" true
+      (List.mem "you are a test" argv);
     match after_flag argv with
     | None -> Alcotest.fail "no --mcp-config"
     | Some json ->
       let open Yojson.Safe.Util in
       let entry = Yojson.Safe.from_string json
                   |> member "mcpServers" |> member "discord-agents" in
-      Alcotest.(check string) "command" "ssh" (entry |> member "command" |> to_string);
+      Alcotest.(check string) "command" "sh" (entry |> member "command" |> to_string);
       let args = entry |> member "args" |> to_list |> List.map to_string in
-      Alcotest.(check string) "remote command"
-        (Printf.sprintf "env DISCORD_AGENTS_THREAD_ID='4242' %s"
-           (Discord_agents.Remote_script.quote mcp))
-        (List.nth args (List.length args - 1)))
+      Alcotest.(check bool) "server path passed, quoted" true
+        (List.mem (Discord_agents.Remote_script.quote mcp) args);
+      Alcotest.(check bool) "no thread id baked in" false
+        (List.exists (fun a -> Discord_agents.Resource.contains_substring
+                                 ~haystack:a ~needle:"4242") args))
+
+(* Claude session recovery matches the agent's stderr inside the failure
+   message; it must still trigger when that stderr came over ssh. *)
+let test_claude_recovery_over_ssh () =
+  with_env (fun ~base ~ssh ~mcp:_ ~work ->
+    Unix.putenv "FAKE_CLAUDE_RECOVER" "1";
+    Fun.protect ~finally:(fun () -> Unix.putenv "FAKE_CLAUDE_RECOVER" "") @@ fun () ->
+    let r, _ = run_turn ~ssh ~work ~message_count:0 () in
+    (match r with Ok () -> () | Error e -> Alcotest.failf "not recovered: %s" e);
+    Alcotest.(check int) "retried once" 2
+      (List.length (String.split_on_char '\n'
+                      (String.trim (read (Filename.concat base "claude.calls"))))))
+
+let test_codex_turn_over_ssh () =
+  with_env (fun ~base ~ssh ~mcp:_ ~work ->
+    let r, events = run_turn ~ssh ~work ~kind:Discord_agents.Config.Codex () in
+    (match r with Ok () -> () | Error e -> Alcotest.failf "turn failed: %s" e);
+    Alcotest.(check bool) "agent text arrived" true
+      (List.exists (function
+         | Agent_process.Text_delta t ->
+           Discord_agents.Resource.contains_substring ~haystack:t ~needle:"codex says hi"
+         | Agent_process.Result { text; _ } ->
+           Discord_agents.Resource.contains_substring ~haystack:text ~needle:"codex says hi"
+         | _ -> false) events);
+    let argv = read (Filename.concat base "codex.argv") in
+    Alcotest.(check bool) "mcp command override" true
+      (Discord_agents.Resource.contains_substring ~haystack:argv
+         ~needle:{|mcp_servers.discord_agents.command="sh"|}))
 
 let test_unreachable_turn () =
   with_env (fun ~base:_ ~ssh ~mcp:_ ~work ->
@@ -198,18 +288,35 @@ let test_remote_gemini_settings () =
     let host = { (Host.local_host "framework0") with
                  Host.transport = Host.Ssh "remote" } in
     Agent_process.setup_gemini_mcp_remote ~ssh ~host ~working_dir:work
-      ~command:"ssh" ~args:["--"; "tower0"; "env X=1 /m"] ();
+      ~mcp:(Some ("sh", ["-c"; "exec ssh tower0"])) ();
     let open Yojson.Safe.Util in
     let json = Yojson.Safe.from_file (Filename.concat work ".gemini/settings.json") in
     Alcotest.(check string) "user key kept" "dark" (json |> member "theme" |> to_string);
     Alcotest.(check string) "other server kept" "x"
       (json |> member "mcpServers" |> member "other" |> member "command" |> to_string);
-    Alcotest.(check string) "our server" "ssh"
+    Alcotest.(check string) "our server" "sh"
       (json |> member "mcpServers" |> member "discord-agents" |> member "command"
        |> to_string);
     let exclude = read (Filename.concat work ".git/info/exclude") in
     Alcotest.(check bool) "excluded from git" true
       (Agent_process.exclude_already_lists_gemini exclude))
+
+(* With no MCP server to register, withdraw a stale entry, as locally. *)
+let test_remote_gemini_withdraws_entry_without_mcp () =
+  with_env (fun ~base:_ ~ssh ~mcp:_ ~work ->
+    Eio_main.run @@ fun _env ->
+    Unix.mkdir (Filename.concat work ".gemini") 0o755;
+    Out_channel.with_open_text (Filename.concat work ".gemini/settings.json")
+      (fun oc -> output_string oc
+          {|{"theme":"dark","mcpServers":{"discord-agents":{"command":"old"}}}|});
+    let host = { (Host.local_host "framework0") with
+                 Host.transport = Host.Ssh "remote" } in
+    Agent_process.setup_gemini_mcp_remote ~ssh ~host ~working_dir:work ~mcp:None ();
+    let open Yojson.Safe.Util in
+    let json = Yojson.Safe.from_file (Filename.concat work ".gemini/settings.json") in
+    Alcotest.(check string) "user key kept" "dark" (json |> member "theme" |> to_string);
+    Alcotest.(check bool) "our entry gone" true
+      (json |> member "mcpServers" |> member "discord-agents" = `Null))
 
 let () =
   Alcotest.run "remote_runs" [
@@ -217,11 +324,16 @@ let () =
       Alcotest.test_case "remote mcp command" `Quick test_remote_mcp_command;
       Alcotest.test_case "codex overrides" `Quick test_codex_overrides_for_remote;
       Alcotest.test_case "failure message" `Quick test_remote_failure_message;
+      Alcotest.test_case "attachment storage name" `Quick test_attachment_storage_name;
     ];
     "over ssh", [
       Alcotest.test_case "claude turn" `Quick test_claude_turn_over_ssh;
       Alcotest.test_case "unreachable" `Quick test_unreachable_turn;
       Alcotest.test_case "attachment" `Quick test_remote_attachment_saved_in_worktree;
       Alcotest.test_case "gemini settings" `Quick test_remote_gemini_settings;
+      Alcotest.test_case "claude recovery" `Quick test_claude_recovery_over_ssh;
+      Alcotest.test_case "codex turn" `Quick test_codex_turn_over_ssh;
+      Alcotest.test_case "gemini withdraws entry without mcp" `Quick
+        test_remote_gemini_withdraws_entry_without_mcp;
     ];
   ]

@@ -210,7 +210,7 @@ let classify_capture ~nonce ~cwd ~ssh_status output =
     line), for writing files without putting their contents in argv.
     Remote only: a local command with [input] is rejected rather than
     silently run without it. *)
-let run_capture ?(ssh = "ssh") ?cwd ?(input = "") (host : Host.t) argv =
+let run_capture ?(ssh = "ssh") ?timeout_s ?cwd ?(input = "") (host : Host.t) argv =
   match host.transport with
   | Host.Local when input <> "" ->
     Error (Setup_failed "input is only supported for remote commands")
@@ -227,9 +227,17 @@ let run_capture ?(ssh = "ssh") ?cwd ?(input = "") (host : Host.t) argv =
         let close fd = try Unix.close fd with Unix.Unix_error _ -> () in
         let in_r, in_w = Unix.pipe ~cloexec:true () in
         let out_r, out_w = Unix.pipe ~cloexec:true () in
+        (* [timeout_s] bounds the whole call with coreutils timeout (KILL
+           5 s after TERM), so a hung executor cannot hold a system
+           thread, or a stop requested meanwhile, indefinitely. *)
+        let argv =
+          let base = ssh_argv ~ssh ~destination in
+          match timeout_s, Resource.executable_in_path "timeout" with
+          | Some t, Some timeout -> [timeout; "-k"; "5"; string_of_int t] @ base
+          | _ -> base
+        in
         match
-          Unix.create_process ssh
-            (Array.of_list (ssh_argv ~ssh ~destination)) in_r out_w out_w
+          Unix.create_process (List.hd argv) (Array.of_list argv) in_r out_w out_w
         with
         | exception Unix.Unix_error (e, _, _) ->
           List.iter close [in_r; in_w; out_r; out_w];
@@ -262,7 +270,12 @@ let run_capture ?(ssh = "ssh") ?cwd ?(input = "") (host : Host.t) argv =
                 reaped := true;
                 output, status)
           in
-          classify_capture ~nonce ~cwd ~ssh_status:(exit_code status) output
+          (match timeout_s, exit_code status with
+           | Some t, (124 | 137) when not (String.length output > 0
+                                          && Option.is_some (find_sub output
+                                               ("\n" ^ Remote_script.exit_tag ^ " " ^ nonce ^ " "))) ->
+             Error (Transport_lost (Printf.sprintf "timed out after %d s" t))
+           | _ -> classify_capture ~nonce ~cwd ~ssh_status:(exit_code status) output)
 
 (* ── Streaming over SSH ──────────────────────────────────────────── *)
 

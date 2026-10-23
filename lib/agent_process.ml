@@ -1875,57 +1875,110 @@ type target =
 
 (** The MCP server command for an agent on an executor: ssh back to the
     writer and run the writer's own MCP server there, so executors need
-    nothing installed and can never run a stale server. The writer's
-    login shell parses the last argument, so its words are quoted. *)
-let remote_mcp_command ~writer_ssh ~thread_id ~mcp_path =
-  ("ssh",
-   Host_exec.ssh_options
-   @ ["--"; writer_ssh;
-      Printf.sprintf "env %s=%s %s" session_thread_id_env
-        (Remote_script.quote thread_id) (Remote_script.quote mcp_path)])
+    nothing installed and can never run a stale server.
+
+    The caller's thread id is not baked in. As on the local path, the
+    agent carries it in [DISCORD_AGENTS_THREAD_ID], and this command
+    forwards it at run time. So the config is the same for every thread
+    and a stale or shared copy (Gemini's lives in the worktree) can never
+    route tool calls to another thread. The forwarded value must be all
+    digits (a Discord id), which is what lets it go unquoted into the
+    command line that the writer's login shell parses; the server path
+    is passed pre-quoted for that shell as a positional parameter, so
+    this [sh] never re-parses it.
+
+    [config_home] is the bot's [XDG_CONFIG_HOME] equivalent (the parent
+    of its app config dir). The server finds the bot's control socket
+    from it; over ssh it would otherwise see the writer's login
+    environment and could reach another bot instance's socket. Note the
+    writer's login shell must not print on stdout for non-interactive
+    shells, or it corrupts the MCP stream. *)
+let remote_mcp_command ~writer_ssh ~mcp_path ~config_home =
+  let script =
+    Printf.sprintf
+      {|case "${%s:-}" in ''|*[!0-9]*) echo "discord-agents-mcp: %s must be a Discord id" >&2; exit 1;; esac; exec ssh %s -- "$1" "env %s=$%s XDG_CONFIG_HOME=$3 $2"|}
+      session_thread_id_env session_thread_id_env
+      (String.concat " " Host_exec.ssh_options)
+      session_thread_id_env session_thread_id_env
+  in
+  ("sh", ["-c"; script; "discord-agents-mcp"; writer_ssh;
+          Remote_script.quote mcp_path; Remote_script.quote config_home])
+
+let is_discord_id s = s <> "" && String.for_all (function '0' .. '9' -> true | _ -> false) s
+
+(* Upper bound on one setup command (reading or writing a small file on
+   an executor). It keeps a hung executor from holding a turn, and a stop
+   requested meanwhile, indefinitely. *)
+let remote_setup_timeout_s = 60
 
 (** Register the MCP server in [working_dir]/.gemini/settings.json on an
     executor, with the same merge as [setup_gemini_mcp] (other servers and
-    keys are kept), and keep [.gemini/] out of git there. Failures are
-    logged, not raised: as locally, Gemini then runs without bot tools
-    rather than not at all. Blocking; call from a system thread. *)
-let setup_gemini_mcp_remote ?ssh ~(host : Host.t) ~working_dir ~command ~args () =
+    keys are kept), and keep [.gemini/] out of git there. With no server
+    to register ([mcp = None]), withdraw our entry and change nothing
+    else, as locally. Writes go to a per-process temp file renamed into
+    place, so an interrupted or concurrent write never leaves a partial
+    file. Failures are logged, not raised: as locally, Gemini then runs
+    without bot tools rather than not at all, and the entry carries no
+    thread id, so a stale one cannot misroute. Blocking; call from a
+    system thread. *)
+let setup_gemini_mcp_remote ?ssh ~(host : Host.t) ~working_dir ~mcp () =
   let run ?input argv =
-    Host_exec.run_capture ?ssh ~cwd:working_dir ?input host argv in
+    Host_exec.run_capture ?ssh ~timeout_s:remote_setup_timeout_s
+      ~cwd:working_dir ?input host argv in
   let warn what f =
     Logs.warn (fun m -> m "agent_process: %s on %s failed: %s" what host.name
       (Host_exec.describe_failure ~host:host.name f
        ^ ": " ^ Host_exec.failure_detail f))
   in
   let settings = ".gemini/settings.json" in
-  let existing =
-    match run ["test"; "-e"; settings] with
+  (* Present: Ok (Some contents); absent: Ok None; unreadable: Error. *)
+  let read_optional path =
+    match run ["test"; "-e"; path] with
     | Error (Host_exec.Exited (1, _)) -> Ok None
     | Error f -> Error f
-    | Ok _ -> Result.map Option.some (run ["cat"; "--"; settings])
+    | Ok _ -> Result.map Option.some (run ["cat"; "--"; path])
   in
+  let existing = read_optional settings in
+  (* An unreachable host fails every later step too, each paying the
+     connect timeout; the agent spawn that follows reports it. *)
+  match existing with
+  | Error (Host_exec.Unreachable _ as f) -> warn "reaching the host" f
+  | _ ->
+  let write_settings contents =
+    match run ~input:contents
+            ["sh"; "-c";
+             "mkdir -p .gemini && cat > \".gemini/settings.json.tmp.$$\" \
+              && mv -f \".gemini/settings.json.tmp.$$\" .gemini/settings.json"]
+    with
+    | Ok _ -> ()
+    | Error f -> warn "writing .gemini/settings.json" f
+  in
+  match mcp with
+  | None ->
+    (match existing with
+     | Error f -> warn "reading .gemini/settings.json" f
+     | Ok existing ->
+       Option.iter write_settings (gemini_settings_without_our_entry existing))
+  | Some (command, args) ->
   (match existing with
    | Error f -> warn "reading .gemini/settings.json" f
-   | Ok existing ->
-     let merged = merge_gemini_settings ~args ~command existing in
-     match run ~input:merged
-             ["sh"; "-c";
-              "mkdir -p .gemini && cat > .gemini/settings.json.tmp \
-               && mv -f .gemini/settings.json.tmp .gemini/settings.json"]
-     with
-     | Ok _ -> ()
-     | Error f -> warn "writing .gemini/settings.json" f);
-  match run ["git"; "rev-parse"; "--git-path"; "info/exclude"] with
+   | Ok existing -> write_settings (merge_gemini_settings ~args ~command existing));
+  (* stderr dropped: capture merges it into the output, and a git
+     warning would otherwise become part of the path. *)
+  match run ["sh"; "-c"; "git rev-parse --git-path info/exclude 2>/dev/null"] with
   | Error _ -> ()  (* not a git checkout: nothing to exclude from *)
   | Ok path ->
     let path = String.trim path in
-    let current =
-      match run ["cat"; "--"; path] with Ok c -> Some c | Error _ -> None in
-    match current with
-    | Some text when exclude_already_lists_gemini text -> ()
-    | current ->
+    (* As locally: an exclude file we cannot read is left alone, never
+       replaced by one holding only our line. *)
+    match read_optional path with
+    | Error f -> warn "reading .git/info/exclude" f
+    | Ok (Some text) when exclude_already_lists_gemini text -> ()
+    | Ok current ->
       match run ~input:(merge_gemini_exclude current)
-              ["sh"; "-c"; "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"";
+              ["sh"; "-c";
+               "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1.tmp.$$\" \
+                && mv -f \"$1.tmp.$$\" \"$1\"";
                "_"; path] with
       | Ok _ -> ()
       | Error f -> warn "updating .git/info/exclude" f
@@ -1937,6 +1990,10 @@ let setup_gemini_mcp_remote ?ssh ~(host : Host.t) ~working_dir ~command ~args ()
 let remote_failure_message ~host = function
   | Host_exec.Exited (code, stderr) ->
     Printf.sprintf "agent exited with code %d on %s: %s" code host stderr
+  | Host_exec.Transport_lost detail ->
+    (* Also what a deliberate stop looks like from here. *)
+    Printf.sprintf "the connection to %s ended (stopped, or the connection \
+                    dropped)%s" host (if detail = "" then "" else ": " ^ detail)
   | failure ->
     let detail = Host_exec.failure_detail failure in
     Host_exec.describe_failure ~host failure
@@ -2009,7 +2066,8 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
     | Local -> None
     | Remote { writer_ssh; _ } ->
       Option.map (fun mcp_path ->
-        remote_mcp_command ~writer_ssh ~thread_id ~mcp_path)
+        remote_mcp_command ~writer_ssh ~mcp_path
+          ~config_home:(Filename.dirname (Resource.app_config_dir ())))
         (mcp_command_opt ())
   in
   let claude_mcp_arg = match kind, target with
@@ -2037,13 +2095,10 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
   (match kind, target with
    | Config.Gemini, Local -> setup_gemini_mcp ~working_dir ()
    | Config.Gemini, Remote { host; destination; _ } ->
-     (match remote_mcp with
-      | None -> ()
-      | Some (command, args) ->
-        let host =
-          { (Host.local_host host) with Host.transport = Host.Ssh destination } in
-        Eio_unix.run_in_systhread (fun () ->
-          setup_gemini_mcp_remote ?ssh ~host ~working_dir ~command ~args ()))
+     let host =
+       { (Host.local_host host) with Host.transport = Host.Ssh destination } in
+     Eio_unix.run_in_systhread (fun () ->
+       setup_gemini_mcp_remote ?ssh ~host ~working_dir ~mcp:remote_mcp ())
    | (Config.Claude | Config.Codex), _ -> ());
   let command_args ~session_id_confirmed =
     let agent_args = match kind with
@@ -2087,12 +2142,18 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
      reaping work unchanged; killing it makes the executor's watchdog
      kill the agent. The lock key is the thread, which is stable even
      while Codex and Gemini swap a placeholder session id for theirs. *)
+  (* The agent carries the caller's thread id in its environment, as
+     locally; the MCP command forwards it (see [remote_mcp_command]). *)
   let run_remote ~host ~destination argv =
-    Host_exec.run_streaming_ssh ~sw ~mgr ?ssh
-      ~prefix:[setsid_command (); "--wait"] ~destination ~cwd:working_dir
-      ~lock_key:thread_id ~argv ~on_line:parse_line
-      ?on_spawn:on_pid ()
-    |> Result.map_error (remote_failure_message ~host)
+    if not (is_discord_id thread_id) then
+      Result.Error (Printf.sprintf
+        "cannot run on %s: thread id %S is not a Discord id" host thread_id)
+    else
+      Host_exec.run_streaming_ssh ~sw ~mgr ?ssh
+        ~prefix:[setsid_command (); "--wait"] ~destination ~cwd:working_dir
+        ~lock_key:thread_id ~env:[session_thread_id_env, thread_id]
+        ~argv ~on_line:parse_line ?on_spawn:on_pid ()
+      |> Result.map_error (remote_failure_message ~host)
   in
   let run_once args =
     let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in

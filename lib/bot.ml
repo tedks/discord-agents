@@ -167,12 +167,21 @@ let is_persistent_session t ~thread_id (session : Session_store.session) =
   || (Option.is_some session.system_prompt
       && is_known_project_name t session.project_name)
 
-(** Whether [session] runs on this machine. Stamps are produced by
-    [Host.session_host_name], so this machine's sessions carry exactly
-    [local_host_name]; compare that, not a fuzzy host match. *)
+(** Whether [session] runs on this machine. New sessions carry exactly
+    [local_host_name], but older ones may spell this machine differently
+    (stamped before a hosts block existed or was respelled: tower0 vs
+    tower0.lan), so with a registry both names are resolved and compared
+    as entries, and without one by [Host.same_host]. *)
 let session_is_local t (session : Session_store.session) =
-  String.equal (String.lowercase_ascii session.host)
-    (String.lowercase_ascii (local_host_name t))
+  let here = local_host_name t in
+  String.equal (String.lowercase_ascii session.host) (String.lowercase_ascii here)
+  || match t.config.Config.hosts with
+     | None -> Host.same_host session.host here
+     | Some registry ->
+       match Host.resolve registry.hosts session.host,
+             Host.resolve registry.hosts here with
+       | Host.Found a, Host.Found b -> String.equal a.name b.name
+       | _ -> false
 
 (** Where [session]'s agent runs. A session on another host needs that
     host in the registry, enabled, with an ssh destination; the MCP
@@ -684,6 +693,9 @@ let request_session_process_stop t (session : Session_store.session) =
    and branch intact for a later resume, PR, or review. Best-effort: never
    lets a cleanup failure block the session actually being removed. *)
 let prune_or_clean_session_worktree t (session : Session_store.session) =
+  (* Worktree cleanup is local git work; a remote session's working_dir
+     is a path on its executor (remote cleanup comes with PR 5). *)
+  if not (session_is_local t session) then () else
   match List.find_opt (fun (p : Project.t) -> p.name = session.project_name)
           (projects t) with
   | None -> ()

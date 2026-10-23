@@ -2267,7 +2267,23 @@ let test_session_target () =
     check "explicit writer_ssh" "remote laptop via laptop, mcp via tower0.lan"
       bot "laptop";
     check "disabled" "error" bot "drynwyn";
-    check "unknown" "error" bot "splinter1")
+    check "unknown" "error" bot "splinter1";
+    check "remote, case-insensitive" "remote framework0 via fw0, mcp via test-host"
+      bot "FRAMEWORK0";
+    (* Stamped before the hosts block existed, with the long hostname:
+       still this machine, not "no ssh route to test-host". *)
+    check "respelled local stamp" "local" bot "test-host.lan";
+    let parse s = Discord_agents.Host.registry_of_yojson (Yojson.Safe.from_string s) in
+    let ambiguous = with_hosts (Some (parse
+      {|{"writer": "test-host", "executors": {
+          "bot.a.example": {"ssh": "a"}, "bot.b.example": {"ssh": "b"}}}|})) in
+    check "ambiguous host" "error" ambiguous "bot";
+    (* Running forced on test-host while tower0 is the configured writer:
+       tower0's sessions have no ssh route from here. *)
+    let forced = with_hosts (Some (parse
+      {|{"writer": "tower0", "executors": {"test-host": {"ssh": "th"}}}|})) in
+    check "writer's session from a forced machine" "error" forced "tower0";
+    check "this machine even though listed with ssh" "local" forced "test-host")
 
 let () =
   Alcotest.run "bot_defaults" [
