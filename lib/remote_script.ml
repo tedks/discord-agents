@@ -19,8 +19,10 @@
       whenever the local ssh process dies. A per-key [flock] stops a
       second run with the same key on the same host.
 
-    Every word interpolated into a script is single-quoted, so the
-    only shell syntax in a script is what this module writes.
+    Every word that comes from a caller is single-quoted, so the only
+    shell syntax in a script is what this module writes. The one
+    unquoted interpolation is the nonce, which [fresh_nonce] makes here
+    from hex digits only.
 
     What the nonce does and does not buy: it keeps the command's output
     from colliding with a marker by accident or by echoing text it saw,
