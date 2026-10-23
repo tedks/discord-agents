@@ -534,8 +534,9 @@ remote launch:
   remote session.
   Identical paths can expose the wrong host's files. The handler now rejects
   that path before any read; next implement executor-side confinement and
-  bounded transfers. Stop cleanup already skips remote worktrees. Keep unsupported
-  operations explicit until they are routed; audit every `working_dir` use.
+  bounded transfers. Stop cleanup already skips remote worktrees. Keep
+  unsupported operations explicit until they are routed; audit every
+  `working_dir` use.
 - **EOF is cleanup, not a lease.** Keepalives bound the writer's wait, not a
   partitioned executor's lifetime. The current run lock uses the thread id,
   so it also cannot exclude two threads resuming the same transcript. Before
