@@ -444,7 +444,7 @@ let test_malformed_host_does_not_default () =
       Alcotest.(check bool) ("rejected " ^ host_json) true
         (Discord_agents.Session_store.find_opt store ~thread_id:"control"
          = None)))
-    [{|42|}; {|"a b"|}; {|"-oProxyCommand=x"|}; {|""|}]
+    [{|42|}; {|null|}; {|"a b"|}; {|"-oProxyCommand=x"|}; {|""|}]
 
 let () =
   Alcotest.run "session_store" [

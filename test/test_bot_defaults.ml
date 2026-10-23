@@ -2178,8 +2178,8 @@ let test_stop_busy_session_signals_tracked_child () =
 let test_persist_migrated_session_hosts () =
   with_test_bot (fun bot ->
     let sessions = bot.Discord_agents.Bot.sessions in
-    Alcotest.(check string) "writer host comes from the store"
-      "test-host" (Discord_agents.Bot.writer_host bot);
+    Alcotest.(check string) "local host name comes from the store"
+      "test-host" (Discord_agents.Bot.local_host_name bot);
     sessions.migrated_host_count <- 2;
     Discord_agents.Bot.persist_migrated_session_hosts
       ~save:(fun _ -> failwith "disk full") bot;
@@ -2194,11 +2194,43 @@ let test_persist_migrated_session_hosts () =
       ~save:(fun _ -> incr saved) bot;
     Alcotest.(check int) "no save when nothing migrated" 1 !saved)
 
+(* The whole startup path, not the helper: creating the bot must leave
+   legacy entries stamped on disk, so a later load under a different
+   name (a writer move) cannot re-home them. *)
+let test_bot_create_persists_legacy_hosts () =
+  with_tmp_home (fun () ->
+    let path =
+      Filename.concat (Sys.getenv "HOME") ".config/discord-agents/sessions.json" in
+    Discord_agents.Resource.ensure_parent_dir path;
+    Discord_agents.Resource.write_file_atomic path
+      {|[{"thread_id":"t1","project_name":"p","working_dir":"/tmp/p","agent_kind":"claude","session_id":"s1","message_count":1}]|};
+    let expected =
+      match Discord_agents.Host.session_host_name None with
+      | Ok name -> name
+      | Error msg -> Alcotest.fail msg
+    in
+    Eio_main.run @@ fun env ->
+    Eio.Switch.run @@ fun sw ->
+    let config = { Discord_agents.Config.default with discord_token = "t" } in
+    let bot = Discord_agents.Bot.create ~sw ~env config in
+    Alcotest.(check string) "stamped in memory" expected
+      (Discord_agents.Bot.local_host_name bot);
+    let reloaded =
+      Discord_agents.Session_store.create ~default_host:"elsewhere" () in
+    match Discord_agents.Session_store.find_opt reloaded ~thread_id:"t1" with
+    | Some session ->
+      Alcotest.(check string) "host persisted by startup" expected session.host;
+      Alcotest.(check int) "nothing left to migrate" 0
+        reloaded.migrated_host_count
+    | None -> Alcotest.fail "session lost")
+
 let () =
   Alcotest.run "bot_defaults" [
     ("session_hosts", [
       Alcotest.test_case "persist migrated session hosts" `Quick
         test_persist_migrated_session_hosts;
+      Alcotest.test_case "bot create persists legacy hosts" `Quick
+        test_bot_create_persists_legacy_hosts;
     ]);
     ("default agent", [
       Alcotest.test_case "busy control session defers default rotation" `Quick

@@ -81,11 +81,12 @@ type top_level_policy_sync_state =
   | Policy_sync_rotation_pending
   | Policy_sync_marker_clear_pending
 
-(** The writer's host name: the host every session created by this
-    process runs on until remote executors exist. The session store
-    holds it because it also stamps it on legacy entries at load, and
-    one source of truth keeps the two from disagreeing. *)
-let writer_host t = t.sessions.Session_store.default_host
+(** The name of the machine this process runs on, as recorded on
+    sessions (see [Host.session_host_name]). Until remote executors
+    exist, every session runs here. The session store holds it because
+    it also stamps it on legacy entries at load, and one source of
+    truth keeps the two from disagreeing. *)
+let local_host_name t = t.sessions.Session_store.default_host
 
 (** Convenience accessors for the current project state snapshot. *)
 let projects t = t.project_state.projects
@@ -1489,10 +1490,35 @@ let child_processes_for_restart t =
 (** Trigger a graceful restart: drain → reap → build → spawn.
     Callable from command handler or signal handler.
     [notify] is called with status messages (may be a no-op for signal-triggered restarts). *)
+(** The checks the respawned process will make before it takes over,
+    run against the config it will load. The old process exits 30 s
+    after a successful build whether or not the new one started, so a
+    config edit that the new one would refuse (a malformed file, or
+    hosts.writer now naming another machine) must stop the restart
+    here, while this bot is still serving. *)
+let restart_preflight () =
+  match Config.load_result () with
+  | Error errors -> Error (String.concat "; " errors)
+  | Ok config ->
+    match Config.validate config with
+    | Error errors -> Error (String.concat "; " errors)
+    | Ok () ->
+      let force =
+        Host.force_writer_source ~args:[]
+          ~env_value:(Sys.getenv_opt Host.force_writer_env)
+      in
+      Result.map ignore (Host.startup_check ?force config.hosts)
+
 let trigger_restart t ~notify =
   if t.draining then begin
     notify "Already restarting.";
-  end else begin
+  end else match restart_preflight () with
+  | Error err ->
+    notify (Printf.sprintf
+      "Not restarting: the new instance would refuse to start (%s). \
+       Fix %s and try again."
+      (Resource.single_line err) (Config.config_path ()))
+  | Ok () -> begin
   (* Set draining BEFORE forking to close the race window where
      a queued message could slip through before the flag flips. *)
   t.draining <- true;
@@ -1723,7 +1749,7 @@ let resolve_resume_target t ~raw_working_dir ~kind_label ~fallback_channel =
 let create_persistent_channel_session t ~channel_id ~project_name ~working_dir
     ~system_prompt ~agent_kind ~session_override_kind =
   let session = Session_store.make_session
-    ~project_name ~host:(writer_host t) ~working_dir ~agent_kind
+    ~project_name ~host:(local_host_name t) ~working_dir ~agent_kind
     ~session_override_kind
     ~session_id:(Resource.generate_uuid ())
     ~thread_id:channel_id
@@ -2001,7 +2027,7 @@ let handle_command t msg cmd =
            reply (Printf.sprintf "Failed to create thread: %s" e)
          | Ok thread_ch ->
            let session = Session_store.make_session
-             ~project_name:p.name ~host:(writer_host t) ~working_dir
+             ~project_name:p.name ~host:(local_host_name t) ~working_dir
              ~agent_kind:kind
              ~session_id:(Resource.generate_uuid ())
              ~thread_id:thread_ch.Discord_types.id
@@ -2114,7 +2140,7 @@ let handle_command t msg cmd =
              would mark the session unconfirmed and the next turn's
              gemini_args would omit --resume, starting a fresh chat. *)
           let session = Session_store.make_session
-            ~project_name ~host:(writer_host t) ~working_dir
+            ~project_name ~host:(local_host_name t) ~working_dir
             ~agent_kind:found_kind
             ~session_id:full_sid ~session_id_confirmed:true
             ~message_count:1
@@ -3379,9 +3405,12 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
      [bot] resolves to the accessor, producing a type error — catching
      stale-closure bugs at compile time. *)
   let discovered_projects = Project.discover ~base_directories:config.base_directories in
-  let sessions =
-    Session_store.create ~default_host:(Config.host_registry config).writer ()
+  let default_host =
+    match Host.session_host_name config.Config.hosts with
+    | Ok name -> name
+    | Error msg -> failwith msg  (* main checks this before we get here *)
   in
+  let sessions = Session_store.create ~default_host () in
   let initial_channels = Channel_manager.create () in
   let gateway = Discord_gateway.create
     ~token:config.discord_token

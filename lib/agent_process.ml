@@ -1861,13 +1861,18 @@ let session_thread_id_env = "DISCORD_AGENTS_THREAD_ID"
 
 (** Build the child environment with caller identity supplied by the bot.
     Remove any inherited value first so restarting the bot from inside an
-    agent session cannot leak that session's thread id into later children. *)
+    agent session cannot leak that session's thread id into later children.
+    The writer override is removed too: it is the bot's own startup
+    decision, and an agent that launches a bot (scripts/run-branch.sh)
+    must face the writer guard rather than inherit a bypass. *)
 let child_environment ?(environment = Unix.environment ()) ~thread_id () =
-  let prefix = session_thread_id_env ^ "=" in
+  let stripped = [session_thread_id_env; Host.force_writer_env] in
   let inherited =
     environment
     |> Array.to_list
-    |> List.filter (fun entry -> not (String.starts_with ~prefix entry))
+    |> List.filter (fun entry ->
+      not (List.exists (fun name ->
+        String.starts_with ~prefix:(name ^ "=") entry) stripped))
   in
   Array.of_list
     (inherited @ [Printf.sprintf "%s=%s" session_thread_id_env thread_id])

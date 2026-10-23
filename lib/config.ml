@@ -133,7 +133,7 @@ type t = {
   projects : project list;
   hosts : Host.registry option;
   (** The [hosts] block, if present. [None] keeps single-host
-      behaviour; use [host_registry] rather than matching on this. *)
+      behaviour: this machine is the only host. *)
 } [@@deriving show]
 
 let default = {
@@ -230,12 +230,6 @@ let yojson_of_t t =
 
 let blank s = String.trim s = ""
 
-(** The host registry in effect: the configured one, or a single local
-    host named after this machine. *)
-let host_registry config =
-  match config.hosts with
-  | Some registry -> registry
-  | None -> Host.default_registry ()
 
 let validation_errors ?(require_guild_id=true) config =
   let errors = ref [] in

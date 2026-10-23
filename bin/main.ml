@@ -157,16 +157,15 @@ let () =
      bot on another host with the same token would answer every message
      twice, so a configured writer is enforced here, also before the
      pidfile so a refused start cannot kill a healthy running bot. *)
-  let force_writer_env = "DISCORD_AGENTS_FORCE_WRITER" in
-  let force_writer =
-    List.mem "--force-writer" args
-    || Sys.getenv_opt force_writer_env = Some "1"
+  let module Host = Discord_agents.Host in
+  let force =
+    Host.force_writer_source ~args
+      ~env_value:(Sys.getenv_opt Host.force_writer_env)
   in
-  if force_writer then Unix.putenv force_writer_env "1";
+  if Option.is_some force then Unix.putenv Host.force_writer_env "1";
   (if not test_mode then
-     match Discord_agents.Host.check_writer ~force:force_writer
-             config.Discord_agents.Config.hosts with
-     | Ok () -> ()
+     match Host.startup_check ?force config.Discord_agents.Config.hosts with
+     | Ok _host_name -> ()
      | Error err ->
        Logs.err (fun m -> m "config: %s" err);
        exit 1);

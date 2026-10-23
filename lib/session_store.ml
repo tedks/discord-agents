@@ -196,8 +196,9 @@ type t = {
   mutable last_reload : float;
   default_host : string;
   (* Host assigned to entries persisted before sessions carried one.
-     Every such session ran on the machine that ran the bot, which is
-     the writer. *)
+     Every such session ran on the machine that ran the bot, so this is
+     that machine's name ([Host.session_host_name]), not the configured
+     writer: they differ when the bot is started with --force-writer. *)
   mutable migrated_host_count : int;
   (* How many loaded entries took [default_host]. Non-zero means the
      file on disk still lacks host fields until the next save. *)
@@ -318,16 +319,24 @@ let sessions_of_json ~default_host json =
         Some (Agent_checkpoint.of_persisted ~message_id ~child_process)
       | _ -> None
     in
+    (* Only an absent key is a legacy entry. [member] reports a present
+       [null] the same way, so look at the object itself: a null host is
+       corruption and must not be routed to whatever machine loads it. *)
+    let host_field =
+      match j with
+      | `Assoc fields -> List.assoc_opt "host" fields
+      | _ -> None
+    in
     let host =
-      match j |> member "host" with
-      | `Null ->
+      match host_field with
+      | None ->
         incr migrated;
         default_host
-      | `String h ->
+      | Some (`String h) ->
         (match Host.validate_name h with
          | Ok h -> h
          | Error msg -> failwith (Printf.sprintf "session %s: %s" thread_id msg))
-      | _ -> failwith (Printf.sprintf "session %s: host: expected string" thread_id)
+      | Some _ -> failwith (Printf.sprintf "session %s: host: expected string" thread_id)
     in
     let session = {
       project_name = j |> member "project_name" |> to_string;
@@ -734,6 +743,9 @@ let maybe_reload t =
       try
         let stat = Unix.stat path in
         if stat.Unix.st_mtime > t.last_reload -. 5.0 then begin
+          (* Migrated entries here need no bookkeeping: the session
+             stamped at startup is the same default, and any save
+             writes the host out. *)
           let loaded, _migrated =
             load_from_disk ~default_host:t.default_host () in
           SessionMap.iter (fun tid session ->

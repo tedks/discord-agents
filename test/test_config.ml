@@ -260,8 +260,7 @@ let test_hosts_block_roundtrips_through_save () =
     | Some a, Some b ->
       Alcotest.(check bool) "hosts survive save" true
         (Discord_agents.Host.equal_registry a b);
-      Alcotest.(check string) "writer" "tower0"
-        (Discord_agents.Config.host_registry reloaded).writer
+      Alcotest.(check string) "writer" "tower0" b.writer
     | _ -> Alcotest.fail "hosts block lost")
 
 let test_absent_hosts_block_stays_absent () =
@@ -276,9 +275,8 @@ let test_absent_hosts_block_stays_absent () =
     let json = Yojson.Safe.from_file path in
     Alcotest.(check bool) "save adds no hosts key" true
       (Yojson.Safe.Util.member "hosts" json = `Null);
-    let registry = Discord_agents.Config.host_registry config in
-    Alcotest.(check string) "default writer is this machine"
-      (Discord_agents.Host.local_hostname ()) registry.writer)
+    Alcotest.(check bool) "this machine still has a usable name" true
+      (Result.is_ok (Discord_agents.Host.session_host_name config.hosts)))
 
 let test_invalid_hosts_block_fails_load () =
   with_tmp_home (fun home ->

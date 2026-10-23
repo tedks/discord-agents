@@ -3633,6 +3633,7 @@ let test_child_environment_sets_thread_id_once () =
     key ^ "=stale-thread";
     "HOME=/tmp";
     key ^ "=duplicate-stale-thread";
+    Discord_agents.Host.force_writer_env ^ "=1";
   |] in
   let matches =
     Discord_agents.Agent_process.child_environment

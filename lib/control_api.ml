@@ -667,7 +667,7 @@ let handle_start_session
              whatever the user sends next instead, so the user never
              sees what context the agent received. *)
           let session = Session_store.make_session
-            ~project_name:p.name ~host:(Bot.writer_host bot) ~working_dir
+            ~project_name:p.name ~host:(Bot.local_host_name bot) ~working_dir
             ~agent_kind:kind
             ~session_id ~thread_id:thread_ch.Discord_types.id
             ~system_prompt:None ~model ~initial_prompt:None () in
@@ -854,7 +854,7 @@ let handle_resume_session (bot : Bot.t) params =
            Resume_session for the rationale — without it, Gemini resumes
            start fresh chats instead of resuming. *)
         let session = Session_store.make_session
-          ~project_name ~host:(Bot.writer_host bot) ~working_dir
+          ~project_name ~host:(Bot.local_host_name bot) ~working_dir
           ~agent_kind:resolved_kind
           ~session_id:full_sid ~session_id_confirmed:true
           ~message_count:1

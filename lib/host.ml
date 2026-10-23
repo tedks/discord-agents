@@ -34,7 +34,8 @@ type registry = {
 }
 [@@deriving show, eq]
 
-let max_name_length = 63
+(* Linux's HOST_NAME_MAX. *)
+let max_name_length = 64
 
 let is_name_char = function
   | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '.' | '_' | '-' -> true
@@ -55,26 +56,63 @@ let validate_name name =
     Error (Printf.sprintf "host name %S must not start with '-' or '.'" name)
   else Ok name
 
-(** SSH destinations are passed to [ssh] as an argument. One that
-    starts with '-' would be parsed as an option (for example
-    [-oProxyCommand=...]), so it is rejected outright, as is anything
-    with whitespace or control characters. *)
+let is_destination_char = function
+  | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9'
+  | '.' | '_' | '-' | '@' | ':' | '%' | '[' | ']' -> true
+  | _ -> false
+
+(** SSH destinations become an argument to ssh here, and [writer_ssh]
+    later becomes a word in a command line that a remote login shell
+    parses. So they are allowlisted to what an ssh-config alias,
+    [user@host], an IPv4 address or a bracketed IPv6 address with a
+    scope id needs, and a leading '-' (which ssh would read as an
+    option such as [-oProxyCommand=...]) is refused. *)
 let validate_destination ~field dest =
   if dest = "" then Error (Printf.sprintf "%s must not be empty" field)
   else if dest.[0] = '-' then
     Error (Printf.sprintf "%s %S must not start with '-'" field dest)
-  else if String.exists (fun c -> c <= ' ' || c = '\127') dest then
+  else if not (String.for_all is_destination_char dest) then
     Error (Printf.sprintf
-      "%s %S must not contain whitespace or control characters" field dest)
+      "%s %S may contain only letters, digits and . _ - @ : %% [ ]" field dest)
   else Ok dest
 
-(** This machine's name, shortened to the part before the first dot so
-    that [tower0] and [tower0.local] compare equal. *)
-let local_hostname () =
-  let full = Unix.gethostname () in
-  match String.index_opt full '.' with
-  | Some i when i > 0 -> String.sub full 0 i
-  | _ -> full
+(** Directories on an executor are always single-quoted before they
+    reach a shell; this only refuses values that are wrong whatever the
+    quoting: empty, option-like, or containing control characters. *)
+let validate_directory ~field dir =
+  if String.trim dir = "" then Error (Printf.sprintf "%s: entries must not be empty" field)
+  else if dir.[0] = '-' then
+    Error (Printf.sprintf "%s: %S must not start with '-'" field dir)
+  else if String.exists (fun c -> c < ' ' || c = '\127') dir then
+    Error (Printf.sprintf "%s: %S must not contain control characters" field dir)
+  else Ok dir
+
+let first_label s =
+  match String.index_opt s '.' with
+  | Some i when i > 0 -> String.sub s 0 i
+  | _ -> s
+
+(** Whether two host names refer to the same machine. Case-insensitive.
+    An unqualified name matches a qualified one by its first label
+    ([tower0] = [tower0.local]), but two qualified names must match
+    exactly: [bot.prod.example] and [bot.dev.example] are different
+    machines, and treating them as one would let both pass the
+    writer guard. *)
+let same_host a b =
+  let a = String.lowercase_ascii a and b = String.lowercase_ascii b in
+  if String.contains a '.' && String.contains b '.' then String.equal a b
+  else String.equal (first_label a) (first_label b)
+
+(** This machine's name as recorded on sessions when no registry entry
+    names it: the lowercased first label of the hostname, validated so
+    that a name the bot writes is always one it can read back. *)
+let this_machine_name ?(hostname = Unix.gethostname ()) () =
+  match validate_name (String.lowercase_ascii (first_label hostname)) with
+  | Ok name -> Ok name
+  | Error msg ->
+    Error (Printf.sprintf
+      "this machine's hostname %S cannot be used as a host name: %s"
+      hostname msg)
 
 let local_host name = {
   name;
@@ -86,10 +124,10 @@ let local_host name = {
 
 let single_host_registry name = { writer = name; hosts = [local_host name] }
 
-let default_registry () = single_host_registry (local_hostname ())
-
+(** Registry keys never share a first label (see [registry_of_yojson]),
+    so at most one host matches. *)
 let find registry name =
-  List.find_opt (fun h -> String.equal h.name name) registry.hosts
+  List.find_opt (fun h -> same_host h.name name) registry.hosts
 
 let writer registry =
   match find registry registry.writer with
@@ -102,38 +140,71 @@ let writer registry =
 let is_local h =
   match h.transport with Local -> true | Ssh _ -> false
 
-(** Whether [name] refers to this machine, accepting the short or the
-    fully-qualified form on either side. *)
 let names_this_machine ?(hostname = Unix.gethostname ()) name =
-  let short s =
-    match String.index_opt s '.' with
-    | Some i when i > 0 -> String.sub s 0 i
-    | _ -> s
-  in
-  String.equal name hostname
-  || String.equal (short name) (short hostname)
+  same_host name hostname
+
+(** The host name to record on sessions this process creates. It must
+    name the machine that actually runs the agents, which is this one:
+    the registry's spelling when the registry's writer is this machine
+    (so lookups by that key work), otherwise this machine's own name.
+    The second case covers a single-host install and a start forced
+    onto a machine that is not the configured writer. Stamping the
+    configured writer there would send those sessions back to a
+    machine that never ran them. *)
+let session_host_name ?hostname registry_opt =
+  match registry_opt with
+  | Some registry when names_this_machine ?hostname registry.writer ->
+    Ok registry.writer
+  | _ -> this_machine_name ?hostname ()
+
+let force_writer_env = "DISCORD_AGENTS_FORCE_WRITER"
+
+
+(** Where a writer override came from, if anywhere. The environment
+    variable exists because !restart respawns the bot with no flags;
+    main exports it whenever the flag is given. *)
+let force_writer_source ~args ~env_value =
+  if List.mem "--force-writer" args then Some "--force-writer"
+  else
+    match env_value with
+    | Some v when List.mem (String.lowercase_ascii (String.trim v))
+                    ["1"; "true"; "yes"; "on"] ->
+      Some (force_writer_env ^ "=" ^ v)
+    | _ -> None
 
 (** The startup guard against two writers. Only an explicit [hosts]
     block names a writer; without one, whatever machine runs the bot
-    is the writer, as before. *)
-let check_writer ?hostname ~force registry_opt =
+    is the writer, as before. [force] names the override's source. *)
+let check_writer ?hostname ?force registry_opt =
   match registry_opt with
   | None -> Ok ()
   | Some registry when names_this_machine ?hostname registry.writer -> Ok ()
   | Some registry ->
     let here = Option.value hostname ~default:(Unix.gethostname ()) in
-    if force then begin
+    match force with
+    | Some source ->
       Logs.warn (fun m ->
         m "hosts.writer is %S but this machine is %S; starting anyway \
-           because --force-writer was given"
-          registry.writer here);
+           because of %s"
+          registry.writer here source);
       Ok ()
-    end else
+    | None ->
       Error (Printf.sprintf
         "hosts.writer is %S but this machine is %S. Only the writer may \
          run the bot, or two bots would answer every Discord message. \
-         Start the bot on %s, change hosts.writer, or pass --force-writer."
-        registry.writer here registry.writer)
+         Start the bot on %s, change hosts.writer, or override with \
+         --force-writer (or %s=1)."
+        registry.writer here registry.writer force_writer_env)
+
+(** Everything about hosts that must hold before this process may act
+    as the bot: the writer guard, and a usable name for this machine.
+    Returns the name to record on sessions. Used at startup and again
+    before !restart shuts anything down, so a respawn that would be
+    refused is caught while the old bot is still serving. *)
+let startup_check ?hostname ?force registry_opt =
+  match check_writer ?hostname ?force registry_opt with
+  | Error _ as e -> e
+  | Ok () -> session_host_name ?hostname registry_opt
 
 (* JSON. Unknown fields are errors, matching the rest of config.json:
    a typo such as "enabeld" silently doing nothing is worse than a
@@ -141,9 +212,14 @@ let check_writer ?hostname ~force registry_opt =
 
 let fail fmt = Printf.ksprintf failwith fmt
 
+(* Yojson keeps every duplicate key and [List.assoc_opt] would quietly
+   pick the first, so a strict parser has to reject them itself. *)
 let check_known ~what ~known fields =
+  let seen = Hashtbl.create 8 in
   List.iter (fun (k, _) ->
-    if not (List.mem k known) then fail "%s: unknown field %s" what k)
+    if not (List.mem k known) then fail "%s: unknown field %s" what k;
+    if Hashtbl.mem seen k then fail "%s: field %s is given twice" what k;
+    Hashtbl.add seen k ())
     fields
 
 let ok_or_fail = function Ok v -> v | Error msg -> failwith msg
@@ -185,8 +261,9 @@ let host_of_yojson name = function
       | None | Some `Null -> None
       | Some (`List xs) ->
         Some (List.map (function
-          | `String s when String.trim s <> "" -> s
-          | `String _ -> fail "%s.base_directories: entries must not be empty" what
+          | `String s ->
+            ok_or_fail
+              (validate_directory ~field:(what ^ ".base_directories") s)
           | _ -> fail "%s.base_directories: expected array of strings" what) xs)
       | Some _ -> fail "%s.base_directories: expected array of strings" what
     in
@@ -215,19 +292,26 @@ let registry_of_yojson = function
       match List.assoc_opt "executors" fields with
       | None | Some `Null -> []
       | Some (`Assoc entries) ->
+        (* Keyed by lowercased first label, which is how [same_host]
+           compares, so [find] can never match two entries. *)
         let seen = Hashtbl.create 8 in
         List.map (fun (name, json) ->
           (match validate_name name with
            | Ok _ -> ()
            | Error msg -> fail "hosts.executors: %s" msg);
-          if Hashtbl.mem seen name then
-            fail "hosts.executors: %s is listed twice" name;
-          Hashtbl.add seen name ();
+          let key = String.lowercase_ascii (first_label name) in
+          (match Hashtbl.find_opt seen key with
+           | Some other when String.equal other name ->
+             fail "hosts.executors: %s is listed twice" name
+           | Some other ->
+             fail "hosts.executors: %s and %s would name the same host" other name
+           | None -> ());
+          Hashtbl.add seen key name;
           host_of_yojson name json) entries
       | Some _ -> fail "hosts.executors: expected object keyed by host name"
     in
     let hosts =
-      match List.find_opt (fun h -> String.equal h.name writer) executors with
+      match List.find_opt (fun h -> same_host h.name writer) executors with
       | None -> local_host writer :: executors
       | Some h ->
         if not (is_local h) then

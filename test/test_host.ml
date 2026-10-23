@@ -21,8 +21,8 @@ let test_validate_name () =
   let bad n = Alcotest.(check bool) n false (Result.is_ok (Host.validate_name n)) in
   ok "tower0"; ok "framework0"; ok "host-1.lan"; ok "a_b";
   bad ""; bad "a b"; bad "a@b"; bad "-x"; bad ".x"; bad "a/b"; bad "a\nb";
-  bad (String.make 64 'a');
-  ok (String.make 63 'a')
+  bad (String.make 65 'a');
+  ok (String.make 64 'a')
 
 let test_validate_destination () =
   let ok d =
@@ -32,8 +32,12 @@ let test_validate_destination () =
     Alcotest.(check bool) d false
       (Result.is_ok (Host.validate_destination ~field:"ssh" d)) in
   ok "framework0"; ok "tedks@framework0.local"; ok "192.168.1.158";
+  ok "tedks@[fe80::1%eth0]"; ok "host:2222";
   bad ""; bad "-oProxyCommand=touch /tmp/x"; bad "-p22"; bad "a b";
-  bad "a\tb"; bad "a\nb"; bad "a\127"
+  bad "a\tb"; bad "a\nb"; bad "a\127";
+  (* writer_ssh ends up as a word a remote login shell parses *)
+  bad "tower0$(touch /tmp/x)"; bad "a;b"; bad "`id`"; bad "a|b"; bad "a&b";
+  bad "a'b"; bad "a\"b"; bad "a>b"; bad "a/b"
 
 let test_minimal_registry_inserts_local_writer () =
   let r = parse {|{"writer": "tower0"}|} in
@@ -123,23 +127,106 @@ let test_names_this_machine () =
   check "fqdn hostname" true "tower0" "tower0.local";
   check "fqdn name" true "tower0.local" "tower0";
   check "different" false "framework0" "tower0";
-  check "prefix is not a match" false "tower" "tower0"
+  check "prefix is not a match" false "tower" "tower0";
+  check "case-insensitive" true "Tower0" "tower0.LOCAL";
+  (* Two qualified names sharing a first label are different machines;
+     equating them would let both pass the writer guard. *)
+  check "qualified names must match exactly" false
+    "bot.prod.example" "bot.dev.example";
+  check "identical qualified names" true "bot.prod.example" "BOT.prod.example"
 
 let test_check_writer () =
   let r = parse {|{"writer": "tower0"}|} in
   Alcotest.(check bool) "no hosts block" true
-    (Result.is_ok (Host.check_writer ~hostname:"anything" ~force:false None));
+    (Result.is_ok (Host.check_writer ~hostname:"anything" None));
   Alcotest.(check bool) "on the writer" true
-    (Result.is_ok (Host.check_writer ~hostname:"tower0" ~force:false (Some r)));
-  (match Host.check_writer ~hostname:"framework0" ~force:false (Some r) with
+    (Result.is_ok (Host.check_writer ~hostname:"tower0" (Some r)));
+  (match Host.check_writer ~hostname:"framework0" (Some r) with
    | Ok () -> Alcotest.fail "expected refusal on another machine"
    | Error msg ->
      List.iter (fun needle ->
        Alcotest.(check bool) ("mentions " ^ needle) true
          (Discord_agents.Resource.contains_substring ~haystack:msg ~needle))
-       ["tower0"; "framework0"; "--force-writer"]);
+       ["tower0"; "framework0"; "--force-writer"; Host.force_writer_env]);
   Alcotest.(check bool) "forced" true
-    (Result.is_ok (Host.check_writer ~hostname:"framework0" ~force:true (Some r)))
+    (Result.is_ok (Host.check_writer ~hostname:"framework0" ~force:"--force-writer" (Some r)))
+
+let test_more_rejections () =
+  check_rejected ~label:"duplicate field" ~mentions:"given twice"
+    {|{"writer": "tower0", "writer": "framework0"}|};
+  check_rejected ~label:"duplicate host field" ~mentions:"given twice"
+    {|{"writer": "tower0",
+       "executors": {"x": {"ssh": "x", "ssh": "-oProxyCommand=y"}}}|};
+  check_rejected ~label:"same first label" ~mentions:"same host"
+    {|{"writer": "tower0",
+       "executors": {"fw": {"ssh": "fw"}, "FW.lan": {"ssh": "fw2"}}}|};
+  check_rejected ~label:"option-like base dir" ~mentions:"base_directories"
+    {|{"writer": "tower0",
+       "executors": {"x": {"ssh": "x", "base_directories": ["-rf"]}}}|};
+  check_rejected ~label:"metachar destination" ~mentions:"may contain only"
+    {|{"writer": "tower0",
+       "executors": {"x": {"ssh": "x", "writer_ssh": "t$(id)"}}}|}
+
+let test_qualified_writer_key_matches_short_executor () =
+  (* hosts.writer spelled with a domain still finds the local entry. *)
+  let r = parse {|{"writer": "tower0.local",
+                   "executors": {"tower0": {"local": true}}}|} in
+  Alcotest.(check (list string)) "no duplicate writer" ["tower0"] (names r);
+  Alcotest.(check bool) "find by short name" true
+    (Option.is_some (Host.find r "tower0"));
+  Alcotest.(check bool) "find by qualified name" true
+    (Option.is_some (Host.find r "TOWER0.local"))
+
+let test_this_machine_name () =
+  let name hostname = Host.this_machine_name ~hostname () in
+  Alcotest.(check (result string string)) "short, lowercased"
+    (Ok "tower0") (name "Tower0.Local");
+  Alcotest.(check bool) "too long" false
+    (Result.is_ok (name (String.make 65 'h')));
+  Alcotest.(check bool) "unusable characters" false
+    (Result.is_ok (name "bad host"))
+
+let test_session_host_name () =
+  let r = parse {|{"writer": "tower0",
+                   "executors": {"framework0": {"ssh": "framework0"}}}|} in
+  let stamp ?registry hostname =
+    Host.session_host_name ~hostname registry in
+  Alcotest.(check (result string string)) "single host"
+    (Ok "tower0") (stamp "tower0.local");
+  Alcotest.(check (result string string)) "on the writer"
+    (Ok "tower0") (stamp ~registry:r "tower0.local");
+  (* Forced onto another machine: sessions really run there, so they
+     must not be recorded as the configured writer's. *)
+  Alcotest.(check (result string string)) "forced elsewhere"
+    (Ok "framework0") (stamp ~registry:r "framework0");
+  let q = parse {|{"writer": "tower0.local"}|} in
+  Alcotest.(check (result string string)) "registry spelling kept"
+    (Ok "tower0.local") (stamp ~registry:q "tower0");
+  Alcotest.(check bool) "unusable hostname" false
+    (Result.is_ok (stamp (String.make 70 'x')))
+
+let test_force_writer_source () =
+  let src ?(args = []) env_value = Host.force_writer_source ~args ~env_value in
+  Alcotest.(check (option string)) "flag" (Some "--force-writer")
+    (src ~args:["--force-writer"] None);
+  List.iter (fun v ->
+    Alcotest.(check bool) ("env " ^ v) true (Option.is_some (src (Some v))))
+    ["1"; "true"; "YES"; " on "];
+  List.iter (fun v ->
+    Alcotest.(check bool) ("env " ^ v) false (Option.is_some (src (Some v))))
+    [""; "0"; "false"; "no"];
+  Alcotest.(check (option string)) "unset" None (src None)
+
+let test_startup_check () =
+  let r = parse {|{"writer": "tower0"}|} in
+  Alcotest.(check (result string string)) "writer" (Ok "tower0")
+    (Host.startup_check ~hostname:"tower0" (Some r));
+  Alcotest.(check bool) "refused" false
+    (Result.is_ok (Host.startup_check ~hostname:"framework0" (Some r)));
+  Alcotest.(check (result string string)) "forced" (Ok "framework0")
+    (Host.startup_check ~hostname:"framework0" ~force:"test" (Some r));
+  Alcotest.(check bool) "bad hostname, no registry" false
+    (Result.is_ok (Host.startup_check ~hostname:"bad host" None))
 
 let () =
   Alcotest.run "host" [
@@ -153,5 +240,12 @@ let () =
       Alcotest.test_case "json roundtrip" `Quick test_roundtrip;
       Alcotest.test_case "names this machine" `Quick test_names_this_machine;
       Alcotest.test_case "check writer" `Quick test_check_writer;
+      Alcotest.test_case "more rejections" `Quick test_more_rejections;
+      Alcotest.test_case "qualified writer key matches short executor" `Quick
+        test_qualified_writer_key_matches_short_executor;
+      Alcotest.test_case "this machine name" `Quick test_this_machine_name;
+      Alcotest.test_case "session host name" `Quick test_session_host_name;
+      Alcotest.test_case "force writer source" `Quick test_force_writer_source;
+      Alcotest.test_case "startup check" `Quick test_startup_check;
     ];
   ]
