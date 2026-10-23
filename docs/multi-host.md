@@ -212,6 +212,18 @@ The wrapper, as validated on framework0:
     kill "$dog" 2>/dev/null
     exit "$rc"
 
+The implementation in `lib/remote_script.ml` refines this sketch after
+council review of PR 3:
+- **Started marker.** The command prints its own started marker before
+  it execs, so the wrapper writes nothing to the channel between spawn
+  and arming the watchdog.
+- **Escalation.** The TERM-then-KILL escalation runs detached and holds
+  the lock, so a normal exit cannot cancel a stop already in progress.
+- **Tool and lock checks.** Missing `flock`, `setsid` or `cat` is
+  reported as a setup failure, and lock contention is told apart from
+  lock errors.
+- **Markers.** Every marker starts its own line.
+
 What each part buys, all observed in the prototype:
 
 - **Watchdog on stdin EOF.** When the local `ssh` client dies (the bot
