@@ -247,7 +247,12 @@ let test_codex_turn_over_ssh () =
     let argv = read (Filename.concat base "codex.argv") in
     Alcotest.(check bool) "mcp command override" true
       (Discord_agents.Resource.contains_substring ~haystack:argv
-         ~needle:{|mcp_servers.discord_agents.command="sh"|}))
+         ~needle:{|mcp_servers.discord_agents.command="sh"|});
+    (* Codex gives MCP servers an allowlisted environment, so the thread
+       id must be in the server's env table, not only the agent's env. *)
+    Alcotest.(check bool) "thread id in the MCP server env table" true
+      (Discord_agents.Resource.contains_substring ~haystack:argv
+         ~needle:{|mcp_servers.discord_agents.env.DISCORD_AGENTS_THREAD_ID="4242"|}))
 
 let test_unreachable_turn () =
   with_env (fun ~base:_ ~ssh ~mcp:_ ~work ->

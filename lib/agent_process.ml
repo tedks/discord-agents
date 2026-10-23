@@ -1754,16 +1754,25 @@ let escape_toml_string s =
 (** TOML overrides that register the discord-agents MCP server for a
     Codex invocation, without touching the user's ~/.codex/config.toml.
     Two key=value pairs because Codex parses each [-c] independently. *)
-let codex_mcp_overrides_for ?(args = []) ~command () =
+(* Codex starts stdio MCP servers with an allowlisted environment
+   (HOME, PATH and a few more), so the caller's thread id, which the
+   server reads from DISCORD_AGENTS_THREAD_ID, has to be put in the
+   server's own env table. -c overrides apply to this run only. *)
+let codex_mcp_overrides_for ?(args = []) ?thread_id ~command () =
   let toml_string s = "\"" ^ escape_toml_string s ^ "\"" in
   [ "-c"; "mcp_servers.discord_agents.command=" ^ toml_string command;
     "-c"; "mcp_servers.discord_agents.args=["
           ^ String.concat ", " (List.map toml_string args) ^ "]" ]
+  @ (match thread_id with
+     | Some id ->
+       ["-c"; "mcp_servers.discord_agents.env.DISCORD_AGENTS_THREAD_ID="
+              ^ toml_string id]
+     | None -> [])
 
-let codex_mcp_overrides () =
+let codex_mcp_overrides ?thread_id () =
   match mcp_command_opt () with
   | None -> []
-  | Some path -> codex_mcp_overrides_for ~command:path ()
+  | Some path -> codex_mcp_overrides_for ?thread_id ~command:path ()
 
 (** Codex allocates its session id server-side in the thread.started
     event, so the UUID the bot pre-generated is invalid for resume on
@@ -2087,9 +2096,9 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
   in
   let codex_mcp_overrides =
     match target, remote_mcp with
-    | Local, _ -> None
+    | Local, _ -> Some (codex_mcp_overrides ~thread_id ())
     | Remote _, Some (command, args) ->
-      Some (codex_mcp_overrides_for ~args ~command ())
+      Some (codex_mcp_overrides_for ~args ~thread_id ~command ())
     | Remote _, None -> Some []
   in
   (match kind, target with

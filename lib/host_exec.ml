@@ -235,15 +235,15 @@ let run_capture ?(ssh = "ssh") ?timeout_s ?cwd ?(input = "") (host : Host.t) arg
         let argv =
           let base = ssh_argv ~ssh ~destination in
           match timeout_s, Resource.executable_in_path "timeout" with
-          | Some t, Some timeout -> Ok ([timeout; "-k"; "5"; string_of_int t] @ base)
+          | Some t, Some timeout -> Ok ([timeout; "-k"; "5"; string_of_int t] @ base, true)
           | Some _, None ->
             Error (Setup_failed
               "a time limit was requested but coreutils `timeout` is not in PATH")
-          | None, _ -> Ok base
+          | None, _ -> Ok (base, false)
         in
         match argv with
         | Error _ as e -> e
-        | Ok argv ->
+        | Ok (argv, in_own_group) ->
         match
           Unix.create_process (List.hd argv) (Array.of_list argv) in_r out_w out_w
         with
@@ -267,7 +267,10 @@ let run_capture ?(ssh = "ssh") ?timeout_s ?cwd ?(input = "") (host : Host.t) arg
                   (* KILL, not TERM: a wait after a signal the process may
                      ignore could hang this cleanup forever. Killing the
                      local ssh is also what stops the remote side. *)
-                  (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
+                  (* coreutils timeout puts itself in a new process group;
+                     signal the group so its ssh child goes too. *)
+                  let target = if in_own_group then -pid else pid in
+                  (try Unix.kill target Sys.sigkill with Unix.Unix_error _ -> ());
                   ignore (waitpid_retry pid)
                 end)
               (fun () ->
