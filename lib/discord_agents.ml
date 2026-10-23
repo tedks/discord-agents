@@ -2,6 +2,7 @@
 
 module Resource = Resource
 module Disk_health = Disk_health
+module Host = Host
 module Config = Config
 module Runtime_settings = Runtime_settings
 module Runtime_limits = Runtime_limits

@@ -215,6 +215,7 @@ let test_save_load_roundtrip () =
       projects = [
         { name = "repo"; path = "/srv/src/repo"; channel_id = Some "chan" };
       ];
+      hosts = None;
     } in
     Discord_agents.Config.save config;
     let loaded = Discord_agents.Config.load () in
@@ -235,6 +236,61 @@ let test_save_load_roundtrip () =
       Alcotest.(check (option string)) "project channel"
         (Some "chan") project.channel_id
     | _ -> Alcotest.fail "expected one project")
+
+let test_hosts_block_roundtrips_through_save () =
+  (* Config.save rewrites config.json (e.g. when channels are created),
+     so dropping the hosts block there would silently turn a multi-host
+     install back into a single-host one. *)
+  with_tmp_home (fun home ->
+    let path = config_path home in
+    Discord_agents.Resource.ensure_parent_dir path;
+    Discord_agents.Resource.write_file_atomic path
+      {|{
+  "discord_token": "test-token",
+  "guild_id": "guild-1",
+  "hosts": {
+    "writer": "tower0",
+    "executors": {"framework0": {"ssh": "framework0", "enabled": false}}
+  }
+}|};
+    let config = Discord_agents.Config.load () in
+    Discord_agents.Config.save config;
+    let reloaded = Discord_agents.Config.load () in
+    match config.hosts, reloaded.hosts with
+    | Some a, Some b ->
+      Alcotest.(check bool) "hosts survive save" true
+        (Discord_agents.Host.equal_registry a b);
+      Alcotest.(check string) "writer" "tower0"
+        (Discord_agents.Config.host_registry reloaded).writer
+    | _ -> Alcotest.fail "hosts block lost")
+
+let test_absent_hosts_block_stays_absent () =
+  with_tmp_home (fun home ->
+    let path = config_path home in
+    Discord_agents.Resource.ensure_parent_dir path;
+    Discord_agents.Resource.write_file_atomic path
+      {|{"discord_token": "test-token", "guild_id": "guild-1"}|};
+    let config = Discord_agents.Config.load () in
+    Alcotest.(check bool) "no hosts" true (config.hosts = None);
+    Discord_agents.Config.save config;
+    let json = Yojson.Safe.from_file path in
+    Alcotest.(check bool) "save adds no hosts key" true
+      (Yojson.Safe.Util.member "hosts" json = `Null);
+    let registry = Discord_agents.Config.host_registry config in
+    Alcotest.(check string) "default writer is this machine"
+      (Discord_agents.Host.local_hostname ()) registry.writer)
+
+let test_invalid_hosts_block_fails_load () =
+  with_tmp_home (fun home ->
+    let path = config_path home in
+    Discord_agents.Resource.ensure_parent_dir path;
+    Discord_agents.Resource.write_file_atomic path
+      {|{"discord_token": "t", "guild_id": "g",
+         "hosts": {"writer": "tower0",
+                   "executors": {"x": {"ssh": "-oProxyCommand=x"}}}}|};
+    match Discord_agents.Config.load_result () with
+    | Ok _ -> Alcotest.fail "expected load to fail"
+    | Error _ -> ())
 
 let test_reasoning_effort_values_by_agent () =
   let values agent =
@@ -333,5 +389,11 @@ let () =
         test_save_reaps_stale_atomic_temp;
       Alcotest.test_case "save/load roundtrip" `Quick
         test_save_load_roundtrip;
+      Alcotest.test_case "hosts block roundtrips through save" `Quick
+        test_hosts_block_roundtrips_through_save;
+      Alcotest.test_case "absent hosts block stays absent" `Quick
+        test_absent_hosts_block_stays_absent;
+      Alcotest.test_case "invalid hosts block fails load" `Quick
+        test_invalid_hosts_block_fails_load;
     ]);
   ]
