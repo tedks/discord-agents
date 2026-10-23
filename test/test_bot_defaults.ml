@@ -1726,7 +1726,7 @@ let test_start_session_model_reaches_first_agent_invocation () =
       let invocation = ref None in
       let effects = ref [] in
       let process_hooks = record_process_hooks effects
-        ~run_agent:(fun ~sw:_ ~env:_ ~rest:_ ~session ~channel_id:_ ~prompt
+        ~run_agent:(fun ~sw:_ ~env:_ ~rest:_ ~target:_ ~session ~channel_id:_ ~prompt
                        ~attachments:_ ~author_name:_ ~channel_name:_
                        ~channel_type:_ ~wrap_width:_ ~output_lines:_
                        ~on_scroll_content:_ ~on_pid:_ ~on_session_id:_ () ->
@@ -1774,7 +1774,7 @@ let test_process_session_message_aborts_when_child_identity_is_missing () =
     let effects = ref [] in
     let hooks = record_process_hooks effects
       ~capture_child_process:(fun _pid -> None)
-      ~run_agent:(fun ~sw:_ ~env:_ ~rest:_ ~session:_ ~channel_id:_ ~prompt:_
+      ~run_agent:(fun ~sw:_ ~env:_ ~rest:_ ~target:_ ~session:_ ~channel_id:_ ~prompt:_
                      ~attachments:_ ~author_name:_ ~channel_name:_ ~channel_type:_
                      ~wrap_width:_ ~output_lines:_ ~on_scroll_content:_
                      ~on_pid ~on_session_id:_ () ->
@@ -1808,7 +1808,7 @@ let test_process_session_message_aborts_on_session_id_persist_failure () =
     let hooks = record_process_hooks effects
       ~set_session_id:(fun _sessions _session ~session_id:_ ->
         failwith "disk full")
-      ~run_agent:(fun ~sw:_ ~env:_ ~rest:_ ~session:_ ~channel_id:_ ~prompt:_
+      ~run_agent:(fun ~sw:_ ~env:_ ~rest:_ ~target:_ ~session:_ ~channel_id:_ ~prompt:_
                      ~attachments:_ ~author_name:_ ~channel_name:_ ~channel_type:_
                      ~wrap_width:_ ~output_lines:_ ~on_scroll_content:_
                      ~on_pid:_ ~on_session_id () ->
@@ -1839,7 +1839,7 @@ let test_process_session_message_replaces_retry_child_pid () =
       ~capture_child_process:(fun pid ->
         Some (Discord_agents.Agent_checkpoint.child_process_identity
           ~pid ~start_ticks:(Int64.of_int pid)))
-      ~run_agent:(fun ~sw:_ ~env:_ ~rest:_ ~session:_ ~channel_id:_ ~prompt:_
+      ~run_agent:(fun ~sw:_ ~env:_ ~rest:_ ~target:_ ~session:_ ~channel_id:_ ~prompt:_
                      ~attachments:_ ~author_name:_ ~channel_name:_ ~channel_type:_
                      ~wrap_width:_ ~output_lines:_ ~on_scroll_content:_
                      ~on_pid ~on_session_id:_ () ->
@@ -1863,7 +1863,7 @@ let test_process_session_message_keeps_run_replayable_on_completion_persist_fail
     let hooks = record_process_hooks effects
       ~persist_completed_run:(fun _bot _session ~had_initial_prompt:_ ->
         Error "disk full")
-      ~run_agent:(fun ~sw:_ ~env:_ ~rest:_ ~session:_ ~channel_id:_ ~prompt:_
+      ~run_agent:(fun ~sw:_ ~env:_ ~rest:_ ~target:_ ~session:_ ~channel_id:_ ~prompt:_
                      ~attachments:_ ~author_name:_ ~channel_name:_ ~channel_type:_
                      ~wrap_width:_ ~output_lines:_ ~on_scroll_content:_
                      ~on_pid:_ ~on_session_id:_ () ->
@@ -2238,6 +2238,53 @@ let test_trigger_restart_reports_refusal () =
          [msg] !notified);
     bot.draining <- false)
 
+let test_session_target () =
+  with_test_bot (fun bot ->
+    let registry = Discord_agents.Host.registry_of_yojson (Yojson.Safe.from_string
+      {|{"writer": "test-host", "executors": {
+          "framework0": {"ssh": "fw0"},
+          "laptop": {"ssh": "laptop", "writer_ssh": "tower0.lan"},
+          "drynwyn": {"ssh": "drynwyn", "enabled": false}}}|}) in
+    let with_hosts hosts =
+      { bot with Discord_agents.Bot.config =
+                   { bot.Discord_agents.Bot.config with hosts } } in
+    let target bot host =
+      Discord_agents.Bot.session_target bot
+        { (make_session Discord_agents.Config.Claude) with host } in
+    let show = function
+      | Ok Discord_agents.Agent_process.Local -> "local"
+      | Ok (Discord_agents.Agent_process.Remote { host; destination; writer_ssh }) ->
+        Printf.sprintf "remote %s via %s, mcp via %s" host destination writer_ssh
+      | Error _ -> "error"
+    in
+    let check label expected bot host =
+      Alcotest.(check string) label expected (show (target bot host)) in
+    check "this machine" "local" bot "test-host";
+    check "case-insensitive" "local" bot "TEST-HOST";
+    check "no registry" "error" bot "framework0";
+    let bot = with_hosts (Some registry) in
+    check "executor" "remote framework0 via fw0, mcp via test-host" bot "framework0";
+    check "explicit writer_ssh" "remote laptop via laptop, mcp via tower0.lan"
+      bot "laptop";
+    check "disabled" "error" bot "drynwyn";
+    check "unknown" "error" bot "splinter1";
+    check "remote, case-insensitive" "remote framework0 via fw0, mcp via test-host"
+      bot "FRAMEWORK0";
+    (* Stamped before the hosts block existed, with the long hostname:
+       still this machine, not "no ssh route to test-host". *)
+    check "respelled local stamp" "local" bot "test-host.lan";
+    let parse s = Discord_agents.Host.registry_of_yojson (Yojson.Safe.from_string s) in
+    let ambiguous = with_hosts (Some (parse
+      {|{"writer": "test-host", "executors": {
+          "bot.a.example": {"ssh": "a"}, "bot.b.example": {"ssh": "b"}}}|})) in
+    check "ambiguous host" "error" ambiguous "bot";
+    (* Running forced on test-host while tower0 is the configured writer:
+       tower0's sessions have no ssh route from here. *)
+    let forced = with_hosts (Some (parse
+      {|{"writer": "tower0", "executors": {"test-host": {"ssh": "th"}}}|})) in
+    check "writer's session from a forced machine" "error" forced "tower0";
+    check "this machine even though listed with ssh" "local" forced "test-host")
+
 let () =
   Alcotest.run "bot_defaults" [
     ("session_hosts", [
@@ -2247,6 +2294,7 @@ let () =
         test_bot_create_persists_legacy_hosts;
       Alcotest.test_case "trigger restart reports refusal" `Quick
         test_trigger_restart_reports_refusal;
+      Alcotest.test_case "session target" `Quick test_session_target;
     ]);
     ("default agent", [
       Alcotest.test_case "busy control session defers default rotation" `Quick

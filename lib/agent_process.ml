@@ -1367,17 +1367,17 @@ let warn_if_deprecated_mcp_script_env () =
    memoized, a writer that re-resolved could disagree with the check
    that let it run, and the disagreement would be written into a
    config file. Passing the resolved path makes that unrepresentable. *)
-let mcp_server_entry ~command =
+let mcp_server_entry ?(args = []) ~command () =
   `Assoc [
     ("command", `String command);
-    ("args", `List []);
+    ("args", `List (List.map (fun a -> `String a) args));
   ]
 
-let mcp_json ~command =
+let mcp_json ?args ~command () =
   Yojson.Safe.to_string
     (`Assoc [
       ("mcpServers", `Assoc [
-        ("discord-agents", mcp_server_entry ~command);
+        ("discord-agents", mcp_server_entry ?args ~command ());
       ]);
     ])
 
@@ -1504,7 +1504,7 @@ let claude_mcp_config_path () =
   | Some command ->
     let config_dir = Resource.app_config_dir () in
     let config_path = Filename.concat config_dir "mcp-generated.json" in
-    write_file_safely ~path:config_path (mcp_json ~command);
+    write_file_safely ~path:config_path (mcp_json ~command ());
     (* [write_file_safely] swallows both a disk-preflight refusal and a
        write exception, so "we tried" is not "there is a file". Claude
        does not degrade when --mcp-config names a missing file, it exits
@@ -1518,7 +1518,7 @@ let claude_mcp_config_path () =
        which is the silent-no-tools failure this PR is closing. A
        directory at that path would also satisfy [Sys.file_exists] and
        then make Claude exit 1. *)
-    let intended = mcp_json ~command in
+    let intended = mcp_json ~command () in
     match read_file_result config_path with
     (* Trimmed, because the comparison is with the file the writer
        produced, not with the string handed to it: write_file_atomic
@@ -1579,8 +1579,9 @@ let gemini_settings_with ~our_entry existing =
       | _ -> render_fresh ()  (* parseable but non-object: discard *)
     with _ -> render_fresh ()
 
-let merge_gemini_settings ~command existing =
-  gemini_settings_with ~our_entry:(Some (mcp_server_entry ~command)) existing
+let merge_gemini_settings ?args ~command existing =
+  gemini_settings_with ~our_entry:(Some (mcp_server_entry ?args ~command ()))
+    existing
 
 (* [None] means "leave the file exactly as it is".
 
@@ -1753,14 +1754,25 @@ let escape_toml_string s =
 (** TOML overrides that register the discord-agents MCP server for a
     Codex invocation, without touching the user's ~/.codex/config.toml.
     Two key=value pairs because Codex parses each [-c] independently. *)
-let codex_mcp_overrides () =
+(* Codex starts stdio MCP servers with an allowlisted environment
+   (HOME, PATH and a few more), so the caller's thread id, which the
+   server reads from DISCORD_AGENTS_THREAD_ID, has to be put in the
+   server's own env table. -c overrides apply to this run only. *)
+let codex_mcp_overrides_for ?(args = []) ?thread_id ~command () =
+  let toml_string s = "\"" ^ escape_toml_string s ^ "\"" in
+  [ "-c"; "mcp_servers.discord_agents.command=" ^ toml_string command;
+    "-c"; "mcp_servers.discord_agents.args=["
+          ^ String.concat ", " (List.map toml_string args) ^ "]" ]
+  @ (match thread_id with
+     | Some id ->
+       ["-c"; "mcp_servers.discord_agents.env.DISCORD_AGENTS_THREAD_ID="
+              ^ toml_string id]
+     | None -> [])
+
+let codex_mcp_overrides ?thread_id () =
   match mcp_command_opt () with
   | None -> []
-  | Some path ->
-    let command = escape_toml_string path in
-    [ "-c"; Printf.sprintf
-        {|mcp_servers.discord_agents.command="%s"|} command;
-      "-c"; {|mcp_servers.discord_agents.args=[]|} ]
+  | Some path -> codex_mcp_overrides_for ?thread_id ~command:path ()
 
 (** Codex allocates its session id server-side in the thread.started
     event, so the UUID the bot pre-generated is invalid for resume on
@@ -1796,13 +1808,15 @@ let codex_reasoning_effort_overrides = function
        (Config.string_of_reasoning_effort effort)]
   | None -> []
 
-let codex_args ~model ~reasoning_effort
-    ~session_id ~session_id_confirmed ~prompt =
+let codex_args ?mcp_overrides ~model ~reasoning_effort
+    ~session_id ~session_id_confirmed ~prompt () =
+  let mcp_overrides =
+    match mcp_overrides with Some o -> o | None -> codex_mcp_overrides () in
   let base = ["codex"; "exec"; "--json";
               "--dangerously-bypass-approvals-and-sandbox";
               "--skip-git-repo-check"]
              @ model_arg model
-             @ codex_mcp_overrides () in
+             @ mcp_overrides in
   let base = base @ codex_reasoning_effort_overrides reasoning_effort in
   if not session_id_confirmed then base @ ["--"; prompt]
   else base @ ["resume"; session_id; "--"; prompt]
@@ -1861,6 +1875,139 @@ let child_environment ?(environment = Unix.environment ()) ~thread_id () =
   Array.of_list
     (inherited @ [Printf.sprintf "%s=%s" session_thread_id_env thread_id])
 
+(** Where an agent turn runs. [Remote] carries what the run needs:
+    [destination] for ssh, [host] for messages, and [writer_ssh], the
+    destination the executor uses to reach this bot for MCP. *)
+type target =
+  | Local
+  | Remote of { host : string; destination : string; writer_ssh : string }
+
+(** The MCP server command for an agent on an executor: ssh back to the
+    writer and run the writer's own MCP server there, so executors need
+    nothing installed and can never run a stale server.
+
+    The caller's thread id is not baked in. As on the local path, the
+    agent carries it in [DISCORD_AGENTS_THREAD_ID], and this command
+    forwards it at run time. So the config is the same for every thread
+    and a stale or shared copy (Gemini's lives in the worktree) can never
+    route tool calls to another thread. The forwarded value must be all
+    digits (a Discord id), which is what lets it go unquoted into the
+    command line that the writer's login shell parses; the server path
+    is passed pre-quoted for that shell as a positional parameter, so
+    this [sh] never re-parses it.
+
+    [config_home] is the bot's [XDG_CONFIG_HOME] equivalent (the parent
+    of its app config dir). The server finds the bot's control socket
+    from it; over ssh it would otherwise see the writer's login
+    environment and could reach another bot instance's socket. Note the
+    writer's login shell must not print on stdout for non-interactive
+    shells, or it corrupts the MCP stream. *)
+let remote_mcp_command ~writer_ssh ~mcp_path ~config_home =
+  let script =
+    Printf.sprintf
+      {|case "${%s:-}" in ''|*[!0-9]*) echo "discord-agents-mcp: %s must be a Discord id" >&2; exit 1;; esac; exec ssh %s -- "$1" "env %s=$%s XDG_CONFIG_HOME=$3 $2"|}
+      session_thread_id_env session_thread_id_env
+      (String.concat " " Host_exec.ssh_options)
+      session_thread_id_env session_thread_id_env
+  in
+  ("sh", ["-c"; script; "discord-agents-mcp"; writer_ssh;
+          Remote_script.quote mcp_path; Remote_script.quote config_home])
+
+let is_discord_id s = s <> "" && String.for_all (function '0' .. '9' -> true | _ -> false) s
+
+(* Upper bound on one setup command (reading or writing a small file on
+   an executor). It keeps a hung executor from holding a turn, and a stop
+   requested meanwhile, indefinitely. *)
+let remote_setup_timeout_s = 60
+
+(** Register the MCP server in [working_dir]/.gemini/settings.json on an
+    executor, with the same merge as [setup_gemini_mcp] (other servers and
+    keys are kept), and keep [.gemini/] out of git there. With no server
+    to register ([mcp = None]), withdraw our entry and change nothing
+    else, as locally. Writes go to a per-process temp file renamed into
+    place, so an interrupted or concurrent write never leaves a partial
+    file. Failures are logged, not raised: as locally, Gemini then runs
+    without bot tools rather than not at all, and the entry carries no
+    thread id, so a stale one cannot misroute. Blocking; call from a
+    system thread. *)
+let setup_gemini_mcp_remote ?ssh ~(host : Host.t) ~working_dir ~mcp () =
+  let run ?input argv =
+    Host_exec.run_capture ?ssh ~timeout_s:remote_setup_timeout_s
+      ~cwd:working_dir ?input host argv in
+  let warn what f =
+    Logs.warn (fun m -> m "agent_process: %s on %s failed: %s" what host.name
+      (Host_exec.describe_failure ~host:host.name f
+       ^ ": " ^ Host_exec.failure_detail f))
+  in
+  let settings = ".gemini/settings.json" in
+  (* Present: Ok (Some contents); absent: Ok None; unreadable: Error. *)
+  let read_optional path =
+    match run ["test"; "-e"; path] with
+    | Error (Host_exec.Exited (1, _)) -> Ok None
+    | Error f -> Error f
+    | Ok _ -> Result.map Option.some (run ["cat"; "--"; path])
+  in
+  let existing = read_optional settings in
+  (* An unreachable host fails every later step too, each paying the
+     connect timeout; the agent spawn that follows reports it. *)
+  match existing with
+  | Error (Host_exec.Unreachable _ as f) -> warn "reaching the host" f
+  | _ ->
+  let write_settings contents =
+    match run ~input:contents
+            ["sh"; "-c";
+             "mkdir -p .gemini && cat > \".gemini/settings.json.tmp.$$\" \
+              && mv -f \".gemini/settings.json.tmp.$$\" .gemini/settings.json"]
+    with
+    | Ok _ -> ()
+    | Error f -> warn "writing .gemini/settings.json" f
+  in
+  match mcp with
+  | None ->
+    (match existing with
+     | Error f -> warn "reading .gemini/settings.json" f
+     | Ok existing ->
+       Option.iter write_settings (gemini_settings_without_our_entry existing))
+  | Some (command, args) ->
+  (match existing with
+   | Error f -> warn "reading .gemini/settings.json" f
+   | Ok existing -> write_settings (merge_gemini_settings ~args ~command existing));
+  (* stderr dropped: capture merges it into the output, and a git
+     warning would otherwise become part of the path. *)
+  match run ["sh"; "-c"; "git rev-parse --git-path info/exclude 2>/dev/null"] with
+  | Error _ -> ()  (* not a git checkout: nothing to exclude from *)
+  | Ok path ->
+    let path = String.trim path in
+    (* As locally: an exclude file we cannot read is left alone, never
+       replaced by one holding only our line. *)
+    match read_optional path with
+    | Error f -> warn "reading .git/info/exclude" f
+    | Ok (Some text) when exclude_already_lists_gemini text -> ()
+    | Ok current ->
+      match run ~input:(merge_gemini_exclude current)
+              ["sh"; "-c";
+               "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1.tmp.$$\" \
+                && mv -f \"$1.tmp.$$\" \"$1\"";
+               "_"; path] with
+      | Ok _ -> ()
+      | Error f -> warn "updating .git/info/exclude" f
+
+(** A failed remote turn, worded like the local one ("agent exited with
+    code N: <stderr>") so callers that match on the agent's own stderr,
+    such as Claude session recovery, work unchanged; other failures name
+    the host and stage. *)
+let remote_failure_message ~host = function
+  | Host_exec.Exited (code, stderr) ->
+    Printf.sprintf "agent exited with code %d on %s: %s" code host stderr
+  | Host_exec.Transport_lost detail ->
+    (* Also what a deliberate stop looks like from here. *)
+    Printf.sprintf "the connection to %s ended (stopped, or the connection \
+                    dropped)%s" host (if detail = "" then "" else ": " ^ detail)
+  | failure ->
+    let detail = Host_exec.failure_detail failure in
+    Host_exec.describe_failure ~host failure
+    ^ (if detail = "" then "" else ": " ^ detail)
+
 let escape_prompt_block text =
   let b = Buffer.create (String.length text) in
   String.iter (function
@@ -1903,7 +2050,8 @@ let compose_session_prompt ~agent_kind ~system_prompt ~message_count
     [?on_pid] is called with the child PID immediately after spawn,
     so the caller can track active subprocesses for cleanup.
     Returns when the process exits. *)
-let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~thread_id ~message_count
+let run_streaming ~sw ~env ?(target = Local) ?ssh
+    ~working_dir ~kind ~session_id ~thread_id ~message_count
     ?fork_from_session_id ?(session_id_confirmed=false) ?system_prompt
     ?(model=None) ?(reasoning_effort=None) ?(goal_context=None)
     ~prompt ~on_event ?on_pid () =
@@ -1920,21 +2068,47 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~thread_id ~message_co
   let close_noerr flow =
     try Eio.Resource.close flow with _ -> ()
   in
-  let claude_mcp_arg = match kind with
-    | Config.Claude ->
+  (* For a remote turn: the ssh command that reaches this bot's MCP server,
+     or None when no server resolves (as locally, run without tools). *)
+  let remote_mcp =
+    match target with
+    | Local -> None
+    | Remote { writer_ssh; _ } ->
+      Option.map (fun mcp_path ->
+        remote_mcp_command ~writer_ssh ~mcp_path
+          ~config_home:(Filename.dirname (Resource.app_config_dir ())))
+        (mcp_command_opt ())
+  in
+  let claude_mcp_arg = match kind, target with
+    | Config.Claude, Local ->
       (* No resolvable server: start without the flag rather than
          point Claude at a config naming a command that isn't there.
          The error is already logged once at resolution. *)
       (match claude_mcp_config_path () with
        | Some path -> ["--mcp-config"; path]
        | None -> [])
-    | Config.Codex
-    | Config.Gemini -> []
+    | Config.Claude, Remote _ ->
+      (* Inline JSON: nothing to write on the executor. *)
+      (match remote_mcp with
+       | Some (command, args) -> ["--mcp-config"; mcp_json ~args ~command ()]
+       | None -> [])
+    | (Config.Codex | Config.Gemini), _ -> []
   in
-  (match kind with
-   | Config.Gemini -> setup_gemini_mcp ~working_dir ()
-   | Config.Claude
-   | Config.Codex -> ());
+  let codex_mcp_overrides =
+    match target, remote_mcp with
+    | Local, _ -> Some (codex_mcp_overrides ~thread_id ())
+    | Remote _, Some (command, args) ->
+      Some (codex_mcp_overrides_for ~args ~thread_id ~command ())
+    | Remote _, None -> Some []
+  in
+  (match kind, target with
+   | Config.Gemini, Local -> setup_gemini_mcp ~working_dir ()
+   | Config.Gemini, Remote { host; destination; _ } ->
+     let host =
+       { (Host.local_host host) with Host.transport = Host.Ssh destination } in
+     Eio_unix.run_in_systhread (fun () ->
+       setup_gemini_mcp_remote ?ssh ~host ~working_dir ~mcp:remote_mcp ())
+   | (Config.Claude | Config.Codex), _ -> ());
   let command_args ~session_id_confirmed =
     let agent_args = match kind with
       | Config.Claude ->
@@ -1954,12 +2128,41 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~thread_id ~message_co
          | Some sp -> base @ ["--append-system-prompt"; sp]
          | None -> base)
       | Config.Codex ->
-        codex_args ~model ~reasoning_effort
-          ~session_id ~session_id_confirmed ~prompt
+        codex_args ?mcp_overrides:codex_mcp_overrides ~model ~reasoning_effort
+          ~session_id ~session_id_confirmed ~prompt ()
       | Config.Gemini ->
         gemini_args ~model ~session_id ~session_id_confirmed ~prompt
     in
-    [setsid_command (); "--wait"] @ agent_args
+    match target with
+    | Local -> [setsid_command (); "--wait"] @ agent_args
+    (* Remote: the wrapper gives the agent its own session on the
+       executor; setsid here applies to the local ssh instead. *)
+    | Remote _ -> agent_args
+  in
+  let parse_line line =
+    if String.length line > 0 then
+      List.iter on_event (match kind with
+        | Config.Claude -> parse_stream_json_line line
+        | Config.Codex -> parse_codex_json_line line
+        | Config.Gemini -> parse_gemini_stream_json_line line)
+  in
+  (* A remote turn: the local ssh is the tracked child (in its own
+     process group, like a local agent), so stop, restart and startup
+     reaping work unchanged; killing it makes the executor's watchdog
+     kill the agent. The lock key is the thread, which is stable even
+     while Codex and Gemini swap a placeholder session id for theirs. *)
+  (* The agent carries the caller's thread id in its environment, as
+     locally; the MCP command forwards it (see [remote_mcp_command]). *)
+  let run_remote ~host ~destination argv =
+    if not (is_discord_id thread_id) then
+      Result.Error (Printf.sprintf
+        "cannot run on %s: thread id %S is not a Discord id" host thread_id)
+    else
+      Host_exec.run_streaming_ssh ~sw ~mgr ?ssh
+        ~prefix:[setsid_command (); "--wait"] ~destination ~cwd:working_dir
+        ~lock_key:thread_id ~env:[session_thread_id_env, thread_id]
+        ~argv ~on_line:parse_line ?on_spawn:on_pid ()
+      |> Result.map_error (remote_failure_message ~host)
   in
   let run_once args =
     let stdout_r, stdout_w = Eio.Process.pipe ~sw mgr in
@@ -2026,6 +2229,11 @@ let run_streaming ~sw ~env ~working_dir ~kind ~session_id ~thread_id ~message_co
       close_noerr stdout_r;
       close_noerr stdout_w;
       raise exn
+  in
+  let run_once args =
+    match target with
+    | Local -> run_once args
+    | Remote { host; destination; _ } -> run_remote ~host ~destination args
   in
   run_with_claude_session_recovery
     ~kind ~session_id ~session_id_confirmed ~message_count

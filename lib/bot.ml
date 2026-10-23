@@ -167,13 +167,63 @@ let is_persistent_session t ~thread_id (session : Session_store.session) =
   || (Option.is_some session.system_prompt
       && is_known_project_name t session.project_name)
 
-let refresh_session_disk_state (session : Session_store.session) =
-  ignore (Disk_health.preflight_write session.working_dir)
+(** Whether [session] runs on this machine. New sessions carry exactly
+    [local_host_name], but older ones may spell this machine differently
+    (stamped before a hosts block existed or was respelled: tower0 vs
+    tower0.lan), so with a registry both names are resolved and compared
+    as entries, and without one by [Host.same_host]. *)
+let session_is_local t (session : Session_store.session) =
+  let here = local_host_name t in
+  String.equal (String.lowercase_ascii session.host) (String.lowercase_ascii here)
+  || match t.config.Config.hosts with
+     | None -> Host.same_host session.host here
+     | Some registry ->
+       match Host.resolve registry.hosts session.host,
+             Host.resolve registry.hosts here with
+       | Host.Found a, Host.Found b -> String.equal a.name b.name
+       | _ -> false
+
+(** Where [session]'s agent runs. A session on another host needs that
+    host in the registry, enabled, with an ssh destination; the MCP
+    callback reaches this bot at the host's [writer_ssh], or else at this
+    machine's name. *)
+let session_target t (session : Session_store.session) =
+  if session_is_local t session then Ok Agent_process.Local
+  else
+    let unknown () = Error (Printf.sprintf
+      "This session ran on %s, which is not a configured host. Add it under \
+       hosts.executors in config.json, or start a new session here."
+      session.host) in
+    match t.config.Config.hosts with
+    | None -> unknown ()
+    | Some registry ->
+      match Host.resolve registry.hosts session.host with
+      | Host.Not_found -> unknown ()
+      | Host.Ambiguous hs -> Error (Printf.sprintf
+          "This session's host %s matches several configured hosts (%s)."
+          session.host (String.concat ", " (List.map (fun (h : Host.t) -> h.name) hs)))
+      | Host.Found { enabled = false; name; _ } -> Error (Printf.sprintf
+          "This session runs on %s, which is disabled in config.json." name)
+      | Host.Found { transport = Host.Local; name; _ } -> Error (Printf.sprintf
+          "This session runs on %s, but this bot is running on %s and has no \
+           ssh route to it." name (local_host_name t))
+      | Host.Found { transport = Host.Ssh destination; name; writer_ssh; _ } ->
+        Ok (Agent_process.Remote {
+          host = name; destination;
+          writer_ssh = Option.value writer_ssh ~default:(local_host_name t);
+        })
+
+(* Local statvfs probes only mean something for local paths; a remote
+   session's working_dir may not exist here, or be a different disk. *)
+let refresh_session_disk_state t (session : Session_store.session) =
+  if session_is_local t session then
+    ignore (Disk_health.preflight_write session.working_dir)
 
 let persistent_session_working_dirs t =
   Session_store.bindings t.sessions
   |> List.filter_map (fun (thread_id, (session : Session_store.session)) ->
-    if is_persistent_session t ~thread_id session then
+    if is_persistent_session t ~thread_id session
+    && session_is_local t session then
       Some session.working_dir
     else
       None)
@@ -643,6 +693,9 @@ let request_session_process_stop t (session : Session_store.session) =
    and branch intact for a later resume, PR, or review. Best-effort: never
    lets a cleanup failure block the session actually being removed. *)
 let prune_or_clean_session_worktree t (session : Session_store.session) =
+  (* Worktree cleanup is local git work; a remote session's working_dir
+     is a path on its executor (remote cleanup comes with PR 5). *)
+  if not (session_is_local t session) then () else
   match List.find_opt (fun (p : Project.t) -> p.name = session.project_name)
           (projects t) with
   | None -> ()
@@ -1279,7 +1332,7 @@ let maybe_apply_pending_session_agent_change t (session : Session_store.session)
            kind is only the scheduling-time target and can become stale when
            disk pressure changes before a busy session finishes. *)
         refresh_disk_state ();
-        refresh_session_disk_state session;
+        refresh_session_disk_state t session;
         effective_top_level_agent t
     in
     if pending.origin = Session_store.Default_rotation
@@ -2735,6 +2788,7 @@ type process_message_hooks = {
     sw:Eio.Switch.t ->
     env:Eio_unix.Stdenv.base ->
     rest:Discord_rest.t ->
+    target:Agent_process.target ->
     session:Session_store.session ->
     channel_id:Discord_types.channel_id ->
     prompt:string ->
@@ -2783,11 +2837,11 @@ let default_process_message_hooks = {
        Eio_unix.run_in_systhread (fun () ->
          child_process_identity_of_pid pid));
   run_agent =
-    (fun ~sw ~env ~rest ~session ~channel_id ~prompt ~attachments
+    (fun ~sw ~env ~rest ~target ~session ~channel_id ~prompt ~attachments
          ~author_name ~channel_name ~channel_type
          ~wrap_width ~output_lines
          ~on_scroll_content ~on_pid ~on_session_id () ->
-       Agent_runner.run ~sw ~env ~rest ~session ~channel_id ~prompt
+       Agent_runner.run ~sw ~env ~rest ~target ~session ~channel_id ~prompt
          ~attachments ~author_name ~channel_name ~channel_type
          ~wrap_width ~output_lines
          ~on_scroll_content ~on_pid ~on_session_id ());
@@ -2947,8 +3001,13 @@ let rec process_session_message_with_hooks hooks t session
               session.thread_id err)
       in
       let result =
+        match session_target t session with
+        | Error msg ->
+          hooks.create_message t.rest ~channel_id ~content:msg;
+          Error msg
+        | Ok target ->
         try
-          hooks.run_agent ~sw:t.sw ~env:t.env ~rest:t.rest
+          hooks.run_agent ~sw:t.sw ~env:t.env ~rest:t.rest ~target
             ~session ~channel_id ~prompt
             ~attachments:msg.attachments
             ~author_name ~channel_name ~channel_type

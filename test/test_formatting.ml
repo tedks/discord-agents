@@ -2435,7 +2435,7 @@ let test_mcp_command_is_not_memoized () =
         codex_mcp_command_override
           (Discord_agents.Agent_process.codex_args
              ~model:None ~reasoning_effort:None
-             ~session_id:"x" ~session_id_confirmed:false ~prompt:"hi")
+             ~session_id:"x" ~session_id_confirmed:false ~prompt:"hi" ())
       in
       Alcotest.(check (list string))
         "codex is told the command while it exists"
@@ -3485,7 +3485,7 @@ let claude_args_tests = [
 let codex_args ~session_id ~session_id_confirmed ~prompt =
   Discord_agents.Agent_process.codex_args
     ~model:None ~reasoning_effort:None
-    ~session_id ~session_id_confirmed ~prompt
+    ~session_id ~session_id_confirmed ~prompt ()
 
 (* The args list now contains MCP TOML overrides, so exact-list
    matching would be brittle. Tests assert on structural shape: the
@@ -3572,7 +3572,7 @@ let test_codex_args_model_and_effort_overrides () =
   let args = Discord_agents.Agent_process.codex_args
     ~model:(Some "gpt-5.5")
     ~reasoning_effort:(Some Discord_agents.Config.Xhigh)
-    ~session_id:"x" ~session_id_confirmed:false ~prompt:"hi" in
+    ~session_id:"x" ~session_id_confirmed:false ~prompt:"hi" () in
   Alcotest.(check bool) "model flag present"
     true (contains_pair args "--model" "gpt-5.5");
   Alcotest.(check bool) "reasoning effort override present"

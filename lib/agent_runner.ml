@@ -147,30 +147,81 @@ let prompt_preview prompt =
 
 (** Download attachments to temp files in the working directory.
     Returns a list of (filename, local_path) for successfully downloaded files. *)
-let download_attachments ~rest ~working_dir
+let max_attachment_bytes = 25 * 1024 * 1024
+
+(** The on-disk name for an attachment: its Discord id, then the file
+    name reduced to [A-Za-z0-9._-] (anything else becomes '_'), with no
+    leading dot and a bounded length. A file name from Discord is not a
+    path: separators, [..], control characters or an overlong name must
+    not choose where the file lands or make it disappear. The prompt
+    still shows the original name. *)
+let attachment_storage_name ~id ~filename =
+  let safe = String.map (function
+    | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '.' | '_' | '-' as c -> c
+    | _ -> '_') filename in
+  let safe =
+    let n = String.length safe in
+    let rec skip i = if i < n && safe.[i] = '.' then skip (i + 1) else i in
+    let i = skip 0 in
+    String.sub safe i (n - i) in
+  let safe = if String.length safe > 120 then String.sub safe 0 120 else safe in
+  let safe = if safe = "" then "file" else safe in
+  let id = String.map (function '0' .. '9' as c -> c | _ -> '_') id in
+  id ^ "_" ^ safe
+
+(** Write a downloaded attachment where the agent will run. Locally,
+    into [working_dir]/.discord-attachments as before; on an executor,
+    the same relative path in its worktree, with the bytes on the remote
+    command's stdin. Returns the path the agent should read, which for a
+    remote session is a path on the executor. *)
+let save_attachment ?ssh ~(target : Agent_process.target) ~working_dir
+    ~name data =
+  let rel = Filename.concat ".discord-attachments" name in
+  match target with
+  | Agent_process.Local ->
+    let tmp_dir = Filename.concat working_dir ".discord-attachments" in
+    (try Unix.mkdir tmp_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+    let local_path = Filename.concat working_dir rel in
+    (try
+       let oc = open_out_bin local_path in
+       Fun.protect ~finally:(fun () -> close_out_noerr oc)
+         (fun () -> output_string oc data);
+       Ok local_path
+     with exn -> Error (Printexc.to_string exn))
+  | Agent_process.Remote { host; destination; _ } ->
+    let h = { (Host.local_host host) with Host.transport = Host.Ssh destination } in
+    Eio_unix.run_in_systhread (fun () ->
+      Host_exec.run_capture ?ssh ~timeout_s:300 ~cwd:working_dir ~input:data h
+        ["sh"; "-c"; "mkdir -p .discord-attachments && cat > \"$1\""; "_"; rel])
+    |> Result.map (fun _ -> Filename.concat working_dir rel)
+    |> Result.map_error (Agent_process.remote_failure_message ~host)
+
+let download_attachments ?ssh ?(target = Agent_process.Local) ~rest ~working_dir
     (attachments : Discord_types.attachment list) =
   List.filter_map (fun (a : Discord_types.attachment) ->
     (* Cap at 25MB to avoid huge downloads *)
-    if a.size > 25 * 1024 * 1024 then begin
+    if a.size > max_attachment_bytes then begin
       Logs.warn (fun m -> m "agent_runner: skipping large attachment %s (%d bytes)"
         a.filename a.size);
       None
     end else
-      let tmp_dir = Filename.concat working_dir ".discord-attachments" in
-      (try Unix.mkdir tmp_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
-      let local_path = Filename.concat tmp_dir
-        (Printf.sprintf "%s_%s" a.id a.filename) in
+      let name = attachment_storage_name ~id:a.id ~filename:a.filename in
       match Discord_rest.download_url rest ~url:a.url () with
+      | Ok data when String.length data > max_attachment_bytes ->
+        (* The size above is Discord's metadata; check what arrived. The
+           REST transport already stops reading any response past its own
+           cap (Discord_rest.max_body_size, 10 MB), which bounds memory
+           and is in practice the tighter limit. *)
+        Logs.warn (fun m -> m "agent_runner: skipping %s: download was %d bytes"
+          a.filename (String.length data));
+        None
       | Ok data ->
-        (try
-          let oc = open_out_bin local_path in
-          output_string oc data;
-          close_out oc;
-          Some (a.filename, local_path)
-        with exn ->
-          Logs.warn (fun m -> m "agent_runner: failed to save %s: %s"
-            a.filename (Printexc.to_string exn));
-          None)
+        (match save_attachment ?ssh ~target ~working_dir ~name data with
+         | Ok path -> Some (a.filename, path)
+         | Error e ->
+           Logs.warn (fun m -> m "agent_runner: failed to save %s: %s"
+             a.filename e);
+           None)
       | Error e ->
         Logs.warn (fun m -> m "agent_runner: failed to download %s: %s"
           a.filename e);
@@ -192,13 +243,14 @@ let attachment_prompt_suffix downloaded =
 (** Run an agent and stream its output to a Discord channel.
     Handles message creation/editing, typing indicators, and splitting.
     Returns Ok () on success, Error msg on failure. *)
-let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
+let run ~sw ~env ~rest ?(target = Agent_process.Local) ?ssh
+    ~session ~(channel_id : Discord_types.channel_id)
     ~prompt ?(attachments=[]) ~author_name ~channel_name ~channel_type
     ?(wrap_width=Agent_process.desktop_width)
     ?(output_lines=Agent_process.default_output_lines)
     ?on_scroll_content ?on_pid ?on_session_id () =
   (* Download attachments and append paths to the prompt *)
-  let downloaded = download_attachments ~rest
+  let downloaded = download_attachments ?ssh ~target ~rest
     ~working_dir:session.Session_store.working_dir attachments in
   let full_prompt = prompt ^ attachment_prompt_suffix downloaded in
   let context_prompt =
@@ -529,7 +581,7 @@ let run ~sw ~env ~rest ~session ~(channel_id : Discord_types.channel_id)
           on_session_id
     in
     Fun.protect ~finally:(fun () -> typing_active := false)
-      (fun () -> Agent_process.run_streaming ~sw ~env
+      (fun () -> Agent_process.run_streaming ~sw ~env ~target ?ssh
           ~working_dir:session.working_dir
           ~kind:session.agent_kind
           ~session_id:session.session_id
