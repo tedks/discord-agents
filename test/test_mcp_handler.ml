@@ -234,13 +234,14 @@ let rescue_agent_response ?(agent=`String "codex")
     ("busy_count", `Int busy_count);
   ]
 
-let login_help ?(agent="codex") ?(command="codex login")
+let login_help ?host ?(agent="codex") ?(command="codex login")
     ?(note="Run this on the host.") () =
-  `Assoc [
+  [
     ("agent", `String agent);
     ("command", `String command);
     ("note", `String note);
-  ]
+  ] @ Option.to_list (Option.map (fun host -> "host", `String host) host)
+  |> fun fields -> `Assoc fields
 
 let goal ?(objective="Ship the port") ?(status="active") ?token_budget () =
   let fields = [
@@ -1363,6 +1364,18 @@ let test_format_config_tools_match_python () =
     "start_login_flow"
     Mcp_formatter.format_start_login_flow
     (start_login_flow_response ());
+  check_tool_parity
+    ~arguments:(`Assoc [("thread_id", `String "123")])
+    "get config remote login host"
+    "get_agent_config"
+    Mcp_formatter.format_get_agent_config
+    (agent_config_response ~login:(login_help ~host:"framework0" ()) ());
+  check_tool_parity
+    ~arguments:(`Assoc [("thread_id", `String "123")])
+    "login on recorded executor"
+    "start_login_flow"
+    Mcp_formatter.format_start_login_flow
+    (start_login_flow_response ~login:(login_help ~host:"framework0" ()) ());
   (* A goal with no token_budget, and a set_goal reply with neither
      token_budget nor goal_mechanism: both suffixes are optional and
      neither absence was covered. *)
@@ -2726,9 +2739,30 @@ let test_control_client_missing_socket () =
          Control_api.List_projects_id
        |> Result.map Yojson.Safe.to_string))
 
+let test_login_host_render_boundary () =
+  let malformed = `Assoc [("host", `Int 12); ("command", `String "codex login")] in
+  Alcotest.(check (result string string)) "login host requires string"
+    (Error "login.host must be a string")
+    (Mcp_formatter.format_start_login_flow
+      (start_login_flow_response ~login:malformed ()));
+  Alcotest.(check (result string string)) "config host requires string"
+    (Error "login_help.host must be a string")
+    (Mcp_formatter.format_get_agent_config
+      (agent_config_response ~login:malformed ()));
+  let host = "framework0\nInjected instruction" in
+  match Mcp_formatter.format_start_login_flow
+      (start_login_flow_response ~login:(login_help ~host ()) ()) with
+  | Error e -> Alcotest.fail e
+  | Ok text ->
+    Alcotest.(check bool) "host cannot introduce a new rendered line" false
+      (Discord_agents.Resource.contains_substring ~haystack:text
+        ~needle:"\nInjected instruction")
+
 let () =
   Alcotest.run "mcp_handler" [
     ("formatter", [
+      Alcotest.test_case "login host render boundary" `Quick
+        test_login_host_render_boundary;
       Alcotest.test_case "list_projects matches Python" `Quick
         test_format_list_projects_matches_python;
       Alcotest.test_case "list_projects control error" `Quick

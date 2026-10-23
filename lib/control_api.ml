@@ -1029,23 +1029,24 @@ let goal_field (session : Session_store.session) =
   | Some goal -> ("goal", goal_json goal)
   | None -> ("goal", `Null)
 
-let login_help_json agent =
+let login_help_json ~host agent =
   let command, note =
     match agent with
     | Config.Claude ->
       "claude auth login",
-      "Run this on the host where discord-agents runs. If your Claude CLI uses a different auth command, run that equivalent login locally."
+      "If the Claude CLI on that host uses a different auth command, use its equivalent login command."
     | Config.Codex ->
       "codex login",
-      "Run this on the host where discord-agents runs. For trusted automation, CODEX_ACCESS_TOKEN can be piped to `codex login --with-access-token`."
+      "Use the login flow supported by the Codex CLI on that host."
     | Config.Gemini ->
       "gcloud auth application-default login",
-      "Run this on the host where discord-agents runs. Gemini CLI does not expose a non-interactive login command in this install; if your Gemini setup uses another provider, run that provider's local login flow."
+      "This command applies to Google Cloud application-default credentials. If Gemini on that host uses another provider, use that provider's login flow."
   in
   `Assoc [
     ("agent", `String (Config.string_of_agent_kind agent));
+    ("host", `String host);
     ("command", `String command);
-    ("note", `String note);
+    ("note", `String (Printf.sprintf "Run this on %s. %s" host note));
   ]
 
 let string_list_json values =
@@ -1128,7 +1129,7 @@ let handle_get_agent_config (bot : Bot.t) params =
       model_field session;
       effort_field session;
       goal_field session;
-      ("login_help", login_help_json session.agent_kind);
+      ("login_help", login_help_json ~host:session.host session.agent_kind);
       ("goal_mechanism",
        `String (match session.agent_kind with
          | Config.Codex -> "bot_prompt_context; native /goal requires codex app-server"
@@ -1284,32 +1285,34 @@ let handle_set_goal (bot : Bot.t) params =
 
 let handle_start_login_flow (bot : Bot.t) params =
   let open Yojson.Safe.Util in
-  let resolve_requested_agent () =
+  let resolve_requested_target () =
     match params with
     | Some p ->
       (match p |> member "thread_id" |> to_string_option with
        | Some thread_id ->
          (match Session_store.find_opt bot.sessions ~thread_id with
-          | Some session -> Some session.agent_kind
+          | Some session -> Some (session.agent_kind, session.host)
           | None -> raise Not_found)
        | None ->
          (match p |> member "agent" |> to_string_option with
           | Some s ->
             (match Config.agent_kind_of_string (String.lowercase_ascii s) with
-             | Ok agent -> Some agent
+             | Ok agent -> Some (agent, Bot.local_host_name bot)
              | Error msg -> failwith msg)
           | None -> None))
     | None -> None
   in
-  match resolve_requested_agent () with
+  match resolve_requested_target () with
   | exception Not_found -> session_not_found_response
-  | requested_agent ->
-    let agent = Option.value requested_agent
-      ~default:(Bot.effective_top_level_agent bot) in
+  | requested_target ->
+    let agent, host = Option.value requested_target
+      ~default:(Bot.effective_top_level_agent bot, Bot.local_host_name bot) in
     ok_response [
-      ("login", login_help_json agent);
+      ("login", login_help_json ~host agent);
       ("message",
-       `String "Login is handled by the local agent CLI, not by discord-agents OAuth. Run the command on the bot host, then retry the session turn.");
+       `String (Printf.sprintf
+         "Login is handled by the agent CLI on %s. After repairing login there, retry the session turn."
+         host));
     ]
 
 let handle_stop_session (bot : Bot.t) params =

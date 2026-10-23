@@ -254,7 +254,7 @@ let all_specs = [
         ~description:"Clear the stored goal" ());
     ]);
   spec ~id:Start_login_flow
-    ~description:"Return the local command needed to repair login for an agent or session. The bot does not run OAuth itself."
+    ~description:"Return the login repair command and executor host for a session, or the current writer host when no thread is supplied. The bot does not run OAuth itself."
     ~control_method:Control_api.Start_login_flow_id
     ~input_schema:(object_schema [
       ("thread_id", session_id_property "Discord thread ID whose agent needs login");

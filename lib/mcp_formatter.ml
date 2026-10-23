@@ -709,12 +709,13 @@ let append_login_help lines fields =
   | Error _ as error -> error
   | Ok [] -> Ok lines
   | Ok login_fields ->
-    (match rendered_string_field_default "" "login_help" "command" login_fields with
-     | Error _ as error -> error
-     | Ok command ->
+    (match rendered_string_field_default "" "login_help" "command" login_fields,
+           rendered_string_field_default "the bot host" "login_help" "host" login_fields with
+     | Error message, _ | _, Error message -> Error message
+     | Ok command, Ok host ->
        Ok (lines @
            [Printf.sprintf
-              "Login repair: run `%s` on the bot host." command]))
+              "Login repair: run `%s` on %s." command host]))
 
 let format_get_agent_config_options lines result_fields options =
   if options = [] then Ok lines
@@ -963,11 +964,13 @@ let format_start_login_flow response =
          own [message], and the shadowing made it read as though the
          response field were being propagated as the error. *)
       (match rendered_string_field_default "" "login" "command" login_fields,
-             rendered_string_field_default "" "login" "note" login_fields with
-       | Ok command, Ok note ->
-         Ok (Printf.sprintf "%s\n\nRun on bot host: `%s`\n%s"
-               intro command note)
-       | Error message, _ | _, Error message -> Error message)
+             rendered_string_field_default "" "login" "note" login_fields,
+             rendered_string_field_default "bot host" "login" "host" login_fields with
+       | Ok command, Ok note, Ok host ->
+         Ok (Printf.sprintf "%s\n\nRun on %s: `%s`\n%s"
+               intro host command note)
+       | Error message, _, _ | _, Error message, _
+       | _, _, Error message -> Error message)
     | Error message, _ | _, Error message -> Error message
   in
   format_object ~format_fields response
