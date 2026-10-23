@@ -2359,6 +2359,61 @@ let test_attachment_upload_respects_session_host () =
         (Discord_agents.Resource.contains_substring ~haystack:bytes
           ~needle:"writer-only attachment bytes")) !uploaded)
 
+let test_login_guidance_uses_session_executor () =
+  let rest_call ~headers:_ ?body:_ _ _ =
+    Alcotest.fail "login guidance must not call Discord" in
+  with_test_bot ~rest_call (fun bot ->
+    let forced = { bot with Discord_agents.Bot.config =
+      { bot.config with hosts = Some (Discord_agents.Host.registry_of_yojson
+        (Yojson.Safe.from_string
+          {|{"writer":"tower0","executors":{
+            "test-host":{"ssh":"th"},
+            "framework0":{"ssh":"fw0"},
+            "disabled":{"ssh":"disabled","enabled":false}}}|})) } } in
+    let open Yojson.Safe.Util in
+    let check_login label host agent login =
+      Alcotest.(check string) (label ^ " host") host
+        (login |> member "host" |> to_string);
+      Alcotest.(check string) (label ^ " agent") (kind_string agent)
+        (login |> member "agent" |> to_string);
+      Alcotest.(check bool) (label ^ " note identifies host") true
+        (Discord_agents.Resource.contains_substring
+          ~haystack:(login |> member "note" |> to_string) ~needle:host) in
+    let check_rendered label fragment = function
+      | Error e -> Alcotest.fail e
+      | Ok text -> Alcotest.(check bool) label true
+          (Discord_agents.Resource.contains_substring ~haystack:text ~needle:fragment) in
+    List.iter (fun agent ->
+      List.iter (fun host ->
+        let session = { (make_session ~thread_id:"4242" agent) with host } in
+        Discord_agents.Session_store.add bot.sessions ~thread_id:"4242" session;
+        let params = Some (`Assoc [
+          ("thread_id", `String "4242");
+          (* The recorded session wins over this unrelated caller selection. *)
+          ("agent", `String "gemini");
+        ]) in
+        let config = Discord_agents.Control_api.handle_get_agent_config forced params in
+        check_login "get config" host agent (config |> member "login_help");
+        check_rendered "config renderer keeps executor" ("on " ^ host ^ ".")
+          (Discord_agents.Mcp_formatter.format_get_agent_config config);
+        let login = Discord_agents.Control_api.handle_start_login_flow forced params in
+        check_login "login flow" host agent (login |> member "login");
+        check_rendered "login renderer keeps executor" ("Run on " ^ host ^ ":")
+          (Discord_agents.Mcp_formatter.format_start_login_flow login)
+      ) ["framework0"; "disabled"; "unconfigured"; "test-host"]
+    ) [Discord_agents.Config.Claude; Codex; Gemini];
+    List.iter (fun params ->
+      let result = Discord_agents.Control_api.handle_start_login_flow forced params in
+      Alcotest.(check string) "no session uses actual writer, not configured writer"
+        "test-host" (result |> member "login" |> member "host" |> to_string)
+    ) [None; Some (`Assoc [("agent", `String "codex")])];
+    let missing = Discord_agents.Control_api.handle_start_login_flow forced
+      (Some (`Assoc [("thread_id", `String "missing")])) in
+    Alcotest.(check bool) "missing session reports error" true
+      (missing |> member "error" <> `Null);
+    Alcotest.(check bool) "missing session cannot fall back to writer guidance" true
+      (missing |> member "login" = `Null))
+
 let () =
   Alcotest.run "bot_defaults" [
     ("session_hosts", [
@@ -2371,6 +2426,8 @@ let () =
       Alcotest.test_case "session target" `Quick test_session_target;
       Alcotest.test_case "attachments respect session host" `Quick
         test_attachment_upload_respects_session_host;
+      Alcotest.test_case "login guidance uses session executor" `Quick
+        test_login_guidance_uses_session_executor;
     ]);
     ("default agent", [
       Alcotest.test_case "busy control session defers default rotation" `Quick

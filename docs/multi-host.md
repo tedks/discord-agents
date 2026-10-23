@@ -13,8 +13,9 @@ now rejects remote uploads before writer-local reads; executor uploads remain
 [145](https://github.com/tedks/discord-agents/issues/145), and transcript/run
 ownership is tracked in
 [146](https://github.com/tedks/discord-agents/issues/146). The next bounded
-implementation mission is host capability observations, beginning with
-executor-specific login repair guidance. See the revised
+implementation mission is host capability observations. Login repair guidance
+now names the session executor in both MCP renderers, including when that
+host is unavailable; a request without a session names the actual writer. See the revised
 [Stacked PR plan](#stacked-pr-plan).
 
 The architecture below is the intended design, not a claim that every path
@@ -424,9 +425,11 @@ is #80's probe run through `Host_exec`.
 Model rejections are **learned per `(host, agent, model)`**. When a run
 fails with a recognisable "model not supported for this account" error,
 the writer records it and names the host in the error message. A later
-`set_model` or `start_session` naming that combination warns up front.
-Config can pre-declare denials. There is no silent fallback to another
-model or host (Q6).
+`set_model` or `start_session` naming a combination still known to be
+incompatible refuses with host-specific repair guidance. Stale evidence is
+revalidated after CLI/account changes; unknown is not denied. Config can
+pre-declare denials. There is no silent fallback to another model, agent or
+host (accepted Q6).
 
 ### Disk pressure and rescue per host
 

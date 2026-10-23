@@ -378,7 +378,7 @@ TOOLS = [
     },
     {
         "name": "start_login_flow",
-        "description": "Return the local command needed to repair login for an agent or session. The bot does not run OAuth itself.",
+        "description": "Return the login repair command and executor host for a session, or the current writer host when no thread is supplied. The bot does not run OAuth itself.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -688,7 +688,7 @@ def handle_tool_call(name, arguments):
             lines.append("Goal: none")
         login = result.get("login_help") or {}
         if login:
-            lines.append(f"Login repair: run `{login.get('command', '')}` on the bot host.")
+            lines.append(f"Login repair: run `{login.get('command', '')}` on {login.get('host', 'the bot host')}.")
         mechanism = result.get("goal_mechanism")
         if mechanism:
             lines.append(f"Goal mechanism: {mechanism}.")
@@ -778,7 +778,7 @@ def handle_tool_call(name, arguments):
         command = login.get("command", "")
         note = login.get("note", "")
         message = result.get("message", "")
-        return f"{message}\n\nRun on bot host: `{command}`\n{note}"
+        return f"{message}\n\nRun on {login.get('host', 'bot host')}: `{command}`\n{note}"
 
     elif name == "restart_bot":
         result = control_request("restart")
