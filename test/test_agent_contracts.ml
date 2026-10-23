@@ -122,7 +122,7 @@ let fresh_uuid () =
 let codex_command ~ephemeral ~session_id ~session_id_confirmed prompt =
   let args = Discord_agents.Agent_process.codex_args
     ~model:None ~reasoning_effort:None
-    ~session_id ~session_id_confirmed ~prompt in
+    ~session_id ~session_id_confirmed ~prompt () in
   let args = if ephemeral then
       match args with
       | "codex" :: "exec" :: rest -> "codex" :: "exec" :: "--ephemeral" :: rest
