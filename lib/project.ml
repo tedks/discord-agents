@@ -290,22 +290,13 @@ let rec rm_rf path =
     Unix.rmdir path
   | _ -> Unix.unlink path
 
+(* Git runs through Host_exec so that later multi-host work can route
+   these same calls to an executor; today they are always local, with
+   the behaviour this module always had (merged output, a newline after
+   every line, the output as the error text). *)
 let run_capture ?cwd args =
-  let prefix = match cwd with
-    | Some dir -> "cd " ^ Filename.quote dir ^ " && "
-    | None -> "" in
-  let cmd = prefix ^ String.concat " " (List.map Filename.quote args) ^ " 2>&1" in
-  let ic = Unix.open_process_in cmd in
-  let output = Buffer.create 256 in
-  (try
-     while true do
-       Buffer.add_string output (input_line ic);
-       Buffer.add_char output '\n'
-     done
-   with End_of_file -> ());
-  match Unix.close_process_in ic with
-  | Unix.WEXITED 0 -> Ok (Buffer.contents output)
-  | _ -> Error (Buffer.contents output)
+  Host_exec.local_capture ?cwd args
+  |> Result.map_error Host_exec.failure_detail
 
 let default_branch project =
   let branch_exists name =
@@ -506,24 +497,7 @@ let create_worktree project ~branch_name =
     branch_name (Buffer.contents output))
 
 let run_git_capture project args =
-  let cmd =
-    "git -C "
-    ^ Filename.quote project.path
-    ^ " "
-    ^ String.concat " " (List.map Filename.quote args)
-    ^ " 2>&1"
-  in
-  let ic = Unix.open_process_in cmd in
-  let output = Buffer.create 256 in
-  (try
-     while true do
-       Buffer.add_string output (input_line ic);
-       Buffer.add_char output '\n'
-     done
-   with End_of_file -> ());
-  match Unix.close_process_in ic with
-  | Unix.WEXITED 0 -> Ok ()
-  | _ -> Error (Buffer.contents output)
+  run_capture ("git" :: "-C" :: project.path :: args) |> Result.map ignore
 
 let remove_worktree project ~branch_name ~worktree_path =
   let path_existed = Sys.file_exists worktree_path in
