@@ -310,6 +310,12 @@ back explicitly. Persisting the concrete name rather than a symbolic
 `"local"` means a later writer move does not re-route old sessions to a
 host that never ran them.
 
+A session whose `host` names the machine running the bot always runs
+locally, even if the registry also lists that machine with an `ssh`
+transport. This happens when a start is forced onto an executor with
+`--force-writer`. Routing therefore checks "is this machine" before it
+looks at the transport.
+
 The `active_run` checkpoint gains an optional remote child: `(host,
 remote_pid)`, captured from `remote_started`, alongside the tracked
 local `ssh` pid. The `Agent_checkpoint` GADT shape is unchanged.

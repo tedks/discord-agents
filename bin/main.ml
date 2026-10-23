@@ -258,8 +258,10 @@ let () =
           Unix.read restart_r buf 0 1) in
         if n > 0 then begin
           Logs.info (fun m -> m "restart: SIGUSR1 received");
-          Discord_agents.Bot.trigger_restart bot ~notify:(fun msg ->
-            Logs.info (fun m -> m "restart: %s" msg));
+          (match Discord_agents.Bot.trigger_restart bot ~notify:(fun msg ->
+             Logs.info (fun m -> m "restart: %s" msg)) with
+           | Ok () -> ()
+           | Error msg -> Logs.warn (fun m -> m "restart: refused: %s" msg));
           (* If we're still alive (restart failed), wait for next signal *)
           loop ()
         end

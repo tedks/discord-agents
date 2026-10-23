@@ -1480,9 +1480,10 @@ let handle_send_attachments (bot : Bot.t) params =
             ]
 
 let handle_restart (bot : Bot.t) =
-  Bot.trigger_restart bot ~notify:(fun msg ->
-    Logs.info (fun m -> m "control_api restart: %s" msg));
-  ok_response [("message", `String "Restart initiated.")]
+  match Bot.trigger_restart bot ~notify:(fun msg ->
+    Logs.info (fun m -> m "control_api restart: %s" msg)) with
+  | Ok () -> ok_response [("message", `String "Restart initiated.")]
+  | Error msg -> error_response msg
 
 let handle_rename_thread (bot : Bot.t) params =
   let open Yojson.Safe.Util in

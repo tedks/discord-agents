@@ -1509,15 +1509,22 @@ let restart_preflight () =
       in
       Result.map ignore (Host.startup_check ?force config.hosts)
 
+(** [Ok ()] means the restart was started (it may still fail to build;
+    [notify] reports that). [Error] means nothing was started, with the
+    reason already passed to [notify], so callers that answer someone
+    other than [notify]'s audience (the control API) can say so. *)
 let trigger_restart t ~notify =
   if t.draining then begin
     notify "Already restarting.";
+    Error "Already restarting."
   end else match restart_preflight () with
   | Error err ->
-    notify (Printf.sprintf
+    let msg = Printf.sprintf
       "Not restarting: the new instance would refuse to start (%s). \
        Fix %s and try again."
-      (Resource.single_line err) (Config.config_path ()))
+      (Resource.single_line err) (Config.config_path ()) in
+    notify msg;
+    Error msg
   | Ok () -> begin
   (* Set draining BEFORE forking to close the race window where
      a queued message could slip through before the flag flips. *)
@@ -1605,7 +1612,8 @@ let trigger_restart t ~notify =
         (* Wait for new instance to take over, then exit. *)
         Eio.Time.sleep (Eio.Stdenv.clock t.env) 30.0;
         Logs.info (fun m -> m "bot: restart handoff timeout, exiting");
-        exit 0))
+        exit 0));
+    Ok ()
   end
 
 (** Re-run project discovery and update all derived state atomically.
@@ -2452,7 +2460,7 @@ let handle_command t msg cmd =
            else "")
           worktree_text))
   | Command.Restart ->
-    trigger_restart t ~notify:reply
+    ignore (trigger_restart t ~notify:reply)
   | Command.Refresh ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       match refresh_projects t with

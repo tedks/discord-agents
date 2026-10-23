@@ -63,10 +63,13 @@ let is_destination_char = function
 
 (** SSH destinations become an argument to ssh here, and [writer_ssh]
     later becomes a word in a command line that a remote login shell
-    parses. So they are allowlisted to what an ssh-config alias,
+    parses. They are allowlisted to what an ssh-config alias,
     [user@host], an IPv4 address or a bracketed IPv6 address with a
     scope id needs, and a leading '-' (which ssh would read as an
-    option such as [-oProxyCommand=...]) is refused. *)
+    option such as [-oProxyCommand=...]) is refused. The allowlist is
+    not quoting: '[' and ']' are glob characters, so any code that puts
+    a destination into a shell word must still quote it
+    ([Remote_script.quote]). *)
 let validate_destination ~field dest =
   if dest = "" then Error (Printf.sprintf "%s must not be empty" field)
   else if dest.[0] = '-' then
@@ -104,10 +107,12 @@ let same_host a b =
   else String.equal (first_label a) (first_label b)
 
 (** This machine's name as recorded on sessions when no registry entry
-    names it: the lowercased first label of the hostname, validated so
-    that a name the bot writes is always one it can read back. *)
+    names it: the lowercased hostname, validated so that a name the bot
+    writes is always one it can read back. The whole name, not its first
+    label: [bot.dev.example] and [bot.prod.example] are different
+    machines and must not both be recorded as [bot]. *)
 let this_machine_name ?(hostname = Unix.gethostname ()) () =
-  match validate_name (String.lowercase_ascii (first_label hostname)) with
+  match validate_name (String.lowercase_ascii hostname) with
   | Ok name -> Ok name
   | Error msg ->
     Error (Printf.sprintf
@@ -124,10 +129,22 @@ let local_host name = {
 
 let single_host_registry name = { writer = name; hosts = [local_host name] }
 
-(** Registry keys never share a first label (see [registry_of_yojson]),
-    so at most one host matches. *)
-let find registry name =
-  List.find_opt (fun h -> same_host h.name name) registry.hosts
+(** The host [name] refers to: an exact (case-insensitive) match first,
+    otherwise the only host [same_host] matches. [None] when nothing
+    matches or the name is ambiguous ([tower0] when both [tower0.lan]
+    and [tower0.local] are configured): routing by list order would
+    pick a machine arbitrarily. *)
+let lookup hosts name =
+  let lower = String.lowercase_ascii name in
+  match List.find_opt (fun h ->
+          String.equal (String.lowercase_ascii h.name) lower) hosts with
+  | Some _ as exact -> exact
+  | None ->
+    match List.filter (fun h -> same_host h.name name) hosts with
+    | [h] -> Some h
+    | _ -> None
+
+let find registry name = lookup registry.hosts name
 
 let writer registry =
   match find registry registry.writer with
@@ -145,17 +162,18 @@ let names_this_machine ?(hostname = Unix.gethostname ()) name =
 
 (** The host name to record on sessions this process creates. It must
     name the machine that actually runs the agents, which is this one:
-    the registry's spelling when the registry's writer is this machine
+    the registry's spelling of this machine when the registry has it
     (so lookups by that key work), otherwise this machine's own name.
-    The second case covers a single-host install and a start forced
-    onto a machine that is not the configured writer. Stamping the
-    configured writer there would send those sessions back to a
-    machine that never ran them. *)
-let session_host_name ?hostname registry_opt =
-  match registry_opt with
-  | Some registry when names_this_machine ?hostname registry.writer ->
-    Ok registry.writer
-  | _ -> this_machine_name ?hostname ()
+    Under a forced start that is not the configured writer, and
+    stamping the writer would send those sessions back to a machine
+    that never ran them. A forced machine may be listed as an SSH
+    executor; sessions recorded with this machine's name still run
+    locally (routing must check [names_this_machine] before the
+    transport). *)
+let session_host_name ?(hostname = Unix.gethostname ()) registry_opt =
+  match Option.bind registry_opt (fun r -> lookup r.hosts hostname) with
+  | Some h -> Ok h.name
+  | None -> this_machine_name ~hostname ()
 
 let force_writer_env = "DISCORD_AGENTS_FORCE_WRITER"
 
@@ -292,27 +310,32 @@ let registry_of_yojson = function
       match List.assoc_opt "executors" fields with
       | None | Some `Null -> []
       | Some (`Assoc entries) ->
-        (* Keyed by lowercased first label, which is how [same_host]
-           compares, so [find] can never match two entries. *)
-        let seen = Hashtbl.create 8 in
+        (* No two keys may name the same machine by [same_host]'s rule,
+           which is how lookups compare. *)
+        let seen = ref [] in
         List.map (fun (name, json) ->
           (match validate_name name with
            | Ok _ -> ()
            | Error msg -> fail "hosts.executors: %s" msg);
-          let key = String.lowercase_ascii (first_label name) in
-          (match Hashtbl.find_opt seen key with
+          (match List.find_opt (fun other -> same_host other name) !seen with
            | Some other when String.equal other name ->
              fail "hosts.executors: %s is listed twice" name
            | Some other ->
              fail "hosts.executors: %s and %s would name the same host" other name
            | None -> ());
-          Hashtbl.add seen key name;
+          seen := name :: !seen;
           host_of_yojson name json) entries
       | Some _ -> fail "hosts.executors: expected object keyed by host name"
     in
     let hosts =
-      match List.find_opt (fun h -> same_host h.name writer) executors with
-      | None -> local_host writer :: executors
+      match lookup executors writer with
+      | None ->
+        (match List.filter (fun h -> same_host h.name writer) executors with
+         | [] -> local_host writer :: executors
+         | matches ->
+           fail "hosts.writer %s matches more than one executor (%s); \
+                 spell it exactly as one of them" writer
+             (String.concat ", " (List.map (fun h -> h.name) matches)))
       | Some h ->
         if not (is_local h) then
           fail "hosts.executors.%s: the writer runs agents locally; \

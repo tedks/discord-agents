@@ -2224,6 +2224,20 @@ let test_bot_create_persists_legacy_hosts () =
         reloaded.migrated_host_count
     | None -> Alcotest.fail "session lost")
 
+(* A restart that starts nothing must say so to callers that are not
+   the notify audience (the control API answers the MCP tool). *)
+let test_trigger_restart_reports_refusal () =
+  with_test_bot (fun bot ->
+    bot.Discord_agents.Bot.draining <- true;
+    let notified = ref [] in
+    (match Discord_agents.Bot.trigger_restart bot
+             ~notify:(fun m -> notified := m :: !notified) with
+     | Ok () -> Alcotest.fail "expected a refusal while draining"
+     | Error msg ->
+       Alcotest.(check (list string)) "notified once with the reason"
+         [msg] !notified);
+    bot.draining <- false)
+
 let () =
   Alcotest.run "bot_defaults" [
     ("session_hosts", [
@@ -2231,6 +2245,8 @@ let () =
         test_persist_migrated_session_hosts;
       Alcotest.test_case "bot create persists legacy hosts" `Quick
         test_bot_create_persists_legacy_hosts;
+      Alcotest.test_case "trigger restart reports refusal" `Quick
+        test_trigger_restart_reports_refusal;
     ]);
     ("default agent", [
       Alcotest.test_case "busy control session defers default rotation" `Quick

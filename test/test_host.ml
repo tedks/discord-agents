@@ -177,10 +177,37 @@ let test_qualified_writer_key_matches_short_executor () =
   Alcotest.(check bool) "find by qualified name" true
     (Option.is_some (Host.find r "TOWER0.local"))
 
+let test_qualified_hosts_sharing_a_label () =
+  let r = parse {|{"writer": "bot.prod.example",
+                   "executors": {"bot.dev.example": {"ssh": "bot-dev"}}}|} in
+  Alcotest.(check (list string)) "both kept"
+    ["bot.prod.example"; "bot.dev.example"] (names r);
+  let found n = Option.map (fun (h : Host.t) -> h.name) (Host.find r n) in
+  Alcotest.(check (option string)) "exact prod" (Some "bot.prod.example")
+    (found "BOT.prod.example");
+  Alcotest.(check (option string)) "exact dev" (Some "bot.dev.example")
+    (found "bot.dev.example");
+  Alcotest.(check (option string)) "short name is ambiguous" None (found "bot");
+  (* Forced onto the dev machine: recorded as dev, not as a bare "bot"
+     that could resolve to prod. *)
+  Alcotest.(check (result string string)) "forced on dev"
+    (Ok "bot.dev.example")
+    (Host.session_host_name ~hostname:"bot.dev.example" (Some r));
+  let both = parse {|{"writer": "w", "executors": {
+                       "bot.prod.example": {"ssh": "a"},
+                       "bot.dev.example": {"ssh": "b"}}}|} in
+  Alcotest.(check int) "two qualified executors" 3 (List.length both.hosts);
+  check_rejected ~label:"writer matching two executors" ~mentions:"more than one"
+    {|{"writer": "tower0", "executors": {
+         "tower0.local": {"ssh": "a"}, "tower0.lan": {"ssh": "b"}}}|}
+
 let test_this_machine_name () =
   let name hostname = Host.this_machine_name ~hostname () in
-  Alcotest.(check (result string string)) "short, lowercased"
-    (Ok "tower0") (name "Tower0.Local");
+  Alcotest.(check (result string string)) "lowercased"
+    (Ok "tower0") (name "Tower0");
+  (* The whole name: two FQDNs sharing a first label are two machines. *)
+  Alcotest.(check (result string string)) "qualified kept whole"
+    (Ok "bot.dev.example") (name "Bot.Dev.Example");
   Alcotest.(check bool) "too long" false
     (Result.is_ok (name (String.make 65 'h')));
   Alcotest.(check bool) "unusable characters" false
@@ -192,7 +219,9 @@ let test_session_host_name () =
   let stamp ?registry hostname =
     Host.session_host_name ~hostname registry in
   Alcotest.(check (result string string)) "single host"
-    (Ok "tower0") (stamp "tower0.local");
+    (Ok "tower0") (stamp "tower0");
+  Alcotest.(check (result string string)) "single host, qualified hostname"
+    (Ok "tower0.local") (stamp "tower0.local");
   Alcotest.(check (result string string)) "on the writer"
     (Ok "tower0") (stamp ~registry:r "tower0.local");
   (* Forced onto another machine: sessions really run there, so they
@@ -243,6 +272,8 @@ let () =
       Alcotest.test_case "more rejections" `Quick test_more_rejections;
       Alcotest.test_case "qualified writer key matches short executor" `Quick
         test_qualified_writer_key_matches_short_executor;
+      Alcotest.test_case "qualified hosts sharing a label" `Quick
+        test_qualified_hosts_sharing_a_label;
       Alcotest.test_case "this machine name" `Quick test_this_machine_name;
       Alcotest.test_case "session host name" `Quick test_session_host_name;
       Alcotest.test_case "force writer source" `Quick test_force_writer_source;
