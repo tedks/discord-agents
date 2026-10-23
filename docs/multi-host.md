@@ -1,6 +1,7 @@
 # Multi-host sessions: one Discord writer, remote executors over SSH
 
-Status: design, first pass (2026-10-14). Nothing here is implemented yet.
+Status: design accepted by the operator (2026-10-22). Implementation is
+in progress as a stacked PR series (see [Stacked PR plan](#stacked-pr-plan)).
 Tracking issue: https://github.com/tedks/discord-agents/issues/74.
 Open product questions are filed as separate issues and linked in
 [Open questions](#open-questions).
@@ -483,7 +484,8 @@ single-host behaviour unchanged. Only the bottom PR targets master.
 2. **Host model, config and session host field.** Adds the `Host`
    module and the `hosts` config block (absent means today's
    behaviour). Adds `Session_store.session.host` with the load-time
-   migration, the `--force-writer` check, and thread-name display.
+   migration, and the `--force-writer` check. Thread-name display
+   moves to PR 5 so that PR 2 does not wait on Q2.
    Tests: config parsing, migration round-trip, and old `sessions.json`
    fixtures.
 3. **Host_exec with Local and Ssh transports.** Adds `run_capture` and
@@ -541,7 +543,9 @@ start as soon as this design is accepted.
   wall-clock bound, in line with #30's warning about hangs.
 - **Live (manual, documented in the PR)**: framework0 for all three
   agents, the unreachable path against an offline splinter, and the
-  drynwyn MCP callback once its agents are installed.
+  drynwyn MCP callback once its agents are installed. The operator
+  must make that change; agents do not touch drynwyn (see the
+  decision log).
 
 ## Open questions
 
@@ -576,3 +580,13 @@ Each one is filed with options, a recommendation, and what it blocks:
   This keeps a writer move from mis-routing old sessions.
 - 2026-10-14: address hosts by SSH destination from config. `.local`
   did not resolve for half the fleet from tower0.
+- 2026-10-22: operator accepted the design and authorized PRs 2–4.
+  Their rulings:
+  - **framework0 may keep a resident daemon** for monitoring-type work.
+    The run path keeps the zero-install SSH shape. The startup reaper,
+    health and disk probes, and inventory refresh in PRs 8–9 may use a
+    small resident helper on framework0 if that is simpler than
+    per-call SSH. Each such choice goes in this log.
+  - **Agents do not touch drynwyn.** No probes, installs or test runs
+    there. It stays disabled in example configs until the operator
+    enables it.
