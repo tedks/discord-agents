@@ -81,6 +81,12 @@ type top_level_policy_sync_state =
   | Policy_sync_rotation_pending
   | Policy_sync_marker_clear_pending
 
+(** The writer's host name: the host every session created by this
+    process runs on until remote executors exist. The session store
+    holds it because it also stamps it on legacy entries at load, and
+    one source of truth keeps the two from disagreeing. *)
+let writer_host t = t.sessions.Session_store.default_host
+
 (** Convenience accessors for the current project state snapshot. *)
 let projects t = t.project_state.projects
 let channels t = t.project_state.channels
@@ -272,6 +278,7 @@ let fresh_session_like (session : Session_store.session)
     ~agent_kind ~session_override_kind =
   Session_store.make_session
     ~project_name:session.project_name
+    ~host:session.host
     ~working_dir:session.working_dir
     ~agent_kind
     ~session_override_kind
@@ -962,6 +969,7 @@ let context_change_busy_message action =
 let fresh_context_session t (session : Session_store.session) ~thread_id =
   Session_store.make_session
     ~project_name:session.project_name
+    ~host:session.host
     ~working_dir:session.working_dir
     ~agent_kind:session.agent_kind
     ~session_override_kind:session.session_override_kind
@@ -1344,6 +1352,20 @@ let mark_active_run_failed t (session : Session_store.session)
   ignore (Discord_rest.create_reaction t.rest
     ~channel_id:session.thread_id ~message_id ~emoji:"\xE2\x9D\x8C" ())
 
+(** Write host fields for sessions loaded without one, so the
+    assignment made at load survives a later change of writer. A
+    failure here is not fatal: the next successful save of any session
+    writes them too, and until then the next load assigns the same
+    writer again. *)
+let persist_migrated_session_hosts ?(save=Session_store.save) t =
+  if t.sessions.Session_store.migrated_host_count > 0 then
+    match save t.sessions with
+    | () -> t.sessions.migrated_host_count <- 0
+    | exception exn ->
+      Logs.warn (fun m ->
+        m "bot: could not persist host for %d legacy session(s): %s"
+          t.sessions.migrated_host_count (Printexc.to_string exn))
+
 let reconcile_interrupted_active_runs
     ?(mark_failed=mark_active_run_failed)
     ?(reap_children=(fun t children ->
@@ -1701,7 +1723,7 @@ let resolve_resume_target t ~raw_working_dir ~kind_label ~fallback_channel =
 let create_persistent_channel_session t ~channel_id ~project_name ~working_dir
     ~system_prompt ~agent_kind ~session_override_kind =
   let session = Session_store.make_session
-    ~project_name ~working_dir ~agent_kind
+    ~project_name ~host:(writer_host t) ~working_dir ~agent_kind
     ~session_override_kind
     ~session_id:(Resource.generate_uuid ())
     ~thread_id:channel_id
@@ -1979,7 +2001,8 @@ let handle_command t msg cmd =
            reply (Printf.sprintf "Failed to create thread: %s" e)
          | Ok thread_ch ->
            let session = Session_store.make_session
-             ~project_name:p.name ~working_dir ~agent_kind:kind
+             ~project_name:p.name ~host:(writer_host t) ~working_dir
+             ~agent_kind:kind
              ~session_id:(Resource.generate_uuid ())
              ~thread_id:thread_ch.Discord_types.id
              ~system_prompt:None ~initial_prompt:None () in
@@ -2091,7 +2114,8 @@ let handle_command t msg cmd =
              would mark the session unconfirmed and the next turn's
              gemini_args would omit --resume, starting a fresh chat. *)
           let session = Session_store.make_session
-            ~project_name ~working_dir ~agent_kind:found_kind
+            ~project_name ~host:(writer_host t) ~working_dir
+            ~agent_kind:found_kind
             ~session_id:full_sid ~session_id_confirmed:true
             ~message_count:1
             ~thread_id:thread_ch.Discord_types.id
@@ -3355,7 +3379,9 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
      [bot] resolves to the accessor, producing a type error — catching
      stale-closure bugs at compile time. *)
   let discovered_projects = Project.discover ~base_directories:config.base_directories in
-  let sessions = Session_store.create () in
+  let sessions =
+    Session_store.create ~default_host:(Config.host_registry config).writer ()
+  in
   let initial_channels = Channel_manager.create () in
   let gateway = Discord_gateway.create
     ~token:config.discord_token
@@ -3377,6 +3403,7 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
                last_gateway_supervisor_error = None;
                last_control_api_error = None;
                scroll_states = Hashtbl.create 64 } in
+  persist_migrated_session_hosts bot;
   reconcile_interrupted_active_runs bot;
   reconcile_persisted_stop_requests bot;
   reconcile_persisted_pending_agent_changes bot;
