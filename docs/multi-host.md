@@ -6,9 +6,14 @@ Status (2026-10-23 takeover): foundation PRs
 [138](https://github.com/tedks/discord-agents/pull/138), and
 [142](https://github.com/tedks/discord-agents/pull/142) are merged through
 `f6e8a76`. Remote execution exists; public remote creation and discovery do
-not. Questions 128–135 remain open. The next bounded change is to prevent
-remote attachment requests from reading writer-local files, followed by
-host capability observations. See the revised
+not. Questions 128–135 remain open. The revised plan is merged in
+[144](https://github.com/tedks/discord-agents/pull/144). The attachment handler
+now rejects remote uploads before writer-local reads; executor uploads remain
+[145](https://github.com/tedks/discord-agents/issues/145), and transcript/run
+ownership is tracked in
+[146](https://github.com/tedks/discord-agents/issues/146). The next bounded
+implementation mission is host capability observations; admission policy
+still needs the Q6 ruling. See the revised
 [Stacked PR plan](#stacked-pr-plan).
 
 The architecture below is the intended design, not a claim that every path
@@ -525,10 +530,11 @@ remote launch:
   Never persist credentials or raw login output. Fallback/refusal policy is
   still Q6; capability observation does not decide it.
 - **Host ownership applies to every file operation.** `send_attachments`
-  currently reads the recorded cwd on the writer, even for a remote session.
-  Identical paths can expose the wrong host's files. First reject that path
-  before any read; then implement executor-side confinement and bounded
-  transfers. Stop cleanup already skips remote worktrees. Keep unsupported
+  in the merged foundation read the recorded cwd on the writer, even for a
+  remote session.
+  Identical paths can expose the wrong host's files. The handler now rejects
+  that path before any read; next implement executor-side confinement and
+  bounded transfers. Stop cleanup already skips remote worktrees. Keep unsupported
   operations explicit until they are routed; audit every `working_dir` use.
 - **EOF is cleanup, not a lease.** Keepalives bound the writer's wait, not a
   partitioned executor's lifetime. The current run lock uses the thread id,
