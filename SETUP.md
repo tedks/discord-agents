@@ -70,6 +70,16 @@ Create `~/.config/discord-agents/config.json`:
 - `guild_id` -- Your Discord server ID from step 4.
 - `base_directories` -- List of directories to scan for git repos. Each repo becomes a project channel. `base_dirs` is accepted as a legacy alias.
 - `control_channel_id` (optional) -- A specific channel ID for the control channel. If omitted, the bot creates one.
+- `hosts` (optional) -- Multi-host setup (see `docs/multi-host.md`). Leave it out for a single machine, and the bot treats the machine it runs on as the only host. When it is set, `hosts.writer` names the one machine allowed to run the bot. The bot refuses to start anywhere else, so two bots never answer the same Discord message. Override that with `--force-writer` or `DISCORD_AGENTS_FORCE_WRITER=1`. Remote executors are listed under `hosts.executors` but cannot run sessions yet; that arrives in later PRs. A binary older than this field refuses to start with a `hosts` block present.
+
+  ```json
+  "hosts": {
+    "writer": "tower0",
+    "executors": {
+      "framework0": { "ssh": "framework0", "writer_ssh": "tower0" }
+    }
+  }
+  ```
 
 ## 6. Build and run
 

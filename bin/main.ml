@@ -1,13 +1,17 @@
 (** discord-agents — Discord harness for AI agents.
 
-    Usage: discord-agents [--test [CHANNEL_ID]]
+    Usage: discord-agents [--test [CHANNEL_ID]] [--force-writer]
 
     Reads configuration from ~/.config/discord-agents/config.json
     (or the path given by --config), discovers projects in the configured
     base directories, connects to Discord, and waits for commands.
 
     --test           Run REST + gateway smoke test, then exit
-    --test CHANNEL   Also send a test message to the given channel *)
+    --test CHANNEL   Also send a test message to the given channel
+    --force-writer   Start even though config.json's hosts.writer names
+                     another machine. Also settable as
+                     DISCORD_AGENTS_FORCE_WRITER=1, which is how it
+                     survives !restart (the respawn passes no flags). *)
 
 let setup_logging () =
   Printexc.record_backtrace true;
@@ -149,6 +153,23 @@ let () =
      List.iter (fun err -> Logs.err (fun m -> m "config: %s" err)) errors;
      Logs.err (fun m -> m "update %s" (Discord_agents.Config.config_path ()));
      exit 1);
+  (* The pidfile only excludes a second bot on this machine. A second
+     bot on another host with the same token would answer every message
+     twice, so a configured writer is enforced here, also before the
+     pidfile so a refused start cannot kill a healthy running bot. *)
+  let force_writer_env = "DISCORD_AGENTS_FORCE_WRITER" in
+  let force_writer =
+    List.mem "--force-writer" args
+    || Sys.getenv_opt force_writer_env = Some "1"
+  in
+  if force_writer then Unix.putenv force_writer_env "1";
+  (if not test_mode then
+     match Discord_agents.Host.check_writer ~force:force_writer
+             config.Discord_agents.Config.hosts with
+     | Ok () -> ()
+     | Error err ->
+       Logs.err (fun m -> m "config: %s" err);
+       exit 1);
   (* Acquire pidfile lock after config validation so a bad config cannot
      terminate a healthy running bot and then fail to start. Keeps fd open
      for process lifetime. *)

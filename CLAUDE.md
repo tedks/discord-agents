@@ -100,6 +100,7 @@ Non-command messages in control/project channels are routed to the channel's cur
 
 - **Pidfile lock** (`~/.config/discord-agents/discord-agents.pid`): Only one instance runs.
 - **Session persistence** (`~/.config/discord-agents/sessions.json`): Thread-session mappings survive restarts.
+- **Hosts** (`lib/host.ml`, optional `hosts` block in config.json): each session records the host that ran it (`Session_store.session.host`). Entries saved before this field existed get the writer's concrete name when loaded and are saved straight back. If `hosts.writer` names another machine, the bot refuses to start unless `--force-writer` is given. Multi-host design and PR plan: `docs/multi-host.md`.
 - **Streaming output**: Agent responses appear incrementally, message edited every 2s.
 - **Typing indicator**: Background fiber sends typing every 8s for entire processing duration, stops within 1s of completion.
 - **Emoji lifecycle**: 👀 on receipt, ✅ on success, ❌ on error. Messages sent during processing get ⏳ and are queued.
