@@ -208,7 +208,10 @@ let download_attachments ?ssh ?(target = Agent_process.Local) ~rest ~working_dir
       let name = attachment_storage_name ~id:a.id ~filename:a.filename in
       match Discord_rest.download_url rest ~url:a.url () with
       | Ok data when String.length data > max_attachment_bytes ->
-        (* The size above is Discord's metadata; check what arrived. *)
+        (* The size above is Discord's metadata; check what arrived. The
+           REST transport already stops reading any response past its own
+           cap (Discord_rest.max_body_size, 10 MB), which bounds memory
+           and is in practice the tighter limit. *)
         Logs.warn (fun m -> m "agent_runner: skipping %s: download was %d bytes"
           a.filename (String.length data));
         None

@@ -230,12 +230,20 @@ let run_capture ?(ssh = "ssh") ?timeout_s ?cwd ?(input = "") (host : Host.t) arg
         (* [timeout_s] bounds the whole call with coreutils timeout (KILL
            5 s after TERM), so a hung executor cannot hold a system
            thread, or a stop requested meanwhile, indefinitely. *)
+        (* A requested bound that cannot be enforced is refused rather
+           than silently dropped. *)
         let argv =
           let base = ssh_argv ~ssh ~destination in
           match timeout_s, Resource.executable_in_path "timeout" with
-          | Some t, Some timeout -> [timeout; "-k"; "5"; string_of_int t] @ base
-          | _ -> base
+          | Some t, Some timeout -> Ok ([timeout; "-k"; "5"; string_of_int t] @ base)
+          | Some _, None ->
+            Error (Setup_failed
+              "a time limit was requested but coreutils `timeout` is not in PATH")
+          | None, _ -> Ok base
         in
+        match argv with
+        | Error _ as e -> e
+        | Ok argv ->
         match
           Unix.create_process (List.hd argv) (Array.of_list argv) in_r out_w out_w
         with

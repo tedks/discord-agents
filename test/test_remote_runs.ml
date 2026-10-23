@@ -318,6 +318,21 @@ let test_remote_gemini_withdraws_entry_without_mcp () =
     Alcotest.(check bool) "our entry gone" true
       (json |> member "mcpServers" |> member "discord-agents" = `Null))
 
+(* A requested time limit must never silently become no limit. *)
+let test_timeout_refused_without_coreutils () =
+  with_env (fun ~base:_ ~ssh ~mcp:_ ~work ->
+    let saved = Sys.getenv_opt "PATH" in
+    Unix.putenv "PATH" (Filename.dirname ssh);
+    Fun.protect ~finally:(fun () -> Unix.putenv "PATH" (Option.value saved ~default:""))
+    @@ fun () ->
+    let host = { (Host.local_host "framework0") with Host.transport = Host.Ssh "remote" } in
+    match Discord_agents.Host_exec.run_capture ~ssh ~timeout_s:5 ~cwd:work host ["true"] with
+    | Error (Discord_agents.Host_exec.Setup_failed msg) ->
+      Alcotest.(check bool) msg true
+        (Discord_agents.Resource.contains_substring ~haystack:msg ~needle:"timeout")
+    | Ok _ -> Alcotest.fail "ran without its time limit"
+    | Error f -> Alcotest.failf "unexpected: %s" (Discord_agents.Host_exec.failure_detail f))
+
 let () =
   Alcotest.run "remote_runs" [
     "pure", [
@@ -335,5 +350,7 @@ let () =
       Alcotest.test_case "codex turn" `Quick test_codex_turn_over_ssh;
       Alcotest.test_case "gemini withdraws entry without mcp" `Quick
         test_remote_gemini_withdraws_entry_without_mcp;
+      Alcotest.test_case "timeout refused without coreutils" `Quick
+        test_timeout_refused_without_coreutils;
     ];
   ]
