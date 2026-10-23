@@ -268,9 +268,12 @@ let run_capture ?(ssh = "ssh") ?timeout_s ?cwd ?(input = "") (host : Host.t) arg
                      ignore could hang this cleanup forever. Killing the
                      local ssh is also what stops the remote side. *)
                   (* coreutils timeout puts itself in a new process group;
-                     signal the group so its ssh child goes too. *)
-                  let target = if in_own_group then -pid else pid in
-                  (try Unix.kill target Sys.sigkill with Unix.Unix_error _ -> ());
+                     signal the group so its ssh child goes too. Signal the
+                     pid as well: right after spawn the group may not exist
+                     yet, and the pid alone is what waitpid needs gone. *)
+                  if in_own_group then
+                    (try Unix.kill (-pid) Sys.sigkill with Unix.Unix_error _ -> ());
+                  (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
                   ignore (waitpid_retry pid)
                 end)
               (fun () ->
