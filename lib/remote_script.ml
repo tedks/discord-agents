@@ -183,6 +183,14 @@ let script ~nonce ~mode ~cwd ~env ~argv =
            line "lockrc=$?";
            line "if [ \"$lockrc\" -eq 1 ]; then %s; exit 1; fi" (err "busy");
            line "if [ \"$lockrc\" -ne 0 ]; then %s; exit 1; fi" (err "lock_failed");
+           (* Holding the lock means no earlier watchdog for this key is
+              alive (each keeps fd 9 until it ends), so its done-files are
+              stale: sweep them, which also stops one leaking per stop.
+              The watchdog's disarm signal must start absent, or a stop
+              would be mistaken for a normal finish; refuse to run rather
+              than run unguarded. *)
+           line "rm -f \"$lockfile\".*.done 2>/dev/null";
+           line "if [ -e \"$donefile\" ]; then %s; exit 1; fi" (err "lock_failed");
            (* The command prints its own started marker, with its own pid
               (setsid does not fork here: a background job is not a group
               leader, so the pid is the new session's pgid), then execs.
@@ -212,7 +220,6 @@ let script ~nonce ~mode ~cwd ~env ~argv =
               ([kill -15 -PGID], [kill -0 -PGID]). The KILL can in
               principle hit a reused pgid if the group emptied and its id
               was reallocated between the last poll and the kill. *)
-           line "rm -f \"$donefile\"";
            line "( cat <&3 >/dev/null 2>&1 9>&-; \
                  if [ -e \"$donefile\" ]; then rm -f \"$donefile\"; exit 0; fi; \
                  kill -15 \"-$child\" 2>/dev/null; i=0; \
@@ -223,7 +230,12 @@ let script ~nonce ~mode ~cwd ~env ~argv =
            line "exec 3<&-";
            line "wait \"$child\"";
            line "rc=$?";
-           line "touch \"$donefile\" 2>/dev/null";
+           (* If the disarm cannot be written (a full disk), the run's
+              result stands, but say so: the watchdog will treat channel
+              close as a stop and end detached processes from this turn. *)
+           line "touch \"$donefile\" 2>/dev/null || echo \"discord-agents: could not \
+                 disarm the watchdog; detached processes from this turn will be \
+                 stopped when the channel closes\" >&2";
            line "printf '\\n%%s %%s\\n' %s \"$rc\"" (quote (exit_tag ^ " " ^ nonce));
            line "exit 0");
         Ok (Buffer.contents b)

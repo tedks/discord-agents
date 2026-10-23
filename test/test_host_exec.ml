@@ -498,7 +498,12 @@ let test_lock_released_promptly_after_stop () =
       let waited = retry () in
       Alcotest.(check bool)
         (Printf.sprintf "lock free after %.2fs, well before the 3 s grace" waited)
-        true (waited < 1.5)))
+        true (waited < 1.5);
+      (* The stop's disarm file is swept by the next run of the key. *)
+      let run_dir = Filename.concat (Sys.getenv "HOME") ".cache/discord-agents/run" in
+      let leftovers = Sys.readdir run_dir |> Array.to_list
+                      |> List.filter (fun f -> Filename.check_suffix f ".done") in
+      Alcotest.(check (list string)) "no done-files left" [] leftovers))
 
 (* A normal exit disarms the watchdog: a properly detached background
    process outlives the turn, as it would locally. *)
