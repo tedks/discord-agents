@@ -48,8 +48,15 @@ type mode =
       (** Long-running agent turn: own process group, stdin-EOF
           watchdog, and a per-[lock_key] flock. *)
 
+(* Shell variables the run script uses itself. An env entry with one of
+   these names would be overwritten, or (lockdir, lockfile) could redirect
+   the lock, so they are refused. *)
+let reserved_env_names =
+  ["lockdir"; "lockfile"; "donefile"; "lockrc"; "child"; "rc"; "i"]
+
 let is_env_name s =
-  s <> ""
+  not (List.mem s reserved_env_names)
+  && s <> ""
   && (match s.[0] with 'A' .. 'Z' | 'a' .. 'z' | '_' -> true | _ -> false)
   && String.for_all (function
     | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' -> true
@@ -91,10 +98,12 @@ let marker tag nonce value = Printf.sprintf "%s %s %s" tag nonce value
    environment string longer than this, whatever ARG_MAX is. *)
 let max_arg_bytes = 128 * 1024 - 1
 
-let required_tools = ["flock"; "setsid"; "cat"]
+let required_tools = ["flock"; "setsid"; "cat"; "sleep"; "touch"; "rm"]
 
 let script ~nonce ~mode ~cwd ~env ~argv =
   let too_long s = String.length s > max_arg_bytes in
+  (* The kernel limit covers an environment entry's whole NAME=value. *)
+  let env_too_long (k, v) = String.length k + 1 + String.length v > max_arg_bytes in
   if argv = [] then Error "remote command must not be empty"
   else if List.exists has_nul (cwd :: argv) then
     Error "remote command and directory must not contain NUL bytes"
@@ -103,7 +112,7 @@ let script ~nonce ~mode ~cwd ~env ~argv =
        login directory. *)
     Error (Printf.sprintf "remote directory %S must be absolute" cwd)
   else if List.exists too_long argv
-       || List.exists (fun (_, v) -> too_long v) env then
+       || List.exists env_too_long env then
     Error (Printf.sprintf
       "an argument or environment value exceeds Linux's %d-byte \
        per-argument limit, so exec would fail"
@@ -133,6 +142,12 @@ let script ~nonce ~mode ~cwd ~env ~argv =
         (* Before the exports, so an env entry named HOME cannot move
            the lock and let two runs of one session miss each other. *)
         line "lockdir=\"$HOME/.cache/discord-agents/run\"";
+        (match mode with
+         | Run { lock_key } ->
+           line "lockfile=\"$lockdir\"/%s.lock" (quote lock_key);
+           (* Per wrapper ($$), so concurrent wrappers never share one. *)
+           line "donefile=\"$lockfile.$$.done\""
+         | Capture -> ());
         List.iter (fun (k, v) -> line "export %s=%s" k (quote v)) env;
         line "set -- %s" (String.concat " " (List.map quote argv));
         line "cd %s 2>/dev/null || { %s; exit 1; }" (quote cwd)
@@ -145,7 +160,7 @@ let script ~nonce ~mode ~cwd ~env ~argv =
            line "printf '\\n%%s %%s\\n' %s \"$rc\""
              (quote (exit_tag ^ " " ^ nonce));
            line "exit 0"
-         | Run { lock_key } ->
+         | Run _ ->
            (* A missing tool would otherwise surface as "busy" (flock),
               as the command exiting 127 (setsid), or as a watchdog that
               kills a healthy run at once (cat). *)
@@ -160,7 +175,6 @@ let script ~nonce ~mode ~cwd ~env ~argv =
            (* [exec 9>file] is a special builtin: a failed redirection
               would kill the shell before any [||] ran. Create it first
               with an ordinary command. *)
-           line "lockfile=\"$lockdir\"/%s.lock" (quote lock_key);
            line "mkdir -p \"$lockdir\" 2>/dev/null && touch \"$lockfile\" 2>/dev/null \
                  || { %s; exit 1; }" (err "lock_failed");
            line "exec 9>\"$lockfile\"";
@@ -175,27 +189,41 @@ let script ~nonce ~mode ~cwd ~env ~argv =
               So the wrapper writes nothing to the channel between spawn
               and arming the watchdog, and a channel that is already gone
               kills the marker's printf before the command runs. *)
-           line "setsid --wait sh -c 'printf \"\\n%%s %%s\\n\" \"$0\" \"$$\"; exec \"$@\"' \
-                 %s \"$@\" </dev/null 3<&- 9>&- &"
+           (* [|| exit 1]: if the marker cannot be delivered (SIGPIPE may
+              be inherited as ignored, so printf just fails), the command
+              must not run unannounced. *)
+           line "setsid --wait sh -c 'printf \"\\n%%s %%s\\n\" \"$1\" \"$$\" || exit 1; shift; exec \"$@\"' \
+                 discord-agents-run %s \"$@\" </dev/null 3<&- 9>&- &"
              (quote (started_tag ^ " " ^ nonce));
            line "child=$!";
-           (* On stdin EOF, TERM the group and KILL it 3 s later. The
-              escalation runs as its own background job, so the wrapper's
-              [kill $dog] after a normal exit cannot cancel a stop that
-              has already begun; it keeps fd 9, so the lock is held until
-              the group is gone. dash's kill only signals a group in the
-              numeric form ([kill -15 -PGID]). The KILL can in principle
-              hit a reused pgid if the group emptied and its id was
-              reallocated within 3 s; the local path has the same window. *)
+           (* The watchdog. On stdin EOF, unless the wrapper has marked the
+              run done, TERM the group, wait up to 3 s for it to empty
+              (polling, so the lock is released as soon as it has), and
+              KILL whatever is left. It keeps fd 9, so the lock is held
+              until the group is gone.
+
+              The wrapper disarms it with the done-file rather than by
+              killing it: the shell may reap the watchdog early, and a
+              later [kill $pid] could then hit an unrelated process that
+              reused the pid. Disarmed or not, the watchdog ends at stdin
+              EOF, which comes as soon as sshd closes the channel.
+
+              dash's kill only signals a group in the numeric form
+              ([kill -15 -PGID], [kill -0 -PGID]). The KILL can in
+              principle hit a reused pgid if the group emptied and its id
+              was reallocated between the last poll and the kill. *)
+           line "rm -f \"$donefile\"";
            line "( cat <&3 >/dev/null 2>&1 9>&-; \
-                 ( kill -15 \"-$child\" 2>/dev/null; sleep 3; \
-                   kill -9 \"-$child\" 2>/dev/null ) </dev/null >/dev/null 2>&1 & \
+                 if [ -e \"$donefile\" ]; then rm -f \"$donefile\"; exit 0; fi; \
+                 kill -15 \"-$child\" 2>/dev/null; i=0; \
+                 while [ \"$i\" -lt 30 ] && kill -0 \"-$child\" 2>/dev/null; do \
+                   sleep 0.1; i=$((i + 1)); done; \
+                 if kill -0 \"-$child\" 2>/dev/null; then kill -9 \"-$child\" 2>/dev/null; fi \
                  ) </dev/null >/dev/null 2>&1 &";
-           line "dog=$!";
            line "exec 3<&-";
            line "wait \"$child\"";
            line "rc=$?";
-           line "kill \"$dog\" 2>/dev/null";
+           line "touch \"$donefile\" 2>/dev/null";
            line "printf '\\n%%s %%s\\n' %s \"$rc\"" (quote (exit_tag ^ " " ^ nonce));
            line "exit 0");
         Ok (Buffer.contents b)

@@ -105,6 +105,11 @@ let test_script_rejects () =
   rejected "oversized env value"
     (script ~env:["A", String.make (128 * 1024) 'x'] ["true"]);
   Alcotest.(check bool) "dot cwd" true (Result.is_ok (script ~cwd:"." ["true"]));
+  rejected "reserved env name" (script ~env:["lockdir", "/tmp"] ["true"]);
+  (* The limit covers NAME=value: a value under it with a long name is
+     still too long. *)
+  rejected "env entry with long name"
+    (script ~env:[String.make 100 'A', String.make (128 * 1024 - 50) 'x'] ["true"]);
   Alcotest.(check bool) "ok" true
     (Result.is_ok (script ~mode:(Run { lock_key = "abc-123_x.y" }) ["true"]))
 
@@ -468,6 +473,48 @@ let test_env_home_does_not_move_lock () =
             (stream ~sw ~mgr ~ssh ~lock_key:"same"
                ~env:["HOME", Filename.concat base "elsewhere"] ["true"]))))
 
+(* After a stop, a retry of the same session must not be refused as busy
+   for a fixed grace period when the group died at TERM straight away. *)
+let test_lock_released_promptly_after_stop () =
+  with_env (fun ~base:_ ~ssh ->
+    with_eio (fun ~sw ~mgr ~clock ->
+      let local_pid = ref None and started = ref false in
+      Eio.Fiber.both
+        (fun () ->
+          ignore (stream ~sw ~mgr ~ssh ~lock_key:"again"
+                    ~on_spawn:(fun p -> local_pid := Some p)
+                    ~on_remote_pid:(fun _ -> started := true) ["sleep"; "300"]))
+        (fun () ->
+          wait_until ~clock "started" (fun () -> !started);
+          Unix.kill (Option.get !local_pid) Sys.sigterm);
+      let t0 = Unix.gettimeofday () in
+      let rec retry () =
+        match stream ~sw ~mgr ~ssh ~lock_key:"again" ["true"] with
+        | Ok () -> Unix.gettimeofday () -. t0
+        | Error Host_exec.Busy when Unix.gettimeofday () -. t0 < 5.0 ->
+          Eio.Time.sleep clock 0.1; retry ()
+        | Error f -> Alcotest.failf "retry: %s" (failure_name f)
+      in
+      let waited = retry () in
+      Alcotest.(check bool)
+        (Printf.sprintf "lock free after %.2fs, well before the 3 s grace" waited)
+        true (waited < 1.5)))
+
+(* A normal exit disarms the watchdog: a properly detached background
+   process outlives the turn, as it would locally. *)
+let test_normal_exit_leaves_detached_process () =
+  with_env (fun ~base ~ssh ->
+    with_eio (fun ~sw ~mgr ~clock ->
+      let pidfile = Filename.concat base "daemon.pid" in
+      check_ok "turn" "" (Result.map (fun () -> "")
+        (stream ~sw ~mgr ~ssh
+           ["sh"; "-c"; Printf.sprintf "sleep 30 >/dev/null 2>&1 & echo $! > %s"
+                          (Filename.quote pidfile)]));
+      Eio.Time.sleep clock 1.0;
+      let daemon = read_pid pidfile in
+      Alcotest.(check bool) "detached process still running" true (alive daemon);
+      (try Unix.kill daemon Sys.sigkill with Unix.Unix_error _ -> ())))
+
 let () =
   Alcotest.run "host_exec" [
     "remote_script", [
@@ -503,5 +550,9 @@ let () =
         test_bash_login_shell_with_banner;
       Alcotest.test_case "env HOME does not move lock" `Quick
         test_env_home_does_not_move_lock;
+      Alcotest.test_case "lock released promptly after stop" `Quick
+        test_lock_released_promptly_after_stop;
+      Alcotest.test_case "normal exit leaves detached process" `Quick
+        test_normal_exit_leaves_detached_process;
     ];
   ]

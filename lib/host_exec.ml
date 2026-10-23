@@ -99,57 +99,47 @@ let local_capture ?cwd argv =
   | Unix.WEXITED 0 -> Ok (Buffer.contents output)
   | status -> Error (Exited (exit_code status, Buffer.contents output))
 
-(** Write [payload] to [in_w] while reading [out_r] to EOF, with select,
-    so neither side can deadlock the other: a remote command that stops
-    reading its input (it failed, or never reads stdin) cannot block the
-    write once pipe and SSH window buffers fill, and output the command
-    writes before it reads cannot block it either. Takes ownership of
-    [in_w] and closes it exactly once (when the payload is written, the
-    reader has gone, or on the way out): closing an fd twice can close
-    whatever another thread opened under the reused number. *)
-let exchange ~in_w ~payload ~out_r =
+let read_all fd =
   let buf = Buffer.create 4096 in
   let chunk = Bytes.create 65536 in
-  let in_open = ref true in
-  let close_in () =
-    if !in_open then begin
-      in_open := false;
-      try Unix.close in_w with Unix.Unix_error _ -> ()
-    end
+  let rec loop () =
+    match Unix.read fd chunk 0 (Bytes.length chunk) with
+    | 0 -> ()
+    | n -> Buffer.add_subbytes buf chunk 0 n; loop ()
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> loop ()
   in
-  Fun.protect ~finally:close_in @@ fun () ->
-  Unix.set_nonblock in_w;
-  let len = String.length payload in
-  let rec loop ~off ~writing =
-    let writing =
-      if writing && off >= len then (close_in (); false) else writing in
-    let reads, writes, _ =
-      try Unix.select [out_r] (if writing then [in_w] else []) [] (-1.0)
-      with Unix.Unix_error (Unix.EINTR, _, _) -> [], [], []
-    in
-    let off, writing =
-      if writes = [] then off, writing
-      else
-        match Unix.write_substring in_w payload off (min 65536 (len - off)) with
-        | n -> off + n, writing
-        | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) ->
-          off, writing
-        | exception Unix.Unix_error ((Unix.EPIPE | Unix.ECONNRESET), _, _) ->
-          (* The reader is gone; its output says why. *)
-          close_in (); off, false
-    in
-    let eof =
-      if reads = [] then false
-      else
-        match Unix.read out_r chunk 0 (Bytes.length chunk) with
-        | 0 -> true
-        | n -> Buffer.add_subbytes buf chunk 0 n; false
-        | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EINTR), _, _) -> false
-    in
-    if eof then () else loop ~off ~writing
-  in
-  loop ~off:0 ~writing:true;
+  loop ();
   Buffer.contents buf
+
+let rec write_all fd s off =
+  if off < String.length s then
+    match Unix.write_substring fd s off (String.length s - off) with
+    | n -> write_all fd s (off + n)
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> write_all fd s off
+
+(** Write [payload] to [in_w] while reading [out_r] to EOF, so neither
+    side can deadlock the other: a remote command that stops reading its
+    input (it failed, or never reads stdin) cannot block the write once
+    pipe and SSH window buffers fill, and output it writes before reading
+    cannot block it either.
+
+    The write runs on its own thread, which owns [in_w] and closes it
+    exactly once (closing an fd twice can close whatever another thread
+    opened under the reused number). A thread rather than [select],
+    which cannot watch fds at or above FD_SETSIZE (1024), and the bot
+    raises its fd limit. If the read raises, the writer is not joined:
+    it ends when the caller's cleanup kills ssh and the write fails. *)
+let exchange ~in_w ~payload ~out_r =
+  let writer = Thread.create (fun () ->
+    Fun.protect ~finally:(fun () -> try Unix.close in_w with Unix.Unix_error _ -> ())
+      (fun () ->
+        try write_all in_w payload 0
+        with Unix.Unix_error ((Unix.EPIPE | Unix.ECONNRESET), _, _) ->
+          (* The reader is gone; its output says why. *) ()))
+    () in
+  let output = read_all out_r in
+  Thread.join writer;
+  output
 
 let find_sub ?(from = 0) s sub =
   let n = String.length s and m = String.length sub in
@@ -248,17 +238,20 @@ let run_capture ?(ssh = "ssh") ?cwd ?(input = "") (host : Host.t) argv =
         | pid ->
           close in_r;
           close out_w;
-          (* Whatever happens below, ssh is reaped: terminated first if
-             the exchange failed part way, so waitpid cannot block. Not
-             on success, where a late SIGTERM could turn a clean exit
-             into a signal status. *)
+          (* Whatever happens below, ssh is reaped: killed first if the
+             exchange failed part way, so waitpid cannot block. Not on
+             success, where a late signal could turn a clean exit into a
+             signal status. *)
           let reaped = ref false in
           let output, status =
             Fun.protect
               ~finally:(fun () ->
                 close out_r;
                 if not !reaped then begin
-                  (try Unix.kill pid Sys.sigterm with Unix.Unix_error _ -> ());
+                  (* KILL, not TERM: a wait after a signal the process may
+                     ignore could hang this cleanup forever. Killing the
+                     local ssh is also what stops the remote side. *)
+                  (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
                   ignore (waitpid_retry pid)
                 end)
               (fun () ->
@@ -409,7 +402,9 @@ let run_streaming_ssh ~sw ~mgr ?(ssh = "ssh") ?(prefix = []) ~destination
           close_noerr stderr_r;
           if Option.is_none !awaited then
             Eio.Cancel.protect (fun () ->
-              (try Eio.Process.signal proc Sys.sigterm with _ -> ());
+              (* KILL so the await below is bounded even if ssh ignores
+                 TERM. *)
+              (try Eio.Process.signal proc Sys.sigkill with _ -> ());
               ignore (await ())))
         (fun () ->
           Option.iter (fun f -> f (Eio.Process.pid proc)) on_spawn;
