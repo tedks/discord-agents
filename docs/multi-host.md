@@ -1,7 +1,19 @@
 # Multi-host sessions: one Discord writer, remote executors over SSH
 
-Status: design accepted by the operator (2026-10-22). Implementation is
-in progress as a stacked PR series (see [Stacked PR plan](#stacked-pr-plan)).
+Status (2026-10-23 takeover): foundation PRs
+[127](https://github.com/tedks/discord-agents/pull/127),
+[136](https://github.com/tedks/discord-agents/pull/136),
+[138](https://github.com/tedks/discord-agents/pull/138), and
+[142](https://github.com/tedks/discord-agents/pull/142) are merged through
+`f6e8a76`. Remote execution exists; public remote creation and discovery do
+not. Questions 128–135 remain open. The next bounded change is to prevent
+remote attachment requests from reading writer-local files, followed by
+host capability observations. See the revised
+[Stacked PR plan](#stacked-pr-plan).
+
+The architecture below is the intended design, not a claim that every path
+is implemented. The operator accepted the foundation on 2026-10-22; the
+remaining product recommendations still require rulings.
 Tracking issue: https://github.com/tedks/discord-agents/issues/74.
 Open product questions are filed as separate issues and linked in
 [Open questions](#open-questions).
@@ -492,61 +504,147 @@ New and changed commands and MCP tools, final syntax subject to Q2:
   optional host filter.
 - `!status`: running processes grouped by host.
 
+## Takeover design review (2026-10-23)
+
+Keep one Discord writer and SSH executors. This fits host-local worktrees,
+transcripts and credentials, avoids distributing Discord state, and needs no
+executor deployment for a turn. Use configured SSH destinations; `.local`
+is an addressing option, not a requirement. Keep drynwyn hands-off.
+
+Change the rollout order and strengthen these contracts before exposing
+remote launch:
+
+- **Capabilities precede admission.** The tower0 CLI/config lag and the
+  framework0 Gemini `--skip-trust` failure demonstrate independent sources
+  of incompatibility. Record executable path, CLI version, required flag
+  support, observation time and auth observation per host and agent. Unknown,
+  missing, incompatible, unreachable and unauthenticated are distinct facts.
+  A version or login probe does not establish model entitlement. Keep model
+  rejection evidence separate, dated and invalidatable after executable or
+  account changes; do not retain an eternal `(host, agent, model)` denial.
+  Never persist credentials or raw login output. Fallback/refusal policy is
+  still Q6; capability observation does not decide it.
+- **Host ownership applies to every file operation.** `send_attachments`
+  currently reads the recorded cwd on the writer, even for a remote session.
+  Identical paths can expose the wrong host's files. First reject that path
+  before any read; then implement executor-side confinement and bounded
+  transfers. Stop cleanup already skips remote worktrees. Keep unsupported
+  operations explicit until they are routed; audit every `working_dir` use.
+- **EOF is cleanup, not a lease.** Keepalives bound the writer's wait, not a
+  partitioned executor's lifetime. The current run lock uses the thread id,
+  so it also cannot exclude two threads resuming the same transcript. Before
+  exposing remote resume, establish executor exclusion keyed by transcript
+  identity (with a stable pre-allocation identity for new Codex/Gemini runs),
+  and test identity transition and writer crash recovery. A busy lock plus a
+  PID is not sufficient authority to kill: verify a run token, process start
+  identity and lock ownership on the executor, including PID reuse cases.
+- **Writer checks are accident guards.** Reachable-peer pidfile checks and
+  `--force-writer` cannot fence a partitioned writer. Manual relocation must
+  establish the old writer is stopped/fenced and preserve host bindings.
+  Automatic failover remains a separate lease/fencing design, subject to Q8.
+- **Inventory is a snapshot.** An offline host retains last-known projects
+  with a timestamp and unavailable status. A failed probe must not mean an
+  empty inventory or justify cleanup. Bound time, output and concurrency of
+  discovery/probes; never run fleet SSH synchronously on the gateway fiber.
+
+These are implementation constraints and recommendations, not new operator
+rulings. No daemon, host upgrade, credential repair or deployment is implied.
+
 ## Stacked PR plan
 
-Each PR builds and passes `dune runtest` on its own, and each leaves
-single-host behaviour unchanged. Only the bottom PR targets master.
+The original PRs 1–4 are already merged: design, host model/persistence,
+transport, and remote runs. Preserve their branches for recoverability.
+The following replaces the remaining original PRs 5–9; smaller boundaries
+bring capabilities and ownership checks ahead of public remote launch.
+Only the bottom open PR targets master. Each child targets its immediate
+parent, then rebases onto master after that parent merges normally. Create
+drafts after the first coherent commit, and run the local gates plus council
+to fixpoint on each substantive PR before merging.
 
-1. **docs: multi-host design** (this PR). The doc and the filed open
-   questions. No code.
-2. **Host model, config and session host field.** Adds the `Host`
-   module and the `hosts` config block (absent means today's
-   behaviour). Adds `Session_store.session.host` with the load-time
-   migration, and the `--force-writer` check. Thread-name display
-   moves to PR 5 so that PR 2 does not wait on Q2.
-   Tests: config parsing, migration round-trip, and old `sessions.json`
-   fixtures.
-3. **Host_exec with Local and Ssh transports.** Adds `run_capture` and
-   `run_streaming`, the bootstrap encoder, the wrapper script as an
-   embedded resource, and exit classification. Moves `Project`'s git
-   calls onto `Host_exec` with `Local`, with no behaviour change. Tests:
-   a fake-ssh harness that runs the bootstrap locally, quoting
-   round-trips (quotes, newlines, non-UTF-8 bytes, a 200 KB payload),
-   flock busy, the watchdog killing a grandchild, and exit
-   classification.
-4. **Remote agent runs.** Makes `run_streaming` host-aware: wrapper,
-   the `remote_started` handling, stdin kept open, and the reverse-SSH
-   MCP config for all three agents. The checkpoint gains the remote
-   child. Stop and restart work via the local `ssh` pid. Usable end to
-   end with a manually created session record. Acceptance: a Claude,
-   Codex and Gemini turn on framework0 streams into a thread, `!stop`
-   mid-run leaves no process on framework0, and an MCP `send_message`
-   from the remote agent lands in the thread.
-5. **Remote projects and worktrees.** Adds inventory discovery,
-   `hosts-inventory.json`, the union with host attribution,
-   `!start <project>@<host>`, `start_session.host`, remote
-   worktree create, stop cleanup and `!cleanup`, and the `!hosts`
-   command. Acceptance: a repo only on framework0 appears in
-   `!projects`, and `!start` on it works.
-6. **Transcript discovery and resume routing.** Splits the
-   `*_sessions` modules into pure and source parts and adds remote
-   sources, aggregated listings, and `!resume …@host` with the
-   ambiguity prompt and preflight. Acceptance: resume a framework0
-   Codex session from Discord.
-7. **Host-routed attachments and session file reads.** Moves
-   `send_attachments` validation to the executor and audits the other
-   `working_dir` readers.
-8. **Per-host health: disk, rescue, agents, models.** Adds keyed
-   `Disk_health` observations, remote probes, per-host rescue
-   evaluation, the agent presence probe, and learned model rejections.
-9. **Hardening.** Adds the startup remote reaper, the peer-writer
-   check, ControlMaster multiplexing behind a flag, and fault-injection
-   tests (killed transport, partition simulated with a fake ssh that
-   stalls).
+1. **Takeover review and revised plan (docs).** Record actual merged state,
+   design objections, decision dependencies and acceptance criteria. This
+   does not resolve questions 128–135.
+2. **Reject writer-local reads for remote attachment uploads.** Guard the
+   actual `send_attachments` handler with the existing host resolution rules.
+   Acceptance: remote, unknown, disabled and ambiguous hosts cannot read or
+   upload a same-path writer file; local and local-alias uploads still work.
+   No live SSH is needed. This is the first implementation slice this pass.
+3. **Host capability observations.** Add bounded, injectable local/SSH probes
+   and typed snapshots for executable identity/version, required CLI flags,
+   auth observation and callback health. Keep model knowledge separate and
+   distinguish unknown from denied. Tests cover old CLI flags, missing CLI,
+   stale observations, noisy output, timeout and unreachable hosts. No login
+   or upgrade side effects. Q4 governs membership/refresh exposure; Q6 governs
+   admission and rejection-cache policy. Do not infer approval from the
+   existing host config parser.
+4. **Executor file reads.** Replace the temporary attachment refusal with
+   remote canonicalization, regular-file validation and capped transfer;
+   recheck received length on the writer. Audit session file readers.
+   Acceptance: binary round-trip, same path/different bytes across hosts,
+   traversal/symlink escape, FIFO, changing file, excessive output and
+   interrupted transfer; no partial Discord upload. Depends on slice 2.
+5. **Run identity and reconciliation.** Persist executor run identity, bind
+   locks to transcripts, and implement verified cleanup/reconciliation.
+   Acceptance: duplicate resume from two threads, server-allocated session id
+   transition, transport loss, writer crash, stale PID reuse and unavailable
+   executor. No kill based solely on a locked filename and recorded PID.
+   Q7 governs user-facing fail/queue/migrate behavior; Q8 governs relocation.
+6. **Project inventory by host.** Pure record parsing first, then bounded
+   discovery and a durable last-seen cache. Logical project union uses remote
+   URL; locations remain keyed by host. Acceptance: remote-only repo, duplicate
+   remote, no remote URL, offline snapshot retained and malformed/truncated
+   discovery rejected. Q4 blocks the exposed inventory policy.
+7. **Remote worktree lifecycle.** Host-routed create, rollback, stop cleanup
+   and merged-worktree sweep. Protect in-use worktrees across async yields.
+   Acceptance: failed creation leaves no session, stopped/unmerged work stays
+   recoverable, offline cleanup is reported and never treated as success.
+   Depends on inventory; Q3 governs absent projects. Remote import is a
+   separate follow-up if authorized.
+8. **Admission and explicit remote launch.** Integrate capability freshness,
+   model/auth diagnostics, writer-state disk gating and target-host pressure
+   before allocating the thread/worktree. Then expose host selection and
+   display through Discord and MCP. Acceptance: unavailable CLI, unsupported
+   flag/model, auth failure, disk pressure and unreachable host produce the
+   operator-selected behavior; Claude/Codex/Gemini live acceptance must each
+   be recorded honestly. Depends on slices 3–7 and rulings Q1–Q6, Q7–Q8 where
+   operational policy applies. No silent model/agent/host change without a
+   ruling authorizing it.
+9. **Transcript inventory and remote resume.** Separate pure decoders from
+   host-local sources, add bounded aggregation, then host-qualified resume.
+   Acceptance: a real framework0 transcript resumes in its original cwd;
+   duplicate prefixes across hosts ask for qualification; missing cwd and
+   transcript are distinct; stale auth/version facts are rechecked. Depends
+   on admission and run exclusion; Q2 and Q7 govern syntax/failure behavior.
+10. **Optional optimizations.** Multiplexing and any framework0 monitoring
+    helper only after the above behavior is proven. Test a dead SSH master
+    affecting several sessions. Keep automatic writer failover and transcript
+    migration outside this stack unless separately ruled in.
 
-Depending on answers, Q1–Q3 shape PR 5, Q5–Q6 shape PR 8, and Q7–Q8
-shape PR 9. PRs 2–4 do not depend on any open question, so they can
-start as soon as this design is accepted.
+Every code slice must pass `nix develop --command dune build` and
+`nix develop --command dune runtest` on the exact commit being merged. Rebase
+changes require rerunning both. Live acceptance uses framework0 only when
+needed; drynwyn remains excluded. Keep local single-host regression coverage.
+
+### Decision dependencies still open
+
+The earlier claim that all foundations were independent of every question was
+too broad: Q4 explicitly blocks config shape and Q8 the writer guard. Those
+pieces are already merged under the recorded authorization for PRs 2–4;
+that is not a ruling on their remaining product choices. All eight issues
+are still the operator's decision record:
+
+- Q1–Q3: default host, command/thread syntax, absent-project handling.
+- Q4: host membership and discovery policy (a static parser already exists).
+- Q5: pressure policy and cross-host steering.
+- Q6: missing/incompatible CLI, auth and model policy; moved ahead of launch.
+- Q7: unreachable live-session behavior; moved ahead of launch/resume.
+- Q8: writer placement and failover; configuration guards are not fencing.
+
+The recommendations remain: preferred host then writer (otherwise ask),
+`project@host`, explicit remote import, static membership with probes,
+per-target pressure without steering, explicit model/agent/host changes,
+fail unreachable turns while retaining binding, and a manually fenced writer
+move. They have been surfaced for operator ruling; silence is not acceptance.
 
 ## Testing
 
