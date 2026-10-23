@@ -139,6 +139,15 @@ let test_codex_overrides_for_remote () =
     (Agent_process.codex_mcp_overrides_for ~command:"sh"
        ~args:["a\\b"; "tab\there"; "nl\n"; "bell\007"] ())
 
+(* The local path passes the thread id the same way (Codex gives MCP
+   servers an allowlisted environment, so it must be in the env table). *)
+let test_codex_overrides_carry_thread_id () =
+  Alcotest.(check (list string)) "env table entry"
+    ["-c"; {|mcp_servers.discord_agents.command="/x"|};
+     "-c"; {|mcp_servers.discord_agents.args=[]|};
+     "-c"; {|mcp_servers.discord_agents.env.DISCORD_AGENTS_THREAD_ID="123"|}]
+    (Agent_process.codex_mcp_overrides_for ~thread_id:"123" ~command:"/x" ())
+
 let test_attachment_storage_name () =
   let name = Agent_runner.attachment_storage_name in
   Alcotest.(check string) "plain" "123_report.pdf" (name ~id:"123" ~filename:"report.pdf");
@@ -345,6 +354,8 @@ let () =
       Alcotest.test_case "codex overrides" `Quick test_codex_overrides_for_remote;
       Alcotest.test_case "failure message" `Quick test_remote_failure_message;
       Alcotest.test_case "attachment storage name" `Quick test_attachment_storage_name;
+      Alcotest.test_case "codex overrides carry thread id" `Quick
+        test_codex_overrides_carry_thread_id;
     ];
     "over ssh", [
       Alcotest.test_case "claude turn" `Quick test_claude_turn_over_ssh;

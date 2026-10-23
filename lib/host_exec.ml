@@ -224,14 +224,12 @@ let run_capture ?(ssh = "ssh") ?timeout_s ?cwd ?(input = "") (host : Host.t) arg
       match resolve_ssh ssh with
       | Error _ as e -> e
       | Ok ssh ->
-        let close fd = try Unix.close fd with Unix.Unix_error _ -> () in
-        let in_r, in_w = Unix.pipe ~cloexec:true () in
-        let out_r, out_w = Unix.pipe ~cloexec:true () in
         (* [timeout_s] bounds the whole call with coreutils timeout (KILL
            5 s after TERM), so a hung executor cannot hold a system
-           thread, or a stop requested meanwhile, indefinitely. *)
-        (* A requested bound that cannot be enforced is refused rather
-           than silently dropped. *)
+           thread, or a stop requested meanwhile, indefinitely. A
+           requested bound that cannot be enforced is refused rather than
+           silently dropped. Decided before any pipe exists, so the
+           refusal has nothing to leak. *)
         let argv =
           let base = ssh_argv ~ssh ~destination in
           match timeout_s, Resource.executable_in_path "timeout" with
@@ -244,6 +242,9 @@ let run_capture ?(ssh = "ssh") ?timeout_s ?cwd ?(input = "") (host : Host.t) arg
         match argv with
         | Error _ as e -> e
         | Ok (argv, in_own_group) ->
+        let close fd = try Unix.close fd with Unix.Unix_error _ -> () in
+        let in_r, in_w = Unix.pipe ~cloexec:true () in
+        let out_r, out_w = Unix.pipe ~cloexec:true () in
         match
           Unix.create_process (List.hd argv) (Array.of_list argv) in_r out_w out_w
         with
@@ -267,13 +268,14 @@ let run_capture ?(ssh = "ssh") ?timeout_s ?cwd ?(input = "") (host : Host.t) arg
                   (* KILL, not TERM: a wait after a signal the process may
                      ignore could hang this cleanup forever. Killing the
                      local ssh is also what stops the remote side. *)
-                  (* coreutils timeout puts itself in a new process group;
-                     signal the group so its ssh child goes too. Signal the
-                     pid as well: right after spawn the group may not exist
-                     yet, and the pid alone is what waitpid needs gone. *)
+                  (* KILL the pid first: it is what waitpid needs gone, and
+                     once dead, coreutils timeout can spawn nothing more.
+                     Then its group (timeout makes its own), to catch an ssh
+                     child already started. The pid cannot be reused before
+                     the waitpid below reaps it, so the group id stays ours. *)
+                  (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
                   if in_own_group then
                     (try Unix.kill (-pid) Sys.sigkill with Unix.Unix_error _ -> ());
-                  (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
                   ignore (waitpid_retry pid)
                 end)
               (fun () ->
