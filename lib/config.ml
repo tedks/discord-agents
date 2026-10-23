@@ -131,6 +131,9 @@ type t = {
   guild_id : string; (** Discord server/guild to operate in *)
   control_channel_id : string option; (** Top-level channel for server-wide commands *)
   projects : project list;
+  hosts : Host.registry option;
+  (** The [hosts] block, if present. [None] keeps single-host
+      behaviour: this machine is the only host. *)
 } [@@deriving show]
 
 let default = {
@@ -139,13 +142,14 @@ let default = {
   guild_id = "";
   control_channel_id = None;
   projects = [];
+  hosts = None;
 }
 
 let field fields name = List.assoc_opt name fields
 
 let known_top_level_fields =
   ["discord_token"; "base_directories"; "base_dirs"; "guild_id";
-   "control_channel_id"; "projects"]
+   "control_channel_id"; "projects"; "hosts"]
 
 let unknown_top_level_fields fields =
   List.filter_map (fun (name, _) ->
@@ -200,11 +204,17 @@ let t_of_yojson = function
       | Some json -> project_list_field ~name:"projects" json
       | None -> default.projects
     in
-    { discord_token; base_directories; guild_id; control_channel_id; projects }
+    let hosts =
+      match field fields "hosts" with
+      | None | Some `Null -> None
+      | Some json -> Some (Host.registry_of_yojson json)
+    in
+    { discord_token; base_directories; guild_id; control_channel_id; projects;
+      hosts }
   | _ -> failwith "config: expected object"
 
 let yojson_of_t t =
-  `Assoc [
+  `Assoc ([
     ("discord_token", `String t.discord_token);
     ("base_directories",
      `List (List.map (fun path -> `String path) t.base_directories));
@@ -214,9 +224,12 @@ let yojson_of_t t =
       | Some id -> `String id
       | None -> `Null));
     ("projects", `List (List.map yojson_of_project t.projects));
-  ]
+  ] @ (match t.hosts with
+       | Some registry -> [("hosts", Host.yojson_of_registry registry)]
+       | None -> []))
 
 let blank s = String.trim s = ""
+
 
 let validation_errors ?(require_guild_id=true) config =
   let errors = ref [] in

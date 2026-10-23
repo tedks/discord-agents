@@ -81,6 +81,13 @@ type top_level_policy_sync_state =
   | Policy_sync_rotation_pending
   | Policy_sync_marker_clear_pending
 
+(** The name of the machine this process runs on, as recorded on
+    sessions (see [Host.session_host_name]). Until remote executors
+    exist, every session runs here. The session store holds it because
+    it also stamps it on legacy entries at load, and one source of
+    truth keeps the two from disagreeing. *)
+let local_host_name t = t.sessions.Session_store.default_host
+
 (** Convenience accessors for the current project state snapshot. *)
 let projects t = t.project_state.projects
 let channels t = t.project_state.channels
@@ -272,6 +279,7 @@ let fresh_session_like (session : Session_store.session)
     ~agent_kind ~session_override_kind =
   Session_store.make_session
     ~project_name:session.project_name
+    ~host:session.host
     ~working_dir:session.working_dir
     ~agent_kind
     ~session_override_kind
@@ -962,6 +970,7 @@ let context_change_busy_message action =
 let fresh_context_session t (session : Session_store.session) ~thread_id =
   Session_store.make_session
     ~project_name:session.project_name
+    ~host:session.host
     ~working_dir:session.working_dir
     ~agent_kind:session.agent_kind
     ~session_override_kind:session.session_override_kind
@@ -1344,6 +1353,20 @@ let mark_active_run_failed t (session : Session_store.session)
   ignore (Discord_rest.create_reaction t.rest
     ~channel_id:session.thread_id ~message_id ~emoji:"\xE2\x9D\x8C" ())
 
+(** Write host fields for sessions loaded without one, so the
+    assignment made at load survives a later change of writer. A
+    failure here is not fatal: the next successful save of any session
+    writes them too, and until then the next load assigns the same
+    writer again. *)
+let persist_migrated_session_hosts ?(save=Session_store.save) t =
+  if t.sessions.Session_store.migrated_host_count > 0 then
+    match save t.sessions with
+    | () -> t.sessions.migrated_host_count <- 0
+    | exception exn ->
+      Logs.warn (fun m ->
+        m "bot: could not persist host for %d legacy session(s): %s"
+          t.sessions.migrated_host_count (Printexc.to_string exn))
+
 let reconcile_interrupted_active_runs
     ?(mark_failed=mark_active_run_failed)
     ?(reap_children=(fun t children ->
@@ -1467,10 +1490,42 @@ let child_processes_for_restart t =
 (** Trigger a graceful restart: drain → reap → build → spawn.
     Callable from command handler or signal handler.
     [notify] is called with status messages (may be a no-op for signal-triggered restarts). *)
+(** The checks the respawned process will make before it takes over,
+    run against the config it will load. The old process exits 30 s
+    after a successful build whether or not the new one started, so a
+    config edit that the new one would refuse (a malformed file, or
+    hosts.writer now naming another machine) must stop the restart
+    here, while this bot is still serving. *)
+let restart_preflight () =
+  match Config.load_result () with
+  | Error errors -> Error (String.concat "; " errors)
+  | Ok config ->
+    match Config.validate config with
+    | Error errors -> Error (String.concat "; " errors)
+    | Ok () ->
+      let force =
+        Host.force_writer_source ~args:[]
+          ~env_value:(Sys.getenv_opt Host.force_writer_env)
+      in
+      Result.map ignore (Host.startup_check ?force config.hosts)
+
+(** [Ok ()] means the restart was started (it may still fail to build;
+    [notify] reports that). [Error] means nothing was started, with the
+    reason already passed to [notify], so callers that answer someone
+    other than [notify]'s audience (the control API) can say so. *)
 let trigger_restart t ~notify =
   if t.draining then begin
     notify "Already restarting.";
-  end else begin
+    Error "Already restarting."
+  end else match restart_preflight () with
+  | Error err ->
+    let msg = Printf.sprintf
+      "Not restarting: the new instance would refuse to start (%s). \
+       Fix %s and try again."
+      (Resource.single_line err) (Config.config_path ()) in
+    notify msg;
+    Error msg
+  | Ok () -> begin
   (* Set draining BEFORE forking to close the race window where
      a queued message could slip through before the flag flips. *)
   t.draining <- true;
@@ -1557,7 +1612,8 @@ let trigger_restart t ~notify =
         (* Wait for new instance to take over, then exit. *)
         Eio.Time.sleep (Eio.Stdenv.clock t.env) 30.0;
         Logs.info (fun m -> m "bot: restart handoff timeout, exiting");
-        exit 0))
+        exit 0));
+    Ok ()
   end
 
 (** Re-run project discovery and update all derived state atomically.
@@ -1701,7 +1757,7 @@ let resolve_resume_target t ~raw_working_dir ~kind_label ~fallback_channel =
 let create_persistent_channel_session t ~channel_id ~project_name ~working_dir
     ~system_prompt ~agent_kind ~session_override_kind =
   let session = Session_store.make_session
-    ~project_name ~working_dir ~agent_kind
+    ~project_name ~host:(local_host_name t) ~working_dir ~agent_kind
     ~session_override_kind
     ~session_id:(Resource.generate_uuid ())
     ~thread_id:channel_id
@@ -1979,7 +2035,8 @@ let handle_command t msg cmd =
            reply (Printf.sprintf "Failed to create thread: %s" e)
          | Ok thread_ch ->
            let session = Session_store.make_session
-             ~project_name:p.name ~working_dir ~agent_kind:kind
+             ~project_name:p.name ~host:(local_host_name t) ~working_dir
+             ~agent_kind:kind
              ~session_id:(Resource.generate_uuid ())
              ~thread_id:thread_ch.Discord_types.id
              ~system_prompt:None ~initial_prompt:None () in
@@ -2091,7 +2148,8 @@ let handle_command t msg cmd =
              would mark the session unconfirmed and the next turn's
              gemini_args would omit --resume, starting a fresh chat. *)
           let session = Session_store.make_session
-            ~project_name ~working_dir ~agent_kind:found_kind
+            ~project_name ~host:(local_host_name t) ~working_dir
+            ~agent_kind:found_kind
             ~session_id:full_sid ~session_id_confirmed:true
             ~message_count:1
             ~thread_id:thread_ch.Discord_types.id
@@ -2402,7 +2460,7 @@ let handle_command t msg cmd =
            else "")
           worktree_text))
   | Command.Restart ->
-    trigger_restart t ~notify:reply
+    ignore (trigger_restart t ~notify:reply)
   | Command.Refresh ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       match refresh_projects t with
@@ -3355,7 +3413,12 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
      [bot] resolves to the accessor, producing a type error — catching
      stale-closure bugs at compile time. *)
   let discovered_projects = Project.discover ~base_directories:config.base_directories in
-  let sessions = Session_store.create () in
+  let default_host =
+    match Host.session_host_name config.Config.hosts with
+    | Ok name -> name
+    | Error msg -> failwith msg  (* main checks this before we get here *)
+  in
+  let sessions = Session_store.create ~default_host () in
   let initial_channels = Channel_manager.create () in
   let gateway = Discord_gateway.create
     ~token:config.discord_token
@@ -3377,6 +3440,7 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
                last_gateway_supervisor_error = None;
                last_control_api_error = None;
                scroll_states = Hashtbl.create 64 } in
+  persist_migrated_session_hosts bot;
   reconcile_interrupted_active_runs bot;
   reconcile_persisted_stop_requests bot;
   reconcile_persisted_pending_agent_changes bot;

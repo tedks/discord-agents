@@ -1,13 +1,17 @@
 (** discord-agents — Discord harness for AI agents.
 
-    Usage: discord-agents [--test [CHANNEL_ID]]
+    Usage: discord-agents [--test [CHANNEL_ID]] [--force-writer]
 
     Reads configuration from ~/.config/discord-agents/config.json
     (or the path given by --config), discovers projects in the configured
     base directories, connects to Discord, and waits for commands.
 
     --test           Run REST + gateway smoke test, then exit
-    --test CHANNEL   Also send a test message to the given channel *)
+    --test CHANNEL   Also send a test message to the given channel
+    --force-writer   Start even though config.json's hosts.writer names
+                     another machine. Also settable as
+                     DISCORD_AGENTS_FORCE_WRITER=1, which is how it
+                     survives !restart (the respawn passes no flags). *)
 
 let setup_logging () =
   Printexc.record_backtrace true;
@@ -149,6 +153,22 @@ let () =
      List.iter (fun err -> Logs.err (fun m -> m "config: %s" err)) errors;
      Logs.err (fun m -> m "update %s" (Discord_agents.Config.config_path ()));
      exit 1);
+  (* The pidfile only excludes a second bot on this machine. A second
+     bot on another host with the same token would answer every message
+     twice, so a configured writer is enforced here, also before the
+     pidfile so a refused start cannot kill a healthy running bot. *)
+  let module Host = Discord_agents.Host in
+  let force =
+    Host.force_writer_source ~args
+      ~env_value:(Sys.getenv_opt Host.force_writer_env)
+  in
+  if Option.is_some force then Unix.putenv Host.force_writer_env "1";
+  (if not test_mode then
+     match Host.startup_check ?force config.Discord_agents.Config.hosts with
+     | Ok _host_name -> ()
+     | Error err ->
+       Logs.err (fun m -> m "config: %s" err);
+       exit 1);
   (* Acquire pidfile lock after config validation so a bad config cannot
      terminate a healthy running bot and then fail to start. Keeps fd open
      for process lifetime. *)
@@ -238,8 +258,10 @@ let () =
           Unix.read restart_r buf 0 1) in
         if n > 0 then begin
           Logs.info (fun m -> m "restart: SIGUSR1 received");
-          Discord_agents.Bot.trigger_restart bot ~notify:(fun msg ->
-            Logs.info (fun m -> m "restart: %s" msg));
+          (match Discord_agents.Bot.trigger_restart bot ~notify:(fun msg ->
+             Logs.info (fun m -> m "restart: %s" msg)) with
+           | Ok () -> ()
+           | Error msg -> Logs.warn (fun m -> m "restart: refused: %s" msg));
           (* If we're still alive (restart failed), wait for next signal *)
           loop ()
         end

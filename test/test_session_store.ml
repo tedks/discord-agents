@@ -45,7 +45,7 @@ let write_primary_sessions home content =
     (fun () -> output_string oc content)
 
 let make_session () =
-  Discord_agents.Session_store.make_session
+  Discord_agents.Session_store.make_session ~host:"test-host"
     ~project_name:"control"
     ~working_dir:"/tmp/project"
     ~agent_kind:Discord_agents.Config.Claude
@@ -108,7 +108,7 @@ let test_agent_checkpoint_tracks_child_by_construction () =
 
 let test_save_updates_backup () =
   with_tmp_home (fun home ->
-    let store = Discord_agents.Session_store.create () in
+    let store = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let session = make_session () in
     Discord_agents.Session_store.add store ~thread_id:"control" session;
     let primary = sessions_path home in
@@ -121,7 +121,7 @@ let test_save_updates_backup () =
 
 let test_load_uses_backup_when_primary_corrupt () =
   with_tmp_home (fun home ->
-    let store = Discord_agents.Session_store.create () in
+    let store = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let session = make_session () in
     Discord_agents.Session_store.add store ~thread_id:"control" session;
     (match Discord_agents.Session_store.set_stop_requested store session true with
@@ -136,14 +136,14 @@ let test_load_uses_backup_when_primary_corrupt () =
       primary
       backup_stat.Unix.st_atime
       backup_stat.Unix.st_mtime;
-    let reloaded = Discord_agents.Session_store.create () in
+    let reloaded = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let recovered = find_control_session reloaded in
     Alcotest.(check bool) "stop_requested recovered from backup"
       true recovered.Discord_agents.Session_store.stop_requested)
 
 let test_load_uses_backup_when_primary_has_wrong_shape () =
   with_tmp_home (fun home ->
-    let store = Discord_agents.Session_store.create () in
+    let store = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let session = make_session () in
     Discord_agents.Session_store.add store ~thread_id:"control" session;
     (match Discord_agents.Session_store.set_stop_requested store session true with
@@ -153,25 +153,25 @@ let test_load_uses_backup_when_primary_has_wrong_shape () =
     let oc = open_out primary in
     output_string oc "{}";
     close_out oc;
-    let reloaded = Discord_agents.Session_store.create () in
+    let reloaded = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let recovered = find_control_session reloaded in
     Alcotest.(check bool) "structural error recovered from backup"
       true recovered.Discord_agents.Session_store.stop_requested)
 
 let test_load_uses_backup_when_primary_missing () =
   with_tmp_home (fun home ->
-    let store = Discord_agents.Session_store.create () in
+    let store = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let session = make_session () in
     Discord_agents.Session_store.add store ~thread_id:"control" session;
     Sys.remove (sessions_path home);
-    let reloaded = Discord_agents.Session_store.create () in
+    let reloaded = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let recovered = find_control_session reloaded in
     Alcotest.(check string) "project recovered from backup"
       "control" recovered.Discord_agents.Session_store.project_name)
 
 let test_save_with_visible_but_unconfirmed_primary_updates_backup () =
   with_tmp_home (fun home ->
-    let store = Discord_agents.Session_store.create () in
+    let store = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let session = make_session () in
     Discord_agents.Session_store.add store ~thread_id:"control" session;
     session.stop_requested <- true;
@@ -189,14 +189,14 @@ let test_save_with_visible_but_unconfirmed_primary_updates_backup () =
       (Discord_agents.Resource.read_file (sessions_path home))
       (Discord_agents.Resource.read_file (backup_path home));
     Sys.remove (sessions_path home);
-    let reloaded = Discord_agents.Session_store.create () in
+    let reloaded = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let recovered = find_control_session reloaded in
     Alcotest.(check bool) "backup captured updated stop_requested"
       true recovered.Discord_agents.Session_store.stop_requested)
 
 let test_save_marks_primary_newer_when_backup_update_fails () =
   with_tmp_home (fun home ->
-    let store = Discord_agents.Session_store.create () in
+    let store = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let session = make_session () in
     Discord_agents.Session_store.add store ~thread_id:"control" session;
     session.stop_requested <- true;
@@ -229,7 +229,7 @@ let test_persisted_active_run_without_child_loads () =
   }
 ]
 |};
-    let store = Discord_agents.Session_store.create () in
+    let store = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let recovered = find_control_session store in
     expect_active_run_without_child recovered ~message_id:"message-legacy")
 
@@ -250,7 +250,7 @@ let test_persisted_active_run_with_child_loads () =
   }
 ]
 |};
-    let store = Discord_agents.Session_store.create () in
+    let store = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let recovered = find_control_session store in
     expect_active_run recovered
       ~message_id:"message-legacy"
@@ -259,7 +259,7 @@ let test_persisted_active_run_with_child_loads () =
 
 let test_load_ignores_stale_backup_when_primary_is_newer_and_corrupt () =
   with_tmp_home (fun home ->
-    let store = Discord_agents.Session_store.create () in
+    let store = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let session = make_session () in
     Discord_agents.Session_store.add store ~thread_id:"control" session;
     session.stop_requested <- true;
@@ -278,7 +278,7 @@ let test_load_ignores_stale_backup_when_primary_is_newer_and_corrupt () =
       (sessions_path home)
       backup_stat.Unix.st_atime
       (backup_stat.Unix.st_mtime +. 10.0);
-    let reloaded = Discord_agents.Session_store.create () in
+    let reloaded = Discord_agents.Session_store.create ~default_host:"test-host" () in
     Alcotest.(check bool) "stale backup ignored"
       true
       (Option.is_none
@@ -286,7 +286,7 @@ let test_load_ignores_stale_backup_when_primary_is_newer_and_corrupt () =
 
 let test_active_run_roundtrips_through_backup () =
   with_tmp_home (fun home ->
-    let store = Discord_agents.Session_store.create () in
+    let store = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let session = make_session () in
     Discord_agents.Session_store.add store ~thread_id:"control" session;
     let child =
@@ -304,7 +304,7 @@ let test_active_run_roundtrips_through_backup () =
      | Ok () -> ()
      | Error err -> Alcotest.failf "set_active_run failed: %s" err);
     Sys.remove (sessions_path home);
-    let reloaded = Discord_agents.Session_store.create () in
+    let reloaded = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let recovered = find_control_session reloaded in
     expect_active_run recovered
       ~message_id:"message-42"
@@ -313,7 +313,7 @@ let test_active_run_roundtrips_through_backup () =
 
 let test_session_agent_config_roundtrips () =
   with_tmp_home (fun _home ->
-    let store = Discord_agents.Session_store.create () in
+    let store = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let session = make_session () in
     Discord_agents.Session_store.add store ~thread_id:"control" session;
     (match Discord_agents.Session_store.set_model
@@ -332,7 +332,7 @@ let test_session_agent_config_roundtrips () =
     (match Discord_agents.Session_store.set_goal store session (Some goal) with
      | Ok () -> ()
      | Error err -> Alcotest.failf "set_goal failed: %s" err);
-    let reloaded = Discord_agents.Session_store.create () in
+    let reloaded = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let recovered = find_control_session reloaded in
     Alcotest.(check (option string)) "model persisted"
       (Some "gpt-5.5")
@@ -357,7 +357,7 @@ let test_invalid_optional_agent_config_does_not_abort_load () =
   with_tmp_home (fun home ->
     write_primary_sessions home
       {|[{"thread_id":"control","project_name":"control","working_dir":"/tmp/project","agent_kind":"claude","session_id":"session-1","message_count":0,"model":42,"reasoning_effort":"future-effort","goal":{"objective":"Finish","status":"future-status","token_budget":1234}}]|};
-    let store = Discord_agents.Session_store.create () in
+    let store = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let recovered = find_control_session store in
     Alcotest.(check (option string)) "invalid model ignored"
       None recovered.Discord_agents.Session_store.model;
@@ -368,7 +368,7 @@ let test_invalid_optional_agent_config_does_not_abort_load () =
 
 let test_save_refuses_read_only_preflight () =
   with_tmp_home (fun home ->
-    let store = Discord_agents.Session_store.create () in
+    let store = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let session = make_session () in
     store.Discord_agents.Session_store.sessions <-
       Discord_agents.Session_store.SessionMap.add
@@ -394,6 +394,58 @@ let test_save_refuses_read_only_preflight () =
     Alcotest.(check bool) "primary absent"
       false (Sys.file_exists (sessions_path home)))
 
+let legacy_entry =
+  {|{"thread_id":"control","project_name":"control","working_dir":"/tmp/project","agent_kind":"claude","session_id":"session-1","message_count":0}|}
+
+let test_legacy_entry_gets_default_host () =
+  with_tmp_home (fun home ->
+    write_primary_sessions home ("[" ^ legacy_entry ^ "]");
+    let store = Discord_agents.Session_store.create ~default_host:"tower0" () in
+    let session = find_control_session store in
+    Alcotest.(check string) "host" "tower0" session.host;
+    Alcotest.(check int) "migrated count" 1 store.migrated_host_count)
+
+let test_explicit_host_is_kept () =
+  with_tmp_home (fun home ->
+    write_primary_sessions home
+      {|[{"thread_id":"control","host":"framework0","project_name":"control","working_dir":"/tmp/project","agent_kind":"codex","session_id":"s","message_count":3}]|};
+    let store = Discord_agents.Session_store.create ~default_host:"tower0" () in
+    let session = find_control_session store in
+    Alcotest.(check string) "host" "framework0" session.host;
+    Alcotest.(check int) "nothing migrated" 0 store.migrated_host_count)
+
+(* The migration must be durable after the first save: a later writer
+   with a different name must not re-home these sessions. *)
+let test_migrated_host_is_persisted_on_save () =
+  with_tmp_home (fun home ->
+    write_primary_sessions home ("[" ^ legacy_entry ^ "]");
+    let store = Discord_agents.Session_store.create ~default_host:"tower0" () in
+    Discord_agents.Session_store.save store;
+    let reloaded =
+      Discord_agents.Session_store.create ~default_host:"drynwyn" () in
+    Alcotest.(check string) "host survives a writer change"
+      "tower0" (find_control_session reloaded).host;
+    Alcotest.(check int) "nothing migrated on reload"
+      0 reloaded.migrated_host_count)
+
+let test_malformed_host_does_not_default () =
+  (* A wrong-typed or invalid host is corruption, not a legacy entry:
+     defaulting it would silently route the session to the wrong
+     machine. It fails the primary load like any other malformed
+     required field, which falls back to the backup. *)
+  List.iter (fun host_json ->
+    with_tmp_home (fun home ->
+      write_primary_sessions home
+        (Printf.sprintf
+          {|[{"thread_id":"control","host":%s,"project_name":"control","working_dir":"/tmp/project","agent_kind":"claude","session_id":"s","message_count":0}]|}
+          host_json);
+      let store =
+        Discord_agents.Session_store.create ~default_host:"tower0" () in
+      Alcotest.(check bool) ("rejected " ^ host_json) true
+        (Discord_agents.Session_store.find_opt store ~thread_id:"control"
+         = None)))
+    [{|42|}; {|null|}; {|"a b"|}; {|"-oProxyCommand=x"|}; {|""|}]
+
 let () =
   Alcotest.run "session_store" [
     ("persistence", [
@@ -401,6 +453,14 @@ let () =
         test_agent_checkpoint_tracks_child_by_construction;
       Alcotest.test_case "save updates backup" `Quick
         test_save_updates_backup;
+      Alcotest.test_case "legacy entry gets default host" `Quick
+        test_legacy_entry_gets_default_host;
+      Alcotest.test_case "explicit host is kept" `Quick
+        test_explicit_host_is_kept;
+      Alcotest.test_case "migrated host is persisted on save" `Quick
+        test_migrated_host_is_persisted_on_save;
+      Alcotest.test_case "malformed host does not default" `Quick
+        test_malformed_host_does_not_default;
       Alcotest.test_case "load uses backup when primary corrupt" `Quick
         test_load_uses_backup_when_primary_corrupt;
       Alcotest.test_case "load uses backup when primary has wrong shape" `Quick

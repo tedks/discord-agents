@@ -1817,7 +1817,8 @@ let test_legacy_codex_session_defaults_unconfirmed () =
      "agent_kind":"codex","session_id":"placeholder-uuid",
      "thread_id":"123","message_count":2}
   ]|} in
-  let map = Discord_agents.Session_store.sessions_of_json json in
+  let map, _migrated =
+    Discord_agents.Session_store.sessions_of_json ~default_host:"test-host" json in
   let sessions = Discord_agents.Session_store.SessionMap.bindings map in
   match sessions with
   | [(_, s)] ->
@@ -1831,7 +1832,8 @@ let test_legacy_claude_session_defaults_confirmed () =
      "agent_kind":"claude","session_id":"some-uuid",
      "thread_id":"123","message_count":2}
   ]|} in
-  let map = Discord_agents.Session_store.sessions_of_json json in
+  let map, _migrated =
+    Discord_agents.Session_store.sessions_of_json ~default_host:"test-host" json in
   let sessions = Discord_agents.Session_store.SessionMap.bindings map in
   match sessions with
   | [(_, s)] ->
@@ -1855,7 +1857,8 @@ let test_session_migration_unknown_fields_ignored () =
      "future_field_2":{"nested":"object"},
      "future_field_3":[1,2,3]}
   ]|} in
-  let map = Discord_agents.Session_store.sessions_of_json json in
+  let map, _migrated =
+    Discord_agents.Session_store.sessions_of_json ~default_host:"test-host" json in
   let sessions = Discord_agents.Session_store.SessionMap.bindings map in
   match sessions with
   | [(_, s)] ->
@@ -1876,7 +1879,8 @@ let test_session_migration_wrong_type_session_id_confirmed () =
      "message_count":1,
      "session_id_confirmed":"true"}
   ]|} in
-  let map = Discord_agents.Session_store.sessions_of_json json in
+  let map, _migrated =
+    Discord_agents.Session_store.sessions_of_json ~default_host:"test-host" json in
   let sessions = Discord_agents.Session_store.SessionMap.bindings map in
   match sessions with
   | [(_, s)] ->
@@ -1894,7 +1898,8 @@ let test_legacy_gemini_session_defaults_unconfirmed () =
      "agent_kind":"gemini","session_id":"placeholder-uuid",
      "thread_id":"123","message_count":2}
   ]|} in
-  let map = Discord_agents.Session_store.sessions_of_json json in
+  let map, _migrated =
+    Discord_agents.Session_store.sessions_of_json ~default_host:"test-host" json in
   let sessions = Discord_agents.Session_store.SessionMap.bindings map in
   match sessions with
   | [(_, s)] ->
@@ -1911,7 +1916,7 @@ let test_legacy_gemini_session_defaults_unconfirmed () =
    and start a fresh chat. This test pins the override. *)
 let test_make_session_resume_override_gemini_confirms () =
   let s = Discord_agents.Session_store.make_session
-    ~project_name:"foo" ~working_dir:"/tmp/foo"
+    ~project_name:"foo" ~host:"test-host" ~working_dir:"/tmp/foo"
     ~agent_kind:Discord_agents.Config.Gemini
     ~session_id:"recovered-from-disk"
     ~session_id_confirmed:true ~message_count:1
@@ -1923,7 +1928,7 @@ let test_make_session_resume_override_gemini_confirms () =
 
 let test_make_session_default_gemini_unconfirmed () =
   let s = Discord_agents.Session_store.make_session
-    ~project_name:"foo" ~working_dir:"/tmp/foo"
+    ~project_name:"foo" ~host:"test-host" ~working_dir:"/tmp/foo"
     ~agent_kind:Discord_agents.Config.Gemini
     ~session_id:"placeholder"
     ~thread_id:"123" ~system_prompt:None ~initial_prompt:None ()
@@ -1934,7 +1939,7 @@ let test_make_session_default_gemini_unconfirmed () =
 
 let test_make_session_default_claude_unconfirmed () =
   let s = Discord_agents.Session_store.make_session
-    ~project_name:"foo" ~working_dir:"/tmp/foo"
+    ~project_name:"foo" ~host:"test-host" ~working_dir:"/tmp/foo"
     ~agent_kind:Discord_agents.Config.Claude
     ~session_id:"caller-pinned"
     ~thread_id:"123" ~system_prompt:None ~initial_prompt:None ()
@@ -1945,7 +1950,7 @@ let test_make_session_default_claude_unconfirmed () =
 
 let test_fork_from_session_id_roundtrip_and_set_session_id_clears () =
   let session = Discord_agents.Session_store.make_session
-    ~project_name:"foo" ~working_dir:"/tmp/foo"
+    ~project_name:"foo" ~host:"test-host" ~working_dir:"/tmp/foo"
     ~agent_kind:Discord_agents.Config.Claude
     ~session_id:"placeholder-new-session"
     ~fork_from_session_id:"source-session"
@@ -1955,12 +1960,13 @@ let test_fork_from_session_id_roundtrip_and_set_session_id_clears () =
     Discord_agents.Session_store.SessionMap.empty
     |> Discord_agents.Session_store.SessionMap.add "123" session
   in
-  let reparsed =
+  let reparsed, _migrated =
     Discord_agents.Session_store.sessions_to_json map
-    |> Discord_agents.Session_store.sessions_of_json
+    |> Discord_agents.Session_store.sessions_of_json ~default_host:"test-host"
   in
   let store = { Discord_agents.Session_store.sessions = reparsed;
-                last_reload = 0.0 } in
+                last_reload = 0.0; default_host = "test-host";
+                migrated_host_count = 0 } in
   match Discord_agents.Session_store.SessionMap.bindings reparsed with
   | [(_, s)] ->
     Alcotest.(check (option string)) "fork source survives roundtrip"
@@ -1975,7 +1981,7 @@ let test_fork_from_session_id_roundtrip_and_set_session_id_clears () =
 
 let test_pending_agent_kind_roundtrip () =
   let session = Discord_agents.Session_store.make_session
-    ~project_name:"foo" ~working_dir:"/tmp/foo"
+    ~project_name:"foo" ~host:"test-host" ~working_dir:"/tmp/foo"
     ~agent_kind:Discord_agents.Config.Claude
     ~session_id:"caller-pinned"
     ~thread_id:"123" ~system_prompt:None ~initial_prompt:None
@@ -1991,7 +1997,8 @@ let test_pending_agent_kind_roundtrip () =
     |> Discord_agents.Session_store.SessionMap.add "123" session
   in
   let json = Discord_agents.Session_store.sessions_to_json map in
-  let reparsed = Discord_agents.Session_store.sessions_of_json json in
+  let reparsed, _migrated =
+    Discord_agents.Session_store.sessions_of_json ~default_host:"test-host" json in
   let sessions = Discord_agents.Session_store.SessionMap.bindings reparsed in
   match sessions with
   | [(_, s)] ->
@@ -2036,7 +2043,8 @@ let test_legacy_pending_agent_defaults_to_default_rotation () =
      "message_count":1,
      "pending_agent_kind":"codex"}
   ]|} in
-  let map = Discord_agents.Session_store.sessions_of_json json in
+  let map, _migrated =
+    Discord_agents.Session_store.sessions_of_json ~default_host:"test-host" json in
   let sessions = Discord_agents.Session_store.SessionMap.bindings map in
   match sessions with
   | [(_, s)] ->
@@ -2065,7 +2073,8 @@ let test_unknown_pending_agent_origin_defaults_to_default_rotation () =
      "pending_agent_kind":"codex",
      "pending_agent_origin":"future_origin"}
   ]|} in
-  let map = Discord_agents.Session_store.sessions_of_json json in
+  let map, _migrated =
+    Discord_agents.Session_store.sessions_of_json ~default_host:"test-host" json in
   let sessions = Discord_agents.Session_store.SessionMap.bindings map in
   match sessions with
   | [(_, s)] ->
@@ -2627,6 +2636,7 @@ let test_truncate_utf8_drops_2byte_lead_at_cut () =
 let test_context_header_truncates_utf8_boundary () =
   let session : Discord_agents.Session_store.session = {
     project_name = String.make 99 'p' ^ "\xC3\xA9tail";
+    host = "test-host";
     working_dir = "/tmp/project";
     agent_kind = Discord_agents.Config.Claude;
     session_override_kind = None;
@@ -3623,6 +3633,7 @@ let test_child_environment_sets_thread_id_once () =
     key ^ "=stale-thread";
     "HOME=/tmp";
     key ^ "=duplicate-stale-thread";
+    Discord_agents.Host.force_writer_env ^ "=1";
   |] in
   let matches =
     Discord_agents.Agent_process.child_environment

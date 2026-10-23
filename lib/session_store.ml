@@ -147,6 +147,12 @@ let optional_goal_field ~thread_id = function
 
 type session = {
   project_name : string;
+  (* The host whose agent CLI ran this session. Transcripts live only
+     there, so resume must route back to it, and [working_dir] is a
+     path on that host. Always a concrete host name, never a symbolic
+     "local", so a later move of the writer cannot re-home sessions
+     that never ran on the new machine. *)
+  host : string;
   working_dir : string;
   agent_kind : Config.agent_kind;
   (* Persisted top-level session pin set via [!session-agent]. When
@@ -188,6 +194,14 @@ type session = {
 type t = {
   mutable sessions : session SessionMap.t;
   mutable last_reload : float;
+  default_host : string;
+  (* Host assigned to entries persisted before sessions carried one.
+     Every such session ran on the machine that ran the bot, so this is
+     that machine's name ([Host.session_host_name]), not the configured
+     writer: they differ when the bot is started with --force-writer. *)
+  mutable migrated_host_count : int;
+  (* How many loaded entries took [default_host]. Non-zero means the
+     file on disk still lacks host fields until the next save. *)
 }
 
 let sessions_file () =
@@ -205,6 +219,7 @@ let sessions_to_json sessions =
   `List (List.map (fun (_tid, s) ->
     `Assoc ([
       ("project_name", `String s.project_name);
+      ("host", `String s.host);
       ("working_dir", `String s.working_dir);
       ("agent_kind", `String (Config.string_of_agent_kind s.agent_kind));
       ("session_id", `String s.session_id);
@@ -258,8 +273,9 @@ let sessions_to_json sessions =
   ) entries)
 
 (** Deserialize sessions from JSON. *)
-let sessions_of_json json =
+let sessions_of_json ~default_host json =
   let open Yojson.Safe.Util in
+  let migrated = ref 0 in
   let int64_of_json = function
     | `Int n -> Some (Int64.of_int n)
     | `Intlit s | `String s -> Int64.of_string_opt s
@@ -303,8 +319,28 @@ let sessions_of_json json =
         Some (Agent_checkpoint.of_persisted ~message_id ~child_process)
       | _ -> None
     in
+    (* Only an absent key is a legacy entry. [member] reports a present
+       [null] the same way, so look at the object itself: a null host is
+       corruption and must not be routed to whatever machine loads it. *)
+    let host_field =
+      match j with
+      | `Assoc fields -> List.assoc_opt "host" fields
+      | _ -> None
+    in
+    let host =
+      match host_field with
+      | None ->
+        incr migrated;
+        default_host
+      | Some (`String h) ->
+        (match Host.validate_name h with
+         | Ok h -> h
+         | Error msg -> failwith (Printf.sprintf "session %s: %s" thread_id msg))
+      | Some _ -> failwith (Printf.sprintf "session %s: host: expected string" thread_id)
+    in
     let session = {
       project_name = j |> member "project_name" |> to_string;
+      host;
       working_dir = j |> member "working_dir" |> to_string;
       agent_kind;
       session_override_kind =
@@ -340,8 +376,11 @@ let sessions_of_json json =
     } in
     (thread_id, session)
   ) in
-  List.fold_left (fun acc (tid, s) -> SessionMap.add tid s acc)
-    SessionMap.empty entries
+  let sessions =
+    List.fold_left (fun acc (tid, s) -> SessionMap.add tid s acc)
+      SessionMap.empty entries
+  in
+  (sessions, !migrated)
 
 (** Save sessions to disk with file locking. *)
 let log_visible_but_unconfirmed path exn =
@@ -420,9 +459,9 @@ let save t =
   save_with ~write_file:(fun path rendered ->
     Resource.write_file_atomic path rendered) t
 
-let load_file path =
+let load_file ~default_host path =
   let contents = Resource.read_file path in
-  sessions_of_json (Yojson.Safe.from_string contents)
+  sessions_of_json ~default_host (Yojson.Safe.from_string contents)
 
 let file_mtime path =
   try Some (Unix.stat path).Unix.st_mtime
@@ -438,11 +477,13 @@ let backup_is_stale ~primary ~backup =
   | _ -> false
 
 (** Load sessions from disk. *)
-let load_from_disk () =
+let load_from_disk ~default_host () =
+  let load_file = load_file ~default_host in
+  let empty = (SessionMap.empty, 0) in
   let path = sessions_file () in
   let backup = backup_file () in
   match Sys.file_exists path, Sys.file_exists backup with
-  | false, false -> SessionMap.empty
+  | false, false -> empty
   | false, true ->
     (match load_file backup with
      | sessions ->
@@ -453,7 +494,7 @@ let load_from_disk () =
        Logs.warn (fun m ->
          m "session_store: backup load error from %s: %s"
            backup (Printexc.to_string backup_exn));
-       SessionMap.empty)
+       empty)
   | true, _ ->
     (match load_file path with
      | sessions -> sessions
@@ -465,7 +506,7 @@ let load_from_disk () =
          Logs.warn (fun m ->
            m "session_store: refusing stale backup %s because it predates unreadable primary %s"
              backup path);
-         SessionMap.empty)
+         empty)
        else
          (match load_file backup with
           | sessions ->
@@ -476,16 +517,22 @@ let load_from_disk () =
             Logs.warn (fun m ->
               m "session_store: backup load error from %s: %s"
                 backup (Printexc.to_string backup_exn));
-            SessionMap.empty))
+            empty))
 
 (** Create a session store, loading persisted sessions from disk. *)
-let create () =
-  { sessions = load_from_disk (); last_reload = Unix.gettimeofday () }
+let create ~default_host () =
+  let sessions, migrated_host_count = load_from_disk ~default_host () in
+  if migrated_host_count > 0 then
+    Logs.info (fun m ->
+      m "session_store: assigned host %s to %d session(s) persisted without one"
+        default_host migrated_host_count);
+  { sessions; last_reload = Unix.gettimeofday (); default_host;
+    migrated_host_count }
 
 (** Construct a session record with sensible defaults. Fresh sessions
     start with [session_id_confirmed=false]. Callers resuming an id
     discovered on disk override this with [true]. *)
-let make_session ~project_name ~working_dir ~agent_kind ~session_id
+let make_session ~project_name ~host ~working_dir ~agent_kind ~session_id
     ~thread_id ~system_prompt ~initial_prompt
     ?(message_count = 0)
     ?(session_override_kind = None)
@@ -497,7 +544,7 @@ let make_session ~project_name ~working_dir ~agent_kind ~session_id
     ?fork_from_session_id
     ?session_id_confirmed () =
   let session_id_confirmed = Option.value ~default:false session_id_confirmed in
-  { project_name; working_dir; agent_kind; session_override_kind; session_id;
+  { project_name; host; working_dir; agent_kind; session_override_kind; session_id;
     fork_from_session_id; session_id_confirmed; thread_id; system_prompt;
     model; reasoning_effort; goal;
     message_count; processing = false;
@@ -696,7 +743,11 @@ let maybe_reload t =
       try
         let stat = Unix.stat path in
         if stat.Unix.st_mtime > t.last_reload -. 5.0 then begin
-          let loaded = load_from_disk () in
+          (* Migrated entries here need no bookkeeping: the session
+             stamped at startup is the same default, and any save
+             writes the host out. *)
+          let loaded, _migrated =
+            load_from_disk ~default_host:t.default_host () in
           SessionMap.iter (fun tid session ->
             if not (SessionMap.mem tid t.sessions) then
               t.sessions <- SessionMap.add tid session t.sessions

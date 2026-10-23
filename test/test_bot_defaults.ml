@@ -76,7 +76,7 @@ let with_test_bot ?rest_call f =
           ~intents:Discord_agents.Discord_gateway.default_intents
           ~handler:(fun _ -> ());
         project_state;
-        sessions = Discord_agents.Session_store.create ();
+        sessions = Discord_agents.Session_store.create ~default_host:"test-host" ();
         env;
         sw;
         started_at = Unix.gettimeofday ();
@@ -129,7 +129,7 @@ let set_projects bot projects =
 let make_session ?(project_name="control") ?(working_dir="/tmp/project")
     ?(thread_id="control") ?(processing=false) ?session_override_kind
     ?pending_agent_change ?(system_prompt=Some "prompt") agent_kind =
-  let session = Discord_agents.Session_store.make_session
+  let session = Discord_agents.Session_store.make_session ~host:"test-host"
     ~project_name
     ~working_dir
     ~agent_kind
@@ -1487,13 +1487,13 @@ let test_ppid_of_proc_stat_line_handles_spaces_and_parens () =
 
 let test_stop_requested_roundtrips_through_disk () =
   with_tmp_home (fun () ->
-    let store = Discord_agents.Session_store.create () in
+    let store = Discord_agents.Session_store.create ~default_host:"test-host" () in
     let session = make_session Discord_agents.Config.Claude in
     Discord_agents.Session_store.add store ~thread_id:"control" session;
     (match Discord_agents.Session_store.set_stop_requested store session true with
      | Ok () -> ()
      | Error err -> Alcotest.failf "set_stop_requested failed: %s" err);
-    let reloaded = Discord_agents.Session_store.create () in
+    let reloaded = Discord_agents.Session_store.create ~default_host:"test-host" () in
     match Discord_agents.Session_store.find_opt reloaded ~thread_id:"control" with
     | Some saved ->
       Alcotest.(check bool) "stop requested persisted" true saved.stop_requested
@@ -1546,7 +1546,7 @@ let test_reconcile_interrupted_active_runs_clears_checkpoint () =
       ~mark_failed:(fun _t _session ~message_id:_ -> ()) bot;
     Alcotest.(check bool) "active run cleared in memory"
       true (Option.is_none session.active_run);
-    let reloaded = Discord_agents.Session_store.create () in
+    let reloaded = Discord_agents.Session_store.create ~default_host:"test-host" () in
     match Discord_agents.Session_store.find_opt reloaded ~thread_id:"control" with
     | Some saved ->
       Alcotest.(check bool) "active run cleared on disk"
@@ -1793,7 +1793,7 @@ let test_process_session_message_aborts_when_child_identity_is_missing () =
       true (Option.is_none session.active_run);
     Alcotest.(check (option int)) "child pid cleared after cleanup"
       None session.child_pid;
-    let reloaded = Discord_agents.Session_store.create () in
+    let reloaded = Discord_agents.Session_store.create ~default_host:"test-host" () in
     match Discord_agents.Session_store.find_opt reloaded ~thread_id:"control" with
     | Some saved ->
       Alcotest.(check bool) "active run cleared on disk"
@@ -1879,7 +1879,7 @@ let test_process_session_message_keeps_run_replayable_on_completion_persist_fail
       (List.rev !effects);
     Alcotest.(check bool) "active run remains in memory"
       true (Option.is_some session.active_run);
-    let reloaded = Discord_agents.Session_store.create () in
+    let reloaded = Discord_agents.Session_store.create ~default_host:"test-host" () in
     match Discord_agents.Session_store.find_opt reloaded ~thread_id:"control" with
     | Some saved ->
       Alcotest.(check bool) "active run remains on disk"
@@ -2175,8 +2175,79 @@ let test_stop_busy_session_signals_tracked_child () =
               true (wait_for_process_exit pid)
           | _ -> Alcotest.fail "expected busy session to stop tracked child"))
 
+let test_persist_migrated_session_hosts () =
+  with_test_bot (fun bot ->
+    let sessions = bot.Discord_agents.Bot.sessions in
+    Alcotest.(check string) "local host name comes from the store"
+      "test-host" (Discord_agents.Bot.local_host_name bot);
+    sessions.migrated_host_count <- 2;
+    Discord_agents.Bot.persist_migrated_session_hosts
+      ~save:(fun _ -> failwith "disk full") bot;
+    Alcotest.(check int) "failed save keeps the count" 2
+      sessions.migrated_host_count;
+    let saved = ref 0 in
+    Discord_agents.Bot.persist_migrated_session_hosts
+      ~save:(fun _ -> incr saved) bot;
+    Alcotest.(check int) "saved once" 1 !saved;
+    Alcotest.(check int) "count cleared" 0 sessions.migrated_host_count;
+    Discord_agents.Bot.persist_migrated_session_hosts
+      ~save:(fun _ -> incr saved) bot;
+    Alcotest.(check int) "no save when nothing migrated" 1 !saved)
+
+(* The whole startup path, not the helper: creating the bot must leave
+   legacy entries stamped on disk, so a later load under a different
+   name (a writer move) cannot re-home them. *)
+let test_bot_create_persists_legacy_hosts () =
+  with_tmp_home (fun () ->
+    let path =
+      Filename.concat (Sys.getenv "HOME") ".config/discord-agents/sessions.json" in
+    Discord_agents.Resource.ensure_parent_dir path;
+    Discord_agents.Resource.write_file_atomic path
+      {|[{"thread_id":"t1","project_name":"p","working_dir":"/tmp/p","agent_kind":"claude","session_id":"s1","message_count":1}]|};
+    let expected =
+      match Discord_agents.Host.session_host_name None with
+      | Ok name -> name
+      | Error msg -> Alcotest.fail msg
+    in
+    Eio_main.run @@ fun env ->
+    Eio.Switch.run @@ fun sw ->
+    let config = { Discord_agents.Config.default with discord_token = "t" } in
+    let bot = Discord_agents.Bot.create ~sw ~env config in
+    Alcotest.(check string) "stamped in memory" expected
+      (Discord_agents.Bot.local_host_name bot);
+    let reloaded =
+      Discord_agents.Session_store.create ~default_host:"elsewhere" () in
+    match Discord_agents.Session_store.find_opt reloaded ~thread_id:"t1" with
+    | Some session ->
+      Alcotest.(check string) "host persisted by startup" expected session.host;
+      Alcotest.(check int) "nothing left to migrate" 0
+        reloaded.migrated_host_count
+    | None -> Alcotest.fail "session lost")
+
+(* A restart that starts nothing must say so to callers that are not
+   the notify audience (the control API answers the MCP tool). *)
+let test_trigger_restart_reports_refusal () =
+  with_test_bot (fun bot ->
+    bot.Discord_agents.Bot.draining <- true;
+    let notified = ref [] in
+    (match Discord_agents.Bot.trigger_restart bot
+             ~notify:(fun m -> notified := m :: !notified) with
+     | Ok () -> Alcotest.fail "expected a refusal while draining"
+     | Error msg ->
+       Alcotest.(check (list string)) "notified once with the reason"
+         [msg] !notified);
+    bot.draining <- false)
+
 let () =
   Alcotest.run "bot_defaults" [
+    ("session_hosts", [
+      Alcotest.test_case "persist migrated session hosts" `Quick
+        test_persist_migrated_session_hosts;
+      Alcotest.test_case "bot create persists legacy hosts" `Quick
+        test_bot_create_persists_legacy_hosts;
+      Alcotest.test_case "trigger restart reports refusal" `Quick
+        test_trigger_restart_reports_refusal;
+    ]);
     ("default agent", [
       Alcotest.test_case "busy control session defers default rotation" `Quick
         test_set_default_agent_defers_busy_control_session;
