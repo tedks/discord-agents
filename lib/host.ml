@@ -175,6 +175,8 @@ let writer registry =
 let is_local h =
   match h.transport with Local -> true | Ssh _ -> false
 
+(** Name comparison only, with no registry: use [resolve] wherever a
+    registry exists, so ambiguity is caught. *)
 let names_this_machine ?(hostname = Unix.gethostname ()) name =
   same_host name hostname
 
@@ -186,8 +188,11 @@ let names_this_machine ?(hostname = Unix.gethostname ()) name =
     stamping the writer would send those sessions back to a machine
     that never ran them. A forced machine may be listed as an SSH
     executor; sessions recorded with this machine's name still run
-    locally (routing must check [names_this_machine] before the
-    transport). *)
+    locally. Routing must decide "is this session's host this machine"
+    with [resolve] against the hostname, as this function and
+    [check_writer] do, before looking at the transport. Not with
+    [names_this_machine]: plain [same_host] can say yes to a hostname
+    that [resolve] reports as ambiguous. *)
 let session_host_name ?(hostname = Unix.gethostname ()) registry_opt =
   match registry_opt with
   | None -> this_machine_name ~hostname ()
