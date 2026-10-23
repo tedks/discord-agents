@@ -145,10 +145,11 @@ let script ~nonce ~mode ~cwd ~env ~argv =
         (match mode with
          | Run { lock_key } ->
            line "lockfile=\"$lockdir\"/%s.lock" (quote lock_key);
-           (* Per wrapper ($$), so concurrent wrappers never share one.
-              '+' cannot occur in a lock key, so no key's pattern below
-              can match another key's file (keys may contain dots). *)
-           line "donefile=\"$lockfile+$$.done\""
+           (* Per invocation: the wrapper pid and this call's nonce, so
+              no two runs ever share one, even if a pid is reused. '+'
+              cannot occur in a lock key, so no key's pattern below can
+              match another key's file (keys may contain dots). *)
+           line "donefile=\"$lockfile+$$-%s.done\"" nonce
          | Capture -> ());
         List.iter (fun (k, v) -> line "export %s=%s" k (quote v)) env;
         line "set -- %s" (String.concat " " (List.map quote argv));
