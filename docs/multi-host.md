@@ -6,22 +6,25 @@ Status (2026-10-23 takeover): foundation PRs
 [138](https://github.com/tedks/discord-agents/pull/138), and
 [142](https://github.com/tedks/discord-agents/pull/142) are merged through
 `f6e8a76`. Remote execution exists; public remote creation and discovery do
-not. Questions 128–135 remain open. The revised plan is merged in
+not. Ted accepted the recommendations for questions 128–135 on 2026-10-23;
+those decision issues are closed and their implementation remains under #74. The revised plan is merged in
 [144](https://github.com/tedks/discord-agents/pull/144). The attachment handler
 now rejects remote uploads before writer-local reads; executor uploads remain
 [145](https://github.com/tedks/discord-agents/issues/145), and transcript/run
 ownership is tracked in
 [146](https://github.com/tedks/discord-agents/issues/146). The next bounded
-implementation mission is host capability observations; admission policy
-still needs the Q6 ruling. See the revised
+implementation mission is host capability observations, beginning with
+executor-specific login repair guidance. See the revised
 [Stacked PR plan](#stacked-pr-plan).
 
 The architecture below is the intended design, not a claim that every path
 is implemented. The operator accepted the foundation on 2026-10-22; the
-remaining product recommendations still require rulings.
+remaining product recommendations were accepted on 2026-10-23.
+Implementation may adapt to evidence within that intent; new product,
+credential, cost or host-authority decisions still go to the operator.
 Tracking issue: https://github.com/tedks/discord-agents/issues/74.
-Open product questions are filed as separate issues and linked in
-[Open questions](#open-questions).
+Product decision records are linked in
+[Accepted operator decisions](#accepted-operator-decisions).
 
 ## Intent
 
@@ -527,8 +530,9 @@ remote launch:
   A version or login probe does not establish model entitlement. Keep model
   rejection evidence separate, dated and invalidatable after executable or
   account changes; do not retain an eternal `(host, agent, model)` denial.
-  Never persist credentials or raw login output. Fallback/refusal policy is
-  still Q6; capability observation does not decide it.
+  Never persist credentials or raw login output. Q6 now requires explicit
+  choices before changing model, agent or host; capability observation must
+  distinguish unavailable or unknown facts from known incompatibility.
 - **Host ownership applies to every file operation.** `send_attachments`
   in the merged foundation read the recorded cwd on the writer, even for a
   remote session.
@@ -554,8 +558,10 @@ remote launch:
   empty inventory or justify cleanup. Bound time, output and concurrency of
   discovery/probes; never run fleet SSH synchronously on the gateway fiber.
 
-These are implementation constraints and recommendations, not new operator
-rulings. No daemon, host upgrade, credential repair or deployment is implied.
+Ted accepted these recommendations on 2026-10-23. Adapt implementation to
+serve the intent; the plan is a sequence of reviewable outcomes, not a rigid
+checklist. Credential changes, host upgrades and deployment remain separate
+actions; drynwyn stays hands-off.
 
 ## Stacked PR plan
 
@@ -570,20 +576,19 @@ to fixpoint on each substantive PR before merging.
 
 1. **Takeover review and revised plan (docs).** Record actual merged state,
    design objections, decision dependencies and acceptance criteria. This
-   does not resolve questions 128–135.
+   was followed by the operator accepting questions 128–135 on 2026-10-23.
 2. **Reject writer-local reads for remote attachment uploads.** Guard the
    actual `send_attachments` handler with the existing host resolution rules.
    Acceptance: remote, unknown, disabled and ambiguous hosts cannot read or
    upload a same-path writer file; local and local-alias uploads still work.
-   No live SSH is needed. This is the first implementation slice this pass.
+   Merged as https://github.com/tedks/discord-agents/pull/147.
 3. **Host capability observations.** Add bounded, injectable local/SSH probes
    and typed snapshots for executable identity/version, required CLI flags,
    auth observation and callback health. Keep model knowledge separate and
    distinguish unknown from denied. Tests cover old CLI flags, missing CLI,
    stale observations, noisy output, timeout and unreachable hosts. No login
    or upgrade side effects. Q4 governs membership/refresh exposure; Q6 governs
-   admission and rejection-cache policy. Do not infer approval from the
-   existing host config parser.
+   admission and rejection-cache policy. Both decisions are accepted.
 4. **Executor file reads.** Replace the temporary attachment refusal with
    remote canonicalization, regular-file validation and capped transfer;
    recheck received length on the writer. Audit session file readers.
@@ -600,7 +605,7 @@ to fixpoint on each substantive PR before merging.
    discovery and a durable last-seen cache. Logical project union uses remote
    URL; locations remain keyed by host. Acceptance: remote-only repo, duplicate
    remote, no remote URL, offline snapshot retained and malformed/truncated
-   discovery rejected. Q4 blocks the exposed inventory policy.
+   discovery rejected. Q4 sets the exposed inventory policy.
 7. **Remote worktree lifecycle.** Host-routed create, rollback, stop cleanup
    and merged-worktree sweep. Protect in-use worktrees across async yields.
    Acceptance: failed creation leaves no session, stopped/unmerged work stays
@@ -632,26 +637,38 @@ Every code slice must pass `nix develop --command dune build` and
 changes require rerunning both. Live acceptance uses framework0 only when
 needed; drynwyn remains excluded. Keep local single-host regression coverage.
 
-### Decision dependencies still open
+### Accepted operator decisions
 
-The earlier claim that all foundations were independent of every question was
-too broad: Q4 explicitly blocks config shape and Q8 the writer guard. Those
-pieces are already merged under the recorded authorization for PRs 2–4;
-that is not a ruling on their remaining product choices. All eight issues
-are still the operator's decision record:
+Ted accepted the surfaced recommendations on 2026-10-23: “Take
+recommendations. Generally use auftragstaktik rather than rote and maneuver
+according to your understanding of my intent.” These close the decision
+questions, not their implementation:
 
-- Q1–Q3: default host, command/thread syntax, absent-project handling.
-- Q4: host membership and discovery policy (a static parser already exists).
-- Q5: pressure policy and cross-host steering.
-- Q6: missing/incompatible CLI, auth and model policy; moved ahead of launch.
-- Q7: unreachable live-session behavior; moved ahead of launch/resume.
-- Q8: writer placement and failover; configuration guards are not fencing.
+- **Q1 / 128:** configured per-project preferred host, then writer if it has
+  the project; otherwise ask for explicit host qualification. No history- or
+  load-based routing.
+- **Q2 / 129:** `project@host` and `prefix@host`; explicit MCP `host`; show the
+  remote host in thread names when it differs from the writer.
+- **Q3 / 130:** refuse absent projects and name existing locations. Cloning
+  is an explicit remote-import operation, implemented separately.
+- **Q4 / 131:** static trusted membership plus bounded project/capability
+  probes of enabled hosts. Use configured SSH destinations, not automatic
+  mDNS membership.
+- **Q5 / 132:** writer-state pressure remains global; executor rescue/block
+  is per target. Suggest alternatives without automatically moving sessions.
+- **Q6 / 133:** host-specific CLI/version/flag/auth observations and dated
+  model rejection evidence with revalidation after CLI/account changes;
+  optional declarations. Refuse known incompatible or missing prerequisites
+  with repair guidance for that host. Explicit choice before changing model,
+  agent or host; unknown state is not a denial. Do not persist credentials.
+- **Q7 / 134:** fail unreachable turns promptly and retain host binding.
+  No indefinite queue or automatic transcript migration.
+- **Q8 / 135:** tower0 remains writer; relocation is manual with the previous
+  writer stopped/fenced and host bindings preserved. No automatic takeover.
 
-The recommendations remain: preferred host then writer (otherwise ask),
-`project@host`, explicit remote import, static membership with probes,
-per-target pressure without steering, explicit model/agent/host changes,
-fail unreachable turns while retaining binding, and a manually fenced writer
-move. They have been surfaced for operator ruling; silence is not acceptance.
+Keep framework0's resident-helper permission and drynwyn's hands-off boundary.
+Ordinary implementation choices and repairs proceed under standing authority;
+escalate changed authority or product intent, not the next attempt.
 
 ## Testing
 
@@ -670,9 +687,9 @@ move. They have been surfaced for operator ruling; silence is not acceptance.
   must make that change; agents do not touch drynwyn (see the
   decision log).
 
-## Open questions
+## Decision records
 
-Each one is filed with options, a recommendation, and what it blocks:
+Each issue records the accepted recommendation and original alternatives:
 
 - Q1 Default host for a bare `!start <project>`: https://github.com/tedks/discord-agents/issues/128
 - Q2 Host-targeting syntax and thread naming: https://github.com/tedks/discord-agents/issues/129
