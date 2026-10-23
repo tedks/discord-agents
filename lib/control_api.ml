@@ -1456,6 +1456,16 @@ let handle_send_attachments (bot : Bot.t) params =
         error_response
           "The calling Discord session is no longer active; retry from an active thread."
       | Some session ->
+        (* The MCP server runs on the writer even when the caller is remote.
+           The same absolute cwd can exist on both hosts with different files.
+           Until uploads read from the executor, reject before any local I/O. *)
+        match Bot.session_target bot session with
+        | Error error -> error_response error
+        | Ok (Agent_process.Remote { host; _ }) ->
+          error_response (Printf.sprintf
+            "send_attachments is not yet supported for sessions on %s; \
+             files must be read on that host." host)
+        | Ok Agent_process.Local ->
         match Eio_unix.run_in_systhread (fun () ->
           load_attachment_uploads ~working_dir:session.working_dir paths
         ) with
