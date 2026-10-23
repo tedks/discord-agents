@@ -197,6 +197,15 @@ let test_qualified_hosts_sharing_a_label () =
                        "bot.prod.example": {"ssh": "a"},
                        "bot.dev.example": {"ssh": "b"}}}|} in
   Alcotest.(check int) "two qualified executors" 3 (List.length both.hosts);
+  (* A bare "bot" hostname cannot say which of the two it is: refuse,
+     forced or not, rather than record a name that could resolve to the
+     other machine. *)
+  Alcotest.(check bool) "ambiguous hostname refused for stamping" false
+    (Result.is_ok (Host.session_host_name ~hostname:"bot" (Some r)));
+  Alcotest.(check bool) "ambiguous hostname refused by the guard" false
+    (Result.is_ok (Host.check_writer ~hostname:"bot" (Some r)));
+  Alcotest.(check bool) "ambiguous even when forced" false
+    (Result.is_ok (Host.startup_check ~hostname:"bot" ~force:"test" (Some r)));
   check_rejected ~label:"writer matching two executors" ~mentions:"more than one"
     {|{"writer": "tower0", "executors": {
          "tower0.local": {"ssh": "a"}, "tower0.lan": {"ssh": "b"}}}|}

@@ -134,17 +134,35 @@ let single_host_registry name = { writer = name; hosts = [local_host name] }
     matches or the name is ambiguous ([tower0] when both [tower0.lan]
     and [tower0.local] are configured): routing by list order would
     pick a machine arbitrarily. *)
-let lookup hosts name =
+type resolution =
+  | Found of t
+  | Not_found
+  | Ambiguous of t list
+
+let resolve hosts name =
   let lower = String.lowercase_ascii name in
   match List.find_opt (fun h ->
           String.equal (String.lowercase_ascii h.name) lower) hosts with
-  | Some _ as exact -> exact
+  | Some h -> Found h
   | None ->
     match List.filter (fun h -> same_host h.name name) hosts with
-    | [h] -> Some h
-    | _ -> None
+    | [] -> Not_found
+    | [h] -> Found h
+    | hs -> Ambiguous hs
+
+let lookup hosts name =
+  match resolve hosts name with
+  | Found h -> Some h
+  | Not_found | Ambiguous _ -> None
 
 let find registry name = lookup registry.hosts name
+
+let ambiguous_error ~hostname hs =
+  Error (Printf.sprintf
+    "this machine's hostname %S matches several configured hosts (%s). \
+     Spell hosts.executors keys so that only one matches, or give this \
+     machine its fully-qualified hostname."
+    hostname (String.concat ", " (List.map (fun h -> h.name) hs)))
 
 let writer registry =
   match find registry registry.writer with
@@ -171,9 +189,15 @@ let names_this_machine ?(hostname = Unix.gethostname ()) name =
     locally (routing must check [names_this_machine] before the
     transport). *)
 let session_host_name ?(hostname = Unix.gethostname ()) registry_opt =
-  match Option.bind registry_opt (fun r -> lookup r.hosts hostname) with
-  | Some h -> Ok h.name
+  match registry_opt with
   | None -> this_machine_name ~hostname ()
+  | Some r ->
+    match resolve r.hosts hostname with
+    | Found h -> Ok h.name
+    | Not_found -> this_machine_name ~hostname ()
+    (* Recording a name that could resolve to another machine is the
+       failure this function exists to prevent. *)
+    | Ambiguous hs -> ambiguous_error ~hostname hs
 
 let force_writer_env = "DISCORD_AGENTS_FORCE_WRITER"
 
@@ -193,12 +217,17 @@ let force_writer_source ~args ~env_value =
 (** The startup guard against two writers. Only an explicit [hosts]
     block names a writer; without one, whatever machine runs the bot
     is the writer, as before. [force] names the override's source. *)
-let check_writer ?hostname ?force registry_opt =
+let check_writer ?(hostname = Unix.gethostname ()) ?force registry_opt =
   match registry_opt with
   | None -> Ok ()
-  | Some registry when names_this_machine ?hostname registry.writer -> Ok ()
   | Some registry ->
-    let here = Option.value hostname ~default:(Unix.gethostname ()) in
+    let here = hostname in
+    (* Resolve this machine the same way sessions are stamped, so the
+       guard and the stamp can never disagree about which entry is us. *)
+    match resolve registry.hosts hostname with
+    | Ambiguous hs -> ambiguous_error ~hostname hs
+    | Found h when String.equal h.name (writer registry).name -> Ok ()
+    | Found _ | Not_found ->
     match force with
     | Some source ->
       Logs.warn (fun m ->
