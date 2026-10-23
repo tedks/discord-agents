@@ -70,24 +70,6 @@ let resolve_ssh ssh =
 
 (* ── Capture ─────────────────────────────────────────────────────── *)
 
-let read_all fd =
-  let buf = Buffer.create 4096 in
-  let chunk = Bytes.create 65536 in
-  let rec loop () =
-    match Unix.read fd chunk 0 (Bytes.length chunk) with
-    | 0 -> ()
-    | n -> Buffer.add_subbytes buf chunk 0 n; loop ()
-    | exception Unix.Unix_error (Unix.EINTR, _, _) -> loop ()
-  in
-  loop ();
-  Buffer.contents buf
-
-let rec write_all fd s off =
-  if off < String.length s then
-    match Unix.write_substring fd s off (String.length s - off) with
-    | n -> write_all fd s (off + n)
-    | exception Unix.Unix_error (Unix.EINTR, _, _) -> write_all fd s off
-
 let rec waitpid_retry pid =
   match Unix.waitpid [] pid with
   | _, status -> status
@@ -117,6 +99,58 @@ let local_capture ?cwd argv =
   | Unix.WEXITED 0 -> Ok (Buffer.contents output)
   | status -> Error (Exited (exit_code status, Buffer.contents output))
 
+(** Write [payload] to [in_w] while reading [out_r] to EOF, with select,
+    so neither side can deadlock the other: a remote command that stops
+    reading its input (it failed, or never reads stdin) cannot block the
+    write once pipe and SSH window buffers fill, and output the command
+    writes before it reads cannot block it either. Takes ownership of
+    [in_w] and closes it exactly once (when the payload is written, the
+    reader has gone, or on the way out): closing an fd twice can close
+    whatever another thread opened under the reused number. *)
+let exchange ~in_w ~payload ~out_r =
+  let buf = Buffer.create 4096 in
+  let chunk = Bytes.create 65536 in
+  let in_open = ref true in
+  let close_in () =
+    if !in_open then begin
+      in_open := false;
+      try Unix.close in_w with Unix.Unix_error _ -> ()
+    end
+  in
+  Fun.protect ~finally:close_in @@ fun () ->
+  Unix.set_nonblock in_w;
+  let len = String.length payload in
+  let rec loop ~off ~writing =
+    let writing =
+      if writing && off >= len then (close_in (); false) else writing in
+    let reads, writes, _ =
+      try Unix.select [out_r] (if writing then [in_w] else []) [] (-1.0)
+      with Unix.Unix_error (Unix.EINTR, _, _) -> [], [], []
+    in
+    let off, writing =
+      if writes = [] then off, writing
+      else
+        match Unix.write_substring in_w payload off (min 65536 (len - off)) with
+        | n -> off + n, writing
+        | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) ->
+          off, writing
+        | exception Unix.Unix_error ((Unix.EPIPE | Unix.ECONNRESET), _, _) ->
+          (* The reader is gone; its output says why. *)
+          close_in (); off, false
+    in
+    let eof =
+      if reads = [] then false
+      else
+        match Unix.read out_r chunk 0 (Bytes.length chunk) with
+        | 0 -> true
+        | n -> Buffer.add_subbytes buf chunk 0 n; false
+        | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EINTR), _, _) -> false
+    in
+    if eof then () else loop ~off ~writing
+  in
+  loop ~off:0 ~writing:true;
+  Buffer.contents buf
+
 let find_sub ?(from = 0) s sub =
   let n = String.length s and m = String.length sub in
   let rec go i =
@@ -136,14 +170,15 @@ let rfind_sub s sub =
   go (n - m)
 
 (** Split the merged output of a remote capture into the command's own
-    output and its exit status, using the nonce-tagged markers. Pure,
-    so every outcome is testable without SSH. *)
+    output and its exit status, using the nonce-tagged markers. Markers
+    are only recognised as whole lines (each is printed after a newline
+    of its own). Pure, so every outcome is testable without SSH. *)
 let classify_capture ~nonce ~cwd ~ssh_status output =
-  let started =
-    Remote_script.(marker started_tag nonce "0") ^ "\n" in
+  let whole_line m = "\n" ^ m ^ "\n" in
+  let started = whole_line Remote_script.(marker started_tag nonce "0") in
   match find_sub output started with
   | None ->
-    let missing = Remote_script.(marker error_tag nonce "missing_cwd") in
+    let missing = whole_line Remote_script.(marker error_tag nonce "missing_cwd") in
     if Option.is_some (find_sub output missing) then Error (Missing_cwd cwd)
     else if ssh_status = 255 then Error (Unreachable (String.trim output))
     else Error (Setup_failed (String.trim output))
@@ -179,9 +214,16 @@ let classify_capture ~nonce ~cwd ~ssh_status output =
     existing [Project] git helpers are. Relies on SIGPIPE being ignored,
     which [Eio_main.run] does process-wide, so an ssh that dies before
     reading its stdin is an [EPIPE] here rather than a dead bot. Without
-    [cwd] a remote command runs in the login directory. *)
-let run_capture ?(ssh = "ssh") ?cwd (host : Host.t) argv =
+    [cwd] a remote command runs in the login directory.
+
+    [input] is sent to the remote command's stdin (after the script
+    line), for writing files without putting their contents in argv.
+    Remote only: a local command with [input] is rejected rather than
+    silently run without it. *)
+let run_capture ?(ssh = "ssh") ?cwd ?(input = "") (host : Host.t) argv =
   match host.transport with
+  | Host.Local when input <> "" ->
+    Error (Setup_failed "input is only supported for remote commands")
   | Host.Local -> local_capture ?cwd argv
   | Host.Ssh destination ->
     let cwd = Option.value cwd ~default:"." in
@@ -192,49 +234,68 @@ let run_capture ?(ssh = "ssh") ?cwd (host : Host.t) argv =
       match resolve_ssh ssh with
       | Error _ as e -> e
       | Ok ssh ->
+        let close fd = try Unix.close fd with Unix.Unix_error _ -> () in
         let in_r, in_w = Unix.pipe ~cloexec:true () in
         let out_r, out_w = Unix.pipe ~cloexec:true () in
-        let close fd = try Unix.close fd with Unix.Unix_error _ -> () in
-        let pid =
-          try
-            Unix.create_process ssh
-              (Array.of_list (ssh_argv ~ssh ~destination)) in_r out_w out_w
-          with exn ->
-            List.iter close [in_r; in_w; out_r; out_w];
-            raise exn
-        in
-        close in_r;
-        close out_w;
-        (* An early-exiting ssh (unreachable host) closes its stdin: the
-           write fails with EPIPE and the output below explains why. *)
-        (try write_all in_w (Remote_script.stdin_line script) 0
-         with Unix.Unix_error ((Unix.EPIPE | Unix.ECONNRESET), _, _) -> ());
-        close in_w;
-        let output =
-          Fun.protect ~finally:(fun () -> close out_r) (fun () -> read_all out_r)
-        in
-        let status = waitpid_retry pid in
-        classify_capture ~nonce ~cwd ~ssh_status:(exit_code status) output
+        match
+          Unix.create_process ssh
+            (Array.of_list (ssh_argv ~ssh ~destination)) in_r out_w out_w
+        with
+        | exception Unix.Unix_error (e, _, _) ->
+          List.iter close [in_r; in_w; out_r; out_w];
+          Error (Setup_failed (Printf.sprintf "could not start %s: %s"
+            ssh (Unix.error_message e)))
+        | pid ->
+          close in_r;
+          close out_w;
+          (* Whatever happens below, ssh is reaped: terminated first if
+             the exchange failed part way, so waitpid cannot block. Not
+             on success, where a late SIGTERM could turn a clean exit
+             into a signal status. *)
+          let reaped = ref false in
+          let output, status =
+            Fun.protect
+              ~finally:(fun () ->
+                close out_r;
+                if not !reaped then begin
+                  (try Unix.kill pid Sys.sigterm with Unix.Unix_error _ -> ());
+                  ignore (waitpid_retry pid)
+                end)
+              (fun () ->
+                let output =
+                  exchange ~in_w
+                    ~payload:(Remote_script.stdin_line script ^ input) ~out_r in
+                let status = waitpid_retry pid in
+                reaped := true;
+                output, status)
+          in
+          classify_capture ~nonce ~cwd ~ssh_status:(exit_code status) output
 
 (* ── Streaming over SSH ──────────────────────────────────────────── *)
 
 let max_stderr_bytes = 64 * 1024
 let max_line_bytes = 1024 * 1024
 
-(** Read a flow to EOF, keeping only the first [limit] bytes. Unlike
-    [Buf_read.take_all ~max_size], it keeps draining past the limit, so
-    a chatty child can never block on a full stderr pipe. *)
+(** Read a flow to EOF, keeping only the first [limit] bytes and saying
+    so when more was dropped. Unlike [Buf_read.take_all ~max_size], it
+    keeps draining past the limit, so a chatty child can never block on
+    a full stderr pipe. *)
 let drain_capped flow ~limit =
   let buf = Buffer.create 1024 in
+  let dropped = ref 0 in
   let chunk = Cstruct.create 4096 in
   (try
      while true do
        let n = Eio.Flow.single_read flow chunk in
        let keep = min n (limit - Buffer.length buf) in
        if keep > 0 then
-         Buffer.add_string buf (Cstruct.to_string ~len:keep chunk)
+         Buffer.add_string buf (Cstruct.to_string ~len:keep chunk);
+       dropped := !dropped + (n - max keep 0)
      done
    with End_of_file -> ());
+  if !dropped > 0 then
+    Buffer.add_string buf
+      (Printf.sprintf "\n[... %d more bytes of stderr dropped]" !dropped);
   Buffer.contents buf
 
 type stream_state = {
@@ -244,19 +305,29 @@ type stream_state = {
   mutable remote_pid : int option;
   mutable exit_status : int option;
   mutable remote_error : string option;
-  mutable pre_start_noise : string list;  (* newest first, capped *)
+  mutable unexpected_lines : string list;
+  (* Output outside the started..exit window (login-shell banners,
+     stragglers after exit), newest first, capped; diagnostics only. *)
 }
 
-let classify_stream ~cwd ~ssh_status ~stderr state =
+(** Markers are a small state machine: an error only before start, one
+    start, then one exit. A marker out of that order is treated as
+    ordinary output, so a command echoing marker-shaped text cannot
+    restart or end the run early. [locally_signalled]: ssh was killed on
+    this side (a stop), which is not a remote setup failure whether or
+    not the command had started. *)
+let classify_stream ~cwd ~ssh_status ~locally_signalled ~stderr state =
   match state.exit_status, state.remote_error, state.remote_pid with
   | Some 0, _, _ -> Ok ()
   | Some rc, _, _ -> Error (Exited (rc, stderr))
   | None, Some "busy", _ -> Error Busy
   | None, Some "missing_cwd", _ -> Error (Missing_cwd cwd)
-  | None, Some code, _ -> Error (Setup_failed (code ^ (if stderr = "" then "" else ": " ^ stderr)))
+  | None, Some code, _ ->
+    Error (Setup_failed (code ^ (if stderr = "" then "" else ": " ^ stderr)))
   | None, None, Some _ -> Error (Transport_lost stderr)
+  | None, None, None when locally_signalled -> Error (Transport_lost stderr)
   | None, None, None ->
-    let noise = String.concat "\n" (List.rev state.pre_start_noise) in
+    let noise = String.concat "\n" (List.rev state.unexpected_lines) in
     let detail = String.trim (String.concat "\n" [stderr; noise]) in
     if ssh_status = 255 then Error (Unreachable detail)
     else Error (Setup_failed detail)
@@ -269,8 +340,11 @@ let classify_stream ~cwd ~ssh_status ~stderr state =
     is [setsid --wait]): the remote watchdog sees stdin close and kills
     the command's process group. [on_remote_pid] gets the remote pid
     once the command has started. Marker lines are never passed to
-    [on_line]. If a callback raises, stdin is closed before the
-    exception propagates, which stops the remote command too. *)
+    [on_line].
+
+    If a callback raises or the fiber is cancelled, stdin is closed (which
+    stops the remote command) and the local ssh is terminated and reaped
+    before the exception propagates. *)
 let run_streaming_ssh ~sw ~mgr ?(ssh = "ssh") ?(prefix = []) ~destination
     ~cwd ~lock_key ?(env = []) ~argv ~on_line ?on_spawn ?on_remote_pid () =
   let nonce = Remote_script.fresh_nonce () in
@@ -289,33 +363,54 @@ let run_streaming_ssh ~sw ~mgr ?(ssh = "ssh") ?(prefix = []) ~destination
         close_noerr stdout_r; close_noerr stdout_w;
         close_noerr stderr_r; close_noerr stderr_w
       in
-      let proc =
-        try
-          Eio.Process.spawn ~sw mgr ~stdin:stdin_r ~stdout:stdout_w
-            ~stderr:stderr_w (prefix @ ssh_argv ~ssh ~destination)
-        with exn -> close_all (); raise exn
-      in
+      match
+        Eio.Process.spawn ~sw mgr ~stdin:stdin_r ~stdout:stdout_w
+          ~stderr:stderr_w (prefix @ ssh_argv ~ssh ~destination)
+      with
+      | exception (Eio.Cancel.Cancelled _ as exn) -> close_all (); raise exn
+      | exception exn ->
+        close_all ();
+        Error (Setup_failed (Printf.sprintf "could not start %s: %s"
+          ssh (Printexc.to_string exn)))
+      | proc ->
       close_noerr stdin_r;
       close_noerr stdout_w;
       close_noerr stderr_w;
       let state = {
         deferred_empty = 0;
         remote_pid = None; exit_status = None; remote_error = None;
-        pre_start_noise = [];
+        unexpected_lines = [];
       } in
       let flush_empty () =
         for _ = 1 to state.deferred_empty do on_line "" done;
         state.deferred_empty <- 0
       in
+      let note_unexpected line =
+        if List.length state.unexpected_lines < 20 then
+          state.unexpected_lines <- line :: state.unexpected_lines
+      in
       let stderr_text = ref "" in
+      let awaited = ref None in
+      let await () =
+        match !awaited with
+        | Some status -> status
+        | None ->
+          let status = Eio.Process.await proc in
+          awaited := Some status;
+          status
+      in
       Fun.protect
         ~finally:(fun () ->
           (* Closing stdin is the remote stop signal. Always do it, so an
              exception or cancellation here never leaves a remote agent
-             running. *)
+             running, and reap ssh so it never outlives this call. *)
           close_noerr stdin_w;
           close_noerr stdout_r;
-          close_noerr stderr_r)
+          close_noerr stderr_r;
+          if Option.is_none !awaited then
+            Eio.Cancel.protect (fun () ->
+              (try Eio.Process.signal proc Sys.sigterm with _ -> ());
+              ignore (await ())))
         (fun () ->
           Option.iter (fun f -> f (Eio.Process.pid proc)) on_spawn;
           (try Eio.Flow.copy_string (Remote_script.stdin_line script) stdin_w
@@ -326,35 +421,41 @@ let run_streaming_ssh ~sw ~mgr ?(ssh = "ssh") ?(prefix = []) ~destination
             (fun () -> stderr_text := drain_capped stderr_r ~limit:max_stderr_bytes)
             (fun () ->
               let reader = Eio.Buf_read.of_flow ~max_size:max_line_bytes stdout_r in
+              let running () =
+                Option.is_some state.remote_pid && Option.is_none state.exit_status in
               try
                 while true do
                   let line = Eio.Buf_read.line reader in
                   match Remote_script.parse_marker ~nonce line with
-                  | Remote_script.Started pid ->
+                  | Remote_script.Started pid
+                    when Option.is_none state.remote_pid
+                      && Option.is_none state.remote_error ->
                     state.remote_pid <- Some pid;
                     Option.iter (fun f -> f pid) on_remote_pid
-                  | Remote_script.Exit rc ->
+                  | Remote_script.Exit rc when running () ->
                     state.deferred_empty <- max 0 (state.deferred_empty - 1);
                     flush_empty ();
                     state.exit_status <- Some rc
-                  | Remote_script.Remote_error code -> state.remote_error <- Some code
-                  | Remote_script.Not_marker ->
-                    if Option.is_some state.remote_pid
-                    && Option.is_none state.exit_status then begin
-                      if line = "" then
-                        state.deferred_empty <- state.deferred_empty + 1
-                      else begin
-                        flush_empty ();
-                        on_line line
-                      end
+                  | Remote_script.Remote_error code
+                    when Option.is_none state.remote_pid ->
+                    state.remote_error <- Some code
+                  | _ when running () ->
+                    if line = "" then
+                      state.deferred_empty <- state.deferred_empty + 1
+                    else begin
+                      flush_empty ();
+                      on_line line
                     end
-                    else if List.length state.pre_start_noise < 20 then
-                      state.pre_start_noise <- line :: state.pre_start_noise
+                  | _ -> if line <> "" then note_unexpected line
                 done
-              with End_of_file -> ());
-          let ssh_status =
-            match Eio.Process.await proc with
-            | `Exited n -> n
-            | `Signaled n -> 128 + n
+              with End_of_file ->
+                (* No exit marker (connection lost): held-back empty lines
+                   were the command's own. *)
+                if running () then flush_empty ());
+          let ssh_status, locally_signalled =
+            match await () with
+            | `Exited n -> n, false
+            | `Signaled n -> 128 + n, true
           in
-          classify_stream ~cwd ~ssh_status ~stderr:(String.trim !stderr_text) state)
+          classify_stream ~cwd ~ssh_status ~locally_signalled
+            ~stderr:(String.trim !stderr_text) state)

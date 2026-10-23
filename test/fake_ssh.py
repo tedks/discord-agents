@@ -10,12 +10,26 @@ connection does. A plain `exec sh -c` would leave the remote command
 holding the caller's pipes and could not model a lost connection.
 
 Destination "unreachable" behaves like a host with no route.
+
+FAKE_SSH_LOGIN_SHELL picks the login shell that runs the command
+(default sh), as sshd uses the user's shell. FAKE_SSH_BANNER=1 makes the
+"login" print text with no trailing newline on stdout and stderr before
+the command runs, as noisy shell startup files do.
 """
 
 import os
 import subprocess
 import sys
 import threading
+
+
+def write_all(fd, data):
+    # os.write may write less than asked (a pipe can take a partial
+    # chunk); a relay that ignored that would truncate the stream.
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
 
 
 def main():
@@ -33,8 +47,13 @@ def main():
             "ssh: connect to host unreachable port 22: No route to host\n")
         return 255
 
+    if os.environ.get("FAKE_SSH_BANNER") == "1":
+        write_all(1, b"Welcome to the fake host")
+        write_all(2, b"motd: no newline here")
+    # Empty counts as unset: the OCaml tests cannot unsetenv.
+    shell = os.environ.get("FAKE_SSH_LOGIN_SHELL") or "sh"
     child = subprocess.Popen(
-        ["sh", "-c", command],
+        [shell, "-c", command],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         start_new_session=True, bufsize=0)
 
@@ -44,7 +63,7 @@ def main():
                 chunk = os.read(src, 65536)
                 if not chunk:
                     break
-                os.write(dst, chunk)
+                write_all(dst, chunk)
         except OSError:
             pass
         finally:

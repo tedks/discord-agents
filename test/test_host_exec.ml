@@ -98,6 +98,13 @@ let test_script_rejects () =
   rejected "lock key slash"
     (script ~mode:(Run { lock_key = "a/b" }) ["true"]);
   rejected "empty lock key" (script ~mode:(Run { lock_key = "" }) ["true"]);
+  rejected "cwd dash" (script ~cwd:"-" ["true"]);
+  rejected "relative cwd" (script ~cwd:"a/b" ["true"]);
+  (* exec would fail with E2BIG on one argument this long. *)
+  rejected "oversized argument" (script ["printf"; String.make (128 * 1024) 'x']);
+  rejected "oversized env value"
+    (script ~env:["A", String.make (128 * 1024) 'x'] ["true"]);
+  Alcotest.(check bool) "dot cwd" true (Result.is_ok (script ~cwd:"." ["true"]));
   Alcotest.(check bool) "ok" true
     (Result.is_ok (script ~mode:(Run { lock_key = "abc-123_x.y" }) ["true"]))
 
@@ -118,7 +125,7 @@ let test_parse_marker () =
 let test_classify_capture () =
   let c ?(status = 0) out =
     Host_exec.classify_capture ~nonce:"n" ~cwd:"/w" ~ssh_status:status out in
-  let started = "discord_agents.remote_started n 0\n" in
+  let started = "\ndiscord_agents.remote_started n 0\n" in
   let exit rc = Printf.sprintf "\ndiscord_agents.remote_exit n %d\n" rc in
   check_ok "body kept exactly" "abc" (c (started ^ "abc" ^ exit 0));
   check_ok "trailing newline kept" "abc\n" (c (started ^ "abc\n" ^ exit 0));
@@ -130,7 +137,12 @@ let test_classify_capture () =
   check_error "unreachable" "Unreachable" (c ~status:255 "ssh: no route\n");
   check_error "setup" "Setup_failed" (c ~status:127 "sh: base64: not found\n");
   check_error "missing cwd" "Missing_cwd"
-    (c ~status:1 "discord_agents.remote_error n missing_cwd\n");
+    (c ~status:1 "\ndiscord_agents.remote_error n missing_cwd\n");
+  (* Markers count only as whole lines: inside another line they are text. *)
+  check_error "started marker mid-line" "Setup_failed"
+    (c "banner discord_agents.remote_started n 0\nx");
+  check_ok "banner before the marker" "x"
+    (c ("Welcome, no newline" ^ started ^ "x" ^ exit 0));
   (* Output that imitates a trailer with another nonce is just output. *)
   check_ok "forged trailer ignored"
     "\ndiscord_agents.remote_exit other 0\nreal"
@@ -318,6 +330,144 @@ let test_stream_callback_exception_stops_remote () =
       let pid = Option.get !remote_pid in
       wait_until ~clock "remote command killed" (fun () -> not (alive pid))))
 
+let with_putenv vars f =
+  let saved = List.map (fun (k, _) -> k, Sys.getenv_opt k) vars in
+  List.iter (fun (k, v) -> Unix.putenv k v) vars;
+  Fun.protect f ~finally:(fun () ->
+    List.iter (fun (k, v) -> Unix.putenv k (Option.value v ~default:"")) saved)
+
+let read_pid path =
+  int_of_string (String.trim (In_channel.with_open_text path In_channel.input_all))
+
+let file_ready path =
+  Sys.file_exists path
+  && String.trim (In_channel.with_open_text path In_channel.input_all) <> ""
+
+(* Review finding: when the group leader died on TERM, the wrapper used
+   to cancel the watchdog before its KILL, so a descendant that ignores
+   TERM survived and the lock was released under it. *)
+let test_stream_stop_kills_term_ignoring_descendant () =
+  with_env (fun ~base ~ssh ->
+    with_eio (fun ~sw ~mgr ~clock ->
+      let pidfile = Filename.concat base "stubborn.pid" in
+      let local_pid = ref None in
+      Eio.Fiber.both
+        (fun () ->
+          ignore (stream ~sw ~mgr ~ssh ~on_spawn:(fun p -> local_pid := Some p)
+            ["sh"; "-c";
+             Printf.sprintf "sh -c 'trap \"\" TERM; echo $$ > %s; exec sleep 300' & \
+                             sleep 300" (Filename.quote pidfile)]))
+        (fun () ->
+          wait_until ~clock "descendant started" (fun () -> file_ready pidfile);
+          Unix.kill (Option.get !local_pid) Sys.sigterm);
+      let stubborn = read_pid pidfile in
+      wait_until ~clock ~timeout:12.0 "TERM-ignoring descendant killed"
+        (fun () -> not (alive stubborn))))
+
+(* Missing tools are setup failures, not "busy" (flock) or "the command
+   exited 127" (setsid). PATH is exported before the checks, so an empty
+   or partial directory hides the tools from the remote script only. *)
+let test_stream_missing_tools () =
+  with_env (fun ~base ~ssh ->
+    with_eio (fun ~sw ~mgr ~clock:_ ->
+      let empty = Filename.concat base "empty-bin" in
+      Unix.mkdir empty 0o755;
+      let only_flock = Filename.concat base "flock-bin" in
+      Unix.mkdir only_flock 0o755;
+      (match Discord_agents.Resource.executable_in_path "flock" with
+       | Some flock -> Unix.symlink flock (Filename.concat only_flock "flock")
+       | None -> Alcotest.skip ());
+      let check_missing label path tool =
+        match stream ~sw ~mgr ~ssh ~env:["PATH", path] ["true"] with
+        | Error (Host_exec.Setup_failed detail) ->
+          Alcotest.(check bool) (label ^ ": " ^ detail) true
+            (Discord_agents.Resource.contains_substring ~haystack:detail
+               ~needle:("missing_tool:" ^ tool))
+        | Ok () -> Alcotest.failf "%s: expected Setup_failed" label
+        | Error f -> Alcotest.failf "%s: got %s" label (failure_name f)
+      in
+      check_missing "no flock" empty "flock";
+      check_missing "no setsid" only_flock "setsid"))
+
+(* A stop that lands before the command started is a lost connection
+   (we killed it), not a remote setup failure. *)
+let test_stream_stop_before_start () =
+  with_env (fun ~base:_ ~ssh ->
+    with_eio (fun ~sw ~mgr ~clock:_ ->
+      check_error "killed at spawn" "Transport_lost"
+        (stream ~sw ~mgr ~ssh ~on_spawn:(fun p -> Unix.kill p Sys.sigkill)
+           ["sleep"; "300"])))
+
+let test_stream_empty_lines_survive_lost_connection () =
+  with_env (fun ~base:_ ~ssh ->
+    with_eio (fun ~sw ~mgr ~clock ->
+      let lines = ref [] and local_pid = ref None in
+      Eio.Fiber.both
+        (fun () ->
+          check_error "lost" "Transport_lost"
+            (stream ~sw ~mgr ~ssh ~on_spawn:(fun p -> local_pid := Some p)
+               ~on_line:(fun l -> lines := l :: !lines)
+               ["sh"; "-c"; "printf 'a\\n\\n\\n'; sleep 300"]))
+        (fun () ->
+          wait_until ~clock "output seen" (fun () -> !lines <> []);
+          Eio.Time.sleep clock 0.3;
+          Unix.kill (Option.get !local_pid) Sys.sigterm);
+      Alcotest.(check (list string)) "trailing blanks kept" ["a"; ""; ""]
+        (List.rev !lines)))
+
+let test_stream_on_spawn_exception () =
+  with_env (fun ~base:_ ~ssh ->
+    with_eio (fun ~sw ~mgr ~clock:_ ->
+      match stream ~sw ~mgr ~ssh ~on_spawn:(fun _ -> failwith "spawn hook")
+              ["sleep"; "300"] with
+      | _ -> Alcotest.fail "expected the hook's exception"
+      | exception Failure msg ->
+        Alcotest.(check string) "propagated" "spawn hook" msg))
+
+(* Cancelling the fiber must stop the remote command, not just abandon it. *)
+let test_stream_cancellation_stops_remote () =
+  with_env (fun ~base:_ ~ssh ->
+    with_eio (fun ~sw ~mgr ~clock ->
+      let remote_pid = ref None in
+      Eio.Fiber.first
+        (fun () ->
+          ignore (stream ~sw ~mgr ~ssh
+            ~on_remote_pid:(fun p -> remote_pid := Some p) ["sleep"; "300"]))
+        (fun () -> wait_until ~clock "started" (fun () -> Option.is_some !remote_pid));
+      let pid = Option.get !remote_pid in
+      wait_until ~clock "remote command killed" (fun () -> not (alive pid))))
+
+(* sshd runs the bootstrap with the user's login shell, which may print
+   before anything else. *)
+let test_bash_login_shell_with_banner () =
+  with_env (fun ~base:_ ~ssh ->
+    with_putenv ["FAKE_SSH_LOGIN_SHELL", "bash"; "FAKE_SSH_BANNER", "1"] (fun () ->
+      in_eio (fun () ->
+        check_ok "capture" "it's $x"
+          (Host_exec.run_capture ~ssh remote ["printf"; "%s"; "it's $x"]));
+      with_eio (fun ~sw ~mgr ~clock:_ ->
+        let lines = ref [] in
+        check_ok "stream" "" (Result.map (fun () -> "")
+          (stream ~sw ~mgr ~ssh ~on_line:(fun l -> lines := l :: !lines)
+             ["echo"; "hello"]));
+        Alcotest.(check (list string)) "lines" ["hello"] (List.rev !lines))))
+
+(* The lock path is fixed before the exports, so a run whose env sets
+   HOME still contends with the first. *)
+let test_env_home_does_not_move_lock () =
+  with_env (fun ~base ~ssh ->
+    with_eio (fun ~sw ~mgr ~clock ->
+      let started = ref false in
+      Eio.Fiber.both
+        (fun () ->
+          ignore (stream ~sw ~mgr ~ssh ~lock_key:"same"
+                    ~on_remote_pid:(fun _ -> started := true) ["sleep"; "2"]))
+        (fun () ->
+          wait_until ~clock "first run started" (fun () -> !started);
+          check_error "still busy" "Busy"
+            (stream ~sw ~mgr ~ssh ~lock_key:"same"
+               ~env:["HOME", Filename.concat base "elsewhere"] ["true"]))))
+
 let () =
   Alcotest.run "host_exec" [
     "remote_script", [
@@ -340,5 +490,18 @@ let () =
         test_stream_stop_kills_remote_group;
       Alcotest.test_case "callback exception stops remote" `Quick
         test_stream_callback_exception_stops_remote;
+      Alcotest.test_case "stop kills TERM-ignoring descendant" `Quick
+        test_stream_stop_kills_term_ignoring_descendant;
+      Alcotest.test_case "missing tools" `Quick test_stream_missing_tools;
+      Alcotest.test_case "stop before start" `Quick test_stream_stop_before_start;
+      Alcotest.test_case "empty lines survive lost connection" `Quick
+        test_stream_empty_lines_survive_lost_connection;
+      Alcotest.test_case "on_spawn exception" `Quick test_stream_on_spawn_exception;
+      Alcotest.test_case "cancellation stops remote" `Quick
+        test_stream_cancellation_stops_remote;
+      Alcotest.test_case "bash login shell with banner" `Quick
+        test_bash_login_shell_with_banner;
+      Alcotest.test_case "env HOME does not move lock" `Quick
+        test_env_home_does_not_move_lock;
     ];
   ]

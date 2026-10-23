@@ -20,7 +20,22 @@
       second run with the same key on the same host.
 
     Every word interpolated into a script is single-quoted, so the
-    only shell syntax in a script is what this module writes. *)
+    only shell syntax in a script is what this module writes.
+
+    What the nonce does and does not buy: it keeps the command's output
+    from colliding with a marker by accident or by echoing text it saw,
+    and the reader accepts markers only in protocol order (error before
+    start, one start, one exit). It is not authentication: a hostile
+    process running as the same user could read it from the wrapper's
+    memory and forge an exit status. The command is our own agent CLI,
+    and a hostile same-user process already owns the account.
+
+    Known limits, shared with local runs and tracked separately: one
+    argument (a long prompt) cannot exceed 128 KiB, which [script]
+    refuses up front; a command that exits while a background process
+    still holds its stdout keeps the turn open until that process exits;
+    and the delayed KILL could in principle reach a reused process-group
+    id. *)
 
 let bootstrap =
   {|sh -c 'IFS= read -r l; eval "$(printf %s "$l" | base64 -d)"'|}
@@ -72,12 +87,27 @@ let error_tag = "discord_agents.remote_error"
    that printf in the script needs no escaping. *)
 let marker tag nonce value = Printf.sprintf "%s %s %s" tag nonce value
 
-let lock_dir = {|"$HOME/.cache/discord-agents/run"|}
+(* Linux's MAX_ARG_STRLEN: exec fails with E2BIG on any single argv or
+   environment string longer than this, whatever ARG_MAX is. *)
+let max_arg_bytes = 128 * 1024 - 1
+
+let required_tools = ["flock"; "setsid"; "cat"]
 
 let script ~nonce ~mode ~cwd ~env ~argv =
+  let too_long s = String.length s > max_arg_bytes in
   if argv = [] then Error "remote command must not be empty"
   else if List.exists has_nul (cwd :: argv) then
     Error "remote command and directory must not contain NUL bytes"
+  else if not (cwd = "." || (cwd <> "" && cwd.[0] = '/')) then
+    (* "-" would mean $OLDPWD to cd, and a relative path depends on the
+       login directory. *)
+    Error (Printf.sprintf "remote directory %S must be absolute" cwd)
+  else if List.exists too_long argv
+       || List.exists (fun (_, v) -> too_long v) env then
+    Error (Printf.sprintf
+      "an argument or environment value exceeds Linux's %d-byte \
+       per-argument limit, so exec would fail"
+      max_arg_bytes)
   else
     match List.find_opt (fun (k, v) -> not (is_env_name k) || has_nul v) env with
     | Some (k, _) -> Error (Printf.sprintf "invalid environment entry %S" k)
@@ -92,54 +122,80 @@ let script ~nonce ~mode ~cwd ~env ~argv =
         let b = Buffer.create 1024 in
         let line fmt = Printf.ksprintf (fun s ->
           Buffer.add_string b s; Buffer.add_char b '\n') fmt in
-        let err code =
-          Printf.sprintf "printf '%%s\\n' %s"
-            (quote (marker error_tag nonce code))
+        (* Every marker starts with a newline so it begins a line even
+           after output (a login banner, or the command's last line)
+           that did not end in one; readers skip the empty line. *)
+        let marker_line tag value =
+          Printf.sprintf "printf '\\n%%s\\n' %s" (quote (marker tag nonce value))
         in
+        let err code = marker_line error_tag code in
         line "set -u";
+        (* Before the exports, so an env entry named HOME cannot move
+           the lock and let two runs of one session miss each other. *)
+        line "lockdir=\"$HOME/.cache/discord-agents/run\"";
         List.iter (fun (k, v) -> line "export %s=%s" k (quote v)) env;
         line "set -- %s" (String.concat " " (List.map quote argv));
         line "cd %s 2>/dev/null || { %s; exit 1; }" (quote cwd)
           (err "missing_cwd");
         (match mode with
          | Capture ->
-           line "printf '%%s\\n' %s" (quote (marker started_tag nonce "0"));
+           line "%s" (marker_line started_tag "0");
            line "\"$@\" 2>&1";
            line "rc=$?";
-           (* Leading newline: the command's output need not end in one,
-              and the caller strips exactly this byte back off. *)
            line "printf '\\n%%s %%s\\n' %s \"$rc\""
              (quote (exit_tag ^ " " ^ nonce));
            line "exit 0"
          | Run { lock_key } ->
+           (* A missing tool would otherwise surface as "busy" (flock),
+              as the command exiting 127 (setsid), or as a watchdog that
+              kills a healthy run at once (cat). *)
+           List.iter (fun tool ->
+             line "command -v %s >/dev/null 2>&1 || { %s; exit 1; }"
+               tool (err ("missing_tool:" ^ tool)))
+             required_tools;
            (* fd 3 keeps the SSH channel's stdin for the watchdog; the
               command itself gets /dev/null and neither fd 3 nor the
-              lock fd 9, so it cannot hold the lock or the channel
-              open after the wrapper is gone. *)
+              lock fd 9. *)
            line "exec 3<&0";
-           line "mkdir -p %s 2>/dev/null || { %s; exit 1; }" lock_dir
-             (err "lock_failed");
-           line "exec 9>%s/%s.lock || { %s; exit 1; }" lock_dir
-             (quote lock_key) (err "lock_failed");
-           line "flock -n 9 || { %s; exit 1; }" (err "busy");
-           line "setsid --wait \"$@\" </dev/null 3<&- 9>&- &";
-           line "child=$!";
-           line "printf '%%s %%s\\n' %s \"$child\""
+           (* [exec 9>file] is a special builtin: a failed redirection
+              would kill the shell before any [||] ran. Create it first
+              with an ordinary command. *)
+           line "lockfile=\"$lockdir\"/%s.lock" (quote lock_key);
+           line "mkdir -p \"$lockdir\" 2>/dev/null && touch \"$lockfile\" 2>/dev/null \
+                 || { %s; exit 1; }" (err "lock_failed");
+           line "exec 9>\"$lockfile\"";
+           (* flock -n exits 1 on contention; anything else is a fault. *)
+           line "flock -n 9";
+           line "lockrc=$?";
+           line "if [ \"$lockrc\" -eq 1 ]; then %s; exit 1; fi" (err "busy");
+           line "if [ \"$lockrc\" -ne 0 ]; then %s; exit 1; fi" (err "lock_failed");
+           (* The command prints its own started marker, with its own pid
+              (setsid does not fork here: a background job is not a group
+              leader, so the pid is the new session's pgid), then execs.
+              So the wrapper writes nothing to the channel between spawn
+              and arming the watchdog, and a channel that is already gone
+              kills the marker's printf before the command runs. *)
+           line "setsid --wait sh -c 'printf \"\\n%%s %%s\\n\" \"$0\" \"$$\"; exec \"$@\"' \
+                 %s \"$@\" </dev/null 3<&- 9>&- &"
              (quote (started_tag ^ " " ^ nonce));
-           (* dash's builtin kill only signals a process group with the
-              numeric form: [kill -s TERM -PGID] and [kill -TERM -- -PGID]
-              are both rejected. *)
-           line "( cat <&3 >/dev/null 2>&1; kill -15 \"-$child\" 2>/dev/null; \
-                 sleep 3; kill -9 \"-$child\" 2>/dev/null ) \
-                 </dev/null >/dev/null 2>&1 9>&- &";
+           line "child=$!";
+           (* On stdin EOF, TERM the group and KILL it 3 s later. The
+              escalation runs as its own background job, so the wrapper's
+              [kill $dog] after a normal exit cannot cancel a stop that
+              has already begun; it keeps fd 9, so the lock is held until
+              the group is gone. dash's kill only signals a group in the
+              numeric form ([kill -15 -PGID]). The KILL can in principle
+              hit a reused pgid if the group emptied and its id was
+              reallocated within 3 s; the local path has the same window. *)
+           line "( cat <&3 >/dev/null 2>&1 9>&-; \
+                 ( kill -15 \"-$child\" 2>/dev/null; sleep 3; \
+                   kill -9 \"-$child\" 2>/dev/null ) </dev/null >/dev/null 2>&1 & \
+                 ) </dev/null >/dev/null 2>&1 &";
            line "dog=$!";
            line "exec 3<&-";
            line "wait \"$child\"";
            line "rc=$?";
            line "kill \"$dog\" 2>/dev/null";
-           (* Leading newline, as in Capture: the command's last line may
-              lack one, and the marker must start its own line. The
-              reader drops the empty line this creates otherwise. *)
            line "printf '\\n%%s %%s\\n' %s \"$rc\"" (quote (exit_tag ^ " " ^ nonce));
            line "exit 0");
         Ok (Buffer.contents b)
@@ -158,7 +214,9 @@ let parse_marker ~nonce line =
   match String.split_on_char ' ' line with
   | [tag; n; value] when String.equal n nonce ->
     if String.equal tag started_tag then
-      (match int_of_string_opt value with Some p -> Started p | None -> Not_marker)
+      (match int_of_string_opt value with
+       | Some p when p > 0 -> Started p
+       | _ -> Not_marker)
     else if String.equal tag exit_tag then
       (match int_of_string_opt value with Some rc -> Exit rc | None -> Not_marker)
     else if String.equal tag error_tag then Remote_error value
