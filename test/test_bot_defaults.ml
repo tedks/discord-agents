@@ -2285,6 +2285,80 @@ let test_session_target () =
     check "writer's session from a forced machine" "error" forced "tower0";
     check "this machine even though listed with ssh" "local" forced "test-host")
 
+(* A remote MCP callback runs on the writer. Even an existing local cwd/file
+   must not be interpreted as the remote session's attachment. Exercise the
+   handler, including routing failures and the successful local upload. *)
+let test_attachment_upload_respects_session_host () =
+  let uploaded = ref [] in
+  let rest_call ~headers:_ ?body meth uri =
+    Alcotest.(check string) "attachment uses POST" "POST"
+      (Http.Method.to_string meth);
+    let channel_id = channel_id_of_create_message_path (Uri.path uri) in
+    let bytes = match body with
+      | None -> Alcotest.fail "missing multipart body"
+      | Some body -> Discord_agents.Discord_rest.read_body body in
+    uploaded := bytes :: !uploaded;
+    response 200 (posted_message_json ~id:"upload-1" ~channel_id ~content:"")
+  in
+  with_test_bot ~rest_call (fun bot ->
+    (* with_test_bot owns and removes this temporary HOME. *)
+    let working_dir = Filename.concat (Sys.getenv "HOME") "worktree" in
+    Unix.mkdir working_dir 0o700;
+    let file = Filename.concat working_dir "report.txt" in
+    Out_channel.with_open_bin file (fun oc ->
+      output_string oc "writer-only attachment bytes");
+    let registry = Discord_agents.Host.registry_of_yojson (Yojson.Safe.from_string
+      {|{"writer":"test-host","executors":{
+        "framework0":{"ssh":"fw0"},
+        "disabled":{"ssh":"offline","enabled":false},
+        "ambiguous.a.example":{"ssh":"a"},
+        "ambiguous.b.example":{"ssh":"b"}}}|}) in
+    let configured = { bot with Discord_agents.Bot.config =
+      { bot.config with hosts = Some registry } } in
+    let invoke bot host path =
+      let session = { (make_session ~working_dir ~thread_id:"4242"
+        Discord_agents.Config.Claude) with host } in
+      Discord_agents.Session_store.add bot.Discord_agents.Bot.sessions
+        ~thread_id:"4242" session;
+      Discord_agents.Control_api.handle_send_attachments bot (Some (`Assoc [
+        (Discord_agents.Control_api.caller_thread_id_param, `String "4242");
+        ("paths", `List [`String path]);
+      ])) in
+    let reject bot host path fragment =
+      let result = invoke bot host path in
+      let open Yojson.Safe.Util in
+      let error = result |> member "error" |> to_string in
+      Alcotest.(check bool) (host ^ ": " ^ error) true
+        (Discord_agents.Resource.contains_substring ~haystack:error ~needle:fragment);
+      Alcotest.(check int) "no Discord upload" 0 (List.length !uploaded) in
+    reject configured "framework0" "report.txt" "sessions on framework0";
+    reject configured "FRAMEWORK0" file "sessions on framework0";
+    (* An unavailable path still yields the host error, before filesystem I/O. *)
+    reject configured "framework0" "does-not-exist" "sessions on framework0";
+    reject configured "disabled" "report.txt" "disabled in config.json";
+    reject configured "unknown" "report.txt" "not a configured host";
+    reject configured "ambiguous" "report.txt" "matches several configured hosts";
+    reject bot "framework0" "report.txt" "not a configured host";
+    let forced = { bot with Discord_agents.Bot.config =
+      { bot.config with hosts = Some (Discord_agents.Host.registry_of_yojson
+        (Yojson.Safe.from_string
+          {|{"writer":"tower0","executors":{"test-host":{"ssh":"th"}}}|})) } } in
+    reject forced "tower0" "report.txt" "has no ssh route";
+    List.iter (fun (bot, host) ->
+      let result = invoke bot host "report.txt" in
+      let open Yojson.Safe.Util in
+      Alcotest.(check bool) ("local upload: " ^ host) true
+        (result |> member "ok" |> to_bool);
+      Alcotest.(check int) "one file" 1
+        (result |> member "file_count" |> to_int)
+    ) [bot, "test-host"; configured, "TEST-HOST";
+       configured, "test-host.lan"; forced, "test-host"];
+    Alcotest.(check int) "only local calls upload" 4 (List.length !uploaded);
+    List.iter (fun bytes ->
+      Alcotest.(check bool) "local bytes preserved" true
+        (Discord_agents.Resource.contains_substring ~haystack:bytes
+          ~needle:"writer-only attachment bytes")) !uploaded)
+
 let () =
   Alcotest.run "bot_defaults" [
     ("session_hosts", [
@@ -2295,6 +2369,8 @@ let () =
       Alcotest.test_case "trigger restart reports refusal" `Quick
         test_trigger_restart_reports_refusal;
       Alcotest.test_case "session target" `Quick test_session_target;
+      Alcotest.test_case "attachments respect session host" `Quick
+        test_attachment_upload_respects_session_host;
     ]);
     ("default agent", [
       Alcotest.test_case "busy control session defers default rotation" `Quick

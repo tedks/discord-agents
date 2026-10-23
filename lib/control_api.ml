@@ -1456,28 +1456,38 @@ let handle_send_attachments (bot : Bot.t) params =
         error_response
           "The calling Discord session is no longer active; retry from an active thread."
       | Some session ->
-        match Eio_unix.run_in_systhread (fun () ->
-          load_attachment_uploads ~working_dir:session.working_dir paths
-        ) with
+        (* The MCP server runs on the writer even when the caller is remote.
+           The same absolute cwd can exist on both hosts with different files.
+           Until uploads read from the executor, reject before any local I/O. *)
+        match Bot.session_target bot session with
         | Error error -> error_response error
-        | Ok files ->
-          match Discord_rest.create_message_with_attachments bot.rest
-            ~channel_id:thread_id ~content ~files () with
-          | Error error ->
-            error_response (Printf.sprintf
-              "Failed to send attachments: %s" error)
-          | Ok message ->
-            let file_count = List.length files in
-            ok_response [
-              ("thread_id", `String thread_id);
-              ("message_id", `String message.id);
-              ("file_count", `Int file_count);
-              ("filenames", `List (List.map (fun file ->
-                `String file.Discord_rest.filename) files));
-              ("message", `String (Printf.sprintf
-                "Sent %d attachment%s to <#%s>."
-                file_count (if file_count = 1 then "" else "s") thread_id));
-            ]
+        | Ok (Agent_process.Remote { host; _ }) ->
+          error_response (Printf.sprintf
+            "send_attachments is not yet supported for sessions on %s; \
+             files must be read on that host." host)
+        | Ok Agent_process.Local ->
+          match Eio_unix.run_in_systhread (fun () ->
+            load_attachment_uploads ~working_dir:session.working_dir paths
+          ) with
+          | Error error -> error_response error
+          | Ok files ->
+            match Discord_rest.create_message_with_attachments bot.rest
+              ~channel_id:thread_id ~content ~files () with
+            | Error error ->
+              error_response (Printf.sprintf
+                "Failed to send attachments: %s" error)
+            | Ok message ->
+              let file_count = List.length files in
+              ok_response [
+                ("thread_id", `String thread_id);
+                ("message_id", `String message.id);
+                ("file_count", `Int file_count);
+                ("filenames", `List (List.map (fun file ->
+                  `String file.Discord_rest.filename) files));
+                ("message", `String (Printf.sprintf
+                  "Sent %d attachment%s to <#%s>."
+                  file_count (if file_count = 1 then "" else "s") thread_id));
+              ]
 
 let handle_restart (bot : Bot.t) =
   match Bot.trigger_restart bot ~notify:(fun msg ->
