@@ -598,6 +598,19 @@ Each one is filed with options, a recommendation, and what it blocks:
   This keeps a writer move from mis-routing old sessions.
 - 2026-10-14: address hosts by SSH destination from config. `.local`
   did not resolve for half the fleet from tower0.
+- 2026-10-22: PR 4 does not persist the remote child in the
+  `active_run` checkpoint. Its only consumer is the startup reaper in
+  PR 9, and a field nothing reads would be dead weight until then.
+  Restart-time cleanup already works through the tracked local ssh pid,
+  which drives the stdin-EOF watchdog.
+- 2026-10-22: live acceptance of PR 4 on framework0 passed:
+  - A Claude turn and a Codex turn each streamed back and called the
+    MCP `list_sessions` tool over reverse SSH to tower0.
+  - Stopping a Claude turn that had backgrounded `sleep 120` left no
+    process behind on framework0.
+  - Gemini fails there: framework0 has Gemini CLI 0.20.2, which
+    predates `--skip-trust`. This is per-host capability evidence for
+    https://github.com/tedks/discord-agents/issues/133.
 - 2026-10-22: operator accepted the design and authorized PRs 2–4.
   Their rulings:
   - **framework0 may keep a resident daemon** for monitoring-type work.
