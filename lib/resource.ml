@@ -478,3 +478,24 @@ let normalize_summary ~max_bytes s =
      [data.decode()] strictly and would raise UnicodeDecodeError.
      Sanitizing here makes the session-listing boundary safe. *)
   truncate_utf8 ~max_bytes (sanitize_utf8 (single_line s))
+
+(** Resolve [name] the way exec does: an implicit name is searched in
+    $PATH, anything else is taken as a path. [Some path] only for an
+    executable regular file. *)
+let executable_in_path name =
+  if Filename.is_implicit name then
+    Sys.getenv_opt "PATH"
+    |> Option.value ~default:""
+    |> String.split_on_char ':'
+    |> List.filter_map (fun dir ->
+      let dir = if dir = "" then "." else dir in
+      let path = Filename.concat dir name in
+      if Sys.file_exists path && not (Sys.is_directory path) then Some path
+      else None)
+    |> List.find_opt (fun path ->
+      try Unix.access path [Unix.X_OK]; true
+      with Unix.Unix_error _ -> false)
+  else if Sys.file_exists name && not (Sys.is_directory name) then
+    (try Unix.access name [Unix.X_OK]; Some name with Unix.Unix_error _ -> None)
+  else
+    None
