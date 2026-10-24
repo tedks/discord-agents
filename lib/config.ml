@@ -6,6 +6,7 @@ type agent_kind =
   | Claude
   | Codex
   | Gemini
+  | Agy
 [@@deriving show, eq]
 
 type reasoning_effort =
@@ -20,12 +21,14 @@ let agent_kind_of_string = function
   | "claude" -> Ok Claude
   | "codex" -> Ok Codex
   | "gemini" -> Ok Gemini
+  | "agy" -> Ok Agy
   | s -> Error (Printf.sprintf "unknown agent kind: %s" s)
 
 let string_of_agent_kind = function
   | Claude -> "claude"
   | Codex -> "codex"
   | Gemini -> "gemini"
+  | Agy -> "agy"
 
 let reasoning_effort_of_string = function
   | "low" -> Ok Low
@@ -55,7 +58,7 @@ let yojson_of_reasoning_effort effort =
 let reasoning_efforts_for_agent = function
   | Claude -> [Low; Medium; High; Xhigh; Max]
   | Codex -> [Low; Medium; High; Xhigh]
-  | Gemini -> []
+  | Gemini | Agy -> []
 
 let reasoning_effort_strings_for_agent agent =
   List.map string_of_reasoning_effort (reasoning_efforts_for_agent agent)
@@ -67,6 +70,8 @@ let unsupported_reasoning_effort_message agent effort =
   match agent, effort with
   | Gemini, _ ->
     "Gemini CLI does not expose a reasoning effort flag in this integration."
+  | Agy, _ ->
+    "agy (Antigravity CLI) does not expose a reasoning effort flag."
   | Codex, Max ->
     "Codex reasoning effort does not support max; max is Claude-only."
   | _ ->
@@ -86,7 +91,7 @@ let validate_reasoning_effort_for_agent agent effort =
 let preferred_agent_order preferred =
   preferred
   :: List.filter (fun kind -> not (equal_agent_kind kind preferred))
-       [Claude; Codex; Gemini]
+       [Claude; Codex; Agy; Gemini]
 
 let find_with_preferred_agent preferred f =
   let rec first_found = function
@@ -100,7 +105,8 @@ let find_with_preferred_agent preferred f =
 
 (** Whether this agent accepts a caller-supplied session id at startup
     (Claude's [--session-id]) or allocates its own server-side and
-    emits it on first run (Codex's [thread.started], Gemini's [init]).
+    emits it on first run (Codex's [thread.started], Gemini's [init],
+    agy's [result.conversation_id]).
 
     This remains the compatibility default for persisted sessions
     written before [Session_store.session_id_confirmed] existed.
@@ -108,7 +114,7 @@ let find_with_preferred_agent preferred f =
     process spawn or server-side id event is durably recorded. *)
 let caller_pinned_session_id = function
   | Claude -> true
-  | Codex | Gemini -> false
+  | Codex | Gemini | Agy -> false
 
 let agent_kind_of_yojson = function
   | `String s ->

@@ -812,6 +812,8 @@ let handle_resume_session (bot : Bot.t) params =
         | Config.Claude -> try_claude ()
         | Config.Codex -> try_codex ()
         | Config.Gemini -> try_gemini ()
+        (* No agy session store yet; see Bot's resume handler. *)
+        | Config.Agy -> None
       in
       let found = match kind with
         | Some k -> try_kind k
@@ -1041,6 +1043,9 @@ let login_help_json ~host agent =
     | Config.Gemini ->
       "export GEMINI_API_KEY=<key>",
       "Gemini support is unmaintained: Google no longer offers the consumer OAuth sign-in Gemini CLI used, so only API-key auth works. Export GEMINI_API_KEY in the environment that starts discord-agents there, then restart the bot."
+    | Config.Agy ->
+      "agy",
+      "Run `agy` interactively in a terminal there and complete the Google sign-in it prompts for. agy has no separate login subcommand; a signed-out headless run waits about 60 seconds for an authorization code and then fails."
   in
   `Assoc [
     ("agent", `String (Config.string_of_agent_kind agent));
@@ -1064,7 +1069,7 @@ let effort_notes agent =
 let configuration_options_json agent =
   `Assoc [
     ("agent_kind", `Assoc [
-      ("values", string_list_json ["claude"; "codex"; "gemini"]);
+      ("values", string_list_json ["claude"; "codex"; "gemini"; "agy"]);
       ("current_thread_value", `String (Config.string_of_agent_kind agent));
       ("mutable_for_current_session", `Bool false);
       ("set_with", `String "start_session agent for new sessions, or Discord session-agent outside this MCP config surface");
@@ -1099,7 +1104,7 @@ let configuration_options_json agent =
     ]);
     ("login", `Assoc [
       ("repair_tool", `String "start_login_flow");
-      ("agent_values", string_list_json ["claude"; "codex"; "gemini"]);
+      ("agent_values", string_list_json ["claude"; "codex"; "gemini"; "agy"]);
     ]);
   ]
 

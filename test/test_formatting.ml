@@ -2143,6 +2143,12 @@ let test_resume_not_found_codex_uniform () =
 let test_resume_not_found_gemini_includes_sid () =
   test_resume_not_found_names_kind_and_sid Discord_agents.Config.Gemini "gemini"
 
+let test_resume_not_found_agy_says_unimplemented () =
+  (* agy has no session store yet; the message must not read as a
+     wrong id. *)
+  test_resume_not_found_names_kind_and_sid Discord_agents.Config.Agy
+    "not implemented"
+
 (* A command the test supplies rather than one it looks up: these
    assertions are about the merge, not about where the executable
    happens to live in this build. *)
@@ -3316,6 +3322,8 @@ let resume_helpers_tests = [
     test_resume_not_found_codex_uniform;
   Alcotest.test_case "Gemini resume error names kind+sid" `Quick
     test_resume_not_found_gemini_includes_sid;
+  Alcotest.test_case "agy resume says discovery is unimplemented" `Quick
+    test_resume_not_found_agy_says_unimplemented;
   Alcotest.test_case "merge_gemini_settings preserves other servers" `Quick
     test_merge_gemini_settings_preserves_other_servers;
   Alcotest.test_case "merge_gemini_settings overwrites our stale entry" `Quick
@@ -3932,6 +3940,165 @@ let gemini_args_tests = [
   Alcotest.test_case "model override" `Quick test_gemini_args_model_override;
 ]
 
+(* ── agy (Antigravity CLI) ─────────────────────────────────────────── *)
+
+(* Render events so failures show what the parser produced. Only the
+   constructors the agy parser can emit get detail. *)
+let agy_event_to_string = function
+  | Discord_agents.Agent_process.Text_delta s -> "text:" ^ s
+  | Result { session_id; _ } ->
+    "result:" ^ Option.value session_id ~default:"<none>"
+  | Error e -> "error:" ^ e
+  | Other _ -> "other"
+  | Tool_use _ -> "tool_use"
+  | Tool_result _ -> "tool_result"
+
+let parse_agy line =
+  List.map agy_event_to_string
+    (Discord_agents.Agent_process.parse_agy_stream_json_line line)
+
+(* The exact line agy 1.1.3 emitted on tower0 when signed out
+   (docs/agy-harness.md). *)
+let agy_signed_out_result =
+  {|{"event":"result","result":{"conversation_id":"","status":"ERROR","response":"","error":"authentication failed or timed out","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"total_tokens":0}}}|}
+
+let test_agy_signed_out_result () =
+  Alcotest.(check (list string))
+    "error surfaces; empty conversation_id is no id"
+    ["error:agy: authentication failed or timed out"; "result:<none>"]
+    (parse_agy agy_signed_out_result)
+
+let test_agy_success_result () =
+  let line = {|{"event":"result","result":{"conversation_id":"c0ffee","status":"SUCCESS","response":"done","error":""}}|} in
+  Alcotest.(check (list string))
+    "response is delivered as text, then a flushing result with the id"
+    ["text:done"; "result:c0ffee"]
+    (parse_agy line)
+
+let test_agy_error_status_without_message () =
+  let line = {|{"event":"result","result":{"conversation_id":"c1","status":"error","response":"partial"}}|} in
+  Alcotest.(check (list string))
+    "ERROR status alone is still an error; partial text kept"
+    ["text:partial"; "error:agy: run ended with status ERROR"; "result:c1"]
+    (parse_agy line)
+
+let test_agy_missing_status_is_error () =
+  let line = {|{"event":"result","result":{"conversation_id":"c2","response":"hi"}}|} in
+  Alcotest.(check (list string)) "no status is reported, not a silent success"
+    ["text:hi"; "error:agy: result event has no status"; "result:c2"]
+    (parse_agy line)
+
+let test_agy_unknown_status_not_failed () =
+  (* The success value is unobserved; an unfamiliar status must not
+     turn a real reply into a failure. *)
+  let line = {|{"event":"result","result":{"conversation_id":"c3","status":"DONE","response":"ok"}}|} in
+  Alcotest.(check (list string)) "text and id, no error"
+    ["text:ok"; "result:c3"] (parse_agy line)
+
+let test_agy_unverified_events_pass_through () =
+  (* Event shapes we have not captured must not be guessed at. *)
+  List.iter (fun line ->
+    Alcotest.(check (list string)) line ["other"] (parse_agy line))
+    [ {|{"event":"init","conversation_id":"x"}|};
+      {|{"type":"result","result":"claude-shaped"}|};
+      {|{"event":"result"|};
+      "not json" ]
+
+let test_agy_result_not_an_object () =
+  (* Yojson's member raises on non-objects; the parser must not. *)
+  Alcotest.(check (list string)) "scalar result is Other"
+    ["other"] (parse_agy {|{"event":"result","result":"oops"}|})
+
+let agy_args ?(model = None) ~session_id ~session_id_confirmed prompt =
+  Discord_agents.Agent_process.agy_args
+    ~model ~session_id ~session_id_confirmed ~prompt
+
+let agy_fixed_flags =
+  ["--output-format"; "stream-json"; "--dangerously-skip-permissions";
+   "--print-timeout"; Discord_agents.Agent_process.agy_print_timeout]
+
+let test_agy_args_fresh () =
+  Alcotest.(check (list string)) "fresh run has no --conversation"
+    (["agy"; "-p"; "hello"] @ agy_fixed_flags)
+    (agy_args ~session_id:"placeholder" ~session_id_confirmed:false "hello")
+
+let test_agy_args_resume () =
+  Alcotest.(check (list string)) "confirmed id resumes with --conversation"
+    (["agy"; "-p"; "go on"] @ agy_fixed_flags @ ["--conversation"; "c0ffee"])
+    (agy_args ~session_id:"c0ffee" ~session_id_confirmed:true "go on")
+
+let test_agy_args_dash_prompt () =
+  (* Verified against agy 1.1.3: the argument after -p is taken as the
+     prompt even when it starts with a dash. *)
+  let args = agy_args ~session_id:"x" ~session_id_confirmed:false "--help me" in
+  Alcotest.(check (list string)) "prompt is the -p value"
+    ["agy"; "-p"; "--help me"]
+    (List.filteri (fun i _ -> i < 3) args)
+
+let test_agy_args_model () =
+  let args = agy_args ~model:(Some " gemini-3-pro ")
+      ~session_id:"x" ~session_id_confirmed:false "hi" in
+  Alcotest.(check bool) "trimmed --model present" true
+    (contains_pair args "--model" "gemini-3-pro")
+
+let test_agy_print_timeout_exceeds_default () =
+  (* agy's own default is 5m, too short for real turns. *)
+  let secs = Discord_agents.Agent_process.agy_print_timeout_seconds in
+  Alcotest.(check bool) "well above agy's 5m default" true (secs > 60 * 60);
+  Alcotest.(check string) "rendered as a Go duration"
+    (Printf.sprintf "%ds" secs)
+    Discord_agents.Agent_process.agy_print_timeout
+
+let test_agy_prompt_gets_inline_context () =
+  let out = Discord_agents.Agent_process.compose_session_prompt
+    ~agent_kind:Discord_agents.Config.Agy
+    ~system_prompt:(Some "you are a lead") ~message_count:0
+    ~goal_context:None ~user_prompt:"hi" in
+  Alcotest.(check string)
+    "first turn carries <bot-context> plus the no-MCP notice"
+    (Printf.sprintf "<bot-context>\nyou are a lead\n\n%s\n</bot-context>\n\nhi"
+       Discord_agents.Agent_process.agy_no_mcp_notice)
+    out;
+  (* Pin the meaning too, so an emptied notice can't pass. *)
+  Alcotest.(check bool) "notice says the MCP tools are unavailable" true
+    (try
+       ignore (Str.search_forward
+                 (Str.regexp_string "None of the MCP tools listed above are available")
+                 out 0);
+       true
+     with Not_found -> false)
+
+let test_agy_later_turn_has_no_context () =
+  let out = Discord_agents.Agent_process.compose_session_prompt
+    ~agent_kind:Discord_agents.Config.Agy
+    ~system_prompt:(Some "you are a lead") ~message_count:3
+    ~goal_context:None ~user_prompt:"hi" in
+  Alcotest.(check string) "history carries it; prompt passes through" "hi" out
+
+let agy_tests = [
+  Alcotest.test_case "signed-out result" `Quick test_agy_signed_out_result;
+  Alcotest.test_case "success result" `Quick test_agy_success_result;
+  Alcotest.test_case "ERROR status without message" `Quick
+    test_agy_error_status_without_message;
+  Alcotest.test_case "unverified events pass through" `Quick
+    test_agy_unverified_events_pass_through;
+  Alcotest.test_case "non-object result" `Quick test_agy_result_not_an_object;
+  Alcotest.test_case "missing status is an error" `Quick
+    test_agy_missing_status_is_error;
+  Alcotest.test_case "unknown status is not a failure" `Quick
+    test_agy_unknown_status_not_failed;
+  Alcotest.test_case "later turn passes through" `Quick
+    test_agy_later_turn_has_no_context;
+  Alcotest.test_case "fresh args" `Quick test_agy_args_fresh;
+  Alcotest.test_case "resume args" `Quick test_agy_args_resume;
+  Alcotest.test_case "dash-prefixed prompt" `Quick test_agy_args_dash_prompt;
+  Alcotest.test_case "model override" `Quick test_agy_args_model;
+  Alcotest.test_case "print timeout above default" `Quick
+    test_agy_print_timeout_exceeds_default;
+  Alcotest.test_case "first turn inlines system prompt" `Quick
+    test_agy_prompt_gets_inline_context;
+]
+
 (* ── caller_pinned_session_id ─────────────────────────────────────── *)
 
 let test_caller_pinned_claude () =
@@ -3946,10 +4113,15 @@ let test_caller_pinned_gemini () =
   Alcotest.(check bool) "Gemini allocates server-side"
     false (Discord_agents.Config.caller_pinned_session_id Discord_agents.Config.Gemini)
 
+let test_caller_pinned_agy () =
+  Alcotest.(check bool) "agy allocates server-side"
+    false (Discord_agents.Config.caller_pinned_session_id Discord_agents.Config.Agy)
+
 let caller_pinned_tests = [
   Alcotest.test_case "Claude is caller-pinned" `Quick test_caller_pinned_claude;
   Alcotest.test_case "Codex is server-allocated" `Quick test_caller_pinned_codex;
   Alcotest.test_case "Gemini is server-allocated" `Quick test_caller_pinned_gemini;
+  Alcotest.test_case "agy is server-allocated" `Quick test_caller_pinned_agy;
 ]
 
 (* ── runner ──────────────────────────────────────────────────────── *)
@@ -3973,6 +4145,7 @@ let () =
     "prompt_helpers", prompt_helpers_tests;
     "gemini_json", gemini_json_tests;
     "gemini_args", gemini_args_tests;
+    "agy", agy_tests;
     "caller_pinned", caller_pinned_tests;
     "session_store", session_store_tests;
     "resume_helpers", resume_helpers_tests;

@@ -1178,6 +1178,61 @@ let parse_gemini_stream_json_line line =
     | _ -> [Other line]
   with _ -> [Other line]
 
+(* ── agy (Antigravity CLI) JSON parser ─────────────────────────────
+
+   agy's [--output-format stream-json] is undocumented in [--help] but
+   accepted by its flag parser; see docs/agy-harness.md. Events are
+   discriminated by a top-level [event] field, not [type]. The only
+   shape verified so far is the terminal one:
+
+     {"event":"result","result":{"conversation_id":"…","status":"…",
+      "response":"…","error":"…", …}}
+
+   agy also has init/text-delta/tool step events, but their wire
+   shapes have not been captured yet, so they pass through as [Other]
+   rather than being guessed at. Until they are parsed, the final
+   [response] is the only text the user sees, delivered as one
+   [Text_delta]. Once text deltas are parsed, drop that delta or the
+   reply will appear twice.
+
+   An empty [conversation_id] (agy emits one when it fails before a
+   conversation exists, e.g. signed out) is treated as no id, so the
+   session stays unconfirmed and the next turn starts fresh. *)
+
+let parse_agy_stream_json_line line =
+  try
+    let json = Yojson.Safe.from_string line in
+    match get_string_opt "event" json with
+    | Some "result" ->
+      let result = Yojson.Safe.Util.member "result" json in
+      let session_id =
+        match get_string_opt "conversation_id" result with
+        | Some id when String.trim id <> "" -> Some id
+        | _ -> None
+      in
+      let response = get_string ~default:"" "response" result in
+      let status = get_string ~default:"" "status" result in
+      let error = get_string ~default:"" "error" result in
+      let text = if response = "" then [] else [Text_delta response] in
+      (* agy's success status value hasn't been observed yet, so an
+         unfamiliar non-empty status is logged, not failed. A result
+         with no status at all doesn't match any shape we've seen and
+         is reported, rather than passed off as a silent success.
+         The "SUCCESS" arm is a guess that only keeps the log quiet. *)
+      let err =
+        match String.uppercase_ascii (String.trim status), error with
+        | _, e when String.trim e <> "" -> [Error ("agy: " ^ e)]
+        | "ERROR", _ -> [Error "agy: run ended with status ERROR"]
+        | "", _ -> [Error "agy: result event has no status"]
+        | "SUCCESS", _ -> []
+        | other, _ ->
+          Logs.info (fun m -> m "agy: unrecognized result status %S" other);
+          []
+      in
+      text @ err @ [Result { text = ""; session_id }]
+    | _ -> [Other line]
+  with _ -> [Other line]
+
 (** Build the command args for an agent invocation. *)
 let model_arg = function
   | Some model when String.trim model <> "" -> ["--model"; String.trim model]
@@ -1497,7 +1552,8 @@ let run_with_claude_session_recovery
                retry_flag retry_error))
         | None -> Result.Error error)
      | Config.Codex
-     | Config.Gemini -> Result.Error error)
+     | Config.Gemini
+     | Config.Agy -> Result.Error error)
   | Result.Ok () -> Result.Ok ()
 
 (** Claude: write the MCP config to a well-known location and return
@@ -1850,6 +1906,33 @@ let gemini_args ~model ~session_id ~session_id_confirmed ~prompt =
   if not session_id_confirmed then base
   else base @ ["--resume"; session_id]
 
+(** agy's print mode gives up after [--print-timeout], 5 minutes by
+    default, which real agent turns routinely exceed. Pass a ceiling
+    long enough that only a genuinely stuck run hits it; the bot's own
+    stop/interrupt paths remain the normal way to end a turn. *)
+let agy_print_timeout_seconds = 12 * 60 * 60
+let agy_print_timeout = Printf.sprintf "%ds" agy_print_timeout_seconds
+
+(** agy allocates its conversation id server-side and reports it in
+    the terminal [result] event; we resume with [--conversation] only
+    once that id is confirmed, the same coherence contract as Codex
+    and Gemini. [--dangerously-skip-permissions] is required because
+    headless print mode auto-denies any tool that would need approval;
+    it is the agy counterpart of Codex's
+    [--dangerously-bypass-approvals-and-sandbox] under the bot's
+    single-tenant trust model.
+
+    MCP is not wired for agy yet: the per-worktree route
+    ([.agents/plugins]) is unverified, and the user-global
+    [~/.gemini/config/mcp_config.json] is deliberately not touched. *)
+let agy_args ~model ~session_id ~session_id_confirmed ~prompt =
+  let base = ["agy"; "-p"; prompt; "--output-format"; "stream-json";
+              "--dangerously-skip-permissions";
+              "--print-timeout"; agy_print_timeout]
+             @ model_arg model in
+  if not session_id_confirmed then base
+  else base @ ["--conversation"; session_id]
+
 let executable_in_path = Resource.executable_in_path
 
 let setsid_command () =
@@ -2022,6 +2105,13 @@ let escape_prompt_block text =
   ) text;
   Buffer.contents b
 
+let agy_no_mcp_notice =
+  "NOTE: this session runs on agy, which is not yet connected to the \
+   discord-agents MCP server. None of the MCP tools listed above are \
+   available. Do not attempt them or report their results; tell the \
+   user what you would have done and suggest a Claude or Codex session \
+   for orchestration."
+
 (** Compose the per-turn prompt sent to a non-Claude agent, prepending
     the session's system prompt on the first turn so MCP-aware agents
     know what tools they have. Claude takes [--append-system-prompt]
@@ -2035,7 +2125,7 @@ let compose_session_prompt ~agent_kind ~system_prompt ~message_count
   let needs_inline =
     message_count = 0
     && (match agent_kind with
-        | Config.Codex | Config.Gemini -> true
+        | Config.Codex | Config.Gemini | Config.Agy -> true
         | Config.Claude -> false)
   in
   let user_prompt = match goal_context, agent_kind with
@@ -2043,6 +2133,14 @@ let compose_session_prompt ~agent_kind ~system_prompt ~message_count
       Printf.sprintf "<codex-goal>\n%s\n</codex-goal>\n\n%s"
         (escape_prompt_block goal) user_prompt
     | _ -> user_prompt
+  in
+  (* agy is started without the discord-agents MCP server (see
+     [agy_args]), but channel system prompts list those tools. Say so,
+     or a control agent under agy would try tools it doesn't have. *)
+  let system_prompt = match system_prompt, agent_kind with
+    | Some sp, Config.Agy ->
+      Some (sp ^ "\n\n" ^ agy_no_mcp_notice)
+    | _ -> system_prompt
   in
   match system_prompt with
   | Some sp when needs_inline ->
@@ -2096,7 +2194,7 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
       (match remote_mcp with
        | Some (command, args) -> ["--mcp-config"; mcp_json ~args ~command ()]
        | None -> [])
-    | (Config.Codex | Config.Gemini), _ -> []
+    | (Config.Codex | Config.Gemini | Config.Agy), _ -> []
   in
   let codex_mcp_overrides =
     match target, remote_mcp with
@@ -2112,7 +2210,8 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
        { (Host.local_host host) with Host.transport = Host.Ssh destination } in
      Eio_unix.run_in_systhread (fun () ->
        setup_gemini_mcp_remote ?ssh ~host ~working_dir ~mcp:remote_mcp ())
-   | (Config.Claude | Config.Codex), _ -> ());
+   (* agy: no per-worktree MCP route exists; see [agy_args]. *)
+   | (Config.Claude | Config.Codex | Config.Agy), _ -> ());
   let command_args ~session_id_confirmed =
     let agent_args = match kind with
       | Config.Claude ->
@@ -2136,6 +2235,8 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
           ~session_id ~session_id_confirmed ~prompt ()
       | Config.Gemini ->
         gemini_args ~model ~session_id ~session_id_confirmed ~prompt
+      | Config.Agy ->
+        agy_args ~model ~session_id ~session_id_confirmed ~prompt
     in
     match target with
     | Local -> [setsid_command (); "--wait"] @ agent_args
@@ -2148,7 +2249,8 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
       List.iter on_event (match kind with
         | Config.Claude -> parse_stream_json_line line
         | Config.Codex -> parse_codex_json_line line
-        | Config.Gemini -> parse_gemini_stream_json_line line)
+        | Config.Gemini -> parse_gemini_stream_json_line line
+        | Config.Agy -> parse_agy_stream_json_line line)
   in
   (* A remote turn: the local ssh is the tracked child (in its own
      process group, like a local agent), so stop, restart and startup
@@ -2173,8 +2275,25 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
     try
       let stderr_r, stderr_w = Eio.Process.pipe ~sw mgr in
       try
-        let proc = Eio.Process.spawn ~sw mgr ~cwd ~env:child_env
-          ~stdout:stdout_w ~stderr:stderr_w args in
+        (* A signed-out agy prompts for an authorization code on stdin
+           for up to a minute. With an inherited stdin it would read the
+           bot's terminal (the foreground tmux pane under run-branch.sh),
+           so give it /dev/null, as remote turns already get from the
+           executor wrapper. The child holds its own copy; ours is
+           closed as soon as the spawn returns. *)
+        let stdin =
+          match kind with
+          | Config.Agy ->
+            Some (Eio.Path.open_in ~sw Eio.Path.(fs / "/dev/null"))
+          | Config.Claude | Config.Codex | Config.Gemini -> None
+        in
+        let proc =
+          Fun.protect
+            ~finally:(fun () -> Option.iter close_noerr stdin)
+            (fun () ->
+               Eio.Process.spawn ~sw mgr ~cwd ~env:child_env ?stdin
+                 ~stdout:stdout_w ~stderr:stderr_w args)
+        in
         (* Close write ends so reads get EOF when process exits. Do this before
            callbacks so callback failures cannot strand pipe writers on [sw]. *)
         Eio.Resource.close stdout_w;
@@ -2208,6 +2327,7 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
                      | Config.Claude -> parse_stream_json_line line
                      | Config.Codex -> parse_codex_json_line line
                      | Config.Gemini -> parse_gemini_stream_json_line line
+                     | Config.Agy -> parse_agy_stream_json_line line
                    in
                    List.iter on_event events
                  end

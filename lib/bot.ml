@@ -1117,7 +1117,8 @@ let fork_session_context_to_thread t (session : Session_store.session)
     match session.agent_kind with
     | Config.Claude -> Some session.session_id
     | Config.Codex
-    | Config.Gemini -> None
+    | Config.Gemini
+    | Config.Agy -> None
   in
   let forked_session =
     {
@@ -1752,10 +1753,16 @@ let format_session_listing
       label (String.concat "\n" lines) resume_hint
 
 (** Build the user-facing "session not found" error for the Resume
-    handlers (Discord command, MCP tool). All three agents now have
-    discoverable session stores, so the message is uniform. *)
+    handlers (Discord command, MCP tool). Claude, Codex and Gemini have
+    discoverable session stores; agy does not yet, so an explicit agy
+    lookup says that rather than implying the id was wrong. *)
 let resume_not_found_message ~kind ~sid_prefix =
   match kind with
+  | Some Config.Agy ->
+    Printf.sprintf
+      "Cannot look up agy session %S: agy session discovery is not \
+       implemented yet. An agy session can still be continued in its \
+       own Discord thread." sid_prefix
   | Some k ->
     Printf.sprintf "No %s session matching %S."
       (Config.string_of_agent_kind k) sid_prefix
@@ -2158,6 +2165,10 @@ let handle_command t msg cmd =
         | Config.Claude -> try_claude ()
         | Config.Codex -> try_codex ()
         | Config.Gemini -> try_gemini ()
+        (* agy's on-disk conversation format hasn't been captured yet
+           (docs/agy-harness.md), so there is no store to search; an
+           agy session can still be resumed from its own thread. *)
+        | Config.Agy -> None
       in
       (* Explicit kind hits exactly one store; otherwise try the current
          effective top-level agent first, then the remaining stores. *)
