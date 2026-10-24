@@ -451,6 +451,13 @@ let format_list_gemini_sessions response =
     ~with_working_dir:true
     response
 
+let format_list_agy_sessions response =
+  format_recent_sessions
+    ~empty_message:"No recent agy sessions found."
+    ~footer:"Use resume_session with kind=agy to attach."
+    ~with_working_dir:true
+    response
+
 (* [Config.string_of_agent_kind] is the only real source of [agent_kind],
    so ASCII case mapping is enough — but Python's [str.capitalize()] is
    Unicode-aware, so a non-ASCII kind would diverge. The [lowercase]

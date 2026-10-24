@@ -268,6 +268,20 @@ TOOLS = [
         }
     },
     {
+        "name": "list_agy_sessions",
+        "description": "List recent agy (Antigravity CLI) conversations on this machine (last 24h). Useful for finding sessions to resume. A conversation shows a working directory only while it is the latest one for that directory; others are listed but can't be resumed by id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "hours": {
+                    "type": "integer",
+                    "description": "How many hours back to search",
+                    "default": 24
+                }
+            }
+        }
+    },
+    {
         "name": "default_agent",
         "description": "Show or set the default agent used for new top-level sessions. Existing idle top-level sessions reset to a fresh session immediately; busy ones reset after their queued work finishes.",
         "inputSchema": {
@@ -396,7 +410,7 @@ TOOLS = [
     },
     {
         "name": "resume_session",
-        "description": "Resume an existing Claude, Codex, or Gemini session in a new Discord thread (agy session discovery is not implemented yet). Use list_claude_sessions / list_codex_sessions / list_gemini_sessions to find a session ID. With kind unspecified, the bot tries the current effective top-level agent first, then the others.",
+        "description": "Resume an existing Claude, Codex, Gemini, or agy session in a new Discord thread. Use list_claude_sessions / list_codex_sessions / list_gemini_sessions / list_agy_sessions to find a session ID. With kind unspecified, the bot tries the current effective top-level agent first, then the others.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -571,6 +585,22 @@ def handle_tool_call(name, arguments):
             wd = s.get("working_dir", "") or "(unknown project)"
             lines.append(f"- `{s['session_id_short']}` {age_str} — {wd} — {summary}")
         return "\n".join(lines) + "\n\nUse resume_session with kind=gemini to attach."
+
+    elif name == "list_agy_sessions":
+        result = control_request("list_agy_sessions", arguments)
+        if "error" in result:
+            return result["error"]
+        sessions = result.get("sessions", [])
+        if not sessions:
+            return "No recent agy sessions found."
+        lines = []
+        for s in sessions:
+            age = s.get("age_minutes", 0)
+            age_str = f"{age}m ago" if age < 60 else f"{age // 60}h ago"
+            summary = s.get("summary", "(no summary)")
+            wd = s.get("working_dir", "") or "(unknown project)"
+            lines.append(f"- `{s['session_id_short']}` {age_str} — {wd} — {summary}")
+        return "\n".join(lines) + "\n\nUse resume_session with kind=agy to attach."
 
     elif name == "start_session":
         result = control_request("start_session", arguments, timeout=120)

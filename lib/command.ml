@@ -9,6 +9,7 @@ type t =
   | List_claude_sessions
   | List_codex_sessions
   | List_gemini_sessions
+  | List_agy_sessions
   | Start_agent of { project : string; kind : Config.agent_kind option }
   (** [kind = None] means use the current effective top-level agent. *)
   | Import_project of { url : string; name : string option }
@@ -40,6 +41,7 @@ type id =
   | List_claude_sessions_id
   | List_codex_sessions_id
   | List_gemini_sessions_id
+  | List_agy_sessions_id
   | Start_agent_id
   | Import_project_id
   | Resume_session_id
@@ -82,6 +84,7 @@ let id_of = function
   | List_claude_sessions -> List_claude_sessions_id
   | List_codex_sessions -> List_codex_sessions_id
   | List_gemini_sessions -> List_gemini_sessions_id
+  | List_agy_sessions -> List_agy_sessions_id
   | Start_agent _ -> Start_agent_id
   | Import_project _ -> Import_project_id
   | Resume_session _ -> Resume_session_id
@@ -111,6 +114,7 @@ let string_of_id = function
   | List_claude_sessions_id -> "list_claude_sessions"
   | List_codex_sessions_id -> "list_codex_sessions"
   | List_gemini_sessions_id -> "list_gemini_sessions"
+  | List_agy_sessions_id -> "list_agy_sessions"
   | Start_agent_id -> "start_agent"
   | Import_project_id -> "import_project"
   | Resume_session_id -> "resume_session"
@@ -162,6 +166,9 @@ let all_specs = [
   read_only ~id:List_gemini_sessions_id ~primary:"gemini-sessions"
     ~help:["`!gemini-sessions` — list recent Gemini sessions (unmaintained)"]
     ~no_arg_command:List_gemini_sessions ();
+  read_only ~id:List_agy_sessions_id ~primary:"agy-sessions"
+    ~help:["`!agy-sessions` — list recent agy (Antigravity CLI) conversations"]
+    ~no_arg_command:List_agy_sessions ();
   mutating ~id:Start_agent_id ~primary:"start"
     ~help:[
       "`!start <project> [agent]` — start a session (defaults to the current effective top-level agent)";

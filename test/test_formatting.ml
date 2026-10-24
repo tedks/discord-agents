@@ -863,6 +863,7 @@ let cmd_testable =
       | List_claude_sessions -> "List_claude_sessions"
       | List_codex_sessions -> "List_codex_sessions"
       | List_gemini_sessions -> "List_gemini_sessions"
+      | List_agy_sessions -> "List_agy_sessions"
       | Start_agent { project; kind = None } ->
         "Start_agent(" ^ project ^ ")"
       | Start_agent { project; kind = Some k } ->
@@ -1078,6 +1079,11 @@ let test_parse_gemini_sessions () =
     Discord_agents.Command.List_gemini_sessions
     (Discord_agents.Command.parse "!gemini-sessions")
 
+let test_parse_agy_sessions () =
+  Alcotest.(check cmd_testable) "agy-sessions"
+    Discord_agents.Command.List_agy_sessions
+    (Discord_agents.Command.parse "!agy-sessions")
+
 let test_parse_start_gemini () =
   Alcotest.(check cmd_testable) "start project gemini"
     (Discord_agents.Command.Start_agent
@@ -1226,6 +1232,7 @@ let command_tests = [
   Alcotest.test_case "reset rejects args" `Quick test_parse_reset_rejects_args;
   Alcotest.test_case "codex-sessions" `Quick test_parse_codex_sessions;
   Alcotest.test_case "gemini-sessions" `Quick test_parse_gemini_sessions;
+  Alcotest.test_case "agy-sessions" `Quick test_parse_agy_sessions;
   Alcotest.test_case "resume with codex kind" `Quick test_parse_resume_with_codex_kind;
   Alcotest.test_case "start with gemini kind" `Quick test_parse_start_gemini;
   Alcotest.test_case "start with default agent" `Quick test_parse_start_default_agent;
@@ -2143,11 +2150,8 @@ let test_resume_not_found_codex_uniform () =
 let test_resume_not_found_gemini_includes_sid () =
   test_resume_not_found_names_kind_and_sid Discord_agents.Config.Gemini "gemini"
 
-let test_resume_not_found_agy_says_unimplemented () =
-  (* agy has no session store yet; the message must not read as a
-     wrong id. *)
-  test_resume_not_found_names_kind_and_sid Discord_agents.Config.Agy
-    "not implemented"
+let test_resume_not_found_agy_uniform () =
+  test_resume_not_found_names_kind_and_sid Discord_agents.Config.Agy "agy"
 
 (* A command the test supplies rather than one it looks up: these
    assertions are about the merge, not about where the executable
@@ -3322,8 +3326,8 @@ let resume_helpers_tests = [
     test_resume_not_found_codex_uniform;
   Alcotest.test_case "Gemini resume error names kind+sid" `Quick
     test_resume_not_found_gemini_includes_sid;
-  Alcotest.test_case "agy resume says discovery is unimplemented" `Quick
-    test_resume_not_found_agy_says_unimplemented;
+  Alcotest.test_case "agy resume error names kind+sid" `Quick
+    test_resume_not_found_agy_uniform;
   Alcotest.test_case "merge_gemini_settings preserves other servers" `Quick
     test_merge_gemini_settings_preserves_other_servers;
   Alcotest.test_case "merge_gemini_settings overwrites our stale entry" `Quick
@@ -3999,10 +4003,147 @@ let test_agy_unverified_events_pass_through () =
   (* Event shapes we have not captured must not be guessed at. *)
   List.iter (fun line ->
     Alcotest.(check (list string)) line ["other"] (parse_agy line))
-    [ {|{"event":"init","conversation_id":"x"}|};
+    [ {|{"event":"step_update","step_update":{"conversation_id":"x","step_index":2,"state":"DONE","step_type":"agent_response"}}|};
+      {|{"event":"init","conversation_id":"","init":{}}|};
       {|{"type":"result","result":"claude-shaped"}|};
       {|{"event":"result"|};
       "not json" ]
+
+let test_agy_init_reports_id () =
+  (* Captured shape (agy 1.1.3, signed in), trimmed. *)
+  let line = {|{"event":"init","conversation_id":"b94541d7-80d9-4417-9b1e-96b807826bde","init":{"cwd":"/tmp/x","tools":["run_command","view_file"],"permission_mode":"always-proceed"}}|} in
+  Alcotest.(check (list string)) "init id reported for resume"
+    ["result:b94541d7-80d9-4417-9b1e-96b807826bde"] (parse_agy line)
+
+let agy_guarded ~requested lines =
+  let guard = Discord_agents.Agent_process.agy_resume_guard ~requested in
+  List.concat_map (fun l ->
+    List.map agy_event_to_string
+      (guard (Discord_agents.Agent_process.parse_agy_stream_json_line l)))
+    lines
+
+let agy_init id =
+  Printf.sprintf {|{"event":"init","conversation_id":"%s","init":{}}|} id
+let agy_result id =
+  Printf.sprintf {|{"event":"result","result":{"conversation_id":"%s","status":"ERROR","error":"quota"}}|} id
+
+let test_agy_resume_guard_same_id () =
+  Alcotest.(check (list string)) "resumed id: no notice"
+    ["result:c1"; "error:agy: quota"; "result:c1"]
+    (agy_guarded ~requested:"c1" [agy_init "c1"; agy_result "c1"])
+
+let test_agy_resume_guard_new_id_warns_once () =
+  match agy_guarded ~requested:"c1" [agy_init "c2"; agy_result "c2"] with
+  | notice :: rest ->
+    Alcotest.(check bool) "notice names both ids" true
+      (String.starts_with ~prefix:"text:" notice
+       && (try ignore (Str.search_forward (Str.regexp_string "`c1`") notice 0); true
+           with Not_found -> false)
+       && (try ignore (Str.search_forward (Str.regexp_string "`c2`") notice 0); true
+           with Not_found -> false));
+    Alcotest.(check (list string)) "then the events, warned only once"
+      ["result:c2"; "error:agy: quota"; "result:c2"] rest
+  | [] -> Alcotest.fail "no events"
+
+(* ── Agy_sessions against a fake app-data dir ── *)
+
+let agy_id n = Printf.sprintf "%08d-0000-4000-8000-000000000000" n
+
+let with_agy_root f =
+  let root = Filename.temp_dir "agy-sessions-test" "" in
+  let write path text =
+    let rec mkdir_p d =
+      if not (Sys.file_exists d) then (mkdir_p (Filename.dirname d); Unix.mkdir d 0o755) in
+    mkdir_p (Filename.dirname path);
+    Out_channel.with_open_bin path (fun oc -> output_string oc text)
+  in
+  let add ?(mtime = Unix.gettimeofday ()) id first =
+    let p = Discord_agents.Agy_sessions.transcript_path ~root id in
+    write p (first ^ "\n{\"step_index\":1}\n");
+    Unix.utimes p mtime mtime
+  in
+  Fun.protect
+    ~finally:(fun () -> ignore (Sys.command (Filename.quote_command "rm" ["-rf"; "--"; root])))
+    (fun () -> f ~root ~write ~add)
+
+let user_input text =
+  Yojson.Safe.to_string (`Assoc [
+    ("step_index", `Int 0); ("source", `String "USER_EXPLICIT");
+    ("type", `String "USER_INPUT");
+    ("content", `String (Printf.sprintf
+      "<USER_REQUEST>\n%s\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: now.\n</ADDITIONAL_METADATA>" text)) ])
+
+(* The prompt shape the bot really sends on a session's first turn:
+   compose_session_prompt's <bot-context> block wrapped around
+   build_context_header's line and the user's words. *)
+let bot_first_turn text =
+  "<bot-context>\nyou are a lead\n</bot-context>\n\n\
+   [Discord context: project=p, channel=c (thread), from=ted]\n\n" ^ text
+
+let test_agy_sessions_discover () =
+  with_agy_root (fun ~root ~write ~add ->
+    let now = Unix.gettimeofday () in
+    let proj = Filename.concat root "proj" and other = Filename.concat root "other" in
+    Unix.mkdir proj 0o755; Unix.mkdir other 0o755;
+    add ~mtime:(now -. 60.) (agy_id 1) (user_input "fix the parser");
+    add ~mtime:(now -. 30.) (agy_id 2) (user_input (bot_first_turn "ship it"));
+    add ~mtime:(now -. 20.) (agy_id 4)
+      (user_input "[Discord context: project=p, channel=c (thread), from=ted]\n\nlater turn");
+    add ~mtime:(now -. 10.) (agy_id 5) (user_input "resumed elsewhere");
+    add ~mtime:(now -. 5.) (agy_id 6) (user_input "dir is gone");
+    add ~mtime:(now -. 90_000.) (agy_id 3) (user_input "too old");
+    write (Filename.concat (Filename.concat root "brain") "not-a-uuid/x") "";
+    write (Filename.concat root "cache/last_conversations.json")
+      (Printf.sprintf
+         {|{"%s": "%s", "relative": "%s", "%s": "%s", "%s": "%s", "%s/missing": "%s"}|}
+         proj (agy_id 2) (agy_id 1) other (agy_id 5) (proj ^ "/../proj2") (agy_id 5)
+         root (agy_id 6));
+    let got = Discord_agents.Agy_sessions.discover_in ~root ~hours:24 in
+    Alcotest.(check (list (triple string string string)))
+      "newest first; bot wrapping stripped; dir only when single and existing"
+      [ (agy_id 6, "", "dir is gone");
+        (agy_id 5, "", "resumed elsewhere");
+        (agy_id 4, "", "later turn");
+        (agy_id 2, proj, "ship it");
+        (agy_id 1, "", "fix the parser") ]
+      (List.map (fun (i : Discord_agents.Agy_sessions.info) ->
+         (i.session_id, i.working_dir, i.summary)) got))
+
+let test_agy_sessions_summary_edges () =
+  let summary = Discord_agents.Agy_sessions.summary_of_first_line in
+  Alcotest.(check string) "unclosed bot-context is kept, not swallowed"
+    "<bot-context> half" (summary (user_input "<bot-context>\nhalf"));
+  Alcotest.(check string) "non user-input step has no summary"
+    "" (summary {|{"type":"PLANNER_RESPONSE","content":"x"}|});
+  with_agy_root (fun ~root ~write:_ ~add ->
+    add (agy_id 7) (user_input (String.make (100 * 1024) 'x'));
+    match Discord_agents.Agy_sessions.discover_in ~root ~hours:24 with
+    | [ i ] -> Alcotest.(check string) "oversized first line: no summary" "" i.summary
+    | l -> Alcotest.failf "expected one conversation, got %d" (List.length l))
+
+let test_agy_sessions_find_by_prefix () =
+  with_agy_root (fun ~root ~write:_ ~add ->
+    let now = Unix.gettimeofday () in
+    add ~mtime:(now -. 60.) (agy_id 10) (user_input "older");
+    add ~mtime:(now -. 10.) (agy_id 11) (user_input "newer");
+    let find = Discord_agents.Agy_sessions.find_by_prefix_in ~root in
+    Alcotest.(check (option (pair string string))) "exact id, no dir"
+      (Some (agy_id 10, "")) (find (agy_id 10));
+    Alcotest.(check (option (pair string string))) "ambiguous prefix matches nothing"
+      None (find "000000");
+    let lettered = "abcdef01-0000-4000-8000-00000000beef" in
+    add ~mtime:(now -. 5.) lettered (user_input "hex");
+    Alcotest.(check (option (pair string string))) "prefix is case-insensitive"
+      (Some (lettered, "")) (find "ABCDEF");
+    Alcotest.(check (option (pair string string))) "empty prefix matches nothing"
+      None (find "");
+    Alcotest.(check (option (pair string string))) "unknown"
+      None (find "ffff"))
+
+let test_agy_sessions_missing_root () =
+  Alcotest.(check int) "no app-data dir: nothing, no exception" 0
+    (List.length (Discord_agents.Agy_sessions.discover_in
+                    ~root:"/nonexistent/agy-root" ~hours:24))
 
 let test_agy_result_not_an_object () =
   (* Yojson's member raises on non-objects; the parser must not. *)
@@ -4083,6 +4224,14 @@ let agy_tests = [
   Alcotest.test_case "unverified events pass through" `Quick
     test_agy_unverified_events_pass_through;
   Alcotest.test_case "non-object result" `Quick test_agy_result_not_an_object;
+  Alcotest.test_case "init reports conversation id" `Quick test_agy_init_reports_id;
+  Alcotest.test_case "resume guard: same id" `Quick test_agy_resume_guard_same_id;
+  Alcotest.test_case "resume guard: new id warns once" `Quick
+    test_agy_resume_guard_new_id_warns_once;
+  Alcotest.test_case "sessions: discover" `Quick test_agy_sessions_discover;
+  Alcotest.test_case "sessions: summary edges" `Quick test_agy_sessions_summary_edges;
+  Alcotest.test_case "sessions: find by prefix" `Quick test_agy_sessions_find_by_prefix;
+  Alcotest.test_case "sessions: missing root" `Quick test_agy_sessions_missing_root;
   Alcotest.test_case "missing status is an error" `Quick
     test_agy_missing_status_is_error;
   Alcotest.test_case "unknown status is not a failure" `Quick

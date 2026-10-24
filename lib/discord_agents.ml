@@ -26,6 +26,7 @@ module Command = Command
 module Claude_sessions = Claude_sessions
 module Codex_sessions = Codex_sessions
 module Gemini_sessions = Gemini_sessions
+module Agy_sessions = Agy_sessions
 module Control_client = Control_client
 module Mcp_tool = Mcp_tool
 module Mcp_server = Mcp_server

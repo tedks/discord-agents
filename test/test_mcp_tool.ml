@@ -146,6 +146,7 @@ let expected_tool_ids = [
   List_claude_sessions;
   List_codex_sessions;
   List_gemini_sessions;
+  List_agy_sessions;
   Default_agent;
   Rescue_agent;
   Get_agent_config;

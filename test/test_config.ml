@@ -340,6 +340,22 @@ let test_validate_reasoning_effort_for_agent () =
    | Error msg ->
      Alcotest.(check bool) "agy unsupported"
        true (has_error_substring "agy (Antigravity CLI) does not expose" [msg]));
+  (* Kind-less resume: an unusable hit (no working dir) must not hide a
+     usable one in a later store, but is still returned as a last resort. *)
+  let find ~usable hits =
+    Discord_agents.Config.find_usable_with_preferred_agent
+      Discord_agents.Config.Agy ~usable
+      (fun k -> List.assoc_opt (Discord_agents.Config.string_of_agent_kind k) hits)
+  in
+  Alcotest.(check (option string)) "usable later store wins"
+    (Some "codex-dir")
+    (find ~usable:(fun d -> d <> "") ["agy", ""; "codex", "codex-dir"]);
+  Alcotest.(check (option string)) "first unusable hit is the fallback"
+    (Some "") (find ~usable:(fun d -> d <> "") ["agy", ""; "gemini", ""]);
+  Alcotest.(check (option string)) "preferred usable hit wins outright"
+    (Some "agy-dir")
+    (find ~usable:(fun d -> d <> "") ["agy", "agy-dir"; "claude", "claude-dir"]);
+  Alcotest.(check (option string)) "nothing found" None (find ~usable:(fun _ -> true) []);
   (* Resume lookup with no explicit kind tries the preferred agent,
      then the maintained ones before unmaintained Gemini. *)
   Alcotest.(check (list string)) "preferred agent order keeps Gemini last"

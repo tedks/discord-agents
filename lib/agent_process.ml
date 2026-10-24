@@ -1182,18 +1182,24 @@ let parse_gemini_stream_json_line line =
 
    agy's [--output-format stream-json] is undocumented in [--help] but
    accepted by its flag parser; see docs/agy-harness.md. Events are
-   discriminated by a top-level [event] field, not [type]. The only
-   shape verified so far is the terminal one:
+   discriminated by a top-level [event] field, not [type]. Shapes
+   captured from signed-in agy 1.1.3 runs:
 
+     {"event":"init","conversation_id":"…","init":{"cwd":"…","tools":[…],…}}
+     {"event":"step_update","step_update":{"conversation_id":"…",
+      "step_index":N,"state":"DONE","step_type":"user_input|agent_response|…"}}
      {"event":"result","result":{"conversation_id":"…","status":"…",
       "response":"…","error":"…", …}}
 
-   agy also has init/text-delta/tool step events, but their wire
-   shapes have not been captured yet, so they pass through as [Other]
-   rather than being guessed at. Until they are parsed, the final
-   [response] is the only text the user sees, delivered as one
-   [Text_delta]. Once text deltas are parsed, drop that delta or the
-   reply will appear twice.
+   [init] arrives first, so the conversation id is reported from it as
+   well as from [result]; a turn that dies mid-run still leaves a
+   resumable id. [step_update] carries no text or tool detail in the
+   runs captured so far (all of which ended in quota errors), so it
+   passes through as [Other]. A text-delta field exists in the binary
+   but hasn't been observed on the wire, so it isn't guessed at. Until
+   it is, the final [response] is the only text the user sees,
+   delivered as one [Text_delta]. Once text deltas are parsed, drop
+   that delta or the reply will appear twice.
 
    An empty [conversation_id] (agy emits one when it fails before a
    conversation exists, e.g. signed out) is treated as no id, so the
@@ -1203,6 +1209,11 @@ let parse_agy_stream_json_line line =
   try
     let json = Yojson.Safe.from_string line in
     match get_string_opt "event" json with
+    | Some "init" ->
+      (match get_string_opt "conversation_id" json with
+       | Some id when String.trim id <> "" ->
+         [Result { text = ""; session_id = Some id }]
+       | _ -> [Other line])
     | Some "result" ->
       let result = Yojson.Safe.Util.member "result" json in
       let session_id =
@@ -1232,6 +1243,30 @@ let parse_agy_stream_json_line line =
       text @ err @ [Result { text = ""; session_id }]
     | _ -> [Other line]
   with _ -> [Other line]
+
+(** [agy --conversation <id>] with an id agy doesn't know does not
+    fail: it silently starts a new conversation under a fresh id
+    (verified on agy 1.1.3). The runner then adopts the new id, so the
+    thread keeps working, but the agent has lost its earlier context.
+    Say so once, on the first reported id that differs from the one we
+    asked to resume. Returns a filter over each line's events. *)
+let agy_resume_guard ~requested =
+  let warned = ref false in
+  fun events ->
+    if !warned then events
+    else
+      match List.find_map (function
+          | Result { session_id = Some id; _ } when id <> requested -> Some id
+          | _ -> None) events with
+      | None -> events
+      | Some fresh ->
+        warned := true;
+        Text_delta (Printf.sprintf
+          "⚠️ agy could not resume conversation `%s` and started a new \
+           one (`%s`). Earlier context from this thread is not available \
+           to it.\n\n"
+          requested fresh)
+        :: events
 
 (** Build the command args for an agent invocation. *)
 let model_arg = function
@@ -1922,9 +1957,11 @@ let agy_print_timeout = Printf.sprintf "%ds" agy_print_timeout_seconds
     [--dangerously-bypass-approvals-and-sandbox] under the bot's
     single-tenant trust model.
 
-    MCP is not wired for agy yet: the per-worktree route
-    ([.agents/plugins]) is unverified, and the user-global
-    [~/.gemini/config/mcp_config.json] is deliberately not touched. *)
+    MCP is not wired for agy: agy 1.1.3 has no per-worktree MCP route
+    (workspace [.agents/] configs are not loaded in print mode), and the
+    one route that works, the user-global
+    [~/.gemini/config/mcp_config.json], awaits an operator decision.
+    See docs/agy-harness.md. *)
 let agy_args ~model ~session_id ~session_id_confirmed ~prompt =
   let base = ["agy"; "-p"; prompt; "--output-format"; "stream-json";
               "--dangerously-skip-permissions";
@@ -2244,13 +2281,20 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
        executor; setsid here applies to the local ssh instead. *)
     | Remote _ -> agent_args
   in
+  let agy_guard =
+    match kind with
+    | Config.Agy when session_id_confirmed ->
+      agy_resume_guard ~requested:session_id
+    | Config.Agy | Config.Claude | Config.Codex | Config.Gemini -> Fun.id
+  in
+  let parse_events line = match kind with
+    | Config.Claude -> parse_stream_json_line line
+    | Config.Codex -> parse_codex_json_line line
+    | Config.Gemini -> parse_gemini_stream_json_line line
+    | Config.Agy -> agy_guard (parse_agy_stream_json_line line)
+  in
   let parse_line line =
-    if String.length line > 0 then
-      List.iter on_event (match kind with
-        | Config.Claude -> parse_stream_json_line line
-        | Config.Codex -> parse_codex_json_line line
-        | Config.Gemini -> parse_gemini_stream_json_line line
-        | Config.Agy -> parse_agy_stream_json_line line)
+    if String.length line > 0 then List.iter on_event (parse_events line)
   in
   (* A remote turn: the local ssh is the tracked child (in its own
      process group, like a local agent), so stop, restart and startup
@@ -2322,15 +2366,7 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
             (try
                while true do
                  let line = Eio.Buf_read.line reader in
-                 if String.length line > 0 then begin
-                   let events = match kind with
-                     | Config.Claude -> parse_stream_json_line line
-                     | Config.Codex -> parse_codex_json_line line
-                     | Config.Gemini -> parse_gemini_stream_json_line line
-                     | Config.Agy -> parse_agy_stream_json_line line
-                   in
-                   List.iter on_event events
-                 end
+                 parse_line line
                done
              with End_of_file -> ());
             Eio.Resource.close stdout_r);

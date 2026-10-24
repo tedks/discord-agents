@@ -14,6 +14,7 @@ type id =
   | List_claude_sessions
   | List_codex_sessions
   | List_gemini_sessions
+  | List_agy_sessions
   | Default_agent
   | Rescue_agent
   | Get_agent_config
@@ -46,6 +47,7 @@ let string_of_id = function
   | List_claude_sessions -> "list_claude_sessions"
   | List_codex_sessions -> "list_codex_sessions"
   | List_gemini_sessions -> "list_gemini_sessions"
+  | List_agy_sessions -> "list_agy_sessions"
   | Default_agent -> "default_agent"
   | Rescue_agent -> "rescue_agent"
   | Get_agent_config -> "get_agent_config"
@@ -200,6 +202,10 @@ let all_specs = [
     ~description:"List recent Gemini CLI sessions on this machine (last 24h). Useful for finding sessions to resume. Gemini support is unmaintained (API-key auth only)."
     ~control_method:Control_api.List_gemini_sessions_id
     ~input_schema:(object_schema [("hours", hours_property)]);
+  spec ~id:List_agy_sessions
+    ~description:"List recent agy (Antigravity CLI) conversations on this machine (last 24h). Useful for finding sessions to resume. A conversation shows a working directory only while it is the latest one for that directory; others are listed but can't be resumed by id."
+    ~control_method:Control_api.List_agy_sessions_id
+    ~input_schema:(object_schema [("hours", hours_property)]);
   spec ~id:Default_agent
     ~description:"Show or set the default agent used for new top-level sessions. Existing idle top-level sessions reset to a fresh session immediately; busy ones reset after their queued work finishes."
     ~control_method:Control_api.Default_agent_id
@@ -263,7 +269,7 @@ let all_specs = [
         ~enum:agent_enum ());
     ]);
   spec ~id:Resume_session
-    ~description:"Resume an existing Claude, Codex, or Gemini session in a new Discord thread (agy session discovery is not implemented yet). Use list_claude_sessions / list_codex_sessions / list_gemini_sessions to find a session ID. With kind unspecified, the bot tries the current effective top-level agent first, then the others."
+    ~description:"Resume an existing Claude, Codex, Gemini, or agy session in a new Discord thread. Use list_claude_sessions / list_codex_sessions / list_gemini_sessions / list_agy_sessions to find a session ID. With kind unspecified, the bot tries the current effective top-level agent first, then the others."
     ~control_method:Control_api.Resume_session_id
     ~input_schema:(object_schema ~required:["session_id"] [
       ("session_id", property ~type_:string_type
