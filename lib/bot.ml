@@ -1753,10 +1753,16 @@ let format_session_listing
       label (String.concat "\n" lines) resume_hint
 
 (** Build the user-facing "session not found" error for the Resume
-    handlers (Discord command, MCP tool). All three agents now have
-    discoverable session stores, so the message is uniform. *)
+    handlers (Discord command, MCP tool). Claude, Codex and Gemini have
+    discoverable session stores; agy does not yet, so an explicit agy
+    lookup says that rather than implying the id was wrong. *)
 let resume_not_found_message ~kind ~sid_prefix =
   match kind with
+  | Some Config.Agy ->
+    Printf.sprintf
+      "Cannot look up agy session %S: agy session discovery is not \
+       implemented yet. An agy session can still be continued in its \
+       own Discord thread." sid_prefix
   | Some k ->
     Printf.sprintf "No %s session matching %S."
       (Config.string_of_agent_kind k) sid_prefix

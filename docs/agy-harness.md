@@ -67,8 +67,10 @@ falls back to the final `result.response` text.
   OAuth URL to stderr, then `Waiting for authentication (timeout 60s)...
   Or, paste the authorization code here and press Enter`. This wait is
   separate from `--print-timeout`. When it expires, agy emits the
-  `ERROR` result below. So a signed-out session costs a minute per turn
-  but does not hang. Because agy accepts the code on stdin, a sign-in
+  `ERROR` result below and exits 1 (measured: 60s, exit 1, with stdin at
+  `/dev/null`). So a signed-out turn costs a minute and is reported as a
+  failure, but does not hang. The bot gives agy `/dev/null` as stdin so
+  that prompt can never read the bot's own terminal. Because agy accepts the code on stdin, a sign-in
   flow driven through the bot looks possible, but is untested.
 - **A dash-leading prompt is safe after `-p`.** `agy -p -x …` takes `-x`
   as the prompt; it is not parsed as an unknown flag.

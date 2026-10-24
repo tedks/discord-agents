@@ -396,7 +396,7 @@ TOOLS = [
     },
     {
         "name": "resume_session",
-        "description": "Resume an existing Claude, Codex, Gemini, or agy session in a new Discord thread. Use list_claude_sessions / list_codex_sessions / list_gemini_sessions to find a session ID. With kind unspecified, the bot tries the current effective top-level agent first, then the others.",
+        "description": "Resume an existing Claude, Codex, or Gemini session in a new Discord thread (agy session discovery is not implemented yet). Use list_claude_sessions / list_codex_sessions / list_gemini_sessions to find a session ID. With kind unspecified, the bot tries the current effective top-level agent first, then the others.",
         "inputSchema": {
             "type": "object",
             "properties": {

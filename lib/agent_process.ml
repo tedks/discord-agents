@@ -1214,11 +1214,20 @@ let parse_agy_stream_json_line line =
       let status = get_string ~default:"" "status" result in
       let error = get_string ~default:"" "error" result in
       let text = if response = "" then [] else [Text_delta response] in
+      (* agy's success status value hasn't been observed yet, so an
+         unfamiliar non-empty status is logged, not failed. A result
+         with no status at all doesn't match any shape we've seen and
+         is reported, rather than passed off as a silent success.
+         The "SUCCESS" arm is a guess that only keeps the log quiet. *)
       let err =
-        match String.uppercase_ascii status, error with
+        match String.uppercase_ascii (String.trim status), error with
         | _, e when String.trim e <> "" -> [Error ("agy: " ^ e)]
         | "ERROR", _ -> [Error "agy: run ended with status ERROR"]
-        | _ -> []
+        | "", _ -> [Error "agy: result event has no status"]
+        | "SUCCESS", _ -> []
+        | other, _ ->
+          Logs.info (fun m -> m "agy: unrecognized result status %S" other);
+          []
       in
       text @ err @ [Result { text = ""; session_id }]
     | _ -> [Other line]
@@ -1901,7 +1910,8 @@ let gemini_args ~model ~session_id ~session_id_confirmed ~prompt =
     default, which real agent turns routinely exceed. Pass a ceiling
     long enough that only a genuinely stuck run hits it; the bot's own
     stop/interrupt paths remain the normal way to end a turn. *)
-let agy_print_timeout = "12h"
+let agy_print_timeout_seconds = 12 * 60 * 60
+let agy_print_timeout = Printf.sprintf "%ds" agy_print_timeout_seconds
 
 (** agy allocates its conversation id server-side and reports it in
     the terminal [result] event; we resume with [--conversation] only
@@ -2095,6 +2105,13 @@ let escape_prompt_block text =
   ) text;
   Buffer.contents b
 
+let agy_no_mcp_notice =
+  "NOTE: this session runs on agy, which is not yet connected to the \
+   discord-agents MCP server. None of the MCP tools listed above are \
+   available. Do not attempt them or report their results; tell the \
+   user what you would have done and suggest a Claude or Codex session \
+   for orchestration."
+
 (** Compose the per-turn prompt sent to a non-Claude agent, prepending
     the session's system prompt on the first turn so MCP-aware agents
     know what tools they have. Claude takes [--append-system-prompt]
@@ -2116,6 +2133,14 @@ let compose_session_prompt ~agent_kind ~system_prompt ~message_count
       Printf.sprintf "<codex-goal>\n%s\n</codex-goal>\n\n%s"
         (escape_prompt_block goal) user_prompt
     | _ -> user_prompt
+  in
+  (* agy is started without the discord-agents MCP server (see
+     [agy_args]), but channel system prompts list those tools. Say so,
+     or a control agent under agy would try tools it doesn't have. *)
+  let system_prompt = match system_prompt, agent_kind with
+    | Some sp, Config.Agy ->
+      Some (sp ^ "\n\n" ^ agy_no_mcp_notice)
+    | _ -> system_prompt
   in
   match system_prompt with
   | Some sp when needs_inline ->
@@ -2250,8 +2275,25 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
     try
       let stderr_r, stderr_w = Eio.Process.pipe ~sw mgr in
       try
-        let proc = Eio.Process.spawn ~sw mgr ~cwd ~env:child_env
-          ~stdout:stdout_w ~stderr:stderr_w args in
+        (* A signed-out agy prompts for an authorization code on stdin
+           for up to a minute. With an inherited stdin it would read the
+           bot's terminal (the foreground tmux pane under run-branch.sh),
+           so give it /dev/null, as remote turns already get from the
+           executor wrapper. The child holds its own copy; ours is
+           closed as soon as the spawn returns. *)
+        let stdin =
+          match kind with
+          | Config.Agy ->
+            Some (Eio.Path.open_in ~sw Eio.Path.(fs / "/dev/null"))
+          | Config.Claude | Config.Codex | Config.Gemini -> None
+        in
+        let proc =
+          Fun.protect
+            ~finally:(fun () -> Option.iter close_noerr stdin)
+            (fun () ->
+               Eio.Process.spawn ~sw mgr ~cwd ~env:child_env ?stdin
+                 ~stdout:stdout_w ~stderr:stderr_w args)
+        in
         (* Close write ends so reads get EOF when process exits. Do this before
            callbacks so callback failures cannot strand pipe writers on [sw]. *)
         Eio.Resource.close stdout_w;

@@ -2143,6 +2143,12 @@ let test_resume_not_found_codex_uniform () =
 let test_resume_not_found_gemini_includes_sid () =
   test_resume_not_found_names_kind_and_sid Discord_agents.Config.Gemini "gemini"
 
+let test_resume_not_found_agy_says_unimplemented () =
+  (* agy has no session store yet; the message must not read as a
+     wrong id. *)
+  test_resume_not_found_names_kind_and_sid Discord_agents.Config.Agy
+    "not implemented"
+
 (* A command the test supplies rather than one it looks up: these
    assertions are about the merge, not about where the executable
    happens to live in this build. *)
@@ -3316,6 +3322,8 @@ let resume_helpers_tests = [
     test_resume_not_found_codex_uniform;
   Alcotest.test_case "Gemini resume error names kind+sid" `Quick
     test_resume_not_found_gemini_includes_sid;
+  Alcotest.test_case "agy resume says discovery is unimplemented" `Quick
+    test_resume_not_found_agy_says_unimplemented;
   Alcotest.test_case "merge_gemini_settings preserves other servers" `Quick
     test_merge_gemini_settings_preserves_other_servers;
   Alcotest.test_case "merge_gemini_settings overwrites our stale entry" `Quick
@@ -3974,6 +3982,19 @@ let test_agy_error_status_without_message () =
     ["text:partial"; "error:agy: run ended with status ERROR"; "result:c1"]
     (parse_agy line)
 
+let test_agy_missing_status_is_error () =
+  let line = {|{"event":"result","result":{"conversation_id":"c2","response":"hi"}}|} in
+  Alcotest.(check (list string)) "no status is reported, not a silent success"
+    ["text:hi"; "error:agy: result event has no status"; "result:c2"]
+    (parse_agy line)
+
+let test_agy_unknown_status_not_failed () =
+  (* The success value is unobserved; an unfamiliar status must not
+     turn a real reply into a failure. *)
+  let line = {|{"event":"result","result":{"conversation_id":"c3","status":"DONE","response":"ok"}}|} in
+  Alcotest.(check (list string)) "text and id, no error"
+    ["text:ok"; "result:c3"] (parse_agy line)
+
 let test_agy_unverified_events_pass_through () =
   (* Event shapes we have not captured must not be guessed at. *)
   List.iter (fun line ->
@@ -4022,17 +4043,29 @@ let test_agy_args_model () =
 
 let test_agy_print_timeout_exceeds_default () =
   (* agy's own default is 5m, too short for real turns. *)
-  Alcotest.(check bool) "not the 5m default" true
-    (not (List.mem Discord_agents.Agent_process.agy_print_timeout
-            ["5m"; "5m0s"]))
+  let secs = Discord_agents.Agent_process.agy_print_timeout_seconds in
+  Alcotest.(check bool) "well above agy's 5m default" true (secs > 60 * 60);
+  Alcotest.(check string) "rendered as a Go duration"
+    (Printf.sprintf "%ds" secs)
+    Discord_agents.Agent_process.agy_print_timeout
 
 let test_agy_prompt_gets_inline_context () =
   let out = Discord_agents.Agent_process.compose_session_prompt
     ~agent_kind:Discord_agents.Config.Agy
     ~system_prompt:(Some "you are a lead") ~message_count:0
     ~goal_context:None ~user_prompt:"hi" in
-  Alcotest.(check string) "first turn carries <bot-context>"
-    "<bot-context>\nyou are a lead\n</bot-context>\n\nhi" out
+  Alcotest.(check string)
+    "first turn carries <bot-context> plus the no-MCP notice"
+    (Printf.sprintf "<bot-context>\nyou are a lead\n\n%s\n</bot-context>\n\nhi"
+       Discord_agents.Agent_process.agy_no_mcp_notice)
+    out
+
+let test_agy_later_turn_has_no_context () =
+  let out = Discord_agents.Agent_process.compose_session_prompt
+    ~agent_kind:Discord_agents.Config.Agy
+    ~system_prompt:(Some "you are a lead") ~message_count:3
+    ~goal_context:None ~user_prompt:"hi" in
+  Alcotest.(check string) "history carries it; prompt passes through" "hi" out
 
 let agy_tests = [
   Alcotest.test_case "signed-out result" `Quick test_agy_signed_out_result;
@@ -4042,6 +4075,12 @@ let agy_tests = [
   Alcotest.test_case "unverified events pass through" `Quick
     test_agy_unverified_events_pass_through;
   Alcotest.test_case "non-object result" `Quick test_agy_result_not_an_object;
+  Alcotest.test_case "missing status is an error" `Quick
+    test_agy_missing_status_is_error;
+  Alcotest.test_case "unknown status is not a failure" `Quick
+    test_agy_unknown_status_not_failed;
+  Alcotest.test_case "later turn passes through" `Quick
+    test_agy_later_turn_has_no_context;
   Alcotest.test_case "fresh args" `Quick test_agy_args_fresh;
   Alcotest.test_case "resume args" `Quick test_agy_args_resume;
   Alcotest.test_case "dash-prefixed prompt" `Quick test_agy_args_dash_prompt;
