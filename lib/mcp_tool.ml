@@ -104,7 +104,7 @@ let no_args_schema =
   object_schema []
 
 let agent_enum =
-  ["claude"; "codex"; "gemini"]
+  ["claude"; "codex"; "gemini"; "agy"]
 
 let session_id_property description =
   property ~type_:string_type ~description ()
@@ -119,13 +119,13 @@ let spec ~id ~description ~input_schema ~control_method =
 
 let all_specs = [
   spec ~id:Start_session
-    ~description:"Start a new agent session for a project (claude, codex, or gemini). Creates a Discord thread and git worktree. Returns the thread info."
+    ~description:"Start a new agent session for a project (claude, codex, gemini, or agy). Creates a Discord thread and git worktree. Returns the thread info."
     ~control_method:Control_api.Start_session_id
     ~input_schema:(object_schema ~required:["project"] [
       ("project", property ~type_:string_type
         ~description:"Project name, number from the list, or a prefix/substring to fuzzy match" ());
       ("agent", property ~type_:string_type
-        ~description:"Agent type: claude, codex, or gemini (unmaintained; API-key auth only). If omitted, uses the bot's current effective top-level agent (default agent unless a rescue agent is active under disk pressure)."
+        ~description:"Agent type: claude, codex, gemini (unmaintained; API-key auth only), or agy (Antigravity CLI). If omitted, uses the bot's current effective top-level agent (default agent unless a rescue agent is active under disk pressure)."
         ~enum:agent_enum ());
       ("thread_name", property ~type_:string_type
         ~description:"Short descriptive name for the thread (max 80 chars). If omitted, uses a default name."
@@ -263,7 +263,7 @@ let all_specs = [
         ~enum:agent_enum ());
     ]);
   spec ~id:Resume_session
-    ~description:"Resume an existing Claude, Codex, or Gemini session in a new Discord thread. Use list_claude_sessions / list_codex_sessions / list_gemini_sessions to find a session ID. With kind unspecified, the bot tries the current effective top-level agent first, then the others."
+    ~description:"Resume an existing Claude, Codex, Gemini, or agy session in a new Discord thread. Use list_claude_sessions / list_codex_sessions / list_gemini_sessions to find a session ID. With kind unspecified, the bot tries the current effective top-level agent first, then the others."
     ~control_method:Control_api.Resume_session_id
     ~input_schema:(object_schema ~required:["session_id"] [
       ("session_id", property ~type_:string_type

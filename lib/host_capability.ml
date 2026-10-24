@@ -210,7 +210,8 @@ let observe ~run ~now ~host ~cwd ~agent =
             | Ok () -> help scope in
         pages @ [scope, observed]) [] (scopes agent) in
       let credentials = match agent with
-        | Config.Gemini -> Unknown Not_supported
+        (* Neither has a non-interactive auth-status command. *)
+        | Config.Gemini | Config.Agy -> Unknown Not_supported
         | Config.Claude | Config.Codex ->
           let parent = if agent = Config.Claude then "auth" else "login" in
           let root = List.assoc [] helps in

@@ -174,7 +174,7 @@ let all_specs = [
   mutating ~id:Default_agent_id ~primary:"default-agent"
     ~aliases:["default_agent"]
     ~help:[
-      "`!default-agent [agent]` / `!default_agent [agent]` — show or set the default agent (claude|codex|gemini; gemini is unmaintained)";
+      "`!default-agent [agent]` / `!default_agent [agent]` — show or set the default agent (claude|codex|gemini|agy; gemini is unmaintained)";
     ]
     ~no_arg_command:(Default_agent None) ();
   mutating ~id:Rescue_agent_id ~primary:"rescue-agent"

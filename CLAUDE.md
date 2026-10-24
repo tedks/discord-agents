@@ -72,7 +72,7 @@ test/test_formatting.ml  — Tests for formatting, wrapping, escaping, command p
 
 Commands require a `!` prefix:
 
-- `start <project> [agent]` — start a session (agent ∈ {claude, codex, gemini}; defaults to the current effective top-level agent)
+- `start <project> [agent]` — start a session (agent ∈ {claude, codex, gemini, agy}; defaults to the current effective top-level agent)
 - `start` — show numbered project list
 - `resume [agent] <session_id>` — resume an existing session (agent defaults to none; tries the current effective top-level agent first, then the others)
 - `projects` — list discovered projects with numbers

@@ -1117,7 +1117,8 @@ let fork_session_context_to_thread t (session : Session_store.session)
     match session.agent_kind with
     | Config.Claude -> Some session.session_id
     | Config.Codex
-    | Config.Gemini -> None
+    | Config.Gemini
+    | Config.Agy -> None
   in
   let forked_session =
     {
@@ -2158,6 +2159,10 @@ let handle_command t msg cmd =
         | Config.Claude -> try_claude ()
         | Config.Codex -> try_codex ()
         | Config.Gemini -> try_gemini ()
+        (* agy's on-disk conversation format hasn't been captured yet
+           (docs/agy-harness.md), so there is no store to search; an
+           agy session can still be resumed from its own thread. *)
+        | Config.Agy -> None
       in
       (* Explicit kind hits exactly one store; otherwise try the current
          effective top-level agent first, then the remaining stores. *)
