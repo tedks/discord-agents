@@ -7,6 +7,7 @@ module Remote_script = Remote_script
 module Host_exec = Host_exec
 module Probe_process = Probe_process
 module Host_probe = Host_probe
+module Host_capability = Host_capability
 module Config = Config
 module Runtime_settings = Runtime_settings
 module Runtime_limits = Runtime_limits
