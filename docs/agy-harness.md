@@ -63,9 +63,15 @@ falls back to the final `result.response` text.
   the worktree is enough.
 - **Print-mode timeout is 5 minutes by default.** Agent turns routinely
   run longer, so the harness must pass an explicit `--print-timeout`.
-- **Unauthenticated print mode blocks.** It prints an OAuth URL to
-  stderr and waits until the print timeout, even with stdin at
-  `/dev/null`. It does not fail fast.
+- **Unauthenticated print mode blocks for about a minute.** It prints an
+  OAuth URL to stderr, then `Waiting for authentication (timeout 60s)...
+  Or, paste the authorization code here and press Enter`. This wait is
+  separate from `--print-timeout`. When it expires, agy emits the
+  `ERROR` result below. So a signed-out session costs a minute per turn
+  but does not hang. Because agy accepts the code on stdin, a sign-in
+  flow driven through the bot looks possible, but is untested.
+- **A dash-leading prompt is safe after `-p`.** `agy -p -x …` takes `-x`
+  as the prompt; it is not parsed as an unknown flag.
 - **Headless tool approval auto-denies.** The binary contains `the %s
   tool(s) required approval that headless mode cannot prompt for, so
   they were auto-denied`. The harness must pass
@@ -124,5 +130,6 @@ than touching global config.
 3. Test whether the `.agents/plugins` MCP route loads in print mode.
 4. Confirm that `--conversation <id>` resumes in print mode with the id
    from `result.conversation_id`.
-5. Measure whether a signed-out run can be detected early (stderr
-   `Authentication required`) instead of waiting out the timeout.
+5. Decide whether to detect a signed-out run early (stderr
+   `Authentication required`) instead of waiting out agy's 60s auth
+   timeout.
