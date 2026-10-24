@@ -1,6 +1,9 @@
 (** Observation of the executor -> writer MCP/control route. This proves only
     that the selected MCP executable can reach the selected control socket;
-    it says nothing about Discord connectivity, disk admission or model access. *)
+    it says nothing about Discord connectivity, disk admission or model access.
+    The caller must use the writer's resolved MCP path and Control_api.socket_path,
+    and the same host/writer entries as session routing. This module does not
+    establish that correspondence for an arbitrary caller-supplied context. *)
 
 type context = {
   host : Host.t;

@@ -60,12 +60,16 @@ let test_observations () =
 let test_reverse_command () =
   let remote = { host with Host.transport = Ssh "executor"; writer_ssh = Some "writer-alias" } in
   let context = { context with host = remote; mcp_path = Some "/bot's/mcp" } in
-  match H.command context with
+  (match H.command context with
   | Ok argv ->
     check "same SSH options as agent callback"
       (["ssh"] @ Discord_agents.Host_exec.ssh_options @
        ["--"; "writer-alias"; {|'/bot'\''s/mcp' '--check-control' '/config/control.sock'|}]) argv
-  | Error _ -> Alcotest.fail "valid remote callback refused"
+  | Error _ -> Alcotest.fail "valid remote callback refused");
+  match H.command { context with host = { remote with writer_ssh = None } } with
+  | Ok argv ->
+    check "default writer destination" context.writer (List.nth argv (List.length argv - 2))
+  | Error _ -> Alcotest.fail "default writer callback refused"
 
 let test_transport () =
   let dir = Filename.temp_dir "callback ' " "" in
@@ -122,6 +126,23 @@ let test_transport () =
       let snapshot = H.collect ~clock:(Eio.Stdenv.mono_clock env) ~now ~ssh
         { context with cwd = dir; mcp_path; socket_path } in
       check "missing socket is not reachable" (C.Unknown Command_failed) snapshot.control;
+      (* The normal default resolves to a listening decoy. The explicit missing
+         socket must fail before even connecting to that fallback endpoint. *)
+      let decoy = Unix.socket ~cloexec:true Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+      Unix.bind decoy (Unix.ADDR_UNIX socket_path); Unix.listen decoy 1;
+      let old_xdg = Sys.getenv_opt "XDG_CONFIG_HOME" in
+      Fun.protect ~finally:(fun () ->
+        Unix.putenv "XDG_CONFIG_HOME" (Option.value old_xdg ~default:"");
+        Unix.close decoy; Unix.unlink socket_path) (fun () ->
+        Unix.putenv "XDG_CONFIG_HOME" dir;
+        List.iter (fun target ->
+          let observed = H.collect ~clock:(Eio.Stdenv.mono_clock env) ~now ~ssh
+            { context with host = target; cwd = dir; mcp_path;
+              socket_path = Filename.concat dir "missing.sock" } in
+          check "explicit socket never falls back" (C.Unknown Command_failed) observed.control;
+          let readable, _, _ = Unix.select [decoy] [] [] 0. in
+          check "decoy never contacted" [] readable)
+          [host; { host with transport = Ssh "executor" }]);
       let reverse = H.collect ~clock:(Eio.Stdenv.mono_clock env) ~now ~ssh
         { context with host = { host with transport = Ssh "executor"; writer_ssh = Some "unreachable" };
           cwd = dir; mcp_path; socket_path } in

@@ -51,14 +51,22 @@ account denial. There is no environment/account fingerprint or persistent cache.
 
 `Host_callback` separately observes whether the selected MCP executable can
 reach the writer's control socket, from the executor over reverse SSH when
-needed. `discord-agents-mcp --check-control SOCKET` sends only a `health`
+needed. The caller must derive its context from the same resolved MCP path,
+writer control socket and registry entries as the agent route. Today local
+turns inherit the writer's config environment and `remote_mcp_command` pins
+`XDG_CONFIG_HOME` to the writer's resolved config directory. Arbitrary supplied
+paths do not establish that correspondence; #154 must verify it when wiring
+collection. `discord-agents-mcp --check-control SOCKET` sends only a `health`
 request to that explicit socket and emits a fixed success marker, never the
 health response's operational details. The explicit path avoids checking a
 different bot through XDG/legacy fallback when the intended socket is absent.
 The observation has an eight-second outer deadline, a 1 KiB output cap and
 freshness bound to the full callback context. It proves control reachability,
 not that Discord is connected, disk admission permits a turn, every MCP tool
-works or any model is available. Tests use the real MCP binary, private Unix
+works or any model is available. Callback stdout/stderr noise makes the result
+unknown; it is not evidence that the endpoint is down. The MCP executable's
+normal generated configs pass no arguments; other arguments besides this
+diagnostic mode now return a usage error. Tests use the real MCP binary, private Unix
 sockets and fake SSH for both hops. Public inventory, environment binding,
 safe rendering and session admission remain
 [154](https://github.com/tedks/discord-agents/issues/154); no probes run
