@@ -29,8 +29,8 @@ is unchanged and must not be used for capability probes.
 
 `Host_capability` collects dated executable metadata, version, advertised flags
 and CLI-reported credential presence through that transport. It binds evidence
-to the complete host entry, agent and absolute cwd, invalidates a collection if the
-launcher metadata changes, and requires callers to check freshness with
+to the complete host entry, agent and absolute cwd, invalidates a collection
+if launcher metadata changes, and requires callers to check freshness with
 `current`. The metadata probe requires GNU-compatible `stat -L -c`; failure is
 unknown. Help is evidence of advertised syntax, not proof of runtime support.
 Claude/Codex status is queried only after help advertises the command hierarchy;
@@ -53,8 +53,9 @@ and [Codex CLI reference](https://learn.chatgpt.com/docs/developer-commands?surf
 Credential presence does not prove that credentials are valid or that a model
 is included in an account plan.
 
-Login repair guidance now names the session executor in both MCP renderers, including when that
-host is unavailable; a request without a session names the actual writer. See the revised
+Login repair guidance now names the session executor in both MCP renderers,
+including when that host is unavailable; a request without a session names
+the actual writer. See the revised
 [Stacked PR plan](#stacked-pr-plan).
 
 The architecture below is the intended design, not a claim that every path

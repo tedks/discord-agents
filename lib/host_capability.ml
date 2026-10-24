@@ -107,8 +107,8 @@ let parse_help ~agent ~scope text =
         if i < String.length raw && (raw.[i] = ' ' || raw.[i] = '\t') then indentation (i+1) else i in
       let indent = indentation 0 in
       let heading = String.lowercase_ascii line in
-      if List.mem heading ["options:"; "flags:"] then true, None, acc
-      else if String.ends_with ~suffix:":" line then false, None, acc
+      if indent = 0 && List.mem heading ["options:"; "flags:"] then true, None, acc
+      else if indent = 0 && String.ends_with ~suffix:":" line then false, None, acc
       else if not in_options || not (String.starts_with ~prefix:"-" line) ||
         (match option_indent with Some n -> indent > n + (if n <= 2 then 4 else 0) | None -> false)
       then in_options, option_indent, acc else
@@ -123,18 +123,21 @@ let parse_help ~agent ~scope text =
         then List.filter_map flag_of_word tokens else [] in
       (* Clap aligns long-only declarations four columns after short aliases;
          wrapped descriptions are deeper than either declaration column. *)
-      let option_indent = Some (min indent (Option.value option_indent ~default:indent)) in
+      let option_indent = if declarations = [] then option_indent
+        else Some (min indent (Option.value option_indent ~default:indent)) in
       in_options, option_indent, declarations @ acc) (false, None, []) raw_lines in
     let flags = List.sort_uniq String.compare flags in
-    let _, commands = List.fold_left (fun (in_commands, acc) line ->
-      if String.lowercase_ascii line = "commands:" then true, acc
-      else if String.ends_with ~suffix:":" line then false, acc
+    let _, commands = List.fold_left (fun (in_commands, acc) raw ->
+      let line = String.trim raw in
+      let unindented = raw = line in
+      if unindented && String.lowercase_ascii line = "commands:" then true, acc
+      else if unindented && String.ends_with ~suffix:":" line then false, acc
       else if in_commands then
         match words line with
         | command :: _ when String.for_all (function 'a'..'z' | '-' -> true | _ -> false) command ->
           true, command :: acc
         | _ -> in_commands, acc
-      else in_commands, acc) (false, []) lines in
+      else in_commands, acc) (false, []) raw_lines in
     Known { flags; commands = List.sort_uniq String.compare commands }
 
 let auth_of_claude result =
@@ -228,7 +231,7 @@ let observe ~run ~now ~host ~cwd ~agent =
       | Known _ -> unknown Executable_changed
 
 (** Freshness is explicit, caller-chosen and conservative: the timestamp is the
-    beginning of collection, not the end. A changed host entry/cwd invalidates
+    beginning of collection, not the end. A changed host entry/agent/cwd invalidates
     every field. Even fresh evidence is observational, never a model grant. *)
 let current ~now ~max_age ~host ~cwd ~agent snapshot =
   let why =
@@ -239,7 +242,7 @@ let current ~now ~max_age ~host ~cwd ~agent snapshot =
     then Some Stale else None in
   match why with
   | None -> snapshot
-  | Some why -> unknown_snapshot ~host ~cwd ~agent:snapshot.agent
+  | Some why -> unknown_snapshot ~host ~cwd ~agent
       ~observed_at:snapshot.observed_at why
 
 let advertised_flag snapshot ~scope flag =

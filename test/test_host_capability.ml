@@ -12,7 +12,7 @@ let now () = 100.
 
 let page agent scope flags commands =
   "Usage: " ^ Config.string_of_agent_kind agent ^ " " ^ String.concat " " scope ^ " [OPTIONS]\n\nCommands:\n" ^
-  String.concat "" (List.map (fun c -> "  " ^ c ^ "  description\n") commands) ^
+  String.concat "" (List.map (fun c -> "  " ^ c ^ "  description:\n") commands) ^
   "\nOptions:\n" ^ String.concat "" (List.map (fun f -> "  " ^ f ^ "  description\n") flags)
 
 let fixture ?(agent = Config.Codex) ?(modify = fun _ result -> result) () =
@@ -141,6 +141,8 @@ let test_freshness_and_disable () =
     (C.current ~now:100. ~max_age:10. ~host:remote ~cwd:s.cwd ~agent:Config.Codex s).credentials;
   check "agent invalidates" (Unknown Context_changed)
     (C.current ~now:100. ~max_age:10. ~host ~cwd:s.cwd ~agent:Config.Claude s).credentials;
+  check "invalidated view uses requested agent" Config.Claude
+    (C.current ~now:100. ~max_age:10. ~host ~cwd:s.cwd ~agent:Config.Claude s).agent;
   calls := [];
   check "disabled" (Unknown Disabled) (observe ~target:{ host with enabled = false } run).version;
   check "disabled no calls" [] !calls;
@@ -150,10 +152,14 @@ let test_freshness_and_disable () =
 
 let test_help_parser () =
   let help = C.parse_help ~agent:Config.Codex ~scope:[]
-    "noise\nUsage: codex [OPTIONS]\nOptions:\n  -c, --config <key=value>\n          --wrapped description\n      --json  desc\n prose mentions --wrong\nExamples:\n--dangerously-bypass-approvals-and-sandbox is unavailable on this version\n" in
-  match help with
+    "noise\nUsage: codex [OPTIONS]\nOptions:\n  -c, --config <key=value>  Configuration settings:\n          --wrapped description\n          Possible values:\n          - untrusted: ...\n      --json  desc\n prose mentions --wrong\nExamples:\n--dangerously-bypass-approvals-and-sandbox is unavailable on this version\n" in
+  (match help with
   | Known h -> check "only declarations" ["--config"; "--json"; "-c"] h.flags
-  | _ -> Alcotest.fail "help should parse"
+  | _ -> Alcotest.fail "help should parse");
+  match C.parse_help ~agent:Config.Codex ~scope:[]
+    "Usage: codex [OPTIONS]\nOptions:\n      --first  First\n - prose line\n          --wrapped description\n      --last  Last\n" with
+  | Known h -> check "prose cannot move option column" ["--first"; "--last"] h.flags
+  | _ -> Alcotest.fail "long-only options should parse"
 
 let test_real_transport () =
   let dir = Filename.temp_dir "capability = ' " "" in
