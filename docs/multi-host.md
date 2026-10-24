@@ -13,7 +13,15 @@ now rejects remote uploads before writer-local reads; executor uploads remain
 [145](https://github.com/tedks/discord-agents/issues/145), and transcript/run
 ownership is tracked in
 [146](https://github.com/tedks/discord-agents/issues/146). The next bounded
-implementation mission is host capability observations. Login repair guidance
+implementation mission is host capability observations
+([151](https://github.com/tedks/discord-agents/issues/151)). `Host_probe` provides
+the bounded transport foundation: mandatory deadline and output cap, exact
+bytes, disabled-host refusal, and process-group cleanup. It requires `setsid`
+on the writer and coreutils `timeout` on SSH executors. A cancelled remote
+probe may run until its executor deadline; commands that deliberately escape
+their process group are outside this contract. Legacy `Host_exec.run_capture`
+is unchanged and must not be used for capability probes. CLI/auth/model
+observations and their public exposure remain outstanding. Login repair guidance
 now names the session executor in both MCP renderers, including when that
 host is unavailable; a request without a session names the actual writer. See the revised
 [Stacked PR plan](#stacked-pr-plan).
