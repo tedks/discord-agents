@@ -838,8 +838,9 @@ let handle_resume_session (bot : Bot.t) params =
       let found = match kind with
         | Some k -> try_kind k
         | None ->
-          Config.find_with_preferred_agent
-            (Bot.effective_top_level_agent bot) try_kind
+          Config.find_usable_with_preferred_agent
+            (Bot.effective_top_level_agent bot)
+            ~usable:(fun (_, _, wd) -> wd <> "") try_kind
       in
       match found with
       | None ->

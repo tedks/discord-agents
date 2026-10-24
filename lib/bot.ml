@@ -2182,7 +2182,9 @@ let handle_command t msg cmd =
          effective top-level agent first, then the remaining stores. *)
       let found = match kind with
         | Some k -> try_kind k
-        | None -> Config.find_with_preferred_agent (effective_top_level_agent t) try_kind
+        | None ->
+          Config.find_usable_with_preferred_agent (effective_top_level_agent t)
+            ~usable:(fun (_, _, wd) -> wd <> "") try_kind
       in
       match found with
       | None ->

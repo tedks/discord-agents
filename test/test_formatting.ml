@@ -4073,24 +4073,53 @@ let user_input text =
     ("content", `String (Printf.sprintf
       "<USER_REQUEST>\n%s\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: now.\n</ADDITIONAL_METADATA>" text)) ])
 
+(* The prompt shape the bot really sends on a session's first turn:
+   compose_session_prompt's <bot-context> block wrapped around
+   build_context_header's line and the user's words. *)
+let bot_first_turn text =
+  "<bot-context>\nyou are a lead\n</bot-context>\n\n\
+   [Discord context: project=p, channel=c (thread), from=ted]\n\n" ^ text
+
 let test_agy_sessions_discover () =
   with_agy_root (fun ~root ~write ~add ->
     let now = Unix.gettimeofday () in
+    let proj = Filename.concat root "proj" and other = Filename.concat root "other" in
+    Unix.mkdir proj 0o755; Unix.mkdir other 0o755;
     add ~mtime:(now -. 60.) (agy_id 1) (user_input "fix the parser");
-    add ~mtime:(now -. 30.) (agy_id 2)
-      (user_input "<bot-context>\nyou are a lead\n</bot-context>\n\nship it");
+    add ~mtime:(now -. 30.) (agy_id 2) (user_input (bot_first_turn "ship it"));
+    add ~mtime:(now -. 20.) (agy_id 4)
+      (user_input "[Discord context: project=p, channel=c (thread), from=ted]\n\nlater turn");
+    add ~mtime:(now -. 10.) (agy_id 5) (user_input "resumed elsewhere");
+    add ~mtime:(now -. 5.) (agy_id 6) (user_input "dir is gone");
     add ~mtime:(now -. 90_000.) (agy_id 3) (user_input "too old");
     write (Filename.concat (Filename.concat root "brain") "not-a-uuid/x") "";
     write (Filename.concat root "cache/last_conversations.json")
-      (Printf.sprintf {|{"/home/me/proj": "%s", "relative": "%s"}|}
-         (agy_id 2) (agy_id 1));
+      (Printf.sprintf
+         {|{"%s": "%s", "relative": "%s", "%s": "%s", "%s": "%s", "%s/missing": "%s"}|}
+         proj (agy_id 2) (agy_id 1) other (agy_id 5) (proj ^ "/../proj2") (agy_id 5)
+         root (agy_id 6));
     let got = Discord_agents.Agy_sessions.discover_in ~root ~hours:24 in
     Alcotest.(check (list (triple string string string)))
-      "newest first, bot-context stripped, dir only where recorded"
-      [ (agy_id 2, "/home/me/proj", "ship it");
+      "newest first; bot wrapping stripped; dir only when single and existing"
+      [ (agy_id 6, "", "dir is gone");
+        (agy_id 5, "", "resumed elsewhere");
+        (agy_id 4, "", "later turn");
+        (agy_id 2, proj, "ship it");
         (agy_id 1, "", "fix the parser") ]
       (List.map (fun (i : Discord_agents.Agy_sessions.info) ->
          (i.session_id, i.working_dir, i.summary)) got))
+
+let test_agy_sessions_summary_edges () =
+  let summary = Discord_agents.Agy_sessions.summary_of_first_line in
+  Alcotest.(check string) "unclosed bot-context is kept, not swallowed"
+    "<bot-context> half" (summary (user_input "<bot-context>\nhalf"));
+  Alcotest.(check string) "non user-input step has no summary"
+    "" (summary {|{"type":"PLANNER_RESPONSE","content":"x"}|});
+  with_agy_root (fun ~root ~write:_ ~add ->
+    add (agy_id 7) (user_input (String.make (100 * 1024) 'x'));
+    match Discord_agents.Agy_sessions.discover_in ~root ~hours:24 with
+    | [ i ] -> Alcotest.(check string) "oversized first line: no summary" "" i.summary
+    | l -> Alcotest.failf "expected one conversation, got %d" (List.length l))
 
 let test_agy_sessions_find_by_prefix () =
   with_agy_root (fun ~root ~write:_ ~add ->
@@ -4100,8 +4129,12 @@ let test_agy_sessions_find_by_prefix () =
     let find = Discord_agents.Agy_sessions.find_by_prefix_in ~root in
     Alcotest.(check (option (pair string string))) "exact id, no dir"
       (Some (agy_id 10, "")) (find (agy_id 10));
-    Alcotest.(check (option (pair string string))) "ambiguous prefix picks newest"
-      (Some (agy_id 11, "")) (find "000000");
+    Alcotest.(check (option (pair string string))) "ambiguous prefix matches nothing"
+      None (find "000000");
+    let lettered = "abcdef01-0000-4000-8000-00000000beef" in
+    add ~mtime:(now -. 5.) lettered (user_input "hex");
+    Alcotest.(check (option (pair string string))) "prefix is case-insensitive"
+      (Some (lettered, "")) (find "ABCDEF");
     Alcotest.(check (option (pair string string))) "empty prefix matches nothing"
       None (find "");
     Alcotest.(check (option (pair string string))) "unknown"
@@ -4196,6 +4229,7 @@ let agy_tests = [
   Alcotest.test_case "resume guard: new id warns once" `Quick
     test_agy_resume_guard_new_id_warns_once;
   Alcotest.test_case "sessions: discover" `Quick test_agy_sessions_discover;
+  Alcotest.test_case "sessions: summary edges" `Quick test_agy_sessions_summary_edges;
   Alcotest.test_case "sessions: find by prefix" `Quick test_agy_sessions_find_by_prefix;
   Alcotest.test_case "sessions: missing root" `Quick test_agy_sessions_missing_root;
   Alcotest.test_case "missing status is an error" `Quick
