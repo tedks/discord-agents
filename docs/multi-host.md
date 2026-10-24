@@ -12,12 +12,13 @@ those decision issues are closed and their implementation remains under #74. The
 now rejects remote uploads before writer-local reads; executor uploads remain
 [145](https://github.com/tedks/discord-agents/issues/145), and transcript/run
 ownership is tracked in
-[146](https://github.com/tedks/discord-agents/issues/146). The next bounded
-implementation mission is host capability observations
-([151](https://github.com/tedks/discord-agents/issues/151)). Bounded capture
+[146](https://github.com/tedks/discord-agents/issues/146). Capability observations
+are tracked in [151](https://github.com/tedks/discord-agents/issues/151);
+public integration remains [154](https://github.com/tedks/discord-agents/issues/154).
+Bounded capture
 [152](https://github.com/tedks/discord-agents/pull/152) and CLI/auth observations
-[153](https://github.com/tedks/discord-agents/pull/153) are merged. `Host_probe` provides
-the bounded transport foundation: mandatory deadline and output cap, exact
+[153](https://github.com/tedks/discord-agents/pull/153) are merged. `Host_probe`
+provides the bounded transport foundation: mandatory deadline and output cap, exact
 bytes, disabled-host refusal, and process-group cleanup. Output caps cannot
 exceed 1 MiB. It requires util-linux `setsid` on the writer and verifies GNU
 coreutils `timeout` on SSH executors. BusyBox and uutils implementations are
@@ -39,8 +40,8 @@ Claude/Codex status is queried only after help advertises the command hierarchy;
 Gemini credential state remains unknown. Raw auth and transport diagnostics are
 discarded. No login, upgrade or model request is run. There is no model-denial
 cache yet; these observations must not authorize model access or retain older
-denials across a fresh CLI/auth observation. This is an internal API; collection is not yet
-wired to startup or session admission. Probes and normal turns currently share
+denials across a fresh CLI/auth observation. This is an internal API; collection
+is not yet wired to startup or session admission. Probes and normal turns currently share
 the inherited local PATH or the configured SSH destination's noninteractive
 environment; neither sources a login profile. Probe-only overrides suppress
 Claude updates and normalize help output. `login status` describes the CLI's
@@ -55,7 +56,8 @@ needed. The caller must derive its context from the same resolved MCP path,
 writer control socket and registry entries as the agent route. Today local
 turns inherit the writer's config environment and `remote_mcp_command` pins
 `XDG_CONFIG_HOME` to the writer's resolved config directory. Arbitrary supplied
-paths do not establish that correspondence; #154 must verify it when wiring
+paths do not establish that correspondence;
+[154](https://github.com/tedks/discord-agents/issues/154) must verify it when wiring
 collection. `discord-agents-mcp --check-control SOCKET` sends only a `health`
 request to that explicit socket and emits a fixed success marker, never the
 health response's operational details. The explicit path avoids checking a
@@ -66,8 +68,8 @@ not that Discord is connected, disk admission permits a turn, every MCP tool
 works or any model is available. Callback stdout/stderr noise makes the result
 unknown; it is not evidence that the endpoint is down. The MCP executable's
 normal generated configs pass no arguments; other arguments besides this
-diagnostic mode now return a usage error. Tests use the real MCP binary, private Unix
-sockets and fake SSH for both hops. Public inventory, environment binding,
+diagnostic mode now return a usage error. Tests use the real MCP binary,
+private Unix sockets and fake SSH for both hops. Public inventory, environment binding,
 safe rendering and session admission remain
 [154](https://github.com/tedks/discord-agents/issues/154); no probes run
 automatically at startup yet.

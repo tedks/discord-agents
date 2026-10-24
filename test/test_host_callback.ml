@@ -132,9 +132,12 @@ let test_transport () =
       Unix.bind decoy (Unix.ADDR_UNIX socket_path); Unix.listen decoy 1;
       let old_xdg = Sys.getenv_opt "XDG_CONFIG_HOME" in
       Fun.protect ~finally:(fun () ->
+        (* OCaml has no unsetenv; Resource.getenv_nonempty treats empty as
+           absent. Remaining checks use an explicit socket or a pure MCP ping. *)
         Unix.putenv "XDG_CONFIG_HOME" (Option.value old_xdg ~default:"");
         Unix.close decoy; Unix.unlink socket_path) (fun () ->
         Unix.putenv "XDG_CONFIG_HOME" dir;
+        check "decoy is the default" socket_path (Discord_agents.Control_api.socket_path ());
         List.iter (fun target ->
           let observed = H.collect ~clock:(Eio.Stdenv.mono_clock env) ~now ~ssh
             { context with host = target; cwd = dir; mcp_path;
