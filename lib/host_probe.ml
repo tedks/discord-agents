@@ -40,7 +40,8 @@ let run ~clock ~timeout_s ~max_output_bytes ?(ssh = "ssh") ?cwd
             let supervised = Printf.sprintf
               "for probe_tool in timeout cat sh; do command -v \"$probe_tool\" >/dev/null 2>&1 || \
                { echo \"probe supervision requires $probe_tool\" >&2; exit 1; }; done; \
-               probe_timeout_version=$(timeout --version 2>/dev/null) || exit 1; \
+               probe_timeout_version=$(timeout --version 2>/dev/null) || \
+               { echo 'probe supervision requires GNU coreutils timeout' >&2; exit 1; }; \
                case \"$probe_timeout_version\" in 'timeout (GNU coreutils)'*) ;; \
                *) echo 'probe supervision requires GNU coreutils timeout' >&2; exit 1;; esac; \
                timeout -s KILL %d sh -c %s"

@@ -223,14 +223,26 @@ let test_missing_supervision_tools () =
       let args = ["sh"; "-c"; "echo ran > " ^ Filename.quote marker] in
       Alcotest.(check bool) "missing executor timeout refused" true
         (match Probe.run ~clock ~ssh ~timeout_s:1 ~max_output_bytes:100 remote args with
-         | Error (Host (Setup_failed _)) -> true | _ -> false);
+         | Error (Host (Setup_failed message)) ->
+           String.starts_with ~prefix:"probe supervision requires timeout" (String.trim message)
+         | _ -> false);
       let oc = open_out (Filename.concat dir "timeout") in
       output_string oc "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'BusyBox timeout'; exit 0; fi\nexit 99\n";
       close_out oc;
       Unix.chmod (Filename.concat dir "timeout") 0o755;
       Alcotest.(check bool) "non-GNU timeout refused" true
         (match Probe.run ~clock ~ssh ~timeout_s:1 ~max_output_bytes:100 remote args with
-         | Error (Host (Setup_failed _)) -> true | _ -> false);
+         | Error (Host (Setup_failed message)) ->
+           String.starts_with ~prefix:"probe supervision requires GNU coreutils timeout" (String.trim message)
+         | _ -> false);
+      let oc = open_out (Filename.concat dir "timeout") in
+      output_string oc "#!/bin/sh\nexit 1\n";
+      close_out oc;
+      Alcotest.(check bool) "failed version check explains requirement" true
+        (match Probe.run ~clock ~ssh ~timeout_s:1 ~max_output_bytes:100 remote args with
+         | Error (Host (Setup_failed message)) ->
+           String.starts_with ~prefix:"probe supervision requires GNU coreutils timeout" (String.trim message)
+         | _ -> false);
       let path = Sys.getenv "PATH" in
       Fun.protect ~finally:(fun () -> Unix.putenv "PATH" path) (fun () ->
         Unix.putenv "PATH" dir;

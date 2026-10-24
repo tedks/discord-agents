@@ -18,7 +18,8 @@ implementation mission is host capability observations
 the bounded transport foundation: mandatory deadline and output cap, exact
 bytes, disabled-host refusal, and process-group cleanup. Output caps cannot
 exceed 1 MiB. It requires util-linux `setsid` on the writer and verifies GNU
-coreutils `timeout` on SSH executors. Local supervision requires exclusive
+coreutils `timeout` on SSH executors. BusyBox and uutils implementations are
+refused; their process-group supervision has not been verified. Local supervision requires exclusive
 ownership of its children's reaping, as provided by the current Eio runtime;
 auto-reaping SIGCHLD dispositions are refused before launch. A cancelled remote
 probe may run until its executor deadline; commands that deliberately escape
