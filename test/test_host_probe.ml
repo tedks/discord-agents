@@ -29,6 +29,7 @@ let failure = function
   | Process Timed_out -> "timeout"
   | Process Output_limit_exceeded -> "output limit"
   | Process (Setup_failed message) -> "setup: " ^ message
+  | Process (Io_failed message) -> "I/O: " ^ message
   | Host error -> Exec.describe_failure ~host:"test" error
 
 let ok expected = function
@@ -69,6 +70,7 @@ let test_refusals () =
           Alcotest.(check bool) "refused before spawn" true
             (match result with Error (Probe.Process (Setup_failed _)) -> true | _ -> false))
           [run ~timeout_s:0 host ["true"]; run ~max_output_bytes:(-1) host ["true"];
+           run ~max_output_bytes:(1024 * 1024 + 1) host ["true"];
            run host []; run host ["bad\000arg"]; run ~cwd:"relative" host ["true"]];
         Alcotest.(check bool) "missing cwd" true
           (match run ~cwd:(dir ^ "/missing") host ["true"] with
@@ -123,28 +125,40 @@ let test_limits () =
 
 let test_process_cleanup () =
   with_dir (fun dir -> with_clock (fun clock ->
-    let pidfile = Filename.concat dir "pid" in
-    let run = Process.run ~clock ~timeout_s:0.15 ~max_output_bytes:16 in
-    let command tail = ["sh"; "-c"; Printf.sprintf
+    let run = Process.run ~clock ~timeout_s:2. ~max_output_bytes:16 in
+    let command pidfile tail = ["sh"; "-c"; Printf.sprintf
       "sleep 20 >/dev/null 2>&1 & echo $! > %s; %s" (Filename.quote pidfile) tail] in
-    (match run (command "printf ok") with
+    let pidfile = Filename.concat dir "pid-success" in
+    (match run (command pidfile "printf ok") with
      | Ok output ->
        Alcotest.(check string) "success output" "ok" output.text;
        Alcotest.(check bool) "success status" true (output.status = Unix.WEXITED 0)
      | Error _ -> Alcotest.fail "successful probe failed");
     await_stopped clock pidfile;
+    let pidfile = Filename.concat dir "pid-overflow" in
     Alcotest.(check bool) "overflow stops the group" true
-      (run (command "while :; do printf 01234567890123456789; done")
+      (run (command pidfile "while :; do printf 01234567890123456789; done")
        = Error Process.Output_limit_exceeded);
     await_stopped clock pidfile;
+    let pidfile = Filename.concat dir "pid-closed" in
     Alcotest.(check bool) "closed output does not evade timeout" true
-      (run (command "exec 1>&- 2>&-; wait") = Error Process.Timed_out);
+      (Process.run ~clock ~timeout_s:1. ~max_output_bytes:16
+         (command pidfile "exec 1>&- 2>&-; wait") = Error Process.Timed_out);
     await_stopped clock pidfile;
     (* Cancellation propagates, with the same ownership cleanup. *)
-    let result = Eio.Time.Timeout.run (Eio.Time.Timeout.seconds clock 0.05)
-      (fun () -> Result.map_error (fun _ -> `Unexpected)
-        (Process.run ~clock ~timeout_s:10. ~max_output_bytes:16 (command "wait"))) in
-    Alcotest.(check bool) "caller cancellation" true (result = Error `Timeout);
+    let pidfile = Filename.concat dir "pid-cancel" in
+    let rec wait_started () =
+      let ready = try
+        In_channel.with_open_bin pidfile (fun ic -> Option.is_some (int_of_string_opt (input_line ic)))
+        with Sys_error _ | End_of_file -> false in
+      if not ready then (Eio.Time.Mono.sleep clock 0.01; wait_started ())
+    in
+    let result = Eio.Time.Timeout.run_exn (Eio.Time.Timeout.seconds clock 2.) (fun () ->
+      Eio.Fiber.first
+        (fun () -> ignore (Process.run ~clock ~timeout_s:10. ~max_output_bytes:16
+                     (command pidfile "wait")); `Completed)
+        (fun () -> wait_started (); `Cancel)) in
+    Alcotest.(check bool) "caller cancelled after child started" true (result = `Cancel);
     await_stopped clock pidfile))
 
 let test_duplex_and_fds () =
@@ -176,6 +190,11 @@ let test_remote_supervision () =
       await_stopped clock pidfile))
 
 let test_high_fds () =
+  let module Limits = Discord_agents.Runtime_limits in
+  let before = Limits.get_nofile_limit () in
+  if before.hard < 1200L then Alcotest.skip ();
+  Fun.protect ~finally:(fun () -> Limits.set_nofile_soft_limit_raw before.soft) (fun () ->
+  Limits.set_nofile_soft_limit_raw (max before.soft 1200L);
   with_clock (fun clock ->
     let fds = ref [] in
     Fun.protect ~finally:(fun () -> List.iter Unix.close !fds) (fun () ->
@@ -184,14 +203,14 @@ let test_high_fds () =
       done;
       match Process.run ~clock ~timeout_s:1. ~max_output_bytes:3 ["printf"; "yes"] with
       | Ok output -> Alcotest.(check string) "capture above FD_SETSIZE" "yes" output.text
-      | Error _ -> Alcotest.fail "capture with high fds failed"))
+      | Error _ -> Alcotest.fail "capture with high fds failed")))
 
 let test_missing_supervision_tools () =
   with_dir (fun dir ->
     let executable name = Option.get (Discord_agents.Resource.executable_in_path name) in
     let python = executable "python3" in
     List.iter (fun name -> Unix.symlink (executable name) (Filename.concat dir name))
-      ["sh"; "base64"];
+      ["sh"; "base64"; "cat"];
     let ssh = Filename.concat dir "ssh" in
     let oc = open_out ssh in
     Printf.fprintf oc "#!/bin/sh\nPATH=%s; export PATH\nexec %s -I %s \"$@\"\n"
@@ -205,6 +224,13 @@ let test_missing_supervision_tools () =
       Alcotest.(check bool) "missing executor timeout refused" true
         (match Probe.run ~clock ~ssh ~timeout_s:1 ~max_output_bytes:100 remote args with
          | Error (Host (Setup_failed _)) -> true | _ -> false);
+      let oc = open_out (Filename.concat dir "timeout") in
+      output_string oc "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'BusyBox timeout'; exit 0; fi\nexit 99\n";
+      close_out oc;
+      Unix.chmod (Filename.concat dir "timeout") 0o755;
+      Alcotest.(check bool) "non-GNU timeout refused" true
+        (match Probe.run ~clock ~ssh ~timeout_s:1 ~max_output_bytes:100 remote args with
+         | Error (Host (Setup_failed _)) -> true | _ -> false);
       let path = Sys.getenv "PATH" in
       Fun.protect ~finally:(fun () -> Unix.putenv "PATH" path) (fun () ->
         Unix.putenv "PATH" dir;
@@ -213,6 +239,26 @@ let test_missing_supervision_tools () =
            | Error (Process (Setup_failed _)) -> true | _ -> false));
       Alcotest.(check bool) "probe never launched" false (Sys.file_exists marker)))
 
+let test_capture_without_home () =
+  with_clock (fun clock ->
+    let script = Discord_agents.Remote_script.script ~nonce:"test" ~mode:Capture
+      ~cwd:"." ~env:[] ~argv:["printf"; "ok"] |> Result.get_ok in
+    match Process.run ~clock ~timeout_s:2. ~max_output_bytes:4096
+        ["env"; "-u"; "HOME"; "sh"; "-c"; script] with
+    | Ok output ->
+      Alcotest.(check bool) "capture needs no HOME" true
+        (Exec.classify_capture ~nonce:"test" ~cwd:"."
+           ~ssh_status:(Exec.exit_code output.status) output.text = Ok "ok")
+    | Error _ -> Alcotest.fail "capture without HOME failed")
+
+let test_auto_reaping_refused () =
+  with_clock (fun clock ->
+    let previous = Sys.signal Sys.sigchld Sys.Signal_ignore in
+    Fun.protect ~finally:(fun () -> Sys.set_signal Sys.sigchld previous) (fun () ->
+      Alcotest.(check bool) "auto-reaping refused before spawn" true
+        (match Process.run ~clock ~timeout_s:1. ~max_output_bytes:10 ["true"] with
+         | Error (Process.Setup_failed _) -> true | _ -> false)))
+
 let () = Alcotest.run "host_probe" [
   "transport", [
     Alcotest.test_case "exact bytes local and ssh" `Quick test_roundtrip;
@@ -220,10 +266,12 @@ let () = Alcotest.run "host_probe" [
     Alcotest.test_case "time and memory limits" `Quick test_limits;
     Alcotest.test_case "executor cleans up after success and disconnect" `Quick test_remote_supervision;
     Alcotest.test_case "missing supervision tools refuse launch" `Quick test_missing_supervision_tools;
+    Alcotest.test_case "capture without HOME" `Quick test_capture_without_home;
   ];
   "supervision", [
     Alcotest.test_case "cleanup on exit overflow timeout cancellation" `Quick test_process_cleanup;
     Alcotest.test_case "duplex input and descriptor ownership" `Quick test_duplex_and_fds;
     Alcotest.test_case "high file descriptors" `Quick test_high_fds;
+    Alcotest.test_case "auto-reaping disposition refused" `Quick test_auto_reaping_refused;
   ];
 ]

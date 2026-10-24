@@ -3,16 +3,20 @@
     Unlike Eio's process manager, we retain the unreaped child until after
     killing its process group. This pins the group id even if the leader
     exits while a descendant still owns the output pipe. Probes must not
-    daemonize or escape the group with setsid. Requires an Eio context. *)
+    daemonize or escape the group with setsid. Requires an Eio context and
+    exclusive reaping ownership of the children it creates: no competing
+    waitpid(-1), SIGCHLD reaper, or later SIGCHLD disposition changes. *)
 
 type failure =
   | Timed_out
   | Output_limit_exceeded
   | Setup_failed of string
+  | Io_failed of string
 
 type output = { status : Unix.process_status; text : string }
 
 external exited_without_reaping : int -> bool = "discord_agents_probe_exited"
+external children_waitable : unit -> bool = "discord_agents_probe_children_waitable"
 
 exception Output_limit
 
@@ -23,9 +27,12 @@ let run ~clock ~timeout_s ~max_output_bytes ?(input = "") argv =
     Error (Setup_failed "probe output limit must be non-negative")
   else if argv = [] || List.exists Remote_script.has_nul argv then
     Error (Setup_failed "probe command must be non-empty and contain no NUL bytes")
+  else if not (children_waitable ()) then
+    Error (Setup_failed "probe supervision requires waitable children (SIGCHLD must not auto-reap)")
   else match Resource.executable_in_path "setsid" with
   | None -> Error (Setup_failed "probe supervision requires setsid in PATH")
   | Some setsid ->
+    let spawned = ref false in
     let owned = ref [] in
     let close fd =
       if List.mem fd !owned then begin
@@ -47,19 +54,29 @@ let run ~clock ~timeout_s ~max_output_bytes ?(input = "") argv =
            cannot already be its leader, so setsid does not fork. *)
         let pid = Unix.create_process setsid (Array.of_list args)
             stdin_r stdout_w stdout_w in
+        spawned := true;
         close stdin_r;
         close stdout_w;
         let status = ref None in
+        let cleanup_error = ref None in
         let text = Buffer.create (min max_output_bytes 4096) in
         let outcome = Fun.protect
           ~finally:(fun () ->
             Eio.Cancel.protect (fun () ->
+              try
+              (* Check ownership before signalling, including after a
+                 waitid error. ECHILD refuses cleanup instead of risking
+                 a recycled PID. The caller must still exclude competing
+                 reapers between this check and the signals. *)
+              ignore (exited_without_reaping pid);
               (* No wait/reap before these signals. First prevent a child
                  still in setsid from creating a group after our kill. *)
               (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
               (try Unix.kill (-pid) Sys.sigkill with Unix.Unix_error _ -> ());
               status := Some (Eio_unix.run_in_systhread (fun () ->
-                Host_exec.waitpid_retry pid))))
+                Host_exec.waitpid_retry pid))
+              with Unix.Unix_error (error, operation, _) ->
+                cleanup_error := Some (Io_failed (operation ^ ": " ^ Unix.error_message error))))
           (fun () ->
             Unix.set_nonblock stdin_w;
             Unix.set_nonblock stdout_r;
@@ -104,7 +121,10 @@ let run ~clock ~timeout_s ~max_output_bytes ?(input = "") argv =
             | Eio.Time.Timeout -> Error Timed_out
             | Output_limit -> Error Output_limit_exceeded)
         in
-        Result.map (fun () ->
-          { status = Option.get !status; text = Buffer.contents text }) outcome
+        match !cleanup_error with
+        | Some error -> Error error
+        | None -> Result.map (fun () ->
+            { status = Option.get !status; text = Buffer.contents text }) outcome
       with Unix.Unix_error (error, operation, _) ->
-        Error (Setup_failed (operation ^ ": " ^ Unix.error_message error)))
+        let detail = operation ^ ": " ^ Unix.error_message error in
+        Error (if !spawned then Io_failed detail else Setup_failed detail))

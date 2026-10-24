@@ -9,11 +9,12 @@ type failure =
 (* The extra budget bounds login-shell noise and protocol markers too.
    The decoded command output is checked separately, never truncated. *)
 let protocol_budget = 4096
+let max_probe_output_bytes = 1024 * 1024
 
 let run ~clock ~timeout_s ~max_output_bytes ?(ssh = "ssh") ?cwd
     (host : Host.t) argv =
   if not host.enabled then Error Disabled
-  else if max_output_bytes < 0 || max_output_bytes > Sys.max_string_length - protocol_budget then
+  else if max_output_bytes < 0 || max_output_bytes > max_probe_output_bytes then
     Error (Process (Setup_failed "invalid probe output limit"))
   else if timeout_s <= 0 || timeout_s > 3600 then
     Error (Process (Setup_failed "probe timeout must be between 1 and 3600 seconds"))
@@ -39,6 +40,9 @@ let run ~clock ~timeout_s ~max_output_bytes ?(ssh = "ssh") ?cwd
             let supervised = Printf.sprintf
               "for probe_tool in timeout cat sh; do command -v \"$probe_tool\" >/dev/null 2>&1 || \
                { echo \"probe supervision requires $probe_tool\" >&2; exit 1; }; done; \
+               probe_timeout_version=$(timeout --version 2>/dev/null) || exit 1; \
+               case \"$probe_timeout_version\" in 'timeout (GNU coreutils)'*) ;; \
+               *) echo 'probe supervision requires GNU coreutils timeout' >&2; exit 1;; esac; \
                timeout -s KILL %d sh -c %s"
               timeout_s
               (Remote_script.quote (Printf.sprintf

@@ -143,9 +143,9 @@ let script ~nonce ~mode ~cwd ~env ~argv =
         line "set -u";
         (* Before the exports, so an env entry named HOME cannot move
            the lock and let two runs of one session miss each other. *)
-        line "lockdir=\"$HOME/.cache/discord-agents/run\"";
         (match mode with
          | Run { lock_key } ->
+           line "lockdir=\"$HOME/.cache/discord-agents/run\"";
            line "lockfile=\"$lockdir\"/%s.lock" (quote lock_key);
            (* Per invocation: the wrapper pid and this call's nonce, so
               no two runs ever share one, even if a pid is reused. '+'
