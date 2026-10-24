@@ -83,7 +83,8 @@ let flag_of_word word =
 (* Only option declarations count; a flag mentioned in prose is not evidence.
    Help advertises syntax, not runtime support or account entitlement. *)
 let parse_help ~agent ~scope text =
-  let lines = String.split_on_char '\n' text |> List.map String.trim in
+  let raw_lines = String.split_on_char '\n' text in
+  let lines = List.map String.trim raw_lines in
   let expected = Config.string_of_agent_kind agent :: scope in
   let usage_matches line =
     match words (String.lowercase_ascii line) with
@@ -100,14 +101,31 @@ let parse_help ~agent ~scope text =
     | Some word -> String.starts_with ~prefix:"[" word || String.starts_with ~prefix:"<" word in
   if String.length text > 65536 || not (List.exists usage_matches lines) then Unknown Malformed
   else
-    let flags = lines |> List.concat_map (fun line ->
-      if not (String.starts_with ~prefix:"-" line) then [] else
+    let _, _, flags = List.fold_left (fun (in_options, option_indent, acc) raw ->
+      let line = String.trim raw in
+      let rec indentation i =
+        if i < String.length raw && (raw.[i] = ' ' || raw.[i] = '\t') then indentation (i+1) else i in
+      let indent = indentation 0 in
+      let heading = String.lowercase_ascii line in
+      if List.mem heading ["options:"; "flags:"] then true, None, acc
+      else if String.ends_with ~suffix:":" line then false, None, acc
+      else if not in_options || not (String.starts_with ~prefix:"-" line) ||
+        (match option_indent with Some n -> indent > n + (if n <= 2 then 4 else 0) | None -> false)
+      then in_options, option_indent, acc else
       (* Stop at the description column, which is separated by two spaces. *)
       let rec column i =
         if i + 1 >= String.length line then String.length line
         else if line.[i] = ' ' && line.[i+1] = ' ' then i else column (i+1) in
-      words (String.sub line 0 (column 0)) |> List.filter_map flag_of_word)
-      |> List.sort_uniq String.compare in
+      let tokens = words (String.sub line 0 (column 0)) in
+      let declaration_token token = Option.is_some (flag_of_word token) ||
+        String.starts_with ~prefix:"<" token || String.starts_with ~prefix:"[" token in
+      let declarations = if List.for_all declaration_token tokens
+        then List.filter_map flag_of_word tokens else [] in
+      (* Clap aligns long-only declarations four columns after short aliases;
+         wrapped descriptions are deeper than either declaration column. *)
+      let option_indent = Some (min indent (Option.value option_indent ~default:indent)) in
+      in_options, option_indent, declarations @ acc) (false, None, []) raw_lines in
+    let flags = List.sort_uniq String.compare flags in
     let _, commands = List.fold_left (fun (in_commands, acc) line ->
       if String.lowercase_ascii line = "commands:" then true, acc
       else if String.ends_with ~suffix:":" line then false, acc
@@ -165,7 +183,9 @@ let observe ~run ~now ~host ~cwd ~agent =
     | Unknown why -> unknown why
     | Known None -> { (unknown Missing_executable) with executable = Known None }
     | Known (Some exe) as executable ->
-      let command args = ["env"; "DISABLE_AUTOUPDATER=1"; "NO_COLOR=1"; "LC_ALL=C"; exe.path] @ args in
+      let command args = ["sh"; "-c";
+        "DISABLE_AUTOUPDATER=1 NO_COLOR=1 LC_ALL=C; export DISABLE_AUTOUPDATER NO_COLOR LC_ALL; exec \"$@\"";
+        "capability-cli"; exe.path] @ args in
       let help scope =
         match probe ~cap:65536 (command (scope @ ["--help"])) with
         | Ok text -> parse_help ~agent ~scope text
@@ -173,11 +193,19 @@ let observe ~run ~now ~host ~cwd ~agent =
       let version = match probe ~cap:2048 (command ["--version"]) with
         | Ok text -> (match text_line text with Some v -> Known v | None -> Unknown Malformed)
         | Error error -> Unknown (reason error) in
-      let helps = List.map (fun scope -> scope, help scope) (scopes agent) in
       let advertised_command page name = match page with
         | Known h when List.mem name h.commands -> Ok ()
         | Known _ -> Error Not_supported
         | Unknown why -> Error why in
+      let helps = List.fold_left (fun pages scope ->
+        let observed = match List.rev scope with
+          | [] -> help []
+          | name :: reversed_parent ->
+            let parent = List.assoc (List.rev reversed_parent) pages in
+            match advertised_command parent name with
+            | Error why -> Unknown why
+            | Ok () -> help scope in
+        pages @ [scope, observed]) [] (scopes agent) in
       let credentials = match agent with
         | Config.Gemini -> Unknown Not_supported
         | Config.Claude | Config.Codex ->
@@ -196,14 +224,16 @@ let observe ~run ~now ~host ~cwd ~agent =
       match identity () with
       | Known (Some after) when after = exe ->
         { host; cwd; agent; observed_at; executable; version; help = helps; credentials }
-      | _ -> unknown Executable_changed
+      | Unknown why -> unknown why
+      | Known _ -> unknown Executable_changed
 
 (** Freshness is explicit, caller-chosen and conservative: the timestamp is the
     beginning of collection, not the end. A changed host entry/cwd invalidates
     every field. Even fresh evidence is observational, never a model grant. *)
-let current ~now ~max_age ~host ~cwd snapshot =
+let current ~now ~max_age ~host ~cwd ~agent snapshot =
   let why =
-    if not (Host.equal host snapshot.host) || cwd <> snapshot.cwd then Some Context_changed
+    if not (Host.equal host snapshot.host) || cwd <> snapshot.cwd || agent <> snapshot.agent
+    then Some Context_changed
     else if not (finite now && finite max_age && finite snapshot.observed_at) ||
       max_age < 0. || now < snapshot.observed_at || now -. snapshot.observed_at > max_age
     then Some Stale else None in

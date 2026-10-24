@@ -28,10 +28,10 @@ let fixture ?(agent = Config.Codex) ?(modify = fun _ result -> result) () =
         check "fixed identity script" C.identity_script script;
         check "only selected CLI" (Config.string_of_agent_kind agent) name;
         ["identity"], Ok "/cli path/agent\000metadata\n"
-      | "env" :: "DISABLE_AUTOUPDATER=1" :: "NO_COLOR=1" :: "LC_ALL=C" :: "/cli path/agent" :: args ->
+      | "sh" :: "-c" :: _ :: "capability-cli" :: "/cli path/agent" :: args ->
         args, (match args with
         | ["--version"] -> Ok "agent 1.0\n"
-        | ["--help"] -> Ok (page agent [] ["-p"; "--json"] [parent])
+        | ["--help"] -> Ok (page agent [] ["-p"; "--json"] [parent; "exec"])
         | ["exec"; "--help"] -> Ok (page agent ["exec"] ["--json"] ["resume"])
         | ["exec"; "resume"; "--help"] -> Ok (page agent ["exec"; "resume"] ["--json"] [])
         | [p; "--help"] when p = parent -> Ok (page agent [p] [] ["status"])
@@ -87,6 +87,11 @@ let test_identity_and_failures () =
   let s = observe run in
   check "upgrade invalidates version" (Unknown Executable_changed) s.version;
   check "upgrade invalidates auth" (Unknown Executable_changed) s.credentials;
+  let count = ref 0 in
+  let run, _ = fixture ~modify:(fun args result ->
+    if args = ["identity"] then (incr count; if !count = 2 then Error (Probe.Process Timed_out) else result)
+    else result) () in
+  check "recheck failure keeps its cause" (Unknown Timed_out) (observe run).version;
   let run, _ = fixture ~modify:(fun args result ->
     if args = ["--version"] then Ok "banner\nagent 1.0\n" else result) () in
   check "noisy version unknown" (Unknown Malformed) (observe run).version
@@ -97,6 +102,8 @@ let test_status_guards () =
   check "old CLI no auth subcommand" (Unknown Not_supported) (observe run).credentials;
   Alcotest.(check bool) "never attempted status" false
     (List.exists (fun (_,args) -> List.mem "status" args) !calls);
+  Alcotest.(check bool) "no unadvertised exec subcommand" false
+    (List.exists (fun (_,args) -> List.mem "exec" args) !calls);
   let run, _ = fixture ~modify:(fun args result ->
     if args = ["login"; "status"; "--help"] then Ok (page Config.Codex [] [] []) else result) () in
   check "parent help cannot authorize status" (Unknown Malformed) (observe run).credentials;
@@ -124,14 +131,16 @@ let test_auth_parsing () =
 let test_freshness_and_disable () =
   let run, calls = fixture () in
   let s = observe run in
-  let current ~time ~age = C.current ~now:time ~max_age:age ~host ~cwd:s.cwd s in
+  let current ~time ~age = C.current ~now:time ~max_age:age ~host ~cwd:s.cwd ~agent:Config.Codex s in
   check "fresh" s (current ~time:110. ~age:10.);
   List.iter (fun (time,age) -> check "stale" (Unknown Stale) (current ~time ~age).version)
     [110.1,10.; 99.,10.; nan,10.; 100.,infinity; 100.,(-1.)];
   check "cwd invalidates" (Unknown Context_changed)
-    (C.current ~now:100. ~max_age:10. ~host ~cwd:"/other" s).credentials;
+    (C.current ~now:100. ~max_age:10. ~host ~cwd:"/other" ~agent:Config.Codex s).credentials;
   check "host config invalidates" (Unknown Context_changed)
-    (C.current ~now:100. ~max_age:10. ~host:remote ~cwd:s.cwd s).credentials;
+    (C.current ~now:100. ~max_age:10. ~host:remote ~cwd:s.cwd ~agent:Config.Codex s).credentials;
+  check "agent invalidates" (Unknown Context_changed)
+    (C.current ~now:100. ~max_age:10. ~host ~cwd:s.cwd ~agent:Config.Claude s).credentials;
   calls := [];
   check "disabled" (Unknown Disabled) (observe ~target:{ host with enabled = false } run).version;
   check "disabled no calls" [] !calls;
@@ -141,13 +150,13 @@ let test_freshness_and_disable () =
 
 let test_help_parser () =
   let help = C.parse_help ~agent:Config.Codex ~scope:[]
-    "noise\nUsage: codex [OPTIONS]\nOptions:\n -c, --config <key=value>  desc --fake\n --json  desc\n prose mentions --wrong\n" in
+    "noise\nUsage: codex [OPTIONS]\nOptions:\n  -c, --config <key=value>\n          --wrapped description\n      --json  desc\n prose mentions --wrong\nExamples:\n--dangerously-bypass-approvals-and-sandbox is unavailable on this version\n" in
   match help with
   | Known h -> check "only declarations" ["--config"; "--json"; "-c"] h.flags
   | _ -> Alcotest.fail "help should parse"
 
 let test_real_transport () =
-  let dir = Filename.temp_dir "capability ' " "" in
+  let dir = Filename.temp_dir "capability = ' " "" in
   let old_path = Sys.getenv "PATH" in
   Fun.protect ~finally:(fun () ->
     Unix.putenv "PATH" old_path;
@@ -160,8 +169,8 @@ let test_real_transport () =
     let _ = write "codex" {|#!/bin/sh
 case "$*" in
   --version) echo 'codex 0.1';;
-  --help) printf 'Usage: codex [OPTIONS]\nCommands:\n  login  Login\nOptions:\n  --help  Help\n';;
-  'exec --help') printf 'Usage: codex exec [OPTIONS]\nOptions:\n  --json  JSON\n';;
+  --help) printf 'Usage: codex [OPTIONS]\nCommands:\n  login  Login\n  exec  Exec\nOptions:\n  --help  Help\n';;
+  'exec --help') printf 'Usage: codex exec [OPTIONS]\nCommands:\n  resume  Resume\nOptions:\n  --json  JSON\n';;
   'exec resume --help') printf 'Usage: codex exec resume [OPTIONS]\n';;
   'login --help') printf 'Usage: codex login [OPTIONS]\nCommands:\n  status  Status\n';;
   'login status --help') printf 'Usage: codex login status [OPTIONS]\n';;

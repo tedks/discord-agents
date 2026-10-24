@@ -20,8 +20,8 @@ bytes, disabled-host refusal, and process-group cleanup. Output caps cannot
 exceed 1 MiB. It requires util-linux `setsid` on the writer and verifies GNU
 coreutils `timeout` on SSH executors. BusyBox and uutils implementations are
 refused; their process-group supervision has not been verified. Local
-supervision requires exclusive
-ownership of its children's reaping, as provided by the current Eio runtime;
+supervision requires exclusive ownership of its children's reaping, as
+provided by the current Eio runtime;
 auto-reaping SIGCHLD dispositions are refused before launch. A cancelled remote
 probe may run until its executor deadline; commands that deliberately escape
 their process group are outside this contract. Legacy `Host_exec.run_capture`
@@ -29,7 +29,7 @@ is unchanged and must not be used for capability probes.
 
 `Host_capability` collects dated executable metadata, version, advertised flags
 and CLI-reported credential presence through that transport. It binds evidence
-to the complete host entry and absolute cwd, invalidates a collection if the
+to the complete host entry, agent and absolute cwd, invalidates a collection if the
 launcher metadata changes, and requires callers to check freshness with
 `current`. The metadata probe requires GNU-compatible `stat -L -c`; failure is
 unknown. Help is evidence of advertised syntax, not proof of runtime support.
@@ -39,15 +39,21 @@ discarded. No login, upgrade or model request is run. There is no model-denial
 cache yet; these observations must not authorize model access or retain older
 denials across a fresh CLI/auth observation. MCP callback health and public
 exposure remain outstanding. This is an internal API; collection is not yet
-wired to startup or session admission.
+wired to startup or session admission. Probes and normal turns currently share
+the inherited local PATH or the configured SSH destination's noninteractive
+environment; neither sources a login profile. Probe-only overrides suppress
+Claude updates and normalize help output. `login status` describes the CLI's
+credential store, which need not be the credential source a real request uses
+(environment keys or future per-session overrides may differ). Before admission
+wiring, validate this environment contract; never interpret `Absent` as an
+account denial. There is no environment/account fingerprint or persistent cache.
 
 Status contracts: [Claude CLI reference](https://code.claude.com/docs/en/cli-reference)
 and [Codex CLI reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli).
 Credential presence does not prove that credentials are valid or that a model
 is included in an account plan.
 
-Login repair guidance
-now names the session executor in both MCP renderers, including when that
+Login repair guidance now names the session executor in both MCP renderers, including when that
 host is unavailable; a request without a session names the actual writer. See the revised
 [Stacked PR plan](#stacked-pr-plan).
 
