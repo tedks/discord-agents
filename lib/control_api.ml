@@ -1039,8 +1039,8 @@ let login_help_json ~host agent =
       "codex login",
       "Use the login flow supported by the Codex CLI on that host."
     | Config.Gemini ->
-      "gcloud auth application-default login",
-      "This command applies to Google Cloud application-default credentials. If Gemini on that host uses another provider, use that provider's login flow."
+      "export GEMINI_API_KEY=<key>",
+      "Gemini support is unmaintained: Google no longer offers the consumer OAuth sign-in Gemini CLI used, so only API-key auth works. Export GEMINI_API_KEY in the environment that starts discord-agents there, then restart the bot."
   in
   `Assoc [
     ("agent", `String (Config.string_of_agent_kind agent));

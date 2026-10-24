@@ -102,7 +102,7 @@ TOOLS = [
                 },
                 "agent": {
                     "type": "string",
-                    "description": "Agent type: claude, codex, or gemini. If omitted, uses the bot's current effective top-level agent (default agent unless a rescue agent is active under disk pressure).",
+                    "description": "Agent type: claude, codex, or gemini (unmaintained; API-key auth only). If omitted, uses the bot's current effective top-level agent (default agent unless a rescue agent is active under disk pressure).",
                     "enum": ["claude", "codex", "gemini"]
                 },
                 "thread_name": {
@@ -255,7 +255,7 @@ TOOLS = [
     },
     {
         "name": "list_gemini_sessions",
-        "description": "List recent Gemini CLI sessions on this machine (last 24h). Useful for finding sessions to resume.",
+        "description": "List recent Gemini CLI sessions on this machine (last 24h). Useful for finding sessions to resume. Gemini support is unmaintained (API-key auth only).",
         "inputSchema": {
             "type": "object",
             "properties": {

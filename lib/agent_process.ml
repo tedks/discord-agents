@@ -1099,6 +1099,10 @@ let parse_codex_json_line line =
 
 (* ── Gemini JSON parser ────────────────────────────────────────────
 
+   Unmaintained: Gemini support survives only as an API-key fallback
+   since Google withdrew the consumer OAuth path. Keep it compiling;
+   don't extend it. See docs/agy-harness.md.
+
    Gemini's [-o stream-json] schema is flat — one event per line, each
    with a top-level [type] field. The events we care about:
 

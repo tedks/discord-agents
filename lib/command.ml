@@ -160,7 +160,7 @@ let all_specs = [
     ~help:["`!codex-sessions` — list recent Codex sessions"]
     ~no_arg_command:List_codex_sessions ();
   read_only ~id:List_gemini_sessions_id ~primary:"gemini-sessions"
-    ~help:["`!gemini-sessions` — list recent Gemini sessions"]
+    ~help:["`!gemini-sessions` — list recent Gemini sessions (unmaintained)"]
     ~no_arg_command:List_gemini_sessions ();
   mutating ~id:Start_agent_id ~primary:"start"
     ~help:[
@@ -174,7 +174,7 @@ let all_specs = [
   mutating ~id:Default_agent_id ~primary:"default-agent"
     ~aliases:["default_agent"]
     ~help:[
-      "`!default-agent [agent]` / `!default_agent [agent]` — show or set the default agent (claude|codex|gemini)";
+      "`!default-agent [agent]` / `!default_agent [agent]` — show or set the default agent (claude|codex|gemini; gemini is unmaintained)";
     ]
     ~no_arg_command:(Default_agent None) ();
   mutating ~id:Rescue_agent_id ~primary:"rescue-agent"

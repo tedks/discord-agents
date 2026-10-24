@@ -125,7 +125,7 @@ let all_specs = [
       ("project", property ~type_:string_type
         ~description:"Project name, number from the list, or a prefix/substring to fuzzy match" ());
       ("agent", property ~type_:string_type
-        ~description:"Agent type: claude, codex, or gemini. If omitted, uses the bot's current effective top-level agent (default agent unless a rescue agent is active under disk pressure)."
+        ~description:"Agent type: claude, codex, or gemini (unmaintained; API-key auth only). If omitted, uses the bot's current effective top-level agent (default agent unless a rescue agent is active under disk pressure)."
         ~enum:agent_enum ());
       ("thread_name", property ~type_:string_type
         ~description:"Short descriptive name for the thread (max 80 chars). If omitted, uses a default name."
@@ -197,7 +197,7 @@ let all_specs = [
     ~control_method:Control_api.List_codex_sessions_id
     ~input_schema:(object_schema [("hours", hours_property)]);
   spec ~id:List_gemini_sessions
-    ~description:"List recent Gemini CLI sessions on this machine (last 24h). Useful for finding sessions to resume."
+    ~description:"List recent Gemini CLI sessions on this machine (last 24h). Useful for finding sessions to resume. Gemini support is unmaintained (API-key auth only)."
     ~control_method:Control_api.List_gemini_sessions_id
     ~input_schema:(object_schema [("hours", hours_property)]);
   spec ~id:Default_agent
