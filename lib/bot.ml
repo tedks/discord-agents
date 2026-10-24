@@ -902,7 +902,8 @@ You have MCP tools available:
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume
 - list_gemini_sessions: Find recent Gemini CLI sessions to resume
-- resume_session: Resume an existing session (pass kind=claude, kind=codex, or kind=gemini to disambiguate; default tries the current effective top-level agent first)
+- list_agy_sessions: Find recent agy (Antigravity CLI) conversations to resume
+- resume_session: Resume an existing session (pass kind=claude, kind=codex, kind=gemini, or kind=agy to disambiguate; default tries the current effective top-level agent first)
 - default_agent: Show or set the default agent used for new top-level sessions
 - rescue_agent: Show or set the rescue agent automatically used for new top-level sessions under disk pressure
 - restart_bot: Rebuild and restart the bot
@@ -945,7 +946,8 @@ You have MCP tools available:
 - list_claude_sessions: Find recent Claude Code sessions to resume
 - list_codex_sessions: Find recent Codex CLI sessions to resume
 - list_gemini_sessions: Find recent Gemini CLI sessions to resume
-- resume_session: Resume an existing session (pass kind=claude, kind=codex, or kind=gemini to disambiguate; default tries the current effective top-level agent first)
+- list_agy_sessions: Find recent agy (Antigravity CLI) conversations to resume
+- resume_session: Resume an existing session (pass kind=claude, kind=codex, kind=gemini, or kind=agy to disambiguate; default tries the current effective top-level agent first)
 - default_agent: Show or set the default agent used for new top-level sessions
 - rescue_agent: Show or set the rescue agent automatically used for new top-level sessions under disk pressure
 - rename_thread: Rename a Discord thread
@@ -1753,16 +1755,10 @@ let format_session_listing
       label (String.concat "\n" lines) resume_hint
 
 (** Build the user-facing "session not found" error for the Resume
-    handlers (Discord command, MCP tool). Claude, Codex and Gemini have
-    discoverable session stores; agy does not yet, so an explicit agy
-    lookup says that rather than implying the id was wrong. *)
+    handlers (Discord command, MCP tool). All four agents have
+    discoverable session stores, so the message is uniform. *)
 let resume_not_found_message ~kind ~sid_prefix =
   match kind with
-  | Some Config.Agy ->
-    Printf.sprintf
-      "Cannot look up agy session %S: agy session discovery is not \
-       implemented yet. An agy session can still be continued in its \
-       own Discord thread." sid_prefix
   | Some k ->
     Printf.sprintf "No %s session matching %S."
       (Config.string_of_agent_kind k) sid_prefix
@@ -2138,6 +2134,16 @@ let handle_command t msg cmd =
       in
       reply (format_session_listing ~label:"Gemini"
         ~resume_hint:"!resume gemini <session_id_prefix>" entries))
+  | Command.List_agy_sessions ->
+    Eio.Fiber.fork ~sw:t.sw (fun () ->
+      let entries =
+        Agy_sessions.discover ~hours:24 ()
+        |> List.filteri (fun i _ -> i < 10)
+        |> List.map (fun (s : Agy_sessions.info) ->
+          (s.session_id, s.working_dir, s.summary, s.mtime))
+      in
+      reply (format_session_listing ~label:"agy"
+        ~resume_hint:"!resume agy <session_id_prefix>" entries))
   | Command.Resume_session { session_id; kind } ->
     Eio.Fiber.fork ~sw:t.sw (fun () ->
       match new_session_block_message () with
@@ -2161,14 +2167,16 @@ let handle_command t msg cmd =
         | Some (sid, wd) -> Some (Config.Gemini, sid, wd)
         | None -> None
       in
+      let try_agy () =
+        match Agy_sessions.find_by_prefix session_id with
+        | Some (sid, wd) -> Some (Config.Agy, sid, wd)
+        | None -> None
+      in
       let try_kind = function
         | Config.Claude -> try_claude ()
         | Config.Codex -> try_codex ()
         | Config.Gemini -> try_gemini ()
-        (* agy's on-disk conversation format hasn't been captured yet
-           (docs/agy-harness.md), so there is no store to search; an
-           agy session can still be resumed from its own thread. *)
-        | Config.Agy -> None
+        | Config.Agy -> try_agy ()
       in
       (* Explicit kind hits exactly one store; otherwise try the current
          effective top-level agent first, then the remaining stores. *)

@@ -63,6 +63,7 @@ type method_id =
   | List_claude_sessions_id
   | List_codex_sessions_id
   | List_gemini_sessions_id
+  | List_agy_sessions_id
   | Start_session_id
   | Resume_session_id
   | Stop_session_id
@@ -105,6 +106,7 @@ let string_of_method_id = function
   | List_claude_sessions_id -> "list_claude_sessions"
   | List_codex_sessions_id -> "list_codex_sessions"
   | List_gemini_sessions_id -> "list_gemini_sessions"
+  | List_agy_sessions_id -> "list_agy_sessions"
   | Start_session_id -> "start_session"
   | Resume_session_id -> "resume_session"
   | Stop_session_id -> "stop_session"
@@ -527,6 +529,21 @@ let handle_list_gemini_sessions _bot params =
   ) sessions in
   ok_response [("sessions", `List items)]
 
+let handle_list_agy_sessions _bot params =
+  let sessions = Agy_sessions.discover ~hours:(hours_param params) () in
+  let items = List.map (fun (s : Agy_sessions.info) ->
+    let sid_short = Resource.short_id s.session_id in
+    let age_min = int_of_float ((Unix.gettimeofday () -. s.mtime) /. 60.0) in
+    `Assoc [
+      ("session_id", `String s.session_id);
+      ("session_id_short", `String sid_short);
+      ("working_dir", `String s.working_dir);
+      ("summary", `String s.summary);
+      ("age_minutes", `Int age_min);
+    ]
+  ) sessions in
+  ok_response [("sessions", `List items)]
+
 let json_field params name =
   match params with
   | `Assoc fields -> List.assoc_opt name fields
@@ -808,12 +825,15 @@ let handle_resume_session (bot : Bot.t) params =
         match Gemini_sessions.find_by_prefix sid_prefix with
         | Some (sid, wd) -> Some (Config.Gemini, sid, wd) | None -> None
       in
+      let try_agy () =
+        match Agy_sessions.find_by_prefix sid_prefix with
+        | Some (sid, wd) -> Some (Config.Agy, sid, wd) | None -> None
+      in
       let try_kind = function
         | Config.Claude -> try_claude ()
         | Config.Codex -> try_codex ()
         | Config.Gemini -> try_gemini ()
-        (* No agy session store yet; see Bot's resume handler. *)
-        | Config.Agy -> None
+        | Config.Agy -> try_agy ()
       in
       let found = match kind with
         | Some k -> try_kind k
@@ -1558,6 +1578,9 @@ let all_method_specs = [
   method_spec ~id:List_gemini_sessions_id ~mutability:Read_only
     ~mcp_exposed:true
     ~handler:(fun bot params -> handle_list_gemini_sessions bot params) ();
+  method_spec ~id:List_agy_sessions_id ~mutability:Read_only
+    ~mcp_exposed:true
+    ~handler:(fun bot params -> handle_list_agy_sessions bot params) ();
   method_spec ~id:Start_session_id ~mutability:Mutates_session ~mcp_exposed:true
     ~timeout_s:120
     ~handler:(fun bot params -> handle_start_session bot params) ();

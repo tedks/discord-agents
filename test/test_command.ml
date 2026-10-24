@@ -79,6 +79,7 @@ let test_drain_policy_matches_existing_read_only_set () =
     List_claude_sessions;
     List_codex_sessions;
     List_gemini_sessions;
+    List_agy_sessions;
     Status;
     Help;
   ] in
@@ -123,6 +124,7 @@ let expected_spec_ids = [
   List_claude_sessions_id;
   List_codex_sessions_id;
   List_gemini_sessions_id;
+  List_agy_sessions_id;
   Start_agent_id;
   Import_project_id;
   Default_agent_id;

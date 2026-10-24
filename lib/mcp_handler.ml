@@ -68,6 +68,11 @@ let handle_list_gemini_sessions control_client params =
     Control_api.List_gemini_sessions_id
     Mcp_formatter.format_list_gemini_sessions
 
+let handle_list_agy_sessions control_client params =
+  request_and_format ~params control_client
+    Control_api.List_agy_sessions_id
+    Mcp_formatter.format_list_agy_sessions
+
 let handle_start_session control_client params =
   let params = drop_empty_params (Some params) in
   let request_start () =
@@ -193,6 +198,8 @@ let handle_tool_call ~control_client ?caller_thread_id
     handle_list_codex_sessions control_client call.arguments
   | "list_gemini_sessions" ->
     handle_list_gemini_sessions control_client call.arguments
+  | "list_agy_sessions" ->
+    handle_list_agy_sessions control_client call.arguments
   | "default_agent" -> handle_default_agent control_client call.arguments
   | "rescue_agent" -> handle_rescue_agent control_client call.arguments
   | "get_agent_config" ->

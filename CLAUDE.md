@@ -58,6 +58,7 @@ lib/command.ml           — Pure command parsing (no I/O)
 lib/claude_sessions.ml   — Claude Code session discovery on disk (~/.claude/projects/)
 lib/codex_sessions.ml    — Codex CLI session discovery on disk (~/.codex/sessions/)
 lib/gemini_sessions.ml   — Gemini CLI session discovery on disk (~/.gemini/tmp/) — unmaintained
+lib/agy_sessions.ml      — agy (Antigravity CLI) conversation discovery (~/.gemini/antigravity-cli/)
 lib/channel_manager.ml   — Channel creation, ordering, cleanup
 lib/config.ml            — Configuration (JSON file + DISCORD_BOT_TOKEN env)
 lib/project.ml           — Project discovery, dedup by remote, worktree management
@@ -80,6 +81,7 @@ Commands require a `!` prefix:
 - `claude-sessions` — list recent Claude Code sessions on this machine
 - `codex-sessions` — list recent Codex CLI sessions on this machine
 - `gemini-sessions` — list recent Gemini CLI sessions on this machine (Gemini is unmaintained)
+- `agy-sessions` — list recent agy conversations on this machine
 - `default-agent [agent]` — show or set the default agent for new top-level sessions
 - `rescue-agent [agent|off]` — show, set, or disable the rescue agent used at warning-level disk pressure
 - `session-agent [agent]` — show or set the current channel session agent
@@ -143,6 +145,13 @@ Tool results are NOT emitted as separate events; they're internal to Claude Code
 - `{"type":"tool_use","tool_name":"run_shell_command","parameters":{...}}` — tool call
 - `{"type":"tool_result","status":"success|error","output":"..."}` — Gemini *does* emit these
 - `{"type":"result","status":"...","stats":{...}}` — flush
+
+**agy** (`-p --output-format stream-json --dangerously-skip-permissions`, parsed by `parse_agy_stream_json_line`; `--output-format` is real but missing from `agy --help`). Events use an `event` field, not `type`:
+- `{"event":"init","conversation_id":"<uuid>","init":{"cwd":…,"tools":[…]}}` — server-allocated id
+- `{"event":"step_update","step_update":{"step_index":N,"step_type":"…","state":"DONE"}}` — no text/tool detail seen yet; ignored
+- `{"event":"result","result":{"conversation_id":…,"status":…,"response":…,"error":…}}` — final text, error, id
+
+`--conversation <unknown id>` silently starts a new conversation; `agy_resume_guard` tells the user when the reported id differs from the one resumed. Details and open items: `docs/agy-harness.md`.
 
 Gemini tool names (`run_shell_command`, `read_file`, `write_file`, `replace`, `search_file_content`, `glob`, `web_fetch`, `google_web_search`) are translated to Claude-equivalents (`Bash`, `Read`, `Write`, `Edit`, `Grep`, `Glob`, `WebFetch`, `WebSearch`) by `gemini_tool_name_of` so the runner's emoji/verb table stays agent-agnostic.
 

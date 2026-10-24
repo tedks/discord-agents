@@ -104,6 +104,7 @@ let expected_method_ids = [
   List_claude_sessions_id;
   List_codex_sessions_id;
   List_gemini_sessions_id;
+  List_agy_sessions_id;
   Start_session_id;
   Resume_session_id;
   Stop_session_id;
@@ -171,6 +172,7 @@ let expected_mcp_exposed_method_ids = [
   List_claude_sessions_id;
   List_codex_sessions_id;
   List_gemini_sessions_id;
+  List_agy_sessions_id;
   Start_session_id;
   Resume_session_id;
   Stop_session_id;
@@ -246,6 +248,7 @@ let expected_mutability = function
   | List_claude_sessions_id
   | List_codex_sessions_id
   | List_gemini_sessions_id
+  | List_agy_sessions_id
   | Get_agent_config_id
   | Start_login_flow_id -> Control_api.Read_only
   | Start_session_id
