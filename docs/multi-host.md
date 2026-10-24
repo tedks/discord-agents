@@ -14,7 +14,9 @@ now rejects remote uploads before writer-local reads; executor uploads remain
 ownership is tracked in
 [146](https://github.com/tedks/discord-agents/issues/146). The next bounded
 implementation mission is host capability observations
-([151](https://github.com/tedks/discord-agents/issues/151)). `Host_probe` provides
+([151](https://github.com/tedks/discord-agents/issues/151)). Bounded capture
+[152](https://github.com/tedks/discord-agents/pull/152) and CLI/auth observations
+[153](https://github.com/tedks/discord-agents/pull/153) are merged. `Host_probe` provides
 the bounded transport foundation: mandatory deadline and output cap, exact
 bytes, disabled-host refusal, and process-group cleanup. Output caps cannot
 exceed 1 MiB. It requires util-linux `setsid` on the writer and verifies GNU
@@ -37,8 +39,7 @@ Claude/Codex status is queried only after help advertises the command hierarchy;
 Gemini credential state remains unknown. Raw auth and transport diagnostics are
 discarded. No login, upgrade or model request is run. There is no model-denial
 cache yet; these observations must not authorize model access or retain older
-denials across a fresh CLI/auth observation. MCP callback health and public
-exposure remain outstanding. This is an internal API; collection is not yet
+denials across a fresh CLI/auth observation. This is an internal API; collection is not yet
 wired to startup or session admission. Probes and normal turns currently share
 the inherited local PATH or the configured SSH destination's noninteractive
 environment; neither sources a login profile. Probe-only overrides suppress
@@ -47,6 +48,21 @@ credential store, which need not be the credential source a real request uses
 (environment keys or future per-session overrides may differ). Before admission
 wiring, validate this environment contract; never interpret `Absent` as an
 account denial. There is no environment/account fingerprint or persistent cache.
+
+`Host_callback` separately observes whether the selected MCP executable can
+reach the writer's control socket, from the executor over reverse SSH when
+needed. `discord-agents-mcp --check-control SOCKET` sends only a `health`
+request to that explicit socket and emits a fixed success marker, never the
+health response's operational details. The explicit path avoids checking a
+different bot through XDG/legacy fallback when the intended socket is absent.
+The observation has an eight-second outer deadline, a 1 KiB output cap and
+freshness bound to the full callback context. It proves control reachability,
+not that Discord is connected, disk admission permits a turn, every MCP tool
+works or any model is available. Tests use the real MCP binary, private Unix
+sockets and fake SSH for both hops. Public inventory, environment binding,
+safe rendering and session admission remain
+[154](https://github.com/tedks/discord-agents/issues/154); no probes run
+automatically at startup yet.
 
 Status contracts: [Claude CLI reference](https://code.claude.com/docs/en/cli-reference)
 and [Codex CLI reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli).
