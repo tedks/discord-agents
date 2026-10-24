@@ -2401,7 +2401,7 @@ let test_login_guidance_uses_session_executor () =
         check_rendered "login renderer keeps executor" ("Run on " ^ host ^ ":")
           (Discord_agents.Mcp_formatter.format_start_login_flow login)
       ) ["framework0"; "disabled"; "unconfigured"; "test-host"]
-    ) [Discord_agents.Config.Claude; Codex; Gemini];
+    ) [Discord_agents.Config.Claude; Codex; Gemini; Agy];
     List.iter (fun params ->
       let result = Discord_agents.Control_api.handle_start_login_flow forced params in
       Alcotest.(check string) "no session uses actual writer, not configured writer"

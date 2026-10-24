@@ -301,7 +301,9 @@ let test_reasoning_effort_values_by_agent () =
     ["low"; "medium"; "high"; "xhigh"]
     (values Discord_agents.Config.Codex);
   Alcotest.(check (list string)) "gemini efforts"
-    [] (values Discord_agents.Config.Gemini)
+    [] (values Discord_agents.Config.Gemini);
+  Alcotest.(check (list string)) "agy efforts"
+    [] (values Discord_agents.Config.Agy)
 
 let test_validate_reasoning_effort_for_agent () =
   let validate = Discord_agents.Config.validate_reasoning_effort_for_agent in
@@ -331,7 +333,19 @@ let test_validate_reasoning_effort_for_agent () =
     Discord_agents.Config.Claude;
     Discord_agents.Config.Codex;
     Discord_agents.Config.Gemini;
+    Discord_agents.Config.Agy;
   ];
+  (match validate Discord_agents.Config.Agy (Some Discord_agents.Config.High) with
+   | Ok () -> Alcotest.fail "expected agy effort to be rejected"
+   | Error msg ->
+     Alcotest.(check bool) "agy unsupported"
+       true (has_error_substring "agy (Antigravity CLI) does not expose" [msg]));
+  (* Resume lookup with no explicit kind tries the preferred agent,
+     then the maintained ones before unmaintained Gemini. *)
+  Alcotest.(check (list string)) "preferred agent order keeps Gemini last"
+    ["codex"; "claude"; "agy"; "gemini"]
+    (List.map Discord_agents.Config.string_of_agent_kind
+       (Discord_agents.Config.preferred_agent_order Discord_agents.Config.Codex));
   (match validate Discord_agents.Config.Codex (Some Discord_agents.Config.Max) with
    | Ok () -> Alcotest.fail "expected Codex max effort to be rejected"
    | Error msg ->

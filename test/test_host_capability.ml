@@ -113,6 +113,10 @@ let test_status_guards () =
   let run, calls = fixture ~agent:Config.Gemini () in
   check "Gemini unknown" (Unknown Not_supported) (observe ~agent:Config.Gemini run).credentials;
   Alcotest.(check bool) "Gemini no auth command" false
+    (List.exists (fun (_,args) -> List.mem "status" args || List.mem "login" args) !calls);
+  let run, calls = fixture ~agent:Config.Agy () in
+  check "agy unknown" (Unknown Not_supported) (observe ~agent:Config.Agy run).credentials;
+  Alcotest.(check bool) "agy no auth command" false
     (List.exists (fun (_,args) -> List.mem "status" args || List.mem "login" args) !calls)
 
 let test_auth_parsing () =
