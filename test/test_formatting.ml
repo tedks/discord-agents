@@ -4058,7 +4058,15 @@ let test_agy_prompt_gets_inline_context () =
     "first turn carries <bot-context> plus the no-MCP notice"
     (Printf.sprintf "<bot-context>\nyou are a lead\n\n%s\n</bot-context>\n\nhi"
        Discord_agents.Agent_process.agy_no_mcp_notice)
-    out
+    out;
+  (* Pin the meaning too, so an emptied notice can't pass. *)
+  Alcotest.(check bool) "notice says the MCP tools are unavailable" true
+    (try
+       ignore (Str.search_forward
+                 (Str.regexp_string "None of the MCP tools listed above are available")
+                 out 0);
+       true
+     with Not_found -> false)
 
 let test_agy_later_turn_has_no_context () =
   let out = Discord_agents.Agent_process.compose_session_prompt
