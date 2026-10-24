@@ -93,19 +93,10 @@ let preferred_agent_order preferred =
   :: List.filter (fun kind -> not (equal_agent_kind kind preferred))
        [Claude; Codex; Agy; Gemini]
 
-let find_with_preferred_agent preferred f =
-  let rec first_found = function
-    | [] -> None
-    | kind :: rest ->
-      match f kind with
-      | Some _ as found -> found
-      | None -> first_found rest
-  in
-  first_found (preferred_agent_order preferred)
-
-(** Like [find_with_preferred_agent], but a match that [usable] rejects
-    doesn't end the search: a later store's usable match wins, and the
-    first unusable one is returned only if nothing usable turns up. The
+(** Search the agents' stores in [preferred_agent_order preferred]. A
+    match that [usable] rejects doesn't end the search: a later store's
+    usable match wins, and the first unusable one is returned only if
+    nothing usable turns up. The
     kind-less resume lookup uses this so a store hit with no working
     directory (most agy conversations, some Gemini sessions) can't hide
     a resumable session in another store. *)
