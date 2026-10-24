@@ -11,7 +11,7 @@ let check label expected actual = Alcotest.(check bool) label true (expected = a
 let now () = 100.
 
 let page agent scope flags commands =
-  "Usage: " ^ Config.string_of_agent_kind agent ^ " " ^ String.concat " " scope ^ " [OPTIONS]\n\nCommands:\n" ^
+  "Usage: " ^ Config.string_of_agent_kind agent ^ " " ^ String.concat " " scope ^ " [OPTIONS]\n\nCommands: \r\n" ^
   String.concat "" (List.map (fun c -> "  " ^ c ^ "  description:\n") commands) ^
   "\nOptions:\n" ^ String.concat "" (List.map (fun f -> "  " ^ f ^ "  description\n") flags)
 

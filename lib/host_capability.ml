@@ -129,7 +129,7 @@ let parse_help ~agent ~scope text =
     let flags = List.sort_uniq String.compare flags in
     let _, commands = List.fold_left (fun (in_commands, acc) raw ->
       let line = String.trim raw in
-      let unindented = raw = line in
+      let unindented = raw <> "" && raw.[0] <> ' ' && raw.[0] <> '\t' in
       if unindented && String.lowercase_ascii line = "commands:" then true, acc
       else if unindented && String.ends_with ~suffix:":" line then false, acc
       else if in_commands then
