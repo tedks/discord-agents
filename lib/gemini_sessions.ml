@@ -1,5 +1,9 @@
 (** Discovery of Gemini CLI sessions on disk.
 
+    Unmaintained: Gemini support survives only as an API-key fallback
+    since Google withdrew the consumer OAuth path. Keep it compiling;
+    don't extend it. See docs/agy-harness.md.
+
     Scans ~/.gemini/tmp/<project-dir>/chats/session-*.json for recent
     session files, extracts metadata (first user message, project hash),
     and resolves projectHash back to a filesystem path via

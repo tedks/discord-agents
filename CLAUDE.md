@@ -57,7 +57,7 @@ lib/session_store.ml     — Session state, persistence to disk, message queue
 lib/command.ml           — Pure command parsing (no I/O)
 lib/claude_sessions.ml   — Claude Code session discovery on disk (~/.claude/projects/)
 lib/codex_sessions.ml    — Codex CLI session discovery on disk (~/.codex/sessions/)
-lib/gemini_sessions.ml   — Gemini CLI session discovery on disk (~/.gemini/tmp/)
+lib/gemini_sessions.ml   — Gemini CLI session discovery on disk (~/.gemini/tmp/) — unmaintained
 lib/channel_manager.ml   — Channel creation, ordering, cleanup
 lib/config.ml            — Configuration (JSON file + DISCORD_BOT_TOKEN env)
 lib/project.ml           — Project discovery, dedup by remote, worktree management
@@ -79,7 +79,7 @@ Commands require a `!` prefix:
 - `sessions` — list active bot sessions
 - `claude-sessions` — list recent Claude Code sessions on this machine
 - `codex-sessions` — list recent Codex CLI sessions on this machine
-- `gemini-sessions` — list recent Gemini CLI sessions on this machine
+- `gemini-sessions` — list recent Gemini CLI sessions on this machine (Gemini is unmaintained)
 - `default-agent [agent]` — show or set the default agent for new top-level sessions
 - `rescue-agent [agent|off]` — show, set, or disable the rescue agent used at warning-level disk pressure
 - `session-agent [agent]` — show or set the current channel session agent
@@ -137,7 +137,7 @@ Tool results are NOT emitted as separate events; they're internal to Claude Code
 - `{"type":"turn.failed","error":{"message":"..."}}` / `{"type":"error","message":"..."}` — surfaced as Error events
 - `{"type":"turn.completed","usage":{...}}` — flush
 
-**Gemini** (`-o stream-json --yolo`, parsed by `parse_gemini_stream_json_line`):
+**Gemini** (`-o stream-json --yolo`, parsed by `parse_gemini_stream_json_line`) — **unmaintained**: Google withdrew the consumer OAuth path, so this only works with `GEMINI_API_KEY`. Keep it compiling and its tests green; don't extend it. New Google-model work goes to agy (`docs/agy-harness.md`).
 - `{"type":"init","session_id":"<uuid>","model":"..."}` — server-allocated session id
 - `{"type":"message","role":"assistant","content":"...","delta":true}` — incremental text
 - `{"type":"tool_use","tool_name":"run_shell_command","parameters":{...}}` — tool call
