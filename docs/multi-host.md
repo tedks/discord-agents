@@ -1,5 +1,19 @@
 # Multi-host sessions: one Discord writer, remote executors over SSH
 
+Inventory stack in progress (2026-10-25), tracked in
+[167](https://github.com/tedks/discord-agents/issues/167): `Host_project_scan`
+adds bounded, read-only local/SSH discovery with a strict versioned decoder.
+The executor requires Python 3.10+ and Git; the existing transport requires
+GNU timeout over SSH. One scan has a 30-second deadline, 512 KiB output cap,
+4096 directory-entry cap, 512-project cap, at most 32 absolute roots (8192 bytes
+combined), and the existing two-level depth / ten-repositories-per-group limit.
+Missing/unreadable roots, metadata errors, churn and limit overflow fail the
+whole scan rather than emitting a partial or empty inventory. Child symlinks
+are followed with bounded depth and canonical paths deduplicate aliases.
+Successful empty scans are distinct from failures. Network repository identities
+exclude credential-bearing URLs and preserve case outside GitHub; local remotes
+stay host/path-local. No snapshot persistence or public inventory is wired yet.
+
 Current implementation slice (2026-10-24): read-only MCP `list_hosts` and
 `diagnose_host {host, agent, cwd}`. Listing uses configured membership only and
 contacts nobody. Diagnostics require one enabled, routable host and an absolute

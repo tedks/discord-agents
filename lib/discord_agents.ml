@@ -10,6 +10,7 @@ module Host_probe = Host_probe
 module Host_capability = Host_capability
 module Host_callback = Host_callback
 module Host_diagnostics = Host_diagnostics
+module Host_project_scan = Host_project_scan
 module Mcp_health = Mcp_health
 module Config = Config
 module Runtime_settings = Runtime_settings
