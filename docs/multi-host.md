@@ -1,6 +1,28 @@
 # Multi-host sessions: one Discord writer, remote executors over SSH
 
-Status (2026-10-23 takeover): foundation PRs
+Current implementation slice (2026-10-24): read-only MCP `list_hosts` and
+`diagnose_host {host, agent, cwd}`. Listing uses configured membership only and
+contacts nobody. Diagnostics require one enabled, routable host and an absolute
+working directory; they create no directories or sessions. One request runs at
+a time per bot with a 50-second total deadline, in a control connection fiber.
+Unknown, disabled and ambiguous hosts are refused before spawning probes.
+Forced-writer starts use the actual writer identity and refuse the old writer
+when no SSH route exists.
+
+Reports use freshly collected CLI and callback observations, checked for age at
+render time. They display Unicode scalars as `[U+XXXX]`, replace invalid UTF-8,
+escape Discord markup and cap metadata display; these display strings must not
+be reused as filesystem paths. Raw auth/transport output is discarded. There is
+no persistent evidence cache, environment fingerprint, model-entitlement probe,
+background discovery or admission wiring. The callback uses the current resolved
+MCP executable and explicit writer control socket, with the same executor and
+reverse-SSH destination as agent routing. A request without a real working
+directory reports unknown; it never silently probes the writer's same-path file.
+Per-session overrides are not evaluated. Project union/offline snapshots,
+capability-aware login repair and admission remain issue 154 and the stack below.
+Making test/review CLI execution hermetic is deferred under issue 148.
+
+Foundation status (2026-10-23 takeover): PRs
 [127](https://github.com/tedks/discord-agents/pull/127),
 [136](https://github.com/tedks/discord-agents/pull/136),
 [138](https://github.com/tedks/discord-agents/pull/138), and
@@ -40,8 +62,8 @@ Claude/Codex status is queried only after help advertises the command hierarchy;
 Gemini credential state remains unknown. Raw auth and transport diagnostics are
 discarded. No login, upgrade or model request is run. There is no model-denial
 cache yet; these observations must not authorize model access or retain older
-denials across a fresh CLI/auth observation. This is an internal API; collection
-is not yet wired to startup or session admission. Probes and normal turns currently share
+denials across a fresh CLI/auth observation. Collection is available through explicit MCP diagnostics; it is not wired to
+startup or session admission. Probes and normal turns currently share
 the inherited local PATH or the configured SSH destination's noninteractive
 environment; neither sources a login profile. Probe-only overrides suppress
 Claude updates and normalize help output. `login status` describes the CLI's

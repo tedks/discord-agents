@@ -99,6 +99,8 @@ let python_explicit_timeouts () =
 let expected_method_ids = [
   Control_api.Health_id;
   List_projects_id;
+  List_hosts_id;
+  Diagnose_host_id;
   List_sessions_id;
   Import_project_id;
   List_claude_sessions_id;
@@ -167,6 +169,8 @@ let test_lookup_round_trips () =
    control methods should require a conscious update to the metadata tests. *)
 let expected_mcp_exposed_method_ids = [
   Control_api.List_projects_id;
+  List_hosts_id;
+  Diagnose_host_id;
   List_sessions_id;
   Import_project_id;
   List_claude_sessions_id;
@@ -244,6 +248,8 @@ let test_timeout_metadata_matches_python_mcp_client () =
 let expected_mutability = function
   | Control_api.Health_id
   | List_projects_id
+  | List_hosts_id
+  | Diagnose_host_id
   | List_sessions_id
   | List_claude_sessions_id
   | List_codex_sessions_id

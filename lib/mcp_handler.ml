@@ -39,6 +39,14 @@ let response_error_contains fragment = function
      | _ -> false)
   | _ -> false
 
+let format_host_report = function
+  | `Assoc fields ->
+    (match List.assoc_opt "error" fields, List.assoc_opt "report" fields with
+     | Some (`String message), _ -> Ok message
+     | None, Some (`String report) -> Ok report
+     | _ -> Error "Host diagnostic response must contain a report or error string")
+  | _ -> Error "Host diagnostic response must be an object"
+
 let handle_list_projects control_client =
   request_and_format control_client
     Control_api.List_projects_id
@@ -186,6 +194,9 @@ let handle_tool_call ~control_client ?caller_thread_id
   match call.name with
   | "start_session" -> handle_start_session control_client call.arguments
   | "list_projects" -> handle_list_projects control_client
+  | "list_hosts" -> request_and_format control_client Control_api.List_hosts_id format_host_report
+  | "diagnose_host" -> request_and_format ~params:call.arguments control_client
+      Control_api.Diagnose_host_id format_host_report
   | "import_project" -> handle_import_project control_client call.arguments
   | "list_sessions" -> handle_list_sessions control_client
   | "send_message" -> handle_send_message control_client call.arguments
