@@ -130,7 +130,7 @@ let save ?(write = fun path text -> Resource.write_file_atomic path text) path e
     | Ok _ ->
       try write path text; Ok () with
       | Resource.Durable_write_visible_but_unconfirmed _ -> Error "Project inventory write is visible but durability is unconfirmed."
-      | Sys_error _ | Unix.Unix_error _ -> Error "Project inventory cache could not be saved."
+      | Failure _ | Sys_error _ | Unix.Unix_error _ -> Error "Project inventory cache could not be saved."
 
 type view = {
   state : string;

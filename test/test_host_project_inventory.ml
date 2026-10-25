@@ -49,6 +49,7 @@ let test_disk () =
     let failed = record good 20. (Error S.Malformed) in
     ignore (get (I.save path failed));
     check "offline survives restart" [project] (view (get (I.load path)) 21.).projects;
+    check "parent file refused" true (Result.is_error (I.save (Filename.concat path "child") good));
     let denied _ _ = raise (Unix.Unix_error (Unix.ENOSPC,"write","SECRET")) in
     check "write error reported" true (Result.is_error (I.save ~write:denied path good));
     check "prior snapshot intact" (Ok failed) (I.load path);
