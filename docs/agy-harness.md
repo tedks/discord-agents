@@ -142,43 +142,38 @@ Each Gemini integration point gets an agy counterpart in the same place.
 | `login_help_json Gemini` / `start_login_flow` enum | agy entry: run `agy` interactively on the host | scaffold PR |
 | agent enums (`mcp_tool.ml`, `control_api.ml`, Python oracle) | add `"agy"` | scaffold PR |
 
-### MCP: only a user-global route exists
+### MCP: the user-global route, gated by an env var
 
-Measured 2026-10-24 by pointing each candidate at a wrapper that
-records being launched, then execs the real `discord-agents-mcp`:
+Measured on 2026-10-24 with a wrapper that records being launched and then execs the real `discord-agents-mcp`:
 
 | Route | Loaded by `agy -p`? |
 |---|---|
-| `<cwd>/.agents/plugins/<name>/{plugin.json,mcp_config.json}` | **no**: `agy plugin list` says "No imported plugins"; `agy plugin enable <name>` says not found (it passes `agy plugin validate`) |
-| `<cwd>/.agents/mcp_config.json` | **no**: server never launched |
-| `~/.gemini/config/mcp_config.json` (global) | **yes**: launched at startup with cwd = the workspace |
+| `<cwd>/.agents/plugins/<name>/{plugin.json,mcp_config.json}` | **no** (`agy plugin list` says "No imported plugins") |
+| `<cwd>/.agents/mcp_config.json` | **no** |
+| `~/.gemini/config/mcp_config.json` (global) | **yes**: launched at startup, cwd = workspace, agy's env inherited |
 
-The server agy launches inherits agy's environment:
-`DISCORD_AGENTS_THREAD_ID` set on agy reached it unchanged. So one
-static global entry can serve every agy session and still identify the
-calling thread. That global file is user config shared with the user's
-own interactive agy and the Antigravity IDE. Whether the bot may write
-it, or whether it goes into home-manager, is an operator decision. The
-two probe writes were reverted to the original empty file at once.
-
-Recommended shape, so nothing per-session is ever written and
-interactive agy gets nothing:
+Ted ruled (2026-10-24) that agy gets the MCP tools. The bot keeps one static, inert entry in the global file:
 
 ```json
-{"mcpServers":{"discord_agents":{"command":"/bin/sh","args":["-c","[ -n \"$DISCORD_AGENTS_MCP_FOR_AGY\" ] || exit 0; exec \"$DISCORD_AGENTS_MCP_FOR_AGY\""]}}}
+{"mcpServers":{"discord_agents":{"command":"/bin/sh","args":["-c","[ -n \"$DISCORD_AGENTS_MCP_FOR_AGY\" ] || exit 0; exec \"$DISCORD_AGENTS_MCP_FOR_AGY\"","discord-agents-mcp"]}}}
 ```
 
-The bot would set `DISCORD_AGENTS_MCP_FOR_AGY` to the resolved server
-path in agy's child environment only. Still to verify: how agy reacts
-to a server that exits immediately in sessions where the variable is
-unset.
+- The entry is merged in and other servers are kept. The file is rewritten only when the entry is missing or differs. A file the bot can't parse, or whose `mcpServers` isn't an object, is left alone, and the session runs without MCP.
+- The bot sets `DISCORD_AGENTS_MCP_FOR_AGY` to the resolved server, and only on its local agy children. Every child's inherited copy is stripped first.
+- With the variable unset (the user's own agy), the server exits at once, and agy's turn still succeeds (verified).
+- Verified end to end: agy called `list_sessions` on the live bot through `call_mcp_tool`, with the caller's thread id intact.
+- Remote agy turns don't get MCP yet: the executor has its own agy config and no route back. They get the no-MCP notice.
+
+### Workspace: `--add-dir` is required
+
+With only the cwd set, agy reports "No workspace is open" and its file tools work in `~/.gemini/antigravity-cli/scratch` instead of the worktree (verified). `agy_args` passes `--add-dir <working_dir>`, and with that the tools act on the worktree.
 
 ## Remaining
 
 1. Capture a **successful** `stream-json` turn that uses tools, once the
    account quota resets. Then parse text deltas and tool steps and add
    `agy_tool_name_of`.
-2. Operator decision on the MCP route (above), then wire it.
+2. MCP for remote agy turns (the executor's own global config, plus a route back to the writer).
 3. Decide whether to detect a signed-out run early (stderr
    `Authentication required`) instead of waiting out agy's 60s auth
    timeout.

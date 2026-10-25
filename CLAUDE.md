@@ -169,7 +169,9 @@ The bot exposes MCP tools (`start_session`, `stop_session`, `list_sessions`, etc
 - **Codex** — TOML overrides via `-c key=value` per invocation: `mcp_servers.discord_agents.command="<resolved absolute path>"` and `mcp_servers.discord_agents.args=[]`. Doesn't touch the user's `~/.codex/config.toml`.
 - **Gemini** — has no `--mcp-config` flag; loads `mcpServers` from `<cwd>/.gemini/settings.json`. The bot merges its entry into any existing settings file (preserving the user's other MCP servers and unrelated keys) at session start and appends `.gemini/` to the worktree's `.git/info/exclude`.
 
-All three regenerate their config on every spawn, so a stale `mcp-generated.json` or `.gemini/settings.json` from an older version heals itself on the next session.
+- **agy** — loads MCP servers in print mode only from the user-global `~/.gemini/config/mcp_config.json` (workspace `.agents/` configs are ignored). The bot keeps one static `discord_agents` entry there (merged in, other servers preserved; a file it can't parse is left alone). The entry runs `$DISCORD_AGENTS_MCP_FOR_AGY` and exits at once when it is unset, so the user's own agy gets nothing. The bot sets that variable only on its local agy children. Remote agy turns don't get MCP yet. When MCP isn't wired, agy's first-turn bot-context says so. agy also needs `--add-dir <worktree>`, or it treats the session as having no workspace and works in its scratch dir.
+
+All of them regenerate their config on every spawn, so a stale `mcp-generated.json` or `.gemini/settings.json` from an older version heals itself on the next session.
 
 ### Finding the server
 
