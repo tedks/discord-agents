@@ -4535,6 +4535,11 @@ let test_agy_stream_edges () =
     (agy_stream_events [agy_text ~index:2 ~state:"DONE" "Checking.";
                         agy_text ~index:5 ~state:"ACTIVE" "Found ";
                         agy_text ~index:5 ~state:"DONE" "a."; result "Found a."]);
+  (match agy_stream_events [agy_text ~index:2 ~state:"DONE" "do not"; result "donot"] with
+   | ["text:do not"; full; "result:c0"] ->
+     Alcotest.(check bool) "whitespace inside a step is not ignored" true
+       (String.ends_with ~suffix:"here it is:*\n\ndonot" full)
+   | l -> Alcotest.failf "unexpected: %s" (String.concat " | " l));
   Alcotest.(check (list string)) "whole-turn response joined with blank lines: not repeated"
     ["text:Checking."; "text:Found a."; "result:c0"]
     (agy_stream_events [agy_text ~index:2 ~state:"DONE" "Checking.";
@@ -4574,6 +4579,14 @@ let test_agy_stream_edges () =
                 ("tool_name", `String name);
                 ("tool_info", `Assoc ([("name", `String name); ("parameters", `Assoc [])]
                    @ (match output with Some o -> [("output", `String o)] | None -> []))) ]) in
+  let info_named state ?output () =
+    agy_step ([ ("state", `String state); ("step_type", `String "tool");
+                ("tool_info", `Assoc ([("name", `String "run_command");
+                                       ("parameters", `Assoc [("CommandLine", `String "ls")])]
+                   @ (match output with Some o -> [("output", `String o)] | None -> []))) ]) in
+  Alcotest.(check (list string)) "no step_index, name only in tool_info: still pairs"
+    ["tool:Bash:ls"; "out:a"]
+    (agy_stream_events [info_named "ACTIVE" (); info_named "DONE" ~output:"a" ()]);
   Alcotest.(check (list string)) "no step_index: two output-less DONEs stay two"
     ["tool:Write:"; "tool:Write:"]
     (agy_stream_events [no_index_named "write_to_file" "DONE" ();

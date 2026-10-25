@@ -1263,19 +1263,29 @@ let agy_stream_parser () =
      keyed by step_index. Every captured tool step has one; if agy omits
      it, steps pair by order instead (an ACTIVE opens one, which stays
      open until a DONE shows its output), so two identical calls stay
-     two. That fallback assumes unindexed tool calls don't interleave. *)
+     two. That fallback assumes unindexed tool calls don't interleave,
+     and can't tell a repeated DONE of an output-less step (an edit's
+     ACTIVE, DONE, DONE) from a new DONE-only call of the same tool. agy
+     has always sent step_index. *)
   let started = Hashtbl.create 8 and finished = Hashtbl.create 8 in
   (* The open unindexed step's tool name, if an ACTIVE opened it. *)
   let unindexed_open = ref None and unindexed_n = ref 0 in
   (* Text of the most recent reply step (by step_index), to recognise a
      [response] that holds only the last reply step. *)
   let last_step = ref None and last_step_text = Buffer.create 256 in
+  (* Each finished reply step's text, newest first. *)
+  let step_texts = ref [] in
+  let step_tool_name step =
+    let open Yojson.Safe.Util in
+    let info = match step |> member "tool_info" with `Assoc _ as i -> i | _ -> `Assoc [] in
+    match step |> member "tool_name", info |> member "name" with
+    | `String n, _ | _, `String n -> Some n
+    | _ -> None
+  in
   let tool_use step =
     let open Yojson.Safe.Util in
     let info = match step |> member "tool_info" with `Assoc _ as i -> i | _ -> `Assoc [] in
-    let raw_name = match step |> member "tool_name", info |> member "name" with
-      | `String n, _ | _, `String n -> n
-      | _ -> "unknown" in
+    let raw_name = Option.value (step_tool_name step) ~default:"unknown" in
     let params = match info |> member "parameters" with `Assoc _ as p -> p | _ -> `Assoc [] in
     let tool_name, input = agy_tool_of raw_name params in
     (* A summary that can't be built still leaves the tool visible. *)
@@ -1291,7 +1301,7 @@ let agy_stream_parser () =
     match step |> member "step_index" with
     | `Int i -> string_of_int i, true
     | _ ->
-      let name = match step |> member "tool_name" with `String n -> Some n | _ -> None in
+      let name = step_tool_name step in
       (* A DONE joins the open step only if an ACTIVE opened it for the
          same tool; anything else is its own step. Only an ACTIVE leaves
          a step open for a later DONE. *)
@@ -1309,6 +1319,8 @@ let agy_stream_parser () =
        | Some t when t <> "" ->
          let index = match step |> member "step_index" with `Int i -> Some i | _ -> None in
          if index <> !last_step then begin
+           if Buffer.length last_step_text > 0 then
+             step_texts := Buffer.contents last_step_text :: !step_texts;
            Buffer.clear last_step_text;
            last_step := index
          end;
@@ -1372,15 +1384,14 @@ let agy_stream_parser () =
            last reply step. Captures so far have one text step per turn,
            so which of the two agy sends after text-tool-text is
            unverified; both are accepted, nothing looser. *)
-        let squash t =
-          String.to_seq t
-          |> Seq.filter (fun c -> not (c = ' ' || c = '\n' || c = '\t' || c = '\r'))
-          |> String.of_seq in
-        (* Whitespace is ignored in the comparison, so a response that
-           joins reply steps with blank lines still matches. *)
+        (* Exact comparison. The only slack is a separator agy might put
+           between reply steps when it reports the whole turn. *)
+        let steps = List.rev (Buffer.contents last_step_text :: !step_texts)
+                    |> List.filter (fun t -> t <> "") in
+        let whole_turn sep = String.concat sep steps in
         if response = ""
-           || squash response = squash shown
-           || squash response = squash (Buffer.contents last_step_text) then []
+           || response = Buffer.contents last_step_text
+           || List.exists (fun sep -> response = whole_turn sep) [""; "\n"; "\n\n"; " "] then []
         else if String.starts_with ~prefix:shown response then
           [Text_delta (String.sub response (String.length shown)
                          (String.length response - String.length shown))]
