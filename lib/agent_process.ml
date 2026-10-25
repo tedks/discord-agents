@@ -1273,30 +1273,40 @@ let is_steps_joined ~steps s =
     pos + m <= n
     && (let rec eq j = j = m || (s.[pos + j] = t.[j] && eq (j + 1)) in eq 0) in
   let is_sep = is_reply_sep in
-  (* [go i pos]: steps i.. match s from pos, separators allowed before
-     each step after the first. Failed (i, pos) states are memoised, so
-     the search visits each of the k x n states at most once, each doing
-     one step comparison. Recursion depth is up to about n + k. Measured:
-     a 1 MiB whitespace run with a mismatch takes about 4 s (no stack
-     trouble); realistic replies are microseconds. *)
-  let failed = Hashtbl.create 16 in
+  (* run_end.(p): the first position >= p that isn't a separator (or n).
+     A separator scan never leaves the run it starts in. *)
+  let run_end = Array.make (n + 1) n in
+  for p = n - 1 downto 0 do
+    run_end.(p) <- (if is_sep s.[p] then run_end.(p + 1) else p)
+  done;
+  (* failed_from (i, q): the smallest p in the run ending at q from which
+     step i (after skipping separators) was found not to complete. Any
+     later start at or beyond it is answered at once, and a scan from an
+     earlier start stops on reaching it. So each step scans each run
+     once in total: about k x n byte checks, O(1) bookkeeping per scan,
+     recursion depth k. *)
+  let failed_from = Hashtbl.create 16 in
   let rec go i pos =
     if i = k then pos = n
-    else if Hashtbl.mem failed (i, pos) then false
     else begin
       let t = steps.(i) in
-      (* Step i here, or skip one separator and stay on step i: each
-         (i, pos) is a single memoised state, so overlapping whitespace
-         runs aren't rescanned. *)
-      let ok =
-        (at pos t && go (i + 1) (pos + String.length t))
-        || (pos < n && is_sep s.[pos] && go i (pos + 1)) in
-      if not ok then Hashtbl.replace failed (i, pos) ();
-      ok
+      let q = run_end.(pos) in
+      let bound = Option.value (Hashtbl.find_opt failed_from (i, q)) ~default:max_int in
+      if pos >= bound then false
+      else begin
+        let rec scan p =
+          (at p t && go (i + 1) (p + String.length t))
+          || (p < q && p + 1 < bound && scan (p + 1))
+        in
+        let ok = scan pos in
+        if not ok then Hashtbl.replace failed_from (i, q) pos;
+        ok
+      end
     end
   in
-  (* Anchored at 0: leading whitespace matches only when the first step
-     itself contains it. *)
+  (* Anchored at 0: leading whitespace matches only through the first
+     step itself, or through the separators allowed after an empty
+     first step. *)
   k > 0 && at 0 steps.(0) && go 1 (String.length steps.(0))
 
 let agy_stream_parser () =
