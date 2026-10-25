@@ -13,14 +13,29 @@ are followed with bounded depth and canonical paths deduplicate aliases.
 Successful empty scans are distinct from failures; no configured roots is an
 invalid scan. Normal Git discovery retains ownership checks; worktree-prefix
 and bare-directory checks reject an enclosing repository before and after
-reading the origin. Gitfiles remain supported. Git ownership checks
-and unsupported extensions fail the scan; the scanner never overrides them.
-Network repository identities
-exclude credential-bearing URLs and preserve case and transport syntax outside
-GitHub (home-relative scp paths are not absolute SSH URL paths); local remotes
-stay host/path-local. No snapshot persistence or public inventory is wired yet.
-Remaining diagnostic
-and normalization refinements are tracked in [169](https://github.com/tedks/discord-agents/issues/169).
+reading the origin. Gitfiles remain supported. Ownership refusals, unsupported
+extensions and global settings such as `safe.bareRepository=explicit` fail the
+scan; the scanner never overrides them. Network repository identities exclude
+credential-bearing URLs and preserve case and transport syntax outside GitHub
+(home-relative scp paths are not absolute SSH URL paths); local remotes stay
+host/path-local. Remaining diagnostic and normalization refinements are tracked
+in [169](https://github.com/tedks/discord-agents/issues/169).
+
+The snapshot layer (`Host_project_inventory`) stores last-successful projects
+and the last attempt separately in `host-projects.json` in the bot config
+directory. Failed scans retain prior observations only for the identical full
+host entry and ordered roots. Successful empty scans replace them. Disabled or
+reconfigured hosts hide old evidence; observations age after five minutes, and
+clock rollback makes them stale. Atomic, private cache writes must confirm
+durability before callers publish new in-memory state. Corrupt, oversized or
+non-regular caches are errors, not successful empty scans. Cache bounds are
+64 hosts, 512 projects per host, 120 KiB per encoded host entry (with room
+reserved for failure metadata), and 8 MiB total. An oversized host snapshot
+becomes a failed observation retaining its prior success. Callers serialize
+prune/record/save/publication and prune removed hosts before recording. Symlinked
+cache files are permitted within the trusted config directory; regular-file
+checks apply to their targets. This layer is independent of session, channel and cleanup
+state; public refresh/listing wiring follows in the final inventory PR.
 
 Current implementation slice (2026-10-24): read-only MCP `list_hosts` and
 `diagnose_host {host, agent, cwd}`. Listing uses configured membership only and
