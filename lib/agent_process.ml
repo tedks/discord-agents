@@ -1276,10 +1276,11 @@ let is_steps_joined ~steps s =
   (* [go i pos]: steps i.. match s from pos, separators allowed before
      each step after the first. Failed (i, pos) states are memoised, so
      the search visits at most steps x positions states instead of
-     backtracking combinatorially over whitespace-only steps. The worst
-     case is O(n x total step length) byte comparisons, which needs
-     huge whitespace gaps beside huge steps; agy replies aren't like
-     that. *)
+     backtracking combinatorially over whitespace-only steps. Each state
+     may scan a separator run, so the worst case is polynomial, roughly
+     O(k x n^2) for k steps and an n-byte response plus the step
+     comparisons. That needs long whitespace runs; agy replies aren't
+     like that. *)
   let failed = Hashtbl.create 16 in
   let rec go i pos =
     if i = k then pos = n
