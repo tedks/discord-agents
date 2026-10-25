@@ -59,6 +59,7 @@ let decode text =
       if not (Scan.valid_roots roots) then raise Exit;
       let attempted_at = time (List.assoc "attempted_at" xs) in
       let error = optional_string (List.assoc "error" xs) in
+      (match error with Some s when String.length s > 64 -> raise Exit | _ -> ());
       let success = match List.assoc "success" xs with
         | `Null -> None
         | json ->

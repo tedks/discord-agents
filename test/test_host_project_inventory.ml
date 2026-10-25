@@ -43,6 +43,8 @@ let test_disk () =
     check "missing file is unknown inventory" (Ok []) (I.load path);
     let good = record I.empty 10. (Ok [project]) in
     check "roundtrip" (Ok good) (I.decode (I.encode good));
+    let invalid = [{(List.hd good) with I.error=Some (String.make 65 'x')}] in
+    check "bounded failure codes" true (Result.is_error (I.decode (I.encode invalid)));
     ignore (get (I.save path good));
     check "restart reload" (Ok good) (I.load path);
     check "private cache permissions" 0o600 ((Unix.stat path).st_perm land 0o777);
