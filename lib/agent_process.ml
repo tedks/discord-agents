@@ -1260,24 +1260,44 @@ let crlf_to_lf s =
 (** Whether [s] is exactly [steps] in order, with nothing but whitespace
     (spaces, newlines) between consecutive steps; each boundary may
     differ. Text inside a step must match byte for byte. *)
+let is_reply_sep c = c = ' ' || c = '\n' || c = '\r' || c = '\t'
+
 let is_steps_joined ~steps s =
   let n = String.length s in
+  (* A whitespace-only step is absorbed by the separators around it, and
+     dropping it means every remaining step can match in only one place
+     per gap. *)
+  let steps =
+    Array.of_list (List.filter (String.exists (fun c -> not (is_reply_sep c))) steps) in
+  let k = Array.length steps in
   let at pos t =
-    pos + String.length t <= n && String.sub s pos (String.length t) = t in
-  let is_sep c = c = ' ' || c = '\n' || c = '\r' || c = '\t' in
-  let rec go pos = function
-    | [] -> pos = n
-    | t :: rest ->
-      (* Try the step here, then after each further separator char. *)
+    let m = String.length t in
+    pos + m <= n
+    && (let rec eq j = j = m || (s.[pos + j] = t.[j] && eq (j + 1)) in eq 0) in
+  let is_sep = is_reply_sep in
+  (* [go i pos]: steps i.. match s from pos, separators allowed before
+     each step after the first. Failed (i, pos) states are memoised, so
+     the search is bounded by steps x positions x separator run instead
+     of backtracking combinatorially over whitespace-only steps. *)
+  let failed = Hashtbl.create 16 in
+  let rec go i pos =
+    if i = k then pos = n
+    else if Hashtbl.mem failed (i, pos) then false
+    else begin
+      let t = steps.(i) in
       let rec try_from p =
-        (at p t && go (p + String.length t) rest)
+        (at p t && go (i + 1) (p + String.length t))
         || (p < n && is_sep s.[p] && try_from (p + 1))
       in
-      try_from pos
+      let ok = try_from pos in
+      if not ok then Hashtbl.replace failed (i, pos) ();
+      ok
+    end
   in
-  match steps with
-  | [] -> false
-  | first :: rest -> at 0 first && go (String.length first) rest
+  (* Anchored at 0: leading whitespace (even from a dropped
+     whitespace-only first step) is a mismatch, which only costs a
+     labelled repost. *)
+  k > 0 && at 0 steps.(0) && go 1 (String.length steps.(0))
 
 let agy_stream_parser () =
   (* What has been streamed so far, to reconcile with result.response. *)

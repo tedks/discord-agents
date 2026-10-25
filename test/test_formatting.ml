@@ -4548,6 +4548,16 @@ let test_agy_stream_edges () =
   Alcotest.(check bool) "steps out of order don't match" false (joined ~steps:["A"; "B"] "B A");
   Alcotest.(check bool) "non-space between steps doesn't match" false (joined ~steps:["A"; "B"] "A-B");
   Alcotest.(check bool) "leading/trailing extras don't match" false (joined ~steps:["A"; "B"] "A B ");
+  (* Adversarial: whitespace-only steps over a long whitespace run with a
+     mismatch at the end. Exponential without memoisation. *)
+  let spaces = List.init 40 (fun _ -> " ") in
+  let t0 = Unix.gettimeofday () in
+  Alcotest.(check bool) "whitespace-only steps: no match, and fast" false
+    (joined ~steps:(("A" :: spaces) @ ["B"]) ("A" ^ String.make 200 ' ' ^ "C"));
+  Alcotest.(check bool) "...in well under a second" true (Unix.gettimeofday () -. t0 < 1.0);
+  Alcotest.(check bool) "leading extras don't match" false (joined ~steps:["A"; "B"] " A B");
+  Alcotest.(check bool) "whitespace-only steps that do fit still match" true
+    (joined ~steps:["A"; " "; " "; "B"] "A   B");
   Alcotest.(check bool) "a step starting with a newline still matches" true
     (joined ~steps:["A"; "\nB"] "A\n\nB");
   Alcotest.(check (list string)) "whole-turn response joined with blank lines: not repeated"
