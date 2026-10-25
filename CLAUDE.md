@@ -151,7 +151,7 @@ Tool results are NOT emitted as separate events; they're internal to Claude Code
 - `{"event":"init","conversation_id":"<uuid>","init":{"cwd":…,"tools":[…]}}` — server-allocated id
 - `{"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE|DONE","text_delta":"…"}}` — streamed reply text
 - `{"event":"step_update","step_update":{"step_index":N,"step_type":"tool","state":"ACTIVE","tool_name":"run_command","tool_info":{"parameters":{…}}}}` — tool call (then `"state":"DONE"` with `tool_info.output`)
-- `{"event":"result","result":{"conversation_id":…,"status":"SUCCESS|ERROR","response":…,"error":…}}` — id and error; `response` repeats the streamed text and is shown only if nothing streamed
+- `{"event":"result","result":{"conversation_id":…,"status":"SUCCESS|ERROR","response":…,"error":…}}` — id and error; `response` repeats the streamed text, so it only fills in what the stream lost (or follows in full, labelled, if they diverge)
 
 Parsing is stateful per run (`agy_stream_parser`). agy tool names map to the runner's Claude names where the parameters are known: `run_command`→Bash, `view_file`→Read, `write_to_file`→Write, `replace_file_content`/`multi_replace_file_content`→Edit, `grep_search`→Grep, `call_mcp_tool`→`mcp__<server>__<tool>`. Others keep agy's name.
 

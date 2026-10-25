@@ -4516,6 +4516,18 @@ let test_agy_stream_edges () =
      Alcotest.(check bool) "a delta lost mid-stream: full reply follows, labelled" true
        (String.ends_with ~suffix:"in full:*\n\nHello world" full)
    | l -> Alcotest.failf "unexpected: %s" (String.concat " | " l));
+  Alcotest.(check (list string)) "response that is only the last reply step: not repeated"
+    ["text:Checking."; "tool:Bash:ls"; "out:a"; "text:Found a."; "result:c0"]
+    (agy_stream_events [
+       agy_text ~index:2 ~state:"DONE" "Checking.";
+       agy_tool ~index:3 ~state:"ACTIVE" ~name:"run_command" (`Assoc [("CommandLine", `String "ls")]);
+       agy_tool ~index:3 ~state:"DONE" ~name:"run_command" ~output:"a" (`Assoc [("CommandLine", `String "ls")]);
+       agy_text ~index:5 ~state:"DONE" "Found a.";
+       result "Found a." ]);
+  Alcotest.(check (list string)) "response that is the whole turn: not repeated"
+    ["text:Checking."; "text:Found a."; "result:c0"]
+    (agy_stream_events [agy_text ~index:2 ~state:"DONE" "Checking.";
+                        agy_text ~index:5 ~state:"DONE" "Found a."; result "Checking.Found a."]);
   Alcotest.(check (list string)) "an error after partial text still fails the turn"
     ["text:Half"; "error:agy: quota"; "result:c0"]
     (agy_stream_events [agy_text ~index:1 ~state:"ACTIVE" "Half";
@@ -4539,6 +4551,9 @@ let test_agy_stream_edges () =
     ["tool:Bash:ls"; "out:a"; "tool:Bash:ls"; "out:a"]
     (agy_stream_events [no_index "ACTIVE" (); no_index "DONE" ~output:"a" ();
                         no_index "ACTIVE" (); no_index "DONE" ~output:"a" ()]);
+  Alcotest.(check (list string)) "no step_index: DONE without output, then with"
+    ["tool:Bash:ls"; "other"; "out:late"]
+    (agy_stream_events [no_index "ACTIVE" (); no_index "DONE" (); no_index "DONE" ~output:"late" ()]);
   Alcotest.(check (list string)) "no step_index, DONE only: each shown"
     ["tool:Bash:ls"; "out:a"; "tool:Bash:ls"; "out:b"]
     (agy_stream_events [no_index "DONE" ~output:"a" (); no_index "DONE" ~output:"b" ()]);

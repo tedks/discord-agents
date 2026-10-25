@@ -4,7 +4,7 @@ Status: agent kind merged (#157); session discovery and resume in
 progress. Facts below were checked against agy 1.1.3 on tower0, signed
 out on 2026-10-23 and signed in on 2026-10-24. Every signed-in run so
 far ended in an account quota error ("Individual quota reached", on
-every listed model), so no successful turn has been captured yet.
+every listed model) until the quota reset; successful turns were captured later that day.
 Anything marked *unverified* must be confirmed before code relies on
 it.
 
@@ -73,7 +73,7 @@ In those quota-failed runs, `step_update` carried no text or tool detail. A succ
 
 - **Text:** `agent_response` steps carry `text_delta`. Planner responses that only call tools carry none.
 - **Tools:** each tool step is `ACTIVE`, with name and parameters, then `DONE`, with `tool_info.output`. Edit tools give no output and only `TargetFile`.
-- **Result:** `result.response` repeats the streamed text, so it's shown only when nothing streamed.
+- **Result:** `result.response` repeats the streamed text. When it is already the streamed text or its end, nothing more is shown. It fills in a lost tail. If the stream diverged, it follows in full, labelled. Whether `response` is the whole turn or only its last reply step after text, tool, text is unverified; both are handled.
 - **Status:** the success value is `SUCCESS`.
 
 Parameter names seen on the wire:
@@ -149,8 +149,8 @@ Each Gemini integration point gets an agy counterpart in the same place.
 | `caller_pinned_session_id Gemini = false` | `false`; id from `init` and `result` `conversation_id` | done |
 | `reasoning_efforts_for_agent Gemini = []` | `[]`; no effort flag exists | scaffold PR |
 | `gemini_args` | `agy_args`: `agy -p <prompt> --output-format stream-json --dangerously-skip-permissions --print-timeout <long> [--model m] [--conversation <id>]` | scaffold PR |
-| `parse_gemini_stream_json_line` | `parse_agy_stream_json_line`: `init` id, `result` text/error/id; empty `conversation_id` → no id | done; deltas/tools await a successful capture |
-| `gemini_tool_name_of` | `agy_tool_name_of` | awaits a successful capture showing tool steps |
+| `parse_gemini_stream_json_line` | `agy_stream_parser` (per run): `init` id, text deltas, tool steps, `result` error/id | done |
+| `gemini_tool_name_of` | `agy_tool_of` (names and parameters) | done |
 | `compose_session_prompt` inline `<bot-context>` | same (agy has no system-prompt flag) | scaffold PR |
 | `setup_gemini_mcp` (`<cwd>/.gemini/settings.json`) | no per-worktree route exists; see below | **operator decision** |
 | `Gemini_sessions` (`~/.gemini/tmp`) | `Agy_sessions` (`brain/*/…/transcript.jsonl` + `last_conversations.json`) | done |

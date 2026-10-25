@@ -1211,8 +1211,10 @@ let parse_gemini_stream_json_line line =
    - [step_type = "tool"]: [state = "ACTIVE"] with
      [tool_name] and [tool_info.parameters] when the call starts, then
      [state = "DONE"] with [tool_info.output] (absent for edits).
-   [result.response] repeats the streamed text. It fills in a lost tail
-   of the stream, or follows in full (labelled) if the stream diverged. Parsing is therefore stateful per run: use
+   [result.response] repeats the streamed text. When it is already the
+   streamed text or its end, nothing more is shown. It fills in a lost
+   tail of the stream, or follows in full (labelled) if the stream
+   diverged. Parsing is therefore stateful per run: use
    [agy_stream_parser] for a whole run. [parse_agy_stream_json_line]
    is a fresh parser for one line.
 
@@ -1259,8 +1261,9 @@ let agy_stream_parser () =
   let streamed = Buffer.create 1024 in
   (* Per tool step: started (Tool_use shown) and finished (output shown),
      keyed by step_index. Every captured tool step has one; if agy omits
-     it, steps pair by order instead (an ACTIVE opens one, the next DONE
-     closes it), so two identical calls stay two. *)
+     it, steps pair by order instead (an ACTIVE opens one, which stays
+     open until a DONE shows its output), so two identical calls stay
+     two. That fallback assumes unindexed tool calls don't interleave. *)
   let started = Hashtbl.create 8 and finished = Hashtbl.create 8 in
   let unindexed_open = ref false and unindexed_n = ref 0 in
   let tool_use step =
@@ -1276,18 +1279,17 @@ let agy_stream_parser () =
     let detail = try detail_of_tool_input tool_name input with _ -> "" in
     Tool_use { tool_name; tool_summary = summary; tool_detail = detail }
   in
+  (* [Some key, indexed]. An unindexed ACTIVE always opens a new step;
+     an unindexed DONE belongs to the open one, or opens its own. The
+     step stays open until its output is shown (see [step_events]). *)
   let step_key step state =
     let open Yojson.Safe.Util in
     match step |> member "step_index" with
-    | `Int i -> string_of_int i
+    | `Int i -> string_of_int i, true
     | _ ->
-      (* ACTIVE always opens a new unindexed step; DONE closes the open
-         one, or opens and closes its own when none is open. *)
-      if state = "ACTIVE" || not !unindexed_open then begin
-        incr unindexed_n;
-        unindexed_open := state = "ACTIVE"
-      end else unindexed_open := false;
-      "noindex:" ^ string_of_int !unindexed_n
+      if state = "ACTIVE" || not !unindexed_open then incr unindexed_n;
+      unindexed_open := true;
+      "noindex:" ^ string_of_int !unindexed_n, false
   in
   let step_events line step =
     let open Yojson.Safe.Util in
@@ -1298,7 +1300,7 @@ let agy_stream_parser () =
        | Some t when t <> "" -> Buffer.add_string streamed t; [Text_delta t]
        | _ -> [Other line])
     | Some "tool", Some (("ACTIVE" | "DONE") as state) ->
-      let key = step_key step state in
+      let key, indexed = step_key step state in
       let start =
         if Hashtbl.mem started key then []
         else (let ev = tool_use step in Hashtbl.replace started key (); [ev]) in
@@ -1314,6 +1316,7 @@ let agy_stream_parser () =
             [Tool_result { content = crlf_to_lf o }]
           | _ | exception _ -> []
       in
+      if not indexed && output <> [] then unindexed_open := false;
       (match start @ output with [] -> [Other line] | evs -> evs)
     | _ -> [Other line]
   in
@@ -1348,7 +1351,11 @@ let agy_stream_parser () =
          one, so the full reply follows, labelled. *)
       let text =
         let shown = Buffer.contents streamed in
-        if response = "" || response = shown then []
+        (* "Ends with" covers [response] being the whole turn's text or
+           only its last reply step: captures so far have one text step
+           per turn, so which one agy sends after text-tool-text is
+           unverified. *)
+        if response = "" || String.ends_with ~suffix:response shown then []
         else if String.starts_with ~prefix:shown response then
           [Text_delta (String.sub response (String.length shown)
                          (String.length response - String.length shown))]
