@@ -67,6 +67,7 @@ type t = {
   mutable wrap_width : int;
   mutable refreshing : bool;
   host_diagnostics_gate : Host_diagnostics.gate;
+  host_project_service : Host_project_service.t;
   mutable output_lines : int;
   mutable policy_sync_clear_last_warning : (string * string) option;
   mutable last_top_level_disk_refresh_at : float;
@@ -896,6 +897,8 @@ You have MCP tools available:
 - start_session: Start a new agent session for a project
 - import_project: Clone a GitHub repository into the project registry and create its Discord project channel
 - list_projects: List all discovered projects
+- list_project_inventory: Cached project locations across configured hosts; paginated, no probes
+- refresh_host_projects: Explicit bounded refresh for one enabled configured host
 - list_sessions: List active bot sessions
 - send_message: Send a visible user-style message to another active session thread
 - send_attachments: Upload files from this session's worktree to this Discord thread
@@ -940,6 +943,8 @@ You have MCP tools available:
 - start_session: Start a new agent session (creates a thread + worktree)
 - import_project: Clone a GitHub repository into the project registry and create its Discord project channel
 - list_projects: List all discovered projects
+- list_project_inventory: Cached project locations across configured hosts; paginated, no probes
+- refresh_host_projects: Explicit bounded refresh for one enabled configured host
 - list_sessions: List active bot sessions
 - send_message: Send a visible user-style message to another active session thread
 - send_attachments: Upload files from this session's worktree to this Discord thread
@@ -3514,6 +3519,7 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
                wrap_width = Agent_process.desktop_width;
                refreshing = false;
                host_diagnostics_gate = Host_diagnostics.create_gate ();
+               host_project_service = Host_project_service.create (Host_project_inventory.filename ());
                output_lines = Agent_process.default_output_lines;
                policy_sync_clear_last_warning = None;
                last_top_level_disk_refresh_at = 0.0;

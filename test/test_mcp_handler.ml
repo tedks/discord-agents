@@ -2774,6 +2774,8 @@ let test_host_report_tools () =
       [`Assoc ["ok", `Bool true; "report", `String "Host: writer\nModel access: unknown"];
        `Assoc ["error", `String "Host diagnostic timed out; no complete report is available."]])
     ["list_hosts", `Assoc [];
+     "list_project_inventory", `Assoc ["offset", `Int 2; "limit", `Int 3];
+     "refresh_host_projects", `Assoc ["host", `String "remote"];
      "diagnose_host", `Assoc ["host", `String "remote"; "agent", `String "agy"; "cwd", `String "/project"]]
 
 let () =

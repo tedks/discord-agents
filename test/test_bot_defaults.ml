@@ -85,6 +85,7 @@ let with_test_bot ?rest_call f =
         wrap_width = Discord_agents.Agent_process.desktop_width;
         refreshing = false;
         host_diagnostics_gate = Discord_agents.Host_diagnostics.create_gate ();
+        host_project_service = Discord_agents.Host_project_service.create (Discord_agents.Host_project_inventory.filename ());
         output_lines = Discord_agents.Agent_process.default_output_lines;
         policy_sync_clear_last_warning = None;
         last_top_level_disk_refresh_at = 0.0;
@@ -2415,6 +2416,45 @@ let test_login_guidance_uses_session_executor () =
     Alcotest.(check bool) "missing session cannot fall back to writer guidance" true
       (missing |> member "login" = `Null))
 
+let test_project_inventory_handlers () =
+  with_test_bot (fun bot ->
+    let module Api = Discord_agents.Control_api in
+    let module Host = Discord_agents.Host in
+    let here = Discord_agents.Bot.local_host_name bot in
+    let remote = {(Host.local_host "executor") with transport=Host.Ssh "not-contacted"} in
+    let disabled = {remote with name="disabled";enabled=false} in
+    let bot = {bot with config={bot.config with base_directories=["/executor/projects"];
+      hosts=Some Host.{writer=here;hosts=[Host.local_host here;remote;disabled]}}} in
+    let calls=ref 0 in
+    let collect ~host ~roots =
+      incr calls;
+      Alcotest.(check string) "selected executor" "executor" host.Host.name;
+      Alcotest.(check (list string)) "executor roots" ["/executor/projects"] roots;
+      Ok [Discord_agents.Host_project_scan.{name="repo";path="/executor/projects/repo";
+        is_bare=false;repository=Some "github.com/org/repo"}] in
+    let field=Yojson.Safe.Util.member in
+    let request xs=Some (`Assoc xs) in
+    List.iter (fun params ->
+      Alcotest.(check bool) "refused before probe" true
+        (field "error" (Api.handle_refresh_host_projects ~collect bot params) <> `Null))
+      [None;request ["host",`String "disabled"];request ["host",`String "missing"];
+       request ["host",`Int 2];request ["host",`String "executor";"host",`String "executor"];
+       request ["host",`String "executor";"extra",`Bool true]];
+    Alcotest.(check int) "no refused calls" 0 !calls;
+    let response=Api.handle_refresh_host_projects ~collect bot (request ["host",`String "executor"]) in
+    Alcotest.(check bool) "successful handler response" true (field "scan_succeeded" response = `Bool true);
+    Alcotest.(check int) "one probe" 1 !calls;
+    let listed=Api.handle_list_project_inventory bot None in
+    Alcotest.(check bool) "public inventory location" true (field "total_locations" listed = `Int 1);
+    Alcotest.(check bool) "local registry unchanged" true (Discord_agents.Bot.projects bot = []);
+    let loaded=Discord_agents.Host_project_service.create bot.host_project_service.path in
+    Alcotest.(check bool) "restart inventory retained" true (loaded.entries = bot.host_project_service.entries);
+    List.iter (fun params ->
+      Alcotest.(check bool) "invalid pagination refused" true
+        (field "error" (Api.handle_list_project_inventory bot params) <> `Null))
+      [request ["limit",`Int 9];request ["offset",`Int (-1)];request ["offset",`String "1"];
+       request ["offset",`Int 0;"offset",`Int 0]] )
+
 let test_host_diagnostic_refusals () =
   with_test_bot (fun bot ->
     let module Api = Discord_agents.Control_api in
@@ -2450,6 +2490,7 @@ let test_host_diagnostic_refusals () =
 let () =
   Alcotest.run "bot_defaults" [
     ("session_hosts", [
+      Alcotest.test_case "project inventory handlers" `Quick test_project_inventory_handlers;
       Alcotest.test_case "host diagnostics refuse before probe" `Quick test_host_diagnostic_refusals;
       Alcotest.test_case "persist migrated session hosts" `Quick
         test_persist_migrated_session_hosts;

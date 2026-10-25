@@ -195,6 +195,10 @@ let handle_tool_call ~control_client ?caller_thread_id
   | "start_session" -> handle_start_session control_client call.arguments
   | "list_projects" -> handle_list_projects control_client
   | "list_hosts" -> request_and_format control_client Control_api.List_hosts_id format_host_report
+  | "list_project_inventory" -> request_and_format ~params:call.arguments control_client
+      Control_api.List_project_inventory_id format_host_report
+  | "refresh_host_projects" -> request_and_format ~params:call.arguments control_client
+      Control_api.Refresh_host_projects_id format_host_report
   | "diagnose_host" -> request_and_format ~params:call.arguments control_client
       Control_api.Diagnose_host_id format_host_report
   | "import_project" -> handle_import_project control_client call.arguments

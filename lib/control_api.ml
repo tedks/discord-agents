@@ -60,6 +60,8 @@ type method_id =
   | List_projects_id
   | List_hosts_id
   | Diagnose_host_id
+  | List_project_inventory_id
+  | Refresh_host_projects_id
   | List_sessions_id
   | Import_project_id
   | List_claude_sessions_id
@@ -105,6 +107,8 @@ let string_of_method_id = function
   | List_projects_id -> "list_projects"
   | List_hosts_id -> "list_hosts"
   | Diagnose_host_id -> "diagnose_host"
+  | List_project_inventory_id -> "list_project_inventory"
+  | Refresh_host_projects_id -> "refresh_host_projects"
   | List_sessions_id -> "list_sessions"
   | Import_project_id -> "import_project"
   | List_claude_sessions_id -> "list_claude_sessions"
@@ -462,6 +466,43 @@ let handle_diagnose_host (bot : Bot.t) params =
          | Ok (Error `Timeout) -> error_response "Host diagnostic timed out; no complete report is available."
          | Ok (Ok response) -> response)
   | _ -> error_response "host, agent and cwd are required strings. Use list_hosts for configured names."
+
+let inventory_params allowed = function
+  | None -> Ok []
+  | Some (`Assoc xs) when
+      List.length xs = List.length (List.sort_uniq String.compare (List.map fst xs)) &&
+      List.for_all (fun (k,_) -> List.mem k allowed) xs -> Ok xs
+  | _ -> Error "Invalid project inventory parameters."
+
+let handle_list_project_inventory (bot : Bot.t) params =
+  match inventory_params ["offset"; "limit"] params with
+  | Error e -> error_response e
+  | Ok xs ->
+    let integer name default = match List.assoc_opt name xs with
+      | None -> Some default | Some (`Int n) -> Some n | _ -> None in
+    match integer "offset" 0, integer "limit" Host_project_service.max_page_size with
+    | Some offset, Some limit ->
+      (match Host_project_service.listing ~now:(Unix.gettimeofday ())
+        ~local_name:(Bot.local_host_name bot) ~registry:bot.config.hosts
+        ~base_directories:bot.config.base_directories ~offset ~limit bot.host_project_service with
+       | Ok json -> json | Error e -> error_response e)
+    | _ -> error_response "offset and limit must be integers."
+
+let handle_refresh_host_projects ?collect (bot : Bot.t) params =
+  match inventory_params ["host"] params with
+  | Error e -> error_response e
+  | Ok xs ->
+    match List.assoc_opt "host" xs with
+    | Some (`String name) ->
+      let collect = match collect with Some f -> f | None ->
+        (fun ~host ~roots -> Host_project_scan.collect
+          ~clock:(Eio.Stdenv.mono_clock bot.env) ~host ~roots ()) in
+      (match Host_project_service.refresh ~collect ~preflight:Disk_health.preflight_write
+        ~now:Unix.gettimeofday ~local_name:(Bot.local_host_name bot)
+        ~registry:bot.config.hosts ~base_directories:bot.config.base_directories
+        bot.host_project_service name with
+       | Ok json -> json | Error e -> error_response e)
+    | _ -> error_response "host is required. Use list_hosts for configured names."
 
 let handle_list_projects (bot : Bot.t) =
   let projects = List.map (fun (p : Project.t) ->
@@ -1607,6 +1648,10 @@ let all_method_specs = [
     ~handler:(fun bot _params -> handle_list_hosts bot) ();
   method_spec ~id:Diagnose_host_id ~mutability:Read_only ~mcp_exposed:true
     ~handler:(fun bot params -> handle_diagnose_host bot params) ();
+  method_spec ~id:List_project_inventory_id ~mutability:Read_only ~mcp_exposed:true
+    ~handler:(fun bot params -> handle_list_project_inventory bot params) ();
+  method_spec ~id:Refresh_host_projects_id ~mutability:Mutates_runtime ~mcp_exposed:true
+    ~handler:(fun bot params -> handle_refresh_host_projects bot params) ();
   method_spec ~id:List_sessions_id ~mutability:Read_only ~mcp_exposed:true
     ~handler:(fun bot _params -> handle_list_sessions bot) ();
   method_spec ~id:Import_project_id ~mutability:Mutates_projects ~mcp_exposed:true
