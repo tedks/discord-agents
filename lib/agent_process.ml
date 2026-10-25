@@ -1282,9 +1282,12 @@ let is_steps_joined ~steps s =
   (* failed_from (i, q): the smallest p in the run ending at q from which
      step i (after skipping separators) was found not to complete. Any
      later start at or beyond it is answered at once, and a scan from an
-     earlier start stops on reaching it. So each step scans each run
-     once in total: about k x n byte checks, O(1) bookkeeping per scan,
-     recursion depth k. *)
+     earlier start stops on reaching it. So each step tries each start
+     in a run once, k x n candidate starts in total, with O(1)
+     bookkeeping per scan and recursion depth k. Each candidate compares
+     the step, which can cost up to its leading whitespace, so the worst
+     case is quadratic. That needs a response with tens of KB more
+     whitespace than the streamed step; replies are fast. *)
   let failed_from = Hashtbl.create 16 in
   let rec go i pos =
     if i = k then pos = n
