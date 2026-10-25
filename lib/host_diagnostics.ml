@@ -92,10 +92,29 @@ let observed render = function
   | C.Known value -> render value
   | Unknown why -> "unknown (" ^ reason why ^ ")"
 
-let diagnose ~run ~now ~host ~cwd ~agent ~writer ~mcp_path ~socket_path =
-  let capability = C.observe ~run ~now ~host ~cwd ~agent in
+let callback_route_is_current ~host ~writer registry =
+  if Host.is_local host then true
+  else match registry with
+    | None -> true
+    | Some r ->
+      match Host.find r writer with
+      | Some here -> here.name = (Host.writer r).name
+      | None -> false
+
+let diagnose ~run ~now ~host ~cwd ~agent ~writer ~registry ~mcp_path ~socket_path =
+  (* Codex can require nine CLI probes. Four seconds each plus the eight-
+     second callback leaves six seconds of headroom under the outer 50s cap.
+     The outer deadline still bounds setup/cleanup and scheduler delays. *)
+  let run_cli ~timeout_s ~max_output_bytes ~cwd host argv =
+    run ~timeout_s:(min 4 timeout_s) ~max_output_bytes ~cwd host argv in
+  let capability = C.observe ~run:run_cli ~now ~host ~cwd ~agent in
   let context = Host_callback.{ host; cwd; writer; mcp_path; socket_path } in
-  let callback = Host_callback.observe ~run ~now context in
+  (* A forced relocation may leave writer_ssh aliases pointing at an old bot
+     with the same filesystem layout. Do not attest that endpoint as this
+     writer; require the registry to be reconciled before remote callbacks. *)
+  let callback_current = callback_route_is_current ~host ~writer registry in
+  let callback = if callback_current then Host_callback.observe ~run ~now context
+    else Host_callback.{ context; observed_at = now (); control = C.Unknown Context_changed } in
   let finished = now () in
   let capability = C.current ~now:finished ~max_age:60. ~host ~cwd ~agent capability in
   let callback = Host_callback.current ~now:finished ~max_age:60. ~context callback in
@@ -116,7 +135,9 @@ let diagnose ~run ~now ~host ~cwd ~agent ~writer ~mcp_path ~socket_path =
     "CLI credential store: " ^ observed (function C.Present -> "present" | Absent -> "absent") capability.credentials;
     "MCP control callback: " ^ observed (fun () -> "reachable") callback.control;
     "Model access: unknown (not queried)";
-  ] @ flags @ [
+  ] @ (if callback_current then [] else [
+    "Callback not checked: configured writer differs from the running writer; reconcile the writer registry and callback destinations."
+  ]) @ flags @ [
     "Fresh diagnostic only; no session admission decision. Credential-store presence does not establish request credentials, validity or model access.";
     "Uses the current inherited local/SSH environment; per-session overrides are not evaluated. Callback reachability does not establish Discord or disk health.";
     "Display escapes are not executable paths. No login or model request was run.";

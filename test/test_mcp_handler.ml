@@ -2760,17 +2760,19 @@ let test_login_host_render_boundary () =
 
 let test_host_report_tools () =
   List.iter (fun (tool, arguments) ->
-    let response = `Assoc ["ok", `Bool true; "report", `String "Host: writer\nModel access: unknown"] in
-    let client = Control_client.make ~request:(fun request ->
-      Alcotest.(check string) "method" tool request.method_name;
-      Alcotest.(check int) "client budget" 60 request.timeout_s;
-      Alcotest.(check bool) "parameters" true
-        (request.params = if arguments = `Assoc [] then None else Some arguments);
-      Ok response) in
-    let result = Mcp_handler.handle_tool_call ~control_client:client
-      { Mcp_server.name = tool; arguments } in
-    Alcotest.(check (result string string)) "Python parity"
-      (Ok (python_tool_output ~arguments tool response)) result)
+    List.iter (fun response ->
+      let client = Control_client.make ~request:(fun request ->
+        Alcotest.(check string) "method" tool request.method_name;
+        Alcotest.(check int) "client budget" 60 request.timeout_s;
+        Alcotest.(check bool) "parameters" true
+          (request.params = if arguments = `Assoc [] then None else Some arguments);
+        Ok response) in
+      let result = Mcp_handler.handle_tool_call ~control_client:client
+        { Mcp_server.name = tool; arguments } in
+      Alcotest.(check (result string string)) "Python parity"
+        (Ok (python_tool_output ~arguments tool response)) result)
+      [`Assoc ["ok", `Bool true; "report", `String "Host: writer\nModel access: unknown"];
+       `Assoc ["error", `String "Host diagnostic timed out; no complete report is available."]])
     ["list_hosts", `Assoc [];
      "diagnose_host", `Assoc ["host", `String "remote"; "agent", `String "agy"; "cwd", `String "/project"]]
 

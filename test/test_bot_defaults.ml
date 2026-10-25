@@ -2434,6 +2434,11 @@ let test_host_diagnostic_refusals () =
     refused "unregistered host" (params "missing" "/");
     refused "relative cwd" (params here "relative");
     refused "missing params" None;
+    List.iter (fun key ->
+      refused "wrong parameter type" (Some (`Assoc (List.map (fun (k, v) ->
+        k, if k = key then `Int 1 else v)
+        ["host", `String here; "agent", `String "claude"; "cwd", `String "/"]))))
+      ["host"; "agent"; "cwd"];
     refused "oversized cwd" (params here ("/" ^ String.make 4096 'x'));
     bot.host_diagnostics_gate.busy <- true;
     refused "busy service" (params here "/");

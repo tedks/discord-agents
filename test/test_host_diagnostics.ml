@@ -67,13 +67,24 @@ let test_observation () =
       Ok Callback.reply
     end in
   let get now = D.diagnose ~run ~now ~host:remote ~cwd:"/project" ~agent:Discord_agents.Config.Agy
-    ~writer:"writer" ~mcp_path:(Some "/chosen/mcp") ~socket_path:"/chosen/control.sock" |> report in
+    ~writer:"writer" ~registry ~mcp_path:(Some "/chosen/mcp") ~socket_path:"/chosen/control.sock" |> report in
   let text = get (fun () -> 100.) in
   List.iter (fun expected -> check expected true (contains text expected))
     ["CLI credential store: unknown (no advertised probe)"; "MCP control callback: reachable";
      "Model access: unknown"; "[U+202E]"; "--help"];
   check "no auth or model invocation" false
     (List.exists (fun argv -> List.exists (fun x -> x = "login" || x = "auth" || x = "-p") argv) !calls);
+  calls := [];
+  let forced = D.diagnose ~run ~now:(fun () -> 100.) ~host:remote ~cwd:"/project"
+    ~agent:Discord_agents.Config.Agy ~writer:"elsewhere" ~registry
+    ~mcp_path:(Some "/chosen/mcp") ~socket_path:"/chosen/control.sock" |> report in
+  check "forced relocation does not call old callback" false
+    (List.exists (function "ssh" :: _ -> true | _ -> false) !calls);
+  check "forced callback explicitly unknown" true
+    (contains forced "MCP control callback: unknown (context changed)");
+  check "forced callback explanation" true (contains forced "configured writer differs");
+  check "local callback on actual forced writer permitted" true
+    (D.callback_route_is_current ~host:(H.local_host "elsewhere") ~writer:"elsewhere" registry);
   let times = ref [100.; 100.; 200.] in
   let now () = match !times with t::rest -> times := rest; t | [] -> 200. in
   let stale = get now in
@@ -82,12 +93,38 @@ let test_observation () =
   let run ~timeout_s:_ ~max_output_bytes:_ ~cwd:_ _ _ =
     Error (Discord_agents.Host_probe.Host (Discord_agents.Host_exec.Unreachable "SECRET")) in
   let failed = D.diagnose ~run ~now:(fun () -> 100.) ~host:remote ~cwd:"/project"
-    ~agent:Discord_agents.Config.Claude ~writer:"writer" ~mcp_path:(Some "/mcp")
+    ~agent:Discord_agents.Config.Claude ~writer:"writer" ~registry ~mcp_path:(Some "/mcp")
     ~socket_path:"/socket" |> report in
   check "transport failure remains unknown" true (contains failed "unknown (transport unreachable)");
   check "raw failure discarded" false (contains failed "SECRET")
 
+let test_codex_budget () =
+  let elapsed = ref 0. and calls = ref 0 in
+  let now () = !elapsed in
+  let run ~timeout_s ~max_output_bytes:_ ~cwd:_ _ argv =
+    incr calls;
+    elapsed := !elapsed +. float_of_int timeout_s;
+    if List.mem "capability-identity" argv then Ok "/cli/codex\000stamp\n"
+    else if List.mem "--version" argv then Ok "codex 1.0\n"
+    else if List.mem "--help" argv then begin
+      let rec args = function
+        | "/cli/codex" :: rest -> rest | _ :: rest -> args rest | [] -> [] in
+      let scope = args argv |> List.filter ((<>) "--help") in
+      Ok ("Usage: codex " ^ (if scope = [] then "" else String.concat " " scope ^ " ") ^
+        "[options]\nCommands:\n  exec  execute\n  resume  resume\n  login  login\n  status  status\nOptions:\n  --help  help\n")
+    end
+    else if List.mem "status" argv then Ok "private credential output discarded"
+    else Ok Callback.reply in
+  let text = D.diagnose ~run ~now ~host:writer ~cwd:"/project"
+    ~agent:Discord_agents.Config.Codex ~writer:"writer" ~registry ~mcp_path:(Some "/mcp")
+    ~socket_path:"/socket" |> report in
+  check "all nine CLI probes plus callback" 10 !calls;
+  check "worst-case configured probe budget" 44. !elapsed;
+  check "complete report remains fresh" true (contains text "Version: codex 1.0");
+  check "auth output discarded" false (contains text "private credential output")
+
 let () = Alcotest.run "Host diagnostics" ["diagnostics", [
+  Alcotest.test_case "Codex worst-case probe budget" `Quick test_codex_budget;
   Alcotest.test_case "routing and inventory" `Quick test_routing;
   Alcotest.test_case "safe display" `Quick test_display;
   Alcotest.test_case "concurrency and cancellation" `Quick test_gate;

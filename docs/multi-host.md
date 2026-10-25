@@ -5,9 +5,14 @@ Current implementation slice (2026-10-24): read-only MCP `list_hosts` and
 contacts nobody. Diagnostics require one enabled, routable host and an absolute
 working directory; they create no directories or sessions. One request runs at
 a time per bot with a 50-second total deadline, in a control connection fiber.
+CLI probes get four seconds each; the worst-case Codex sequence plus callback
+uses 44 seconds of probe budget, leaving six seconds of headroom.
 Unknown, disabled and ambiguous hosts are refused before spawning probes.
 Forced-writer starts use the actual writer identity and refuse the old writer
-when no SSH route exists.
+when no SSH route exists. Remote callbacks remain unknown while the running
+writer differs from the configured writer: existing reverse-SSH aliases might
+reach the old bot at an identical filesystem path. Reconcile the registry and
+callback destinations before relying on those observations.
 
 Reports use freshly collected CLI and callback observations, checked for age at
 render time. They display Unicode scalars as `[U+XXXX]`, replace invalid UTF-8,
@@ -20,6 +25,10 @@ reverse-SSH destination as agent routing. A request without a real working
 directory reports unknown; it never silently probes the writer's same-path file.
 Per-session overrides are not evaluated. Project union/offline snapshots,
 capability-aware login repair and admission remain issue 154 and the stack below.
+The Python MCP fallback does not implement `--check-control`; selecting it
+produces an unknown callback observation even if ordinary MCP calls work.
+Fallback parity and remaining presentation/test follow-ups are tracked in
+[165](https://github.com/tedks/discord-agents/issues/165).
 Making test/review CLI execution hermetic is deferred under issue 148.
 
 Foundation status (2026-10-23 takeover): PRs

@@ -435,7 +435,7 @@ let handle_list_hosts (bot : Bot.t) =
 let handle_diagnose_host (bot : Bot.t) params =
   let open Yojson.Safe.Util in
   let params = match params with Some (`Assoc _ as p) -> p | _ -> `Assoc [] in
-  let field name = params |> member name |> to_string_option in
+  let field name = match member name params with `String s -> Some s | _ -> None in
   match field "host", field "agent", field "cwd" with
   | Some name, Some agent, Some cwd ->
     (match Config.agent_kind_of_string agent,
@@ -456,7 +456,7 @@ let handle_diagnose_host (bot : Bot.t) params =
                ~run:(fun ~timeout_s ~max_output_bytes ~cwd host argv ->
                  Host_probe.run ~clock ~timeout_s ~max_output_bytes ~cwd host argv)
                ~now:Unix.gettimeofday ~host ~cwd ~agent
-               ~writer:(Bot.local_host_name bot)
+               ~writer:(Bot.local_host_name bot) ~registry:bot.config.hosts
                ~mcp_path:(Agent_process.mcp_command_opt ()) ~socket_path:(socket_path ()))) with
          | Error message -> error_response message
          | Ok (Error `Timeout) -> error_response "Host diagnostic timed out; no complete report is available."
