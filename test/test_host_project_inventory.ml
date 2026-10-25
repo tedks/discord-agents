@@ -20,6 +20,10 @@ let test_history () =
   check "last successful timestamp retained" (Some 10.) offline.last_success_at;
   check "last attempt recorded" (Some 20.) offline.attempted_at;
   check "failure not live availability" "unavailable" offline.state;
+  let aged = view failed 400. in
+  check "failed observation ages" "stale" aged.state;
+  check "aged failure retains projects" [project] aged.projects;
+  check "aged failure retains reason" offline.error aged.error;
   let empty = record failed 30. (Ok []) in
   check "successful empty replaces" [] (view empty 31.).projects;
   check "empty is observed" "observed" (view empty 31.).state;
@@ -67,7 +71,48 @@ let test_disk () =
     let fd=Unix.openfile path [Unix.O_CREAT;Unix.O_WRONLY] 0o600 in
     Unix.ftruncate fd (I.max_file_bytes+1); Unix.close fd;
     check "oversized file refused" true (Result.is_error (I.load path)))
+let test_bounds_and_corruption () =
+  let good=record [] 10. (Ok [project]) in
+  let large=List.init 100 (fun i -> {project with S.name=String.make 2048 'a';path="/repo/" ^ string_of_int i}) in
+  let oversized=record good 20. (Ok large) in
+  check "oversized snapshot becomes failed attempt" (Some "snapshot byte limit exceeded") (view oversized 21.).error;
+  check "oversized snapshot retains prior success" [project] (view oversized 21.).projects;
+  let second={host with H.name="second"} in
+  let both=get (I.record oversized ~now:30. ~host:second ~roots (Ok [])) in
+  check "other hosts continue" 2 (List.length both);
+  check "oversized attempt reloads" (Ok both) (I.decode (I.encode both));
+  let churn=ref [] in
+  for i=0 to 70 do
+    let h={host with H.name="host" ^ string_of_int i} in
+    churn := get (I.record (I.prune !churn ~configured:[h]) ~now:100. ~host:h ~roots (Ok []))
+  done;
+  check "removed host churn bounded" 1 (List.length !churn);
+  let full=List.init 64 (fun i -> {(List.hd good) with I.host={host with name="h" ^ string_of_int i}}) in
+  check "host cap explicit" true (Result.is_error (I.record full ~now:30. ~host:second ~roots (Ok [])));
+  let missing=record [] 10. (Error S.Malformed) in
+  check "failure without prior success reloads" (Ok missing) (I.decode (I.encode missing));
+  let reasons : Discord_agents.Host_capability.unknown list =
+    [Disabled;Invalid_context;Missing_executable;Unreachable;Timed_out;Output_limit;Setup_failed;Io_failed;
+     Command_failed;Malformed;Not_supported;Executable_changed;Stale;Context_changed] in
+  List.iter (fun reason -> let state=record good 20. (Error (S.Transport reason)) in
+    check "all failure labels decode" (Ok state) (I.decode (I.encode state))) reasons;
+  let replace key value = function
+    | `Assoc xs -> `Assoc ((key,value)::List.remove_assoc key xs) | _ -> assert false in
+  let entry=I.entry_json (List.hd good) in
+  let success=I.success_json (Option.get (List.hd good).I.success) in
+  let document entry=Yojson.Safe.to_string (`Assoc ["version",`Int 1;"entries",`List [entry]]) in
+  let malformed = [
+    replace "host" (`Int 5) entry; replace "host" (`Assoc []) entry;
+    replace "roots" (`String "/projects") entry; replace "host_name" (`String "bad\255") entry;
+    replace "success" (replace "at" (`Float 30.) success) entry;
+    replace "success" (replace "projects" (`List [replace "is_bare" (`String "yes") (I.project_json project)]) success) entry;
+    (match entry with `Assoc xs -> `Assoc (("host_name",`String "duplicate")::xs) | _ -> assert false);
+    replace "success" (replace "projects" (`List [
+      (match I.project_json project with `Assoc xs -> `Assoc (("path",`String "/duplicate")::xs) | _ -> assert false)]) success) entry;
+  ] in
+  List.iter(fun bad -> check "nested corruption returns Error" true (Result.is_error (I.decode (document bad)))) malformed
 let () = Alcotest.run "Host inventory snapshots" ["snapshots", [
+  Alcotest.test_case "bounds, churn and nested corruption" `Quick test_bounds_and_corruption;
   Alcotest.test_case "state transitions and contexts" `Quick test_history;
   Alcotest.test_case "durable reload and write/read failures" `Quick test_disk;
 ]]

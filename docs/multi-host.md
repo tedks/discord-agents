@@ -29,7 +29,12 @@ reconfigured hosts hide old evidence; observations age after five minutes, and
 clock rollback makes them stale. Atomic, private cache writes must confirm
 durability before callers publish new in-memory state. Corrupt, oversized or
 non-regular caches are errors, not successful empty scans. Cache bounds are
-64 hosts and 8 MiB. This layer is independent of session, channel and cleanup
+64 hosts, 512 projects per host, 120 KiB per encoded host entry (with room
+reserved for failure metadata), and 8 MiB total. An oversized host snapshot
+becomes a failed observation retaining its prior success. Callers serialize
+prune/record/save/publication and prune removed hosts before recording. Symlinked
+cache files are permitted within the trusted config directory; regular-file
+checks apply to their targets. This layer is independent of session, channel and cleanup
 state; public refresh/listing wiring follows in the final inventory PR.
 
 Current implementation slice (2026-10-24): read-only MCP `list_hosts` and

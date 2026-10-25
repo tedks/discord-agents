@@ -14,11 +14,14 @@ type t = entry list
 let empty = []
 let max_hosts = 64
 let max_file_bytes = 8 * 1024 * 1024
+let max_entry_bytes = 120 * 1024
 let default_max_age = 300.
 let filename () = Filename.concat (Resource.app_config_dir ()) "host-projects.json"
 let same_context entry host roots = Host.equal entry.host host && entry.roots = roots
 let host_key host = String.lowercase_ascii host.Host.name
 let find entries host = List.find_opt (fun e -> host_key e.host = host_key host) entries
+let prune entries ~configured =
+  List.filter (fun e -> List.exists (fun h -> host_key h = host_key e.host) configured) entries
 let error_code = function
   | Scan.Invalid_roots -> "invalid roots" | Malformed -> "malformed response"
   | Transport why -> Host_diagnostics.reason why
@@ -34,6 +37,11 @@ let entry_json e = `Assoc [
   "attempted_at", `Float e.attempted_at;
   "error", (match e.error with None -> `Null | Some s -> `String s);
   "success", (match e.success with None -> `Null | Some s -> success_json s)]
+(* Reserve space for the next timestamp and any bounded failure label, so a
+   failed attempt can retain a snapshot that filled its original budget. *)
+let fits_entry e =
+  String.length (Yojson.Safe.to_string (entry_json {e with attempted_at=0.;error=None}))
+    <= max_entry_bytes - 256
 let encode entries = Yojson.Safe.to_string (`Assoc [
   "version", `Int 1; "entries", `List (List.map entry_json entries)])
 let time = function
@@ -81,12 +89,16 @@ let decode text =
       (match error, success with
        | None, Some s when s.at = attempted_at -> ()
        | Some _, _ -> () | _ -> raise Exit);
-      { host; roots; attempted_at; error; success }) entries in
+      let entry = { host; roots; attempted_at; error; success } in
+      if not (fits_entry entry) then raise Exit;
+      entry) entries in
     Ok entries
   with Exit | Failure _ | Yojson.Json_error _ | Invalid_argument _ -> Error "Invalid project inventory cache."
 
 (* Immutable update: a failure retains earlier projects only for the identical
-   host/config context. A successful empty scan deliberately replaces them. *)
+   host/config context. A successful empty scan deliberately replaces them.
+   Caller serializes prune/record/save/publication and prunes configured hosts
+   first. An oversized scan becomes a bounded failed observation, never empty. *)
 let record entries ~now ~host ~roots result =
   if not (Float.is_finite now) || now < 0. || not (Scan.valid_roots roots) then
     Error "Invalid inventory observation context."
@@ -99,14 +111,18 @@ let record entries ~now ~host ~roots result =
       | Ok projects -> None, Some { at = now; projects }
       | Error failure -> Some (error_code failure), previous in
     let entry = { host; roots; attempted_at = now; error; success } in
+    let entry = if fits_entry entry then entry else
+      {entry with error=Some "snapshot byte limit exceeded"; success=previous} in
     let entries = entry :: List.filter (fun e -> host_key e.host <> host_key host) entries in
-    if List.length entries > max_hosts then Error "Project inventory host limit exceeded."
+    if not (fits_entry entry) then Error "Project inventory host metadata exceeds the entry limit."
+    else if List.length entries > max_hosts then Error "Project inventory host limit exceeded."
     else Ok entries
 
 let load path =
   try
     let fd = Unix.openfile path [Unix.O_RDONLY; Unix.O_NONBLOCK; Unix.O_CLOEXEC] 0 in
-    let ic = Unix.in_channel_of_descr fd in
+    let ic = match Unix.in_channel_of_descr fd with
+      | ic -> ic | exception exn -> Unix.close fd; raise exn in
     Fun.protect ~finally:(fun () -> close_in_noerr ic) (fun () ->
       let stat = Unix.fstat fd in
       if stat.st_kind <> Unix.S_REG || stat.st_size > max_file_bytes then
@@ -149,8 +165,8 @@ let view ?(max_age=default_max_age) entries ~now ~host ~roots =
     | Some e ->
       let state =
         if not (Float.is_finite now && Float.is_finite max_age) || max_age < 0. || now < e.attempted_at then "stale"
-        else if Option.is_some e.error then "unavailable"
-        else if now -. e.attempted_at > max_age then "stale" else "observed" in
+        else if now -. e.attempted_at > max_age then "stale"
+        else if Option.is_some e.error then "unavailable" else "observed" in
       { state; attempted_at=Some e.attempted_at;
         last_success_at=Option.map (fun (s:success) -> s.at) e.success;
         projects=(match e.success with None -> [] | Some s -> s.projects); error=e.error }
