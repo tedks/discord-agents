@@ -1825,6 +1825,306 @@ let setup_gemini_mcp ?resolved ~working_dir () =
     | File_missing ->
       write_file_safely ~path:exclude_path (merge_gemini_exclude None)
 
+(* ── agy MCP (user-global config) ───────────────────────────────────
+
+   agy 1.1.3 loads MCP servers in print mode only from the user-global
+   [~/.gemini/config/mcp_config.json]; workspace [.agents/] configs are
+   ignored (measured; see docs/agy-harness.md). That file is the user's
+   own, shared with their interactive agy and the Antigravity IDE, so
+   the entry we keep there is static and inert outside the bot. It runs
+   the server named by [DISCORD_AGENTS_MCP_FOR_AGY], which only the
+   bot's agy children carry, and exits at once without it. agy tolerates
+   a server that exits like that (verified: the turn succeeds).
+
+   The user's file is never damaged to make room for us. We decline,
+   and the session runs without MCP, when the file:
+   - is a symlink (managed elsewhere, e.g. dotfiles);
+   - won't parse, isn't an object, or has a non-object [mcpServers];
+   - has duplicate [mcpServers] keys or duplicate entries under our name;
+   - has comments, which Yojson accepts but would drop on rewrite;
+   - would not re-serialise as standard JSON (e.g. 1e400);
+   - has an entry under our name that isn't ours, or ours marked
+     [disabled: true] by the user.
+   An entry is ours when its command and args match. Extra keys the
+   user or IDE adds to it are kept, and their presence doesn't trigger
+   a rewrite.
+
+   Writes follow the dotfiles installer for the sibling config.json:
+   under a bot-owned lock, keep the raw bytes, rebuild, and re-read just
+   before the rename, refusing if anything changed in the meantime. agy
+   and the IDE don't take our lock, so a change landing in the last
+   instant before the rename can still be lost. That window is
+   microseconds, against one write per change of our entry. A
+   concurrent chmod with unchanged bytes isn't detected either. The
+   original file mode is kept (a new file is 0600), and the rename
+   makes the bot the file's owner, which is the same user on this
+   single-tenant machine. *)
+
+let agy_mcp_env_var = "DISCORD_AGENTS_MCP_FOR_AGY"
+let agy_mcp_server_name = "discord_agents"
+
+let agy_mcp_command_json = `String "/bin/sh"
+let agy_mcp_args_json =
+  `List [
+    `String "-c";
+    `String (Printf.sprintf
+      "[ -n \"$%s\" ] || exit 0; exec \"$%s\"" agy_mcp_env_var agy_mcp_env_var);
+    `String "discord-agents-mcp";
+  ]
+
+let agy_mcp_entry =
+  `Assoc [("command", agy_mcp_command_json); ("args", agy_mcp_args_json)]
+
+type agy_mcp_update =
+  | Agy_mcp_present          (** our entry is already there, as is *)
+  | Agy_mcp_write of string  (** write this to install it *)
+  | Agy_mcp_declined of string  (** leave the file alone; why *)
+
+(** Whether [text] has a [//] or [/*] outside a string literal. *)
+let json_has_comment text =
+  let n = String.length text in
+  let rec go i in_string =
+    if i >= n then false
+    else
+      match text.[i], in_string with
+      | '\\', true -> go (i + 2) true
+      | '"', _ -> go (i + 1) (not in_string)
+      | '/', false when i + 1 < n && (text.[i+1] = '/' || text.[i+1] = '*') -> true
+      | _ -> go (i + 1) in_string
+  in
+  go 0 false
+
+let count_key k fields = List.length (List.filter (fun (k', _) -> k' = k) fields)
+
+(** Yojson reads 1e400 as infinity and would write it back as a token
+    that isn't JSON at all. *)
+let rec json_has_nonfinite : Yojson.Safe.t -> bool = function
+  | `Float f -> not (Float.is_finite f)
+  | `Assoc kvs -> List.exists (fun (_, v) -> json_has_nonfinite v) kvs
+  | `List vs -> List.exists json_has_nonfinite vs
+  | _ -> false
+
+(** Pure: what to do with the config file's current contents ([None]
+    when it doesn't exist). *)
+let agy_mcp_config_update existing =
+  let render fields =
+    if json_has_nonfinite (`Assoc fields) then
+      Agy_mcp_declined "would not re-serialise as standard JSON"
+    else
+      match Yojson.Safe.pretty_to_string ~std:true (`Assoc fields) with
+      | text -> Agy_mcp_write (text ^ "\n")
+      | exception _ -> Agy_mcp_declined "would not re-serialise as standard JSON"
+  in
+  let fresh_servers = [("mcpServers", `Assoc [(agy_mcp_server_name, agy_mcp_entry)])] in
+  match existing with
+  | None -> render fresh_servers
+  | Some text when String.trim text = "" -> render fresh_servers
+  | Some text when json_has_comment text ->
+    Agy_mcp_declined "has comments, which a rewrite would drop"
+  | Some text ->
+    match Yojson.Safe.from_string text with
+    | exception _ -> Agy_mcp_declined "not valid JSON"
+    | `Assoc fields when count_key "mcpServers" fields > 1 ->
+      Agy_mcp_declined "has more than one mcpServers key"
+    | `Assoc _ as json when json_has_nonfinite json ->
+      Agy_mcp_declined "would not re-serialise as standard JSON"
+    | `Assoc fields ->
+      let with_servers servers =
+        if List.mem_assoc "mcpServers" fields then
+          List.map (fun (k, v) ->
+            if k = "mcpServers" then (k, `Assoc servers) else (k, v)) fields
+        else fields @ [("mcpServers", `Assoc servers)]
+      in
+      (match List.assoc_opt "mcpServers" fields with
+       | Some (`Assoc servers) when count_key agy_mcp_server_name servers > 1 ->
+         Agy_mcp_declined "has more than one discord_agents entry"
+       | Some (`Assoc servers) ->
+         (match List.assoc_opt agy_mcp_server_name servers with
+          | None -> render (with_servers (servers @ [(agy_mcp_server_name, agy_mcp_entry)]))
+          | Some (`Assoc entry)
+            when List.exists (fun (k, _) -> count_key k entry > 1) entry ->
+            Agy_mcp_declined "the discord_agents entry has duplicate keys"
+          | Some (`Assoc entry) ->
+            let field k = List.assoc_opt k entry in
+            let ours =
+              field "command" = Some agy_mcp_command_json
+              && field "args" = Some agy_mcp_args_json in
+            (* Ours only on an exact command+args match; there is no older
+               format of ours to migrate. Anything else under this name is
+               somebody else's server. *)
+            if not ours then
+              Agy_mcp_declined "a different discord_agents server is configured there"
+            else
+              (match field "disabled" with
+               | Some (`Bool true) ->
+                 Agy_mcp_declined "the discord_agents entry is disabled there"
+               | _ -> Agy_mcp_present)
+          | Some _ -> Agy_mcp_declined "the discord_agents entry is not an object")
+       | None -> render (with_servers [(agy_mcp_server_name, agy_mcp_entry)])
+       | Some _ -> Agy_mcp_declined "mcpServers is not an object")
+    | _ -> Agy_mcp_declined "not a JSON object"
+
+let agy_mcp_config_path () =
+  match Sys.getenv_opt "HOME" with
+  | Some home when home <> "" ->
+    Some (Filename.concat home ".gemini/config/mcp_config.json")
+  | _ -> None
+
+let agy_mcp_lock_path () =
+  Filename.concat (Resource.app_config_dir ()) "agy-mcp-config.lock"
+
+type agy_mcp_file =
+  | Agy_file_missing
+  | Agy_file_symlink
+  | Agy_file of { raw : string; perm : int }
+
+let read_agy_mcp_file path =
+  match Unix.lstat path with
+  | exception Unix.Unix_error (Unix.ENOENT, _, _) -> Result.Ok Agy_file_missing
+  | exception exn -> Result.Error exn
+  | { Unix.st_kind = Unix.S_LNK; _ } -> Result.Ok Agy_file_symlink
+  | { Unix.st_kind = Unix.S_REG; st_perm; _ } ->
+    (match In_channel.with_open_bin path In_channel.input_all with
+     | raw -> Result.Ok (Agy_file { raw; perm = st_perm })
+     | exception exn -> Result.Error exn)
+  | _ -> Result.Error (Failure "not a regular file")
+
+(* Our temp files live next to the config (the rename must not cross
+   filesystems) under a prefix nobody else uses. agy's own atomic writes
+   use "<name>.tmp.<n>" (the binary has "config.json.tmp.%d"), so reaping
+   that pattern could delete agy's in-flight temp. *)
+let agy_mcp_temp_prefix path =
+  ".discord-agents." ^ Filename.basename path ^ ".tmp."
+
+let reap_agy_mcp_temps path =
+  let dir = Filename.dirname path and prefix = agy_mcp_temp_prefix path in
+  match Sys.readdir dir with
+  | exception Sys_error _ -> ()
+  | names ->
+    Array.iter (fun name ->
+      if String.starts_with ~prefix name then
+        let p = Filename.concat dir name in
+        match Unix.lstat p with
+        | { Unix.st_kind = Unix.S_REG; _ } -> (try Unix.unlink p with _ -> ())
+        | _ | exception _ -> ()) names
+
+(* Replace [path] with [contents] if it still holds [expected] (raw bytes;
+   [None] = must still be absent). Durability follows
+   [Resource.write_file_atomic]: the temp file is fsynced before the
+   rename and the parent directory after it. Differences:
+   - bytes are written exactly and the mode is [perm];
+   - a failed directory fsync is logged, not raised (the new file is
+     already in place);
+   - outcomes are deliberately not fed to Disk_health. This file sits
+     under ~/.gemini, outside the bot's state, and a failure recorded
+     there would hold the bot in read-only mode until another write
+     there succeeded. The disk-pressure preflight still applies.
+   Must be called with the agy MCP lock held. *)
+let replace_agy_mcp_file ~path ~expected ~perm contents =
+  let dir = Filename.dirname path in
+  match Disk_health.preflight_write path with
+  | Error why -> Result.Error ("disk preflight refused: " ^ why)
+  | Ok () ->
+    if (try Unix.access dir [Unix.W_OK]; false with Unix.Unix_error _ -> true) then
+      Result.Error "its directory is not writable"
+    else
+      let tmp = ref None in
+      let cleanup () =
+        Option.iter (fun t -> try Sys.remove t with Sys_error _ -> ()) !tmp in
+      match
+        reap_agy_mcp_temps path;
+        let t = Filename.temp_file ~temp_dir:dir (agy_mcp_temp_prefix path) "" in
+        tmp := Some t;
+        let fd = Unix.openfile t [Unix.O_WRONLY; Unix.O_TRUNC] 0o600 in
+        Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
+          Resource.write_all fd contents 0 (String.length contents);
+          Unix.fchmod fd perm;
+          Resource.fsync fd);
+        let still = match read_agy_mcp_file path, expected with
+          | Result.Ok Agy_file_missing, None -> true
+          | Result.Ok (Agy_file { raw; _ }), Some e -> String.equal raw e
+          | _ -> false
+        in
+        if still then begin
+          Unix.rename t path;
+          tmp := None;
+          (try Resource.fsync_dir dir with exn ->
+             Logs.warn (fun m ->
+               m "agent_process: wrote %s but could not fsync %s: %s"
+                 path dir (Printexc.to_string exn)));
+          true
+        end else (cleanup (); false)
+      with
+      | ok -> Result.Ok ok
+      | exception exn -> cleanup (); Result.Error (Printexc.to_string exn)
+
+(* The last reason logged, so a persisting problem is logged once and
+   not on every spawn. Cleared when MCP is available again, so a
+   relapse is logged. Systhreads share it; Atomic keeps the updates
+   whole (a lost race at worst logs a line twice). *)
+let agy_mcp_reported = Atomic.make ""
+let report_agy_mcp_unavailable why =
+  if Atomic.exchange agy_mcp_reported why <> why then
+    Logs.warn (fun m ->
+      m "agent_process: agy sessions run without discord-agents MCP tools: %s" why)
+let report_agy_mcp_available () = Atomic.set agy_mcp_reported ""
+
+(** Make sure our inert entry is in agy's global MCP config. Returns
+    whether it is there afterwards. Blocking (file lock, fsync): call it
+    off the Eio domain. The config directory has to
+    exist already: it belongs to agy, and creating it would be making
+    agy's state on the user's behalf. *)
+let setup_agy_mcp ?path ?lock_path () =
+  match (match path with Some p -> Some p | None -> agy_mcp_config_path ()) with
+  | None -> report_agy_mcp_unavailable "HOME is not set"; false
+  | Some path ->
+    if not (try Sys.is_directory (Filename.dirname path) with Sys_error _ -> false)
+    then begin
+      report_agy_mcp_unavailable
+        (Printf.sprintf "%s does not exist (run agy once to create it)"
+           (Filename.dirname path));
+      false
+    end else
+      let decline why =
+        report_agy_mcp_unavailable (Printf.sprintf "left %s alone: %s" path why);
+        `Declined
+      in
+      let decide = function
+        | Result.Error exn -> decline ("cannot read it: " ^ Printexc.to_string exn)
+        | Result.Ok Agy_file_symlink -> decline "it is a symlink"
+        | Result.Ok file ->
+          let raw = match file with Agy_file { raw; _ } -> Some raw | _ -> None in
+          match agy_mcp_config_update raw with
+          | Agy_mcp_present -> `Present
+          | Agy_mcp_declined why -> decline why
+          | Agy_mcp_write contents -> `Write (raw, file, contents)
+      in
+      (* The common case (entry already there) takes no lock. *)
+      let present () = report_agy_mcp_available (); true in
+      match decide (read_agy_mcp_file path) with
+      | `Present -> present ()
+      | `Declined -> false
+      | `Write _ ->
+        let lock_path = Option.value lock_path ~default:(agy_mcp_lock_path ()) in
+        (try
+           Resource.with_flock lock_path (fun () ->
+             match decide (read_agy_mcp_file path) with
+             | `Present -> present ()
+             | `Declined -> false
+             | `Write (expected, file, contents) ->
+               (* A new file gets 0600 like the bot's own state; an
+                  existing one keeps its mode. *)
+               let perm = match file with Agy_file { perm; _ } -> perm | _ -> 0o600 in
+               match replace_agy_mcp_file ~path ~expected ~perm contents with
+               | Result.Ok true -> present ()
+               | Result.Ok false ->
+                 ignore (decline "it changed while we were updating it; will retry next turn");
+                 false
+               | Result.Error why -> ignore (decline why); false)
+         with exn ->
+           ignore (decline ("could not update it: " ^ Printexc.to_string exn));
+           false)
+
 (** Escape a string for embedding inside a TOML double-quoted string.
     Beyond backslash and double-quote (the cases we actually hit with
     filesystem paths), the TOML spec also requires control characters
@@ -1957,15 +2257,18 @@ let agy_print_timeout = Printf.sprintf "%ds" agy_print_timeout_seconds
     [--dangerously-bypass-approvals-and-sandbox] under the bot's
     single-tenant trust model.
 
-    MCP is not wired for agy: agy 1.1.3 has no per-worktree MCP route
-    (workspace [.agents/] configs are not loaded in print mode), and the
-    one route that works, the user-global
-    [~/.gemini/config/mcp_config.json], awaits an operator decision.
-    See docs/agy-harness.md. *)
-let agy_args ~model ~session_id ~session_id_confirmed ~prompt =
+    [--add-dir <working_dir>] is what makes the worktree agy's
+    workspace. With only the cwd set, agy 1.1.3 reports "No workspace is
+    open" and points its file tools at its own scratch directory
+    (verified). An empty [working_dir] is never passed: the resume
+    handlers reject it, and agy would read the flag's value as missing.
+
+    MCP comes from the user-global config; see [setup_agy_mcp]. *)
+let agy_args ~model ~working_dir ~session_id ~session_id_confirmed ~prompt =
   let base = ["agy"; "-p"; prompt; "--output-format"; "stream-json";
               "--dangerously-skip-permissions";
               "--print-timeout"; agy_print_timeout]
+             @ (if working_dir = "" then [] else ["--add-dir"; working_dir])
              @ model_arg model in
   if not session_id_confirmed then base
   else base @ ["--conversation"; session_id]
@@ -1988,7 +2291,7 @@ let session_thread_id_env = "DISCORD_AGENTS_THREAD_ID"
     decision, and an agent that launches a bot (scripts/run-branch.sh)
     must face the writer guard rather than inherit a bypass. *)
 let child_environment ?(environment = Unix.environment ()) ~thread_id () =
-  let stripped = [session_thread_id_env; Host.force_writer_env] in
+  let stripped = [session_thread_id_env; Host.force_writer_env; agy_mcp_env_var] in
   let inherited =
     environment
     |> Array.to_list
@@ -2143,11 +2446,18 @@ let escape_prompt_block text =
   Buffer.contents b
 
 let agy_no_mcp_notice =
-  "NOTE: this session runs on agy, which is not yet connected to the \
+  "NOTE: this session runs on agy, and this turn is not connected to the \
    discord-agents MCP server. None of the MCP tools listed above are \
-   available. Do not attempt them or report their results; tell the \
+   available now. Do not attempt them or report their results; tell the \
    user what you would have done and suggest a Claude or Codex session \
-   for orchestration."
+   for orchestration. Later turns say whether the tools are available."
+
+(** agy decides MCP per turn (the server or config can come and go), but
+    the first-turn notice lives on in the conversation. So later turns
+    of a session that was told about the tools restate their state. *)
+let agy_mcp_status_line ~available =
+  if available then "discord-agents MCP tools are available this turn."
+  else "discord-agents MCP tools are NOT available this turn; do not attempt them."
 
 (** Compose the per-turn prompt sent to a non-Claude agent, prepending
     the session's system prompt on the first turn so MCP-aware agents
@@ -2157,8 +2467,8 @@ let agy_no_mcp_notice =
     it when [message_count = 0].
 
     Pure function so it's testable without a subprocess. *)
-let compose_session_prompt ~agent_kind ~system_prompt ~message_count
-    ~goal_context ~user_prompt =
+let compose_session_prompt ?(agy_mcp = false) ~agent_kind ~system_prompt
+    ~message_count ~goal_context ~user_prompt () =
   let needs_inline =
     message_count = 0
     && (match agent_kind with
@@ -2171,17 +2481,21 @@ let compose_session_prompt ~agent_kind ~system_prompt ~message_count
         (escape_prompt_block goal) user_prompt
     | _ -> user_prompt
   in
-  (* agy is started without the discord-agents MCP server (see
-     [agy_args]), but channel system prompts list those tools. Say so,
-     or a control agent under agy would try tools it doesn't have. *)
+  (* When agy runs without the discord-agents MCP server (remote turn,
+     no server resolved, or a global config we wouldn't touch), the
+     channel system prompts still list those tools. Say so, or a control
+     agent under agy would try tools it doesn't have. *)
   let system_prompt = match system_prompt, agent_kind with
-    | Some sp, Config.Agy ->
+    | Some sp, Config.Agy when not agy_mcp ->
       Some (sp ^ "\n\n" ^ agy_no_mcp_notice)
     | _ -> system_prompt
   in
   match system_prompt with
   | Some sp when needs_inline ->
     Printf.sprintf "<bot-context>\n%s\n</bot-context>\n\n%s" sp user_prompt
+  | Some _ when agent_kind = Config.Agy ->
+    Printf.sprintf "<bot-context>%s</bot-context>\n\n%s"
+      (agy_mcp_status_line ~available:agy_mcp) user_prompt
   | _ -> user_prompt
 
 (** Spawn an agent and stream its output via a callback.
@@ -2198,12 +2512,32 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
   let child_env = child_environment ~thread_id () in
-  (* Codex/Gemini get the system prompt prepended to the first user
+  (* agy reaches the MCP server through its global config entry, which
+     runs whatever [agy_mcp_env_var] names. Remote turns don't get it
+     yet: the executor's agy has its own config and no route back. *)
+  let agy_mcp_command =
+    match kind, target with
+    | Config.Agy, Local ->
+      (match mcp_command_opt () with
+       | Some command
+         when Eio_unix.run_in_systhread (fun () -> setup_agy_mcp ()) ->
+         Some command
+       | _ -> None)
+    | Config.Agy, Remote _
+    | (Config.Claude | Config.Codex | Config.Gemini), _ -> None
+  in
+  let child_env = match agy_mcp_command with
+    | Some command ->
+      Array.append child_env [| Printf.sprintf "%s=%s" agy_mcp_env_var command |]
+    | None -> child_env
+  in
+  (* Codex/Gemini/agy get the system prompt prepended to the first user
      turn (compose_session_prompt); Claude gets it via the dedicated
      [--append-system-prompt] flag instead. *)
   let prompt = compose_session_prompt
+    ~agy_mcp:(Option.is_some agy_mcp_command)
     ~agent_kind:kind ~system_prompt ~message_count ~goal_context
-    ~user_prompt:prompt in
+    ~user_prompt:prompt () in
   let close_noerr flow =
     try Eio.Resource.close flow with _ -> ()
   in
@@ -2247,7 +2581,7 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
        { (Host.local_host host) with Host.transport = Host.Ssh destination } in
      Eio_unix.run_in_systhread (fun () ->
        setup_gemini_mcp_remote ?ssh ~host ~working_dir ~mcp:remote_mcp ())
-   (* agy: no per-worktree MCP route exists; see [agy_args]. *)
+   (* agy: global config, handled with [agy_mcp_command] above. *)
    | (Config.Claude | Config.Codex | Config.Agy), _ -> ());
   let command_args ~session_id_confirmed =
     let agent_args = match kind with
@@ -2273,7 +2607,7 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
       | Config.Gemini ->
         gemini_args ~model ~session_id ~session_id_confirmed ~prompt
       | Config.Agy ->
-        agy_args ~model ~session_id ~session_id_confirmed ~prompt
+        agy_args ~model ~working_dir ~session_id ~session_id_confirmed ~prompt
     in
     match target with
     | Local -> [setsid_command (); "--wait"] @ agent_args
