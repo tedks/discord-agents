@@ -94,8 +94,9 @@ let between ~opening ~closing s =
      | None -> Some (String.sub s start (String.length s - start)))
 
 (** The bot's own wrapping, in the order it is applied to a turn's
-    prompt: [<bot-context>…</bot-context>] on a session's first turn
-    ([Agent_process.compose_session_prompt]), then the
+    prompt: a [<bot-context>…</bot-context>] block (the system prompt
+    on a session's first turn, a one-line MCP status on later agy
+    turns; [Agent_process.compose_session_prompt]), then the
     [[Discord context: …]] header line on every turn
     ([Agent_runner.build_context_header]). The user's words come after
     both. An unclosed block (truncated input) is left in place rather

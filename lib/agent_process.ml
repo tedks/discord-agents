@@ -1854,8 +1854,11 @@ let setup_gemini_mcp ?resolved ~working_dir () =
    before the rename, refusing if anything changed in the meantime. agy
    and the IDE don't take our lock, so a change landing in the last
    instant before the rename can still be lost. That window is
-   microseconds, against one write per change of our entry. The
-   original file mode is kept. *)
+   microseconds, against one write per change of our entry. A
+   concurrent chmod with unchanged bytes isn't detected either. The
+   original file mode is kept (a new file is 0600), and the rename
+   makes the bot the file's owner, which is the same user on this
+   single-tenant machine. *)
 
 let agy_mcp_env_var = "DISCORD_AGENTS_MCP_FOR_AGY"
 let agy_mcp_server_name = "discord_agents"
@@ -1923,6 +1926,8 @@ let agy_mcp_config_update existing =
     | exception _ -> Agy_mcp_declined "not valid JSON"
     | `Assoc fields when count_key "mcpServers" fields > 1 ->
       Agy_mcp_declined "has more than one mcpServers key"
+    | `Assoc _ as json when json_has_nonfinite json ->
+      Agy_mcp_declined "would not re-serialise as standard JSON"
     | `Assoc fields ->
       let with_servers servers =
         if List.mem_assoc "mcpServers" fields then
@@ -1936,34 +1941,24 @@ let agy_mcp_config_update existing =
        | Some (`Assoc servers) ->
          (match List.assoc_opt agy_mcp_server_name servers with
           | None -> render (with_servers (servers @ [(agy_mcp_server_name, agy_mcp_entry)]))
+          | Some (`Assoc entry)
+            when List.exists (fun k -> count_key k entry > 1) ["command"; "args"; "disabled"] ->
+            Agy_mcp_declined "the discord_agents entry has duplicate keys"
           | Some (`Assoc entry) ->
             let field k = List.assoc_opt k entry in
             let ours =
               field "command" = Some agy_mcp_command_json
               && field "args" = Some agy_mcp_args_json in
-            (match field "disabled" with
-             | Some (`Bool true) ->
-               Agy_mcp_declined "the discord_agents entry is disabled there"
-             | _ when ours -> Agy_mcp_present
-             | _ ->
-               (* An older entry of ours mentions our variable; anything
-                  else under this name is somebody else's server. *)
-               let mentions_our_var =
-                 match field "args" with
-                 | Some (`List args) ->
-                   List.exists (function
-                     | `String a -> contains_substring a agy_mcp_env_var
-                     | _ -> false) args
-                 | _ -> false
-               in
-               if not mentions_our_var then
-                 Agy_mcp_declined "a different discord_agents server is configured there"
-               else
-                 let entry' =
-                   List.filter (fun (k, _) -> k <> "command" && k <> "args") entry
-                   @ [("command", agy_mcp_command_json); ("args", agy_mcp_args_json)] in
-                 render (with_servers (List.map (fun (k, v) ->
-                   if k = agy_mcp_server_name then (k, `Assoc entry') else (k, v)) servers)))
+            (* Ours only on an exact command+args match; there is no older
+               format of ours to migrate. Anything else under this name is
+               somebody else's server. *)
+            if not ours then
+              Agy_mcp_declined "a different discord_agents server is configured there"
+            else
+              (match field "disabled" with
+               | Some (`Bool true) ->
+                 Agy_mcp_declined "the discord_agents entry is disabled there"
+               | _ -> Agy_mcp_present)
           | Some _ -> Agy_mcp_declined "the discord_agents entry is not an object")
        | None -> render (with_servers [(agy_mcp_server_name, agy_mcp_entry)])
        | Some _ -> Agy_mcp_declined "mcpServers is not an object")
@@ -1995,37 +1990,63 @@ let read_agy_mcp_file path =
   | _ -> Result.Error (Failure "not a regular file")
 
 (* Replace [path] with [contents] if it still holds [expected] (raw bytes;
-   [None] = must still be absent). Same-directory temp + rename, mode
-   [perm]. *)
+   [None] = must still be absent). The same durability steps as
+   [write_file_safely]/[Resource.write_file_atomic]: disk-pressure
+   preflight, temp file fsynced before the rename, parent directory
+   fsynced after it, the outcome reported to Disk_health, and stale temps
+   from a crashed earlier attempt reaped. The difference is that the
+   bytes are written exactly as given and the mode is [perm]. Must be
+   called with the agy MCP lock held. *)
 let replace_agy_mcp_file ~path ~expected ~perm contents =
   let dir = Filename.dirname path in
-  let tmp = Filename.temp_file ~temp_dir:dir (Filename.basename path ^ ".tmp.") "" in
-  let cleanup () = try Sys.remove tmp with Sys_error _ -> () in
-  match
-    Out_channel.with_open_bin tmp (fun oc -> output_string oc contents);
-    Unix.chmod tmp perm;
-    let still = match read_agy_mcp_file path, expected with
-      | Result.Ok Agy_file_missing, None -> true
-      | Result.Ok (Agy_file { raw; _ }), Some e -> String.equal raw e
-      | _ -> false
-    in
-    if still then (Unix.rename tmp path; true) else (cleanup (); false)
-  with
-  | ok -> ok
-  | exception exn -> cleanup (); raise exn
+  match Disk_health.preflight_write path with
+  | Error why -> Result.Error ("disk preflight refused: " ^ why)
+  | Ok () ->
+    if (try Unix.access dir [Unix.W_OK]; false with Unix.Unix_error _ -> true) then
+      Result.Error "its directory is not writable"
+    else begin
+      Resource.cleanup_atomic_write_temps path;
+      let tmp = Filename.temp_file ~temp_dir:dir (Filename.basename path ^ ".tmp.") "" in
+      let cleanup () = try Sys.remove tmp with Sys_error _ -> () in
+      match
+        let fd = Unix.openfile tmp [Unix.O_WRONLY; Unix.O_TRUNC] 0o600 in
+        Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
+          Resource.write_all fd contents 0 (String.length contents);
+          Unix.fchmod fd perm;
+          Resource.fsync fd);
+        let still = match read_agy_mcp_file path, expected with
+          | Result.Ok Agy_file_missing, None -> true
+          | Result.Ok (Agy_file { raw; _ }), Some e -> String.equal raw e
+          | _ -> false
+        in
+        if still then begin
+          Unix.rename tmp path;
+          (try Resource.fsync_dir dir with _ -> ());
+          true
+        end else (cleanup (); false)
+      with
+      | true -> Disk_health.note_write_success path; Result.Ok true
+      | false -> Result.Ok false
+      | exception exn ->
+        cleanup ();
+        Disk_health.note_write_failure path exn;
+        Result.Error (Printexc.to_string exn)
+    end
 
-let agy_mcp_reported = ref ""
-(** Log a reason once per distinct reason, not on every spawn. *)
+(* The last reason logged, so a persisting problem is logged once and
+   not on every spawn. Cleared when MCP is available again, so a
+   relapse is logged. Systhreads share it; Atomic keeps the updates
+   whole (a lost race at worst logs a line twice). *)
+let agy_mcp_reported = Atomic.make ""
 let report_agy_mcp_unavailable why =
-  if !agy_mcp_reported <> why then begin
-    agy_mcp_reported := why;
+  if Atomic.exchange agy_mcp_reported why <> why then
     Logs.warn (fun m ->
       m "agent_process: agy sessions run without discord-agents MCP tools: %s" why)
-  end
+let report_agy_mcp_available () = Atomic.set agy_mcp_reported ""
 
 (** Make sure our inert entry is in agy's global MCP config. Returns
-    whether it is there afterwards. Blocking (file lock, fsync-free
-    writes): call it off the Eio domain. The config directory has to
+    whether it is there afterwards. Blocking (file lock, fsync): call it
+    off the Eio domain. The config directory has to
     exist already: it belongs to agy, and creating it would be making
     agy's state on the user's behalf. *)
 let setup_agy_mcp ?path ?lock_path () =
@@ -2054,21 +2075,27 @@ let setup_agy_mcp ?path ?lock_path () =
           | Agy_mcp_write contents -> `Write (raw, file, contents)
       in
       (* The common case (entry already there) takes no lock. *)
+      let present () = report_agy_mcp_available (); true in
       match decide (read_agy_mcp_file path) with
-      | `Present -> true
+      | `Present -> present ()
       | `Declined -> false
       | `Write _ ->
         let lock_path = Option.value lock_path ~default:(agy_mcp_lock_path ()) in
         (try
            Resource.with_flock lock_path (fun () ->
              match decide (read_agy_mcp_file path) with
-             | `Present -> true
+             | `Present -> present ()
              | `Declined -> false
              | `Write (expected, file, contents) ->
-               let perm = match file with Agy_file { perm; _ } -> perm | _ -> 0o644 in
-               replace_agy_mcp_file ~path ~expected ~perm contents
-               || (ignore (decline "it changed while we were updating it; will retry next turn");
-                   false))
+               (* A new file gets 0600 like the bot's own state; an
+                  existing one keeps its mode. *)
+               let perm = match file with Agy_file { perm; _ } -> perm | _ -> 0o600 in
+               match replace_agy_mcp_file ~path ~expected ~perm contents with
+               | Result.Ok true -> present ()
+               | Result.Ok false ->
+                 ignore (decline "it changed while we were updating it; will retry next turn");
+                 false
+               | Result.Error why -> ignore (decline why); false)
          with exn ->
            ignore (decline ("could not update it: " ^ Printexc.to_string exn));
            false)

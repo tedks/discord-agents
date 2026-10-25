@@ -4211,7 +4211,7 @@ let test_agy_prompt_gets_inline_context () =
        true
      with Not_found -> false)
 
-let test_agy_later_turn_has_no_context () =
+let test_agy_later_turn_restates_mcp () =
   let out = Discord_agents.Agent_process.compose_session_prompt
     ~agent_kind:Discord_agents.Config.Agy
     ~system_prompt:(Some "you are a lead") ~message_count:3
@@ -4256,21 +4256,28 @@ let test_agy_mcp_update_cases () =
         "a different discord_agents server is configured there";
       "user disabled ours", Printf.sprintf {|{"mcpServers":{"discord_agents":{"command":"/bin/sh","args":%s,"disabled":true}}}|} ours_args,
         "the discord_agents entry is disabled there";
+      "someone else's, disabled", {|{"mcpServers":{"discord_agents":{"command":"theirs","disabled":true}}}|},
+        "a different discord_agents server is configured there";
+      "lookalike that mentions our variable",
+        {|{"mcpServers":{"discord_agents":{"command":"/bin/sh","args":["-c","exec \"$DISCORD_AGENTS_MCP_FOR_AGY\""]}}}|},
+        "a different discord_agents server is configured there";
+      "duplicate keys inside ours", Printf.sprintf {|{"mcpServers":{"discord_agents":{"command":"/bin/sh","args":%s,"disabled":true,"disabled":false}}}|} ours_args,
+        "the discord_agents entry has duplicate keys";
+      "non-finite elsewhere, ours present", Printf.sprintf {|{"x":1e400,"mcpServers":{"discord_agents":{"command":"/bin/sh","args":%s}}}|} ours_args,
+        "would not re-serialise as standard JSON";
       "non-finite number", {|{"x": 1e400}|}, "would not re-serialise as standard JSON" ];
   Alcotest.(check string) "a // inside a string is not a comment" "write"
     (k (Some {|{"url": "https://example.com/x"}|}));
   Alcotest.(check string) "ours plus IDE-added keys: present, no rewrite" "present"
     (k (Some (Printf.sprintf {|{"mcpServers":{"discord_agents":{"command":"/bin/sh","args":%s,"disabled":false,"env":{}}}}|} ours_args)));
   (match AP.agy_mcp_config_update
-           (Some {|{"theme":"dark","mcpServers":{"mine":{"command":"x"},"discord_agents":{"command":"/bin/sh","args":["-c","exec \"$DISCORD_AGENTS_MCP_FOR_AGY\""],"env":{"K":"V"}}}}|}) with
+           (Some {|{"theme":"dark","mcpServers":{"mine":{"command":"x"}}}|}) with
    | AP.Agy_mcp_write text ->
-     Alcotest.(check (list string)) "older entry of ours updated in place"
+     Alcotest.(check (list string)) "ours added after the user's servers"
        ["mine"; "discord_agents"] (agy_servers_of text);
      let json = Yojson.Safe.from_string text in
-     let open Yojson.Safe.Util in
-     Alcotest.(check string) "unrelated keys kept" "dark" (json |> member "theme" |> to_string);
-     Alcotest.(check bool) "extra keys on our entry kept" true
-       (json |> member "mcpServers" |> member "discord_agents" |> member "env" <> `Null);
+     Alcotest.(check string) "unrelated keys kept" "dark"
+       Yojson.Safe.Util.(json |> member "theme" |> to_string);
      Alcotest.(check string) "rewritten file is now up to date" "present" (k (Some text))
    | other -> Alcotest.failf "expected a write, got %s" (agy_update_kind other))
 
@@ -4286,6 +4293,11 @@ let test_agy_mcp_setup_file () =
   with_temp_dir (fun dir ->
     let lock_path = Filename.concat dir "bot.lock" in
     let setup path = AP.setup_agy_mcp ~path ~lock_path () in
+    let fresh_dir = Filename.concat dir "fresh" in
+    Unix.mkdir fresh_dir 0o755;
+    let fresh = Filename.concat fresh_dir "mcp_config.json" in
+    Alcotest.(check bool) "no file yet: created" true (setup fresh);
+    Alcotest.(check int) "a new file is private (0600)" 0o600 ((Unix.stat fresh).Unix.st_perm);
     Alcotest.(check bool) "no agy config dir: not created, no MCP" false
       (setup (Filename.concat dir "absent/mcp_config.json"));
     Alcotest.(check bool) "absent dir stays absent" false
@@ -4319,13 +4331,16 @@ let test_agy_mcp_replace_refuses_changed_file () =
   with_temp_dir (fun dir ->
     let path = Filename.concat dir "mcp_config.json" in
     Out_channel.with_open_bin path (fun oc -> output_string oc "{\"user\":2}");
+    let replace ~expected ~perm c =
+      match AP.replace_agy_mcp_file ~path ~expected ~perm c with
+      | Ok b -> b | Error e -> Alcotest.failf "unexpected error: %s" e in
     Alcotest.(check bool) "content changed since read: refused" false
-      (AP.replace_agy_mcp_file ~path ~expected:(Some "{\"user\":1}") ~perm:0o644 "ours");
+      (replace ~expected:(Some "{\"user\":1}") ~perm:0o644 "ours");
     Alcotest.(check string) "user's newer content survives" "{\"user\":2}" (read_all path);
     Alcotest.(check bool) "file appeared since read as missing: refused" false
-      (AP.replace_agy_mcp_file ~path ~expected:None ~perm:0o644 "ours");
+      (replace ~expected:None ~perm:0o644 "ours");
     Alcotest.(check bool) "unchanged: replaced" true
-      (AP.replace_agy_mcp_file ~path ~expected:(Some "{\"user\":2}") ~perm:0o640 "ours");
+      (replace ~expected:(Some "{\"user\":2}") ~perm:0o640 "ours");
     Alcotest.(check string) "new content" "ours" (read_all path);
     Alcotest.(check int) "requested mode" 0o640 ((Unix.stat path).Unix.st_perm);
     Alcotest.(check (list string)) "no temp files left" ["mcp_config.json"]
@@ -4411,7 +4426,7 @@ let agy_tests = [
   Alcotest.test_case "unknown status is not a failure" `Quick
     test_agy_unknown_status_not_failed;
   Alcotest.test_case "later turn passes through" `Quick
-    test_agy_later_turn_has_no_context;
+    test_agy_later_turn_restates_mcp;
   Alcotest.test_case "mcp: config update cases" `Quick test_agy_mcp_update_cases;
   Alcotest.test_case "mcp: setup against a file" `Quick test_agy_mcp_setup_file;
   Alcotest.test_case "mcp: entry gate" `Quick test_agy_mcp_entry_gate;
