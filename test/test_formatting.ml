@@ -4414,8 +4414,10 @@ let test_agy_prompt_no_notice_with_mcp () =
   Alcotest.(check string) "MCP wired: plain bot-context"
     "<bot-context>\nyou are a lead\n</bot-context>\n\nhi" out
 
-(* ── agy streaming: lines shaped exactly like a captured successful
-   run (agy 1.1.3, 2026-10-24), with neutral ids and paths ── *)
+(* ── agy streaming: lines shaped like a captured successful run (agy
+   1.1.3, 2026-10-24), with neutral values. Captured step_updates also
+   carry conversation_id, duration_seconds and usage; the parser
+   ignores them. ── *)
 
 let agy_step fields =
   Yojson.Safe.to_string (`Assoc [
@@ -4450,7 +4452,7 @@ let test_agy_stream_successful_run () =
       "tool:mcp__discord_agents__list_projects:";
       "out:1. alpha\n2. beta\n3. gamma";
       "tool:Bash:cat a.txt";
-      "out:hello agy\r\n";
+      "out:hello agy\n";
       "text:It returned 3 ";
       "text:projects.\n";
       "result:c0" ]
@@ -4481,6 +4483,8 @@ let test_agy_stream_tool_names () =
   Alcotest.(check string) "write_to_file is Write" "tool:Write:/w/src/main.ml" (one "write_to_file" (path "TargetFile"));
   Alcotest.(check string) "replace_file_content is Edit" "tool:Edit:/w/src/main.ml"
     (one "replace_file_content" (path "TargetFile"));
+  Alcotest.(check string) "multi_replace_file_content is Edit" "tool:Edit:/w/src/main.ml"
+    (one "multi_replace_file_content" (path "TargetFile"));
   Alcotest.(check string) "grep_search is Grep" "tool:Grep:/second/ in a.txt"
     (one "grep_search" (`Assoc [("Query", `String "second"); ("SearchPath", `String "/w/a.txt")]));
   Alcotest.(check string) "unmapped tools keep agy's name" "tool:search_web:cats"
@@ -4501,11 +4505,81 @@ let test_agy_stream_edges () =
     ["text:ok"; "result:c0"]
     (agy_stream_events [
        {|{"event":"result","result":{"conversation_id":"c0","status":"SUCCESS","response":"ok"}}|} ]);
-  Alcotest.(check (list string)) "a fresh parser per run: no state leaks between runs"
-    ["text:ok"; "result:c0"]
-    (ignore (agy_stream_events [agy_text ~index:1 ~state:"DONE" "earlier run"]);
-     agy_stream_events [
-       {|{"event":"result","result":{"conversation_id":"c0","status":"SUCCESS","response":"ok"}}|} ])
+  let result r = Printf.sprintf
+      {|{"event":"result","result":{"conversation_id":"c0","status":"SUCCESS","response":%S}}|} r in
+  Alcotest.(check (list string)) "a lost delta is recovered from the final response"
+    ["text:Hel"; "other"; "text:lo world"; "result:c0"]
+    (agy_stream_events [agy_text ~index:1 ~state:"ACTIVE" "Hel"; "{broken"; result "Hello world"]);
+  Alcotest.(check (list string)) "a diverging response is not shown again"
+    ["text:Hello"; "result:c0"]
+    (agy_stream_events [agy_text ~index:1 ~state:"DONE" "Hello"; result "Goodbye"]);
+  Alcotest.(check (list string)) "an error after partial text still fails the turn"
+    ["text:Half"; "error:agy: quota"; "result:c0"]
+    (agy_stream_events [agy_text ~index:1 ~state:"ACTIVE" "Half";
+      {|{"event":"result","result":{"conversation_id":"c0","status":"ERROR","response":"Half","error":"quota"}}|}]);
+  let ls = `Assoc [("CommandLine", `String "ls")] in
+  Alcotest.(check (list string)) "a repeated DONE shows its output once"
+    ["tool:Bash:ls"; "out:a"; "other"]
+    (agy_stream_events [
+       agy_tool ~index:7 ~state:"ACTIVE" ~name:"run_command" ls;
+       agy_tool ~index:7 ~state:"DONE" ~name:"run_command" ~output:"a" ls;
+       agy_tool ~index:7 ~state:"DONE" ~name:"run_command" ~output:"a" ls ]);
+  let no_index state ?output () =
+    agy_step ([ ("state", `String state); ("step_type", `String "tool");
+                ("tool_name", `String "run_command");
+                ("tool_info", `Assoc ([("name", `String "run_command"); ("parameters", ls)]
+                   @ (match output with Some o -> [("output", `String o)] | None -> []))) ]) in
+  Alcotest.(check (list string)) "no step_index: still one tool line"
+    ["tool:Bash:ls"; "out:a"]
+    (agy_stream_events [no_index "ACTIVE" (); no_index "DONE" ~output:"a" ()]);
+  Alcotest.(check (list string)) "unknown state is ignored, the real start still shows"
+    ["other"; "tool:Bash:ls"]
+    (agy_stream_events [agy_tool ~index:8 ~state:"PENDING" ~name:"run_command" (`Assoc []);
+                        agy_tool ~index:8 ~state:"ACTIVE" ~name:"run_command" ls]);
+  Alcotest.(check (list string)) "non-string first argument still shows the tool"
+    ["tool:mcp__discord_agents__list_sessions:5"; "out:ok"]
+    (agy_stream_events [
+       agy_tool ~index:9 ~state:"ACTIVE" ~name:"call_mcp_tool"
+         (`Assoc [("ServerName", `String "discord_agents"); ("ToolName", `String "list_sessions");
+                  ("Arguments", `Assoc [("limit", `Int 5)])]);
+       agy_tool ~index:9 ~state:"DONE" ~name:"call_mcp_tool" ~output:"ok"
+         (`Assoc [("ServerName", `String "discord_agents"); ("ToolName", `String "list_sessions");
+                  ("Arguments", `Assoc [("limit", `Int 5)])]) ]);
+  Alcotest.(check (list string)) "call_mcp_tool without a server keeps agy's name"
+    ["tool:call_mcp_tool:list_sessions"]
+    (agy_stream_events [agy_tool ~index:10 ~state:"ACTIVE" ~name:"call_mcp_tool"
+                          (`Assoc [("ToolName", `String "list_sessions")])]);
+  Alcotest.(check (list string)) "tool step with no tool_info still shows"
+    ["tool:unknown:"]
+    (agy_stream_events [agy_step [("step_index", `Int 11); ("state", `String "ACTIVE");
+                                  ("step_type", `String "tool")]]);
+  Alcotest.(check (list string)) "text, tool, more text"
+    ["text:Let me check."; "tool:Bash:ls"; "out:a"; "text:Found a."]
+    (agy_stream_events [
+       agy_text ~index:2 ~state:"DONE" "Let me check.";
+       agy_tool ~index:3 ~state:"ACTIVE" ~name:"run_command" ls;
+       agy_tool ~index:3 ~state:"DONE" ~name:"run_command" ~output:"a" ls;
+       agy_text ~index:5 ~state:"DONE" "Found a." ])
+
+let test_agy_stream_renders () =
+  (* Through the runner's own formatter, as Discord will see it. *)
+  match (AP.agy_stream_parser ())
+          (agy_tool ~index:3 ~state:"ACTIVE" ~name:"call_mcp_tool"
+             (`Assoc [("ServerName", `String "discord_agents"); ("ToolName", `String "list_projects");
+                      ("Arguments", `Assoc [])])) with
+  | [AP.Tool_use info] ->
+    Alcotest.(check string) "MCP name with underscores escaped"
+      {|🔧 **Using mcp\_\_discord\_agents\_\_list\_projects**...|}
+      (Discord_agents.Agent_runner.format_tool_status info);
+    (match (AP.agy_stream_parser ())
+             (agy_tool ~index:4 ~state:"ACTIVE" ~name:"run_command"
+                (`Assoc [("CommandLine", `String "git status")])) with
+     | [AP.Tool_use bash] ->
+       Alcotest.(check bool) "shell command rendered as a Bash line" true
+         (String.starts_with ~prefix:"💻 **Running**"
+            (Discord_agents.Agent_runner.format_tool_status bash))
+     | _ -> Alcotest.fail "no Bash tool event")
+  | _ -> Alcotest.fail "no MCP tool event"
 
 let agy_tests = [
   Alcotest.test_case "signed-out result" `Quick test_agy_signed_out_result;
@@ -4542,6 +4616,7 @@ let agy_tests = [
   Alcotest.test_case "stream: successful run" `Quick test_agy_stream_successful_run;
   Alcotest.test_case "stream: tool names" `Quick test_agy_stream_tool_names;
   Alcotest.test_case "stream: edges" `Quick test_agy_stream_edges;
+  Alcotest.test_case "stream: rendered tool lines" `Quick test_agy_stream_renders;
   Alcotest.test_case "fresh args" `Quick test_agy_args_fresh;
   Alcotest.test_case "resume args" `Quick test_agy_args_resume;
   Alcotest.test_case "dash-prefixed prompt" `Quick test_agy_args_dash_prompt;

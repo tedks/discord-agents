@@ -587,7 +587,16 @@ let sanitize_for_inline_code s =
     The result is safe for embedding in Discord inline code spans. *)
 let summarize_tool_input name input =
   let open Yojson.Safe.Util in
-  let get key = input |> member key |> to_string_option in
+  (* Non-string values (numbers, lists, objects) are shown as JSON
+     rather than raising: an exception here would drop the whole tool
+     event in the per-agent parsers' catch-alls. *)
+  let get key =
+    match input |> member key with
+    | `String s -> Some s
+    | `Null -> None
+    | v -> Some (Yojson.Safe.to_string v)
+    | exception _ -> None
+  in
   let get_any key =
     match input |> member key with
     | `Null -> None
@@ -1237,19 +1246,42 @@ let agy_tool_of name params =
      | _ -> name, params)
   | _ -> name, (match params with `Assoc _ -> params | _ -> `Assoc [])
 
+(** "\r\n" to "\n"; a lone "\r" (progress output) is kept. *)
+let crlf_to_lf s =
+  let b = Buffer.create (String.length s) in
+  let n = String.length s in
+  String.iteri (fun i c ->
+    if not (c = '\r' && i + 1 < n && s.[i + 1] = '\n') then Buffer.add_char b c) s;
+  Buffer.contents b
+
 let agy_stream_parser () =
-  let streamed_text = ref false in
-  let tools_started = Hashtbl.create 8 in
+  (* What has been streamed so far, to reconcile with result.response. *)
+  let streamed = Buffer.create 1024 in
+  (* Per tool step: started (Tool_use shown) and finished (output shown).
+     Keyed by step_index, or by name and parameters when agy omits it. *)
+  let started = Hashtbl.create 8 and finished = Hashtbl.create 8 in
   let tool_use step =
     let open Yojson.Safe.Util in
-    let info = step |> member "tool_info" in
-    let raw_name = match step |> member "tool_name" with
-      | `String n -> n
-      | _ -> (match info |> member "name" with `String n -> n | _ -> "unknown") in
-    let params = match info with `Assoc _ -> info |> member "parameters" | _ -> `Null in
+    let info = match step |> member "tool_info" with `Assoc _ as i -> i | _ -> `Assoc [] in
+    let raw_name = match step |> member "tool_name", info |> member "name" with
+      | `String n, _ | _, `String n -> n
+      | _ -> "unknown" in
+    let params = match info |> member "parameters" with `Assoc _ as p -> p | _ -> `Assoc [] in
     let tool_name, input = agy_tool_of raw_name params in
-    Tool_use { tool_name; tool_summary = summarize_tool_input tool_name input;
-               tool_detail = detail_of_tool_input tool_name input }
+    (* A summary that can't be built still leaves the tool visible. *)
+    let summary = try summarize_tool_input tool_name input with _ -> "" in
+    let detail = try detail_of_tool_input tool_name input with _ -> "" in
+    Tool_use { tool_name; tool_summary = summary; tool_detail = detail }
+  in
+  let step_key step =
+    let open Yojson.Safe.Util in
+    match step |> member "step_index" with
+    | `Int i -> string_of_int i
+    | _ ->
+      let field k = try Yojson.Safe.to_string (step |> member k) with _ -> "" in
+      "noindex:" ^ field "tool_name" ^ ":"
+      ^ (try Yojson.Safe.to_string (step |> member "tool_info" |> member "parameters")
+         with _ -> "")
   in
   let step_events line step =
     let open Yojson.Safe.Util in
@@ -1257,21 +1289,23 @@ let agy_stream_parser () =
     match get "step_type", get "state" with
     | Some "agent_response", _ ->
       (match get "text_delta" with
-       | Some t when t <> "" -> streamed_text := true; [Text_delta t]
+       | Some t when t <> "" -> Buffer.add_string streamed t; [Text_delta t]
        | _ -> [Other line])
-    | Some "tool", Some state ->
-      let index = match step |> member "step_index" with `Int i -> Some i | _ -> None in
-      let started = match index with
-        | Some i -> Hashtbl.mem tools_started i | None -> false in
+    | Some "tool", Some (("ACTIVE" | "DONE") as state) ->
+      let key = step_key step in
       let start =
-        if started then []
-        else (Option.iter (fun i -> Hashtbl.replace tools_started i ()) index;
-              [tool_use step]) in
+        if Hashtbl.mem started key then []
+        else (let ev = tool_use step in Hashtbl.replace started key (); [ev]) in
       let output =
-        if state = "ACTIVE" then []
-        else match step |> member "tool_info" |> member "output" with
-          | `String o when String.trim o <> "" -> [Tool_result { content = o }]
+        if state <> "DONE" || Hashtbl.mem finished key then []
+        else begin
+          Hashtbl.replace finished key ();
+          match step |> member "tool_info" |> member "output" with
+          | `String o when String.trim o <> "" ->
+            (* agy's run_command output carries CRLF line ends. *)
+            [Tool_result { content = crlf_to_lf o }]
           | _ | exception _ -> []
+        end
       in
       (match start @ output with [] -> [Other line] | evs -> evs)
     | _ -> [Other line]
@@ -1299,13 +1333,26 @@ let agy_stream_parser () =
       let response = get_string ~default:"" "response" result in
       let status = get_string ~default:"" "status" result in
       let error = get_string ~default:"" "error" result in
+      (* In every capture the streamed deltas join to exactly
+         [response]. If some were lost (a malformed line), [response]
+         still starts with what streamed: show the rest. If they diverge,
+         showing [response] would repeat text, so it is only logged. *)
       let text =
-        if response = "" || !streamed_text then [] else [Text_delta response] in
-      (* agy's success status value hasn't been observed yet, so an
-         unfamiliar non-empty status is logged, not failed. A result
-         with no status at all doesn't match any shape we've seen and
-         is reported, rather than passed off as a silent success.
-         The "SUCCESS" arm is a guess that only keeps the log quiet. *)
+        let shown = Buffer.contents streamed in
+        if response = "" || response = shown then []
+        else if String.starts_with ~prefix:shown response then
+          [Text_delta (String.sub response (String.length shown)
+                         (String.length response - String.length shown))]
+        else begin
+          Logs.info (fun m ->
+            m "agy: final response differs from the streamed text; keeping \
+               the streamed text");
+          []
+        end
+      in
+      (* Statuses seen on the wire: SUCCESS and ERROR. Anything else is
+         logged, not failed. A result with no status matches no shape
+         we've seen and is reported. *)
       let err =
         match String.uppercase_ascii (String.trim status), error with
         | _, e when String.trim e <> "" -> [Error ("agy: " ^ e)]
@@ -1320,6 +1367,9 @@ let agy_stream_parser () =
     | _ -> [Other line]
   with _ -> [Other line]
 
+(** A fresh parser for a single line: for tests and one-off lines only.
+    A run must use one [agy_stream_parser] for all its lines, or the
+    final response is shown again after the streamed text. *)
 let parse_agy_stream_json_line line = agy_stream_parser () line
 
 (** [agy --conversation <id>] with an id agy doesn't know does not
