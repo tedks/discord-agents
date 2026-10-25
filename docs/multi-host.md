@@ -11,12 +11,15 @@ Missing/unreadable roots, metadata errors, churn and limit overflow fail the
 whole scan rather than emitting a partial or empty inventory. Child symlinks
 are followed with bounded depth and canonical paths deduplicate aliases.
 Successful empty scans are distinct from failures; no configured roots is an
-invalid scan. Git reads each candidate's explicit metadata path (including
-gitfiles) so a broken repository cannot borrow an enclosing repository's origin. Git ownership checks
-and unsupported extensions fail the scan; the scanner never overrides them. Network repository identities
+invalid scan. Normal Git discovery retains ownership checks; worktree-prefix
+and bare-directory checks reject an enclosing repository before and after
+reading the origin. Gitfiles remain supported. Git ownership checks
+and unsupported extensions fail the scan; the scanner never overrides them.
+Network repository identities
 exclude credential-bearing URLs and preserve case and transport syntax outside
 GitHub (home-relative scp paths are not absolute SSH URL paths); local remotes
-stay host/path-local. No snapshot persistence or public inventory is wired yet. Remaining diagnostic
+stay host/path-local. No snapshot persistence or public inventory is wired yet.
+Remaining diagnostic
 and normalization refinements are tracked in [169](https://github.com/tedks/discord-agents/issues/169).
 
 Current implementation slice (2026-10-24): read-only MCP `list_hosts` and

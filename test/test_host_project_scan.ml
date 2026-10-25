@@ -88,6 +88,7 @@ let test_real_scan () =
       Unix.mkdir (Filename.concat partial ".git") 0o700;
       check "broken .git directory cannot borrow parent repo" true (Result.is_error (scan local [base]));
       Unix.rmdir (Filename.concat partial ".git"); Unix.rmdir partial;
+      check "scan succeeds after partial fixture removed" true (Result.is_ok (scan local [base]));
       let private_repo = Filename.concat group "private" in
       run ["git";"init";"-q";private_repo];
       if Unix.geteuid () <> 0 then begin
@@ -95,6 +96,18 @@ let test_real_scan () =
         Fun.protect ~finally:(fun () -> Unix.chmod private_repo 0o700) (fun () ->
           check "unsearchable nested repo fails whole scan" true (Result.is_error (scan local [base])))
       end;
+      check "scan succeeds after permissions restored" true (Result.is_ok (scan local [base]));
+      let old_path = Sys.getenv "PATH" in
+      let actual_git = Option.get (Discord_agents.Resource.executable_in_path "git") in
+      let bin = Filename.temp_dir ~temp_dir:"/tmp" "inventory-owner-" "" in
+      let wrapper = Filename.concat bin "git" in
+      write wrapper ("#!/bin/sh\nGIT_TEST_ASSUME_DIFFERENT_OWNER=1 exec " ^ Filename.quote actual_git ^
+        " -c safe.directory= \"$@\"\n");
+      Unix.chmod wrapper 0o755;
+      Fun.protect ~finally:(fun () -> Unix.putenv "PATH" old_path; Unix.unlink wrapper; Unix.rmdir bin) (fun () ->
+        Unix.putenv "PATH" (bin ^ ":" ^ old_path);
+        check "Git dubious ownership policy remains enforced" true (Result.is_error (scan local [base])));
+      check "scan succeeds after owner fixture removed" true (Result.is_ok (scan local [base]));
       check "base repo does not list its .git internals" (Ok []) (scan local [repo]);
       let empty = Filename.concat dir "empty" in Unix.mkdir empty 0o700;
       check "successful empty scan" (Ok []) (scan local [empty]);

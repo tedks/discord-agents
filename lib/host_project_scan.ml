@@ -76,8 +76,8 @@ entries_seen = 0
 projects = {}
 env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
 env['GIT_TERMINAL_PROMPT'] = '0'
-def git(path, git_dir, args, absent=False):
-    p = subprocess.Popen(['git', '--git-dir=' + git_dir, '-C', path] + args, stdin=subprocess.DEVNULL,
+def git(path, args, absent=False):
+    p = subprocess.Popen(['git', '-C', path] + args, stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
     try:
         data = p.stdout.read(8193)
@@ -124,16 +124,28 @@ def candidate(path, name):
         return False
     if path in projects:
         return True
-    # Explicit metadata also handles gitfiles; never search an enclosing repo.
-    git_dir = os.path.join(path, '.git') if marker else path
-    actual_bare = git(path, git_dir, ['rev-parse', '--is-bare-repository']).strip()
+    actual_bare = git(path, ['rev-parse', '--is-bare-repository']).strip()
     if actual_bare not in ('true', 'false'):
         raise ValueError('invalid git response')
-    remote = git(path, git_dir, ['config', '--local', '--null', '--get', 'remote.origin.url'], absent=True)
+    def check_anchor():
+        # Normal discovery retains Git's safe.directory policy. Explicit
+        # --git-dir would bypass it. Verify we did not borrow a parent repo.
+        if actual_bare == 'true':
+            answer = git(path, ['rev-parse', '--absolute-git-dir'])
+            if not answer.endswith('\n'):
+                raise ValueError('invalid git directory response')
+            actual = os.path.realpath(answer[:-1], strict=True)
+            if actual not in (path, os.path.realpath(os.path.join(path, '.git'))):
+                raise ValueError('enclosing bare repository')
+        elif git(path, ['rev-parse', '--show-prefix']) not in ('', '\n'):
+            raise ValueError('enclosing worktree repository')
+    check_anchor()
+    remote = git(path, ['config', '--local', '--null', '--get', 'remote.origin.url'], absent=True)
     if remote is not None:
         if not remote.endswith('\0') or '\0' in remote[:-1]:
             raise ValueError('invalid remote response')
         remote = remote[:-1] or None
+    check_anchor()
     projects[path] = dict(name=name, path=path, is_bare=actual_bare == 'true', remote_url=remote)
     if len(projects) > 512:
         raise ValueError('project limit')
