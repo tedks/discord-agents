@@ -1211,8 +1211,8 @@ let parse_gemini_stream_json_line line =
    - [step_type = "tool"]: [state = "ACTIVE"] with
      [tool_name] and [tool_info.parameters] when the call starts, then
      [state = "DONE"] with [tool_info.output] (absent for edits).
-   [result.response] repeats the streamed text, so it is used only when
-   no delta was streamed. Parsing is therefore stateful per run: use
+   [result.response] repeats the streamed text. It fills in a lost tail
+   of the stream, or follows in full (labelled) if the stream diverged. Parsing is therefore stateful per run: use
    [agy_stream_parser] for a whole run. [parse_agy_stream_json_line]
    is a fresh parser for one line.
 
@@ -1257,9 +1257,12 @@ let crlf_to_lf s =
 let agy_stream_parser () =
   (* What has been streamed so far, to reconcile with result.response. *)
   let streamed = Buffer.create 1024 in
-  (* Per tool step: started (Tool_use shown) and finished (output shown).
-     Keyed by step_index, or by name and parameters when agy omits it. *)
+  (* Per tool step: started (Tool_use shown) and finished (output shown),
+     keyed by step_index. Every captured tool step has one; if agy omits
+     it, steps pair by order instead (an ACTIVE opens one, the next DONE
+     closes it), so two identical calls stay two. *)
   let started = Hashtbl.create 8 and finished = Hashtbl.create 8 in
+  let unindexed_open = ref false and unindexed_n = ref 0 in
   let tool_use step =
     let open Yojson.Safe.Util in
     let info = match step |> member "tool_info" with `Assoc _ as i -> i | _ -> `Assoc [] in
@@ -1273,15 +1276,18 @@ let agy_stream_parser () =
     let detail = try detail_of_tool_input tool_name input with _ -> "" in
     Tool_use { tool_name; tool_summary = summary; tool_detail = detail }
   in
-  let step_key step =
+  let step_key step state =
     let open Yojson.Safe.Util in
     match step |> member "step_index" with
     | `Int i -> string_of_int i
     | _ ->
-      let field k = try Yojson.Safe.to_string (step |> member k) with _ -> "" in
-      "noindex:" ^ field "tool_name" ^ ":"
-      ^ (try Yojson.Safe.to_string (step |> member "tool_info" |> member "parameters")
-         with _ -> "")
+      (* ACTIVE always opens a new unindexed step; DONE closes the open
+         one, or opens and closes its own when none is open. *)
+      if state = "ACTIVE" || not !unindexed_open then begin
+        incr unindexed_n;
+        unindexed_open := state = "ACTIVE"
+      end else unindexed_open := false;
+      "noindex:" ^ string_of_int !unindexed_n
   in
   let step_events line step =
     let open Yojson.Safe.Util in
@@ -1292,20 +1298,21 @@ let agy_stream_parser () =
        | Some t when t <> "" -> Buffer.add_string streamed t; [Text_delta t]
        | _ -> [Other line])
     | Some "tool", Some (("ACTIVE" | "DONE") as state) ->
-      let key = step_key step in
+      let key = step_key step state in
       let start =
         if Hashtbl.mem started key then []
         else (let ev = tool_use step in Hashtbl.replace started key (); [ev]) in
       let output =
         if state <> "DONE" || Hashtbl.mem finished key then []
-        else begin
-          Hashtbl.replace finished key ();
+        else
+          (* Finished only once output is shown: a later DONE may carry
+             the output an earlier one lacked. *)
           match step |> member "tool_info" |> member "output" with
           | `String o when String.trim o <> "" ->
+            Hashtbl.replace finished key ();
             (* agy's run_command output carries CRLF line ends. *)
             [Tool_result { content = crlf_to_lf o }]
           | _ | exception _ -> []
-        end
       in
       (match start @ output with [] -> [Other line] | evs -> evs)
     | _ -> [Other line]
@@ -1334,9 +1341,11 @@ let agy_stream_parser () =
       let status = get_string ~default:"" "status" result in
       let error = get_string ~default:"" "error" result in
       (* In every capture the streamed deltas join to exactly
-         [response]. If some were lost (a malformed line), [response]
-         still starts with what streamed: show the rest. If they diverge,
-         showing [response] would repeat text, so it is only logged. *)
+         [response]. If the tail was lost (a malformed line), [response]
+         still starts with what streamed: show the rest. If they diverge
+         some other way (a delta lost mid-stream), streamed text can't be
+         taken back, and an incomplete answer is worse than a repeated
+         one, so the full reply follows, labelled. *)
       let text =
         let shown = Buffer.contents streamed in
         if response = "" || response = shown then []
@@ -1345,9 +1354,10 @@ let agy_stream_parser () =
                          (String.length response - String.length shown))]
         else begin
           Logs.info (fun m ->
-            m "agy: final response differs from the streamed text; keeping \
-               the streamed text");
-          []
+            m "agy: final response differs from the streamed text; \
+               posting it in full");
+          [Text_delta ("\n\n*agy's final reply differed from the streamed \
+                        text; here it is in full:*\n\n" ^ response)]
         end
       in
       (* Statuses seen on the wire: SUCCESS and ERROR. Anything else is

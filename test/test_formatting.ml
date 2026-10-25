@@ -4510,9 +4510,12 @@ let test_agy_stream_edges () =
   Alcotest.(check (list string)) "a lost delta is recovered from the final response"
     ["text:Hel"; "other"; "text:lo world"; "result:c0"]
     (agy_stream_events [agy_text ~index:1 ~state:"ACTIVE" "Hel"; "{broken"; result "Hello world"]);
-  Alcotest.(check (list string)) "a diverging response is not shown again"
-    ["text:Hello"; "result:c0"]
-    (agy_stream_events [agy_text ~index:1 ~state:"DONE" "Hello"; result "Goodbye"]);
+  (match agy_stream_events [agy_text ~index:1 ~state:"ACTIVE" "Hel";
+                            "{broken"; agy_text ~index:1 ~state:"DONE" " world"; result "Hello world"] with
+   | ["text:Hel"; "other"; "text: world"; full; "result:c0"] ->
+     Alcotest.(check bool) "a delta lost mid-stream: full reply follows, labelled" true
+       (String.ends_with ~suffix:"in full:*\n\nHello world" full)
+   | l -> Alcotest.failf "unexpected: %s" (String.concat " | " l));
   Alcotest.(check (list string)) "an error after partial text still fails the turn"
     ["text:Half"; "error:agy: quota"; "result:c0"]
     (agy_stream_events [agy_text ~index:1 ~state:"ACTIVE" "Half";
@@ -4532,6 +4535,19 @@ let test_agy_stream_edges () =
   Alcotest.(check (list string)) "no step_index: still one tool line"
     ["tool:Bash:ls"; "out:a"]
     (agy_stream_events [no_index "ACTIVE" (); no_index "DONE" ~output:"a" ()]);
+  Alcotest.(check (list string)) "no step_index: two identical calls stay two"
+    ["tool:Bash:ls"; "out:a"; "tool:Bash:ls"; "out:a"]
+    (agy_stream_events [no_index "ACTIVE" (); no_index "DONE" ~output:"a" ();
+                        no_index "ACTIVE" (); no_index "DONE" ~output:"a" ()]);
+  Alcotest.(check (list string)) "no step_index, DONE only: each shown"
+    ["tool:Bash:ls"; "out:a"; "tool:Bash:ls"; "out:b"]
+    (agy_stream_events [no_index "DONE" ~output:"a" (); no_index "DONE" ~output:"b" ()]);
+  Alcotest.(check (list string)) "a later DONE can still supply missing output"
+    ["tool:Bash:ls"; "other"; "out:late"]
+    (agy_stream_events [
+       agy_tool ~index:12 ~state:"ACTIVE" ~name:"run_command" ls;
+       agy_tool ~index:12 ~state:"DONE" ~name:"run_command" ls;
+       agy_tool ~index:12 ~state:"DONE" ~name:"run_command" ~output:"late" ls ]);
   Alcotest.(check (list string)) "unknown state is ignored, the real start still shows"
     ["other"; "tool:Bash:ls"]
     (agy_stream_events [agy_tool ~index:8 ~state:"PENDING" ~name:"run_command" (`Assoc []);
