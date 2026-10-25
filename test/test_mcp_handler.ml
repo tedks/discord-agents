@@ -2761,7 +2761,7 @@ let test_login_host_render_boundary () =
 let test_inventory_default_arguments () =
   let client=Control_client.make ~request:(fun request ->
     Alcotest.(check string) "default inventory method" "list_project_inventory" request.method_name;
-    Alcotest.(check bool) "omitted arguments become empty object" true (request.params = Some (`Assoc []));
+    Alcotest.(check bool) "omitted arguments reach control without params" true (request.params = None);
     Ok (`Assoc ["ok",`Bool true;"report",`String "cached inventory"])) in
   let response=Mcp_server.handle_line ~handle_tool_call:(Mcp_handler.handle_tool_call ~control_client:client)
     {|{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_project_inventory"}}|} in

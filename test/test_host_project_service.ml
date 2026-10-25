@@ -76,6 +76,7 @@ let test_load_recovery () = with_store (fun store ->
   check "other host exact data preserved" (I.find initial local) (I.find recovering.entries local);
   check "recovery durable" (Ok recovering.entries) (I.load store.path);
   check "load warning cleared after recovery" false recovering.load_failed;
+  check "public warning cleared after recovery" None recovering.cache_error;
   Out_channel.with_open_bin store.path (fun oc -> output_string oc "broken");
   let broken=S.create store.path in
   calls := 0;
