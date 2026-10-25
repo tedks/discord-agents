@@ -37,8 +37,7 @@ let refresh ?(save=fun path entries -> Store.save path entries) ~collect ~prefli
           let result = collect ~host ~roots in
           (* Removed hosts cannot consume cache capacity indefinitely. Pruning
              observations is unrelated to project/worktree cleanup. *)
-          let prior = List.filter (fun (e:Store.entry) ->
-            List.exists (fun h -> Store.host_key h = Store.host_key e.host) hs) t.entries in
+          let prior = Store.prune t.entries ~configured:hs in
           match Store.record prior ~now:started_at ~host ~roots result with
           | Error e -> Error e
           | Ok next ->
@@ -46,10 +45,12 @@ let refresh ?(save=fun path entries -> Store.save path entries) ~collect ~prefli
             | Error e -> t.cache_error <- Some e; Error e
             | Ok () ->
               t.entries <- next; t.cache_error <- None;
-              let message = match result with
-                | Ok ps -> Printf.sprintf "Scan completed: %d project locations recorded." (List.length ps)
-                | Error why -> "Scan failed: " ^ Store.error_code why ^ ". Prior observations retained for this configuration, if any." in
-              Ok (`Assoc ["ok", `Bool true; "scan_succeeded", `Bool (Result.is_ok result);
+              let observation = Option.get (Store.find next host) in
+              let message = match observation.error with
+                | None -> Printf.sprintf "Scan completed: %d project locations recorded."
+                    (List.length (Option.get observation.success).projects)
+                | Some why -> "Observation failed: " ^ why ^ ". Prior observations retained for this configuration, if any." in
+              Ok (`Assoc ["ok", `Bool true; "scan_succeeded", `Bool (Option.is_none observation.error);
                 "report", `String ("Host: " ^ Host_diagnostics.display host.name ^ "\n" ^ message ^
                   "\nCached observation only; use list_project_inventory for locations and timestamps.")]))
     end
@@ -106,6 +107,7 @@ let listing ~now ~local_name ~registry ~base_directories ~offset ~limit t =
       "- " ^ display h.Host.name ^ ": " ^ v.state ^
       (match v.last_success_at with None -> "; no successful snapshot"
        | Some at -> Printf.sprintf "; last success %.3f (Unix time)" at) ^
+      (match v.attempted_at with None -> "" | Some at -> Printf.sprintf "; last attempt %.3f" at) ^
       (match v.error with None -> "" | Some e -> "; " ^ display e)) views in
     let group_lines = List.concat_map (fun (key,ls) ->
       let title = match key with Repository r -> display r | Location _ -> "Host-local repository" in

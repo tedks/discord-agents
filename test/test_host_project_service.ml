@@ -42,6 +42,11 @@ let test_refresh () = with_store (fun store ->
   let response=get (refresh ~collect:failing store "remote") in
   check "failure explicit" (`Bool false) (member "scan_succeeded" response);
   check "offline retained" 1 (int "total_locations" (listing (S.create store.path)));
+  let large ~host:_ ~roots:_ = Ok (List.init 100 (fun i ->
+    {(project ("/large/" ^ string_of_int i)) with Scan.name=String.make 2048 'a'})) in
+  let too_large=get (refresh ~collect:large store "remote") in
+  check "oversized observation not reported successful" (`Bool false) (member "scan_succeeded" too_large);
+  check "oversized observation keeps prior locations" 1 (int "total_locations" (listing store));
   let saved=store.entries in
   let denied _ _ = Error "save failed" in
   check "save failure returned" true (Result.is_error (refresh ~save:denied ~collect store "remote"));
@@ -85,10 +90,16 @@ let test_listing () = with_store (fun store ->
   check "display cannot forge line" false (Discord_agents.Resource.contains_substring ~haystack:report ~needle:"fake\nline");
   let huge=String.make 4096 '\001' in
   let huge_path="/" ^ String.sub huge 1 4094 in
-  let ps=List.init 8 (fun n -> Scan.{name=huge;path=huge_path ^ string_of_int n;is_bare=false;repository=Some huge}) in
-  store.entries <- record [] local ps;
+  let hs=List.init 8 (fun i -> {remote with H.name="h" ^ string_of_int i}) in
+  let entries=List.fold_left (fun entries h ->
+    record entries h [Scan.{name=huge;path=huge_path;is_bare=false;repository=Some (String.sub huge 0 4094 ^ h.H.name)}]) [] hs in
+  check "large fixture valid cache" (Ok entries) (I.decode (I.encode entries));
+  store.entries <- entries;
+  let registry=Some H.{writer="h0";hosts=hs} in
+  let large=get (S.listing ~now:101. ~local_name:"writer" ~registry ~base_directories:roots ~offset:0 ~limit:8 store) in
+  check "large fixture not empty" 8 (int "total_locations" large);
   check "response bounded below 1 MiB client cap" true
-    (String.length (Yojson.Safe.to_string (listing store)) < 1024*1024);
+    (String.length (Yojson.Safe.to_string large) < 1024*1024);
   Out_channel.with_open_bin store.path (fun oc -> output_string oc "broken");
   check "corrupt cache warning preserved" true (Option.is_some (S.create store.path).cache_error))
 let () = Alcotest.run "Host project service" ["inventory",[
