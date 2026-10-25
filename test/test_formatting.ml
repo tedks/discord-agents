@@ -4540,6 +4540,16 @@ let test_agy_stream_edges () =
      Alcotest.(check bool) "whitespace inside a step is not ignored" true
        (String.ends_with ~suffix:"here it is:*\n\ndonot" full)
    | l -> Alcotest.failf "unexpected: %s" (String.concat " | " l));
+  Alcotest.(check (list string)) "three steps with mixed separators: not repeated"
+    ["text:A"; "text:B"; "text:C"; "result:c0"]
+    (agy_stream_events [agy_text ~index:1 ~state:"DONE" "A"; agy_text ~index:3 ~state:"DONE" "B";
+                        agy_text ~index:5 ~state:"DONE" "C"; result "A\nB\n\nC"]);
+  let joined = Discord_agents.Agent_process.is_steps_joined in
+  Alcotest.(check bool) "steps out of order don't match" false (joined ~steps:["A"; "B"] "B A");
+  Alcotest.(check bool) "non-space between steps doesn't match" false (joined ~steps:["A"; "B"] "A-B");
+  Alcotest.(check bool) "leading/trailing extras don't match" false (joined ~steps:["A"; "B"] "A B ");
+  Alcotest.(check bool) "a step starting with a newline still matches" true
+    (joined ~steps:["A"; "\nB"] "A\n\nB");
   Alcotest.(check (list string)) "whole-turn response joined with blank lines: not repeated"
     ["text:Checking."; "text:Found a."; "result:c0"]
     (agy_stream_events [agy_text ~index:2 ~state:"DONE" "Checking.";

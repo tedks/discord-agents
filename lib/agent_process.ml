@@ -1211,8 +1211,9 @@ let parse_gemini_stream_json_line line =
    - [step_type = "tool"]: [state = "ACTIVE"] with
      [tool_name] and [tool_info.parameters] when the call starts, then
      [state = "DONE"] with [tool_info.output] (absent for edits).
-   [result.response] repeats the streamed text. When it equals the
-   streamed text or the last reply step's text, nothing more is shown. It fills in a lost
+   [result.response] repeats the streamed text. When it is exactly the
+   last reply step, or the reply steps in order with only whitespace
+   between them, nothing more is shown. It fills in a lost
    tail of the stream, or follows in full (labelled) if the stream
    diverged. Parsing is therefore stateful per run: use
    [agy_stream_parser] for a whole run. [parse_agy_stream_json_line]
@@ -1255,6 +1256,28 @@ let crlf_to_lf s =
   String.iteri (fun i c ->
     if not (c = '\r' && i + 1 < n && s.[i + 1] = '\n') then Buffer.add_char b c) s;
   Buffer.contents b
+
+(** Whether [s] is exactly [steps] in order, with nothing but whitespace
+    (spaces, newlines) between consecutive steps; each boundary may
+    differ. Text inside a step must match byte for byte. *)
+let is_steps_joined ~steps s =
+  let n = String.length s in
+  let at pos t =
+    pos + String.length t <= n && String.sub s pos (String.length t) = t in
+  let is_sep c = c = ' ' || c = '\n' || c = '\r' || c = '\t' in
+  let rec go pos = function
+    | [] -> pos = n
+    | t :: rest ->
+      (* Try the step here, then after each further separator char. *)
+      let rec try_from p =
+        (at p t && go (p + String.length t) rest)
+        || (p < n && is_sep s.[p] && try_from (p + 1))
+      in
+      try_from pos
+  in
+  match steps with
+  | [] -> false
+  | first :: rest -> at 0 first && go (String.length first) rest
 
 let agy_stream_parser () =
   (* What has been streamed so far, to reconcile with result.response. *)
@@ -1388,10 +1411,9 @@ let agy_stream_parser () =
            between reply steps when it reports the whole turn. *)
         let steps = List.rev (Buffer.contents last_step_text :: !step_texts)
                     |> List.filter (fun t -> t <> "") in
-        let whole_turn sep = String.concat sep steps in
         if response = ""
            || response = Buffer.contents last_step_text
-           || List.exists (fun sep -> response = whole_turn sep) [""; "\n"; "\n\n"; " "] then []
+           || is_steps_joined ~steps response then []
         else if String.starts_with ~prefix:shown response then
           [Text_delta (String.sub response (String.length shown)
                          (String.length response - String.length shown))]

@@ -73,7 +73,7 @@ In those quota-failed runs, `step_update` carried no text or tool detail. A succ
 
 - **Text:** `agent_response` steps carry `text_delta`. Planner responses that only call tools carry none.
 - **Tools:** each tool step is `ACTIVE`, with name and parameters, then `DONE`, with `tool_info.output`. Edit tools give no output and only `TargetFile`.
-- **Result:** `result.response` repeats the streamed text. When it is already the streamed text or its end, nothing more is shown. It fills in a lost tail. If the stream diverged, it follows in full, labelled. Whether `response` is the whole turn or only its last reply step after text, tool, text is unverified; both are handled.
+- **Result:** `result.response` repeats the streamed text. When it is exactly the last reply step, or the reply steps in order with only whitespace between them, nothing more is shown. It fills in a lost tail. If the stream diverged, it follows in full, labelled. Whether `response` is the whole turn or only its last reply step after text, tool, text is unverified; both are handled.
 - **Status:** the success value is `SUCCESS`.
 
 Parameter names seen on the wire:
