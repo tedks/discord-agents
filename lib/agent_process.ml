@@ -1211,8 +1211,8 @@ let parse_gemini_stream_json_line line =
    - [step_type = "tool"]: [state = "ACTIVE"] with
      [tool_name] and [tool_info.parameters] when the call starts, then
      [state = "DONE"] with [tool_info.output] (absent for edits).
-   [result.response] repeats the streamed text. When it is already the
-   streamed text or its end, nothing more is shown. It fills in a lost
+   [result.response] repeats the streamed text. When it equals the
+   streamed text or the last reply step's text, nothing more is shown. It fills in a lost
    tail of the stream, or follows in full (labelled) if the stream
    diverged. Parsing is therefore stateful per run: use
    [agy_stream_parser] for a whole run. [parse_agy_stream_json_line]
@@ -1265,7 +1265,11 @@ let agy_stream_parser () =
      open until a DONE shows its output), so two identical calls stay
      two. That fallback assumes unindexed tool calls don't interleave. *)
   let started = Hashtbl.create 8 and finished = Hashtbl.create 8 in
-  let unindexed_open = ref false and unindexed_n = ref 0 in
+  (* The open unindexed step's tool name, if an ACTIVE opened it. *)
+  let unindexed_open = ref None and unindexed_n = ref 0 in
+  (* Text of the most recent reply step (by step_index), to recognise a
+     [response] that holds only the last reply step. *)
+  let last_step = ref None and last_step_text = Buffer.create 256 in
   let tool_use step =
     let open Yojson.Safe.Util in
     let info = match step |> member "tool_info" with `Assoc _ as i -> i | _ -> `Assoc [] in
@@ -1287,8 +1291,13 @@ let agy_stream_parser () =
     match step |> member "step_index" with
     | `Int i -> string_of_int i, true
     | _ ->
-      if state = "ACTIVE" || not !unindexed_open then incr unindexed_n;
-      unindexed_open := true;
+      let name = match step |> member "tool_name" with `String n -> Some n | _ -> None in
+      (* A DONE joins the open step only if an ACTIVE opened it for the
+         same tool; anything else is its own step. Only an ACTIVE leaves
+         a step open for a later DONE. *)
+      let joins = state <> "ACTIVE" && !unindexed_open <> None && !unindexed_open = name in
+      if not joins then incr unindexed_n;
+      unindexed_open := (if state = "ACTIVE" || joins then name else None);
       "noindex:" ^ string_of_int !unindexed_n, false
   in
   let step_events line step =
@@ -1297,7 +1306,15 @@ let agy_stream_parser () =
     match get "step_type", get "state" with
     | Some "agent_response", _ ->
       (match get "text_delta" with
-       | Some t when t <> "" -> Buffer.add_string streamed t; [Text_delta t]
+       | Some t when t <> "" ->
+         let index = match step |> member "step_index" with `Int i -> Some i | _ -> None in
+         if index <> !last_step then begin
+           Buffer.clear last_step_text;
+           last_step := index
+         end;
+         Buffer.add_string streamed t;
+         Buffer.add_string last_step_text t;
+         [Text_delta t]
        | _ -> [Other line])
     | Some "tool", Some (("ACTIVE" | "DONE") as state) ->
       let key, indexed = step_key step state in
@@ -1316,7 +1333,7 @@ let agy_stream_parser () =
             [Tool_result { content = crlf_to_lf o }]
           | _ | exception _ -> []
       in
-      if not indexed && output <> [] then unindexed_open := false;
+      if not indexed && output <> [] then unindexed_open := None;
       (match start @ output with [] -> [Other line] | evs -> evs)
     | _ -> [Other line]
   in
@@ -1351,11 +1368,19 @@ let agy_stream_parser () =
          one, so the full reply follows, labelled. *)
       let text =
         let shown = Buffer.contents streamed in
-        (* "Ends with" covers [response] being the whole turn's text or
-           only its last reply step: captures so far have one text step
-           per turn, so which one agy sends after text-tool-text is
-           unverified. *)
-        if response = "" || String.ends_with ~suffix:response shown then []
+        (* Already shown if it is the whole turn's text or exactly its
+           last reply step. Captures so far have one text step per turn,
+           so which of the two agy sends after text-tool-text is
+           unverified; both are accepted, nothing looser. *)
+        let squash t =
+          String.to_seq t
+          |> Seq.filter (fun c -> not (c = ' ' || c = '\n' || c = '\t' || c = '\r'))
+          |> String.of_seq in
+        (* Whitespace is ignored in the comparison, so a response that
+           joins reply steps with blank lines still matches. *)
+        if response = ""
+           || squash response = squash shown
+           || squash response = squash (Buffer.contents last_step_text) then []
         else if String.starts_with ~prefix:shown response then
           [Text_delta (String.sub response (String.length shown)
                          (String.length response - String.length shown))]
@@ -1364,7 +1389,7 @@ let agy_stream_parser () =
             m "agy: final response differs from the streamed text; \
                posting it in full");
           [Text_delta ("\n\n*agy's final reply differed from the streamed \
-                        text; here it is in full:*\n\n" ^ response)]
+                        text; here it is:*\n\n" ^ response)]
         end
       in
       (* Statuses seen on the wire: SUCCESS and ERROR. Anything else is

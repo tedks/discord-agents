@@ -4514,7 +4514,7 @@ let test_agy_stream_edges () =
                             "{broken"; agy_text ~index:1 ~state:"DONE" " world"; result "Hello world"] with
    | ["text:Hel"; "other"; "text: world"; full; "result:c0"] ->
      Alcotest.(check bool) "a delta lost mid-stream: full reply follows, labelled" true
-       (String.ends_with ~suffix:"in full:*\n\nHello world" full)
+       (String.ends_with ~suffix:"here it is:*\n\nHello world" full)
    | l -> Alcotest.failf "unexpected: %s" (String.concat " | " l));
   Alcotest.(check (list string)) "response that is only the last reply step: not repeated"
     ["text:Checking."; "tool:Bash:ls"; "out:a"; "text:Found a."; "result:c0"]
@@ -4524,6 +4524,21 @@ let test_agy_stream_edges () =
        agy_tool ~index:3 ~state:"DONE" ~name:"run_command" ~output:"a" (`Assoc [("CommandLine", `String "ls")]);
        agy_text ~index:5 ~state:"DONE" "Found a.";
        result "Found a." ]);
+  (match agy_stream_events [agy_text ~index:2 ~state:"DONE" "Checking.";
+                            agy_text ~index:5 ~state:"DONE" "Found a."; result "a."] with
+   | ["text:Checking."; "text:Found a."; full; "result:c0"] ->
+     Alcotest.(check bool) "a mere suffix is not 'already shown'" true
+       (String.ends_with ~suffix:"here it is:*\n\na." full)
+   | l -> Alcotest.failf "unexpected: %s" (String.concat " | " l));
+  Alcotest.(check (list string)) "last step spread over several deltas: not repeated"
+    ["text:Checking."; "text:Found "; "text:a."; "result:c0"]
+    (agy_stream_events [agy_text ~index:2 ~state:"DONE" "Checking.";
+                        agy_text ~index:5 ~state:"ACTIVE" "Found ";
+                        agy_text ~index:5 ~state:"DONE" "a."; result "Found a."]);
+  Alcotest.(check (list string)) "whole-turn response joined with blank lines: not repeated"
+    ["text:Checking."; "text:Found a."; "result:c0"]
+    (agy_stream_events [agy_text ~index:2 ~state:"DONE" "Checking.";
+                        agy_text ~index:5 ~state:"DONE" "Found a."; result "Checking.\n\nFound a."]);
   Alcotest.(check (list string)) "response that is the whole turn: not repeated"
     ["text:Checking."; "text:Found a."; "result:c0"]
     (agy_stream_events [agy_text ~index:2 ~state:"DONE" "Checking.";
@@ -4554,6 +4569,19 @@ let test_agy_stream_edges () =
   Alcotest.(check (list string)) "no step_index: DONE without output, then with"
     ["tool:Bash:ls"; "other"; "out:late"]
     (agy_stream_events [no_index "ACTIVE" (); no_index "DONE" (); no_index "DONE" ~output:"late" ()]);
+  let no_index_named name state ?output () =
+    agy_step ([ ("state", `String state); ("step_type", `String "tool");
+                ("tool_name", `String name);
+                ("tool_info", `Assoc ([("name", `String name); ("parameters", `Assoc [])]
+                   @ (match output with Some o -> [("output", `String o)] | None -> []))) ]) in
+  Alcotest.(check (list string)) "no step_index: two output-less DONEs stay two"
+    ["tool:Write:"; "tool:Write:"]
+    (agy_stream_events [no_index_named "write_to_file" "DONE" ();
+                        no_index_named "write_to_file" "DONE" ()]);
+  Alcotest.(check (list string)) "no step_index: a DONE for another tool is a new step"
+    ["tool:Write:"; "tool:Bash:"; "out:done"]
+    (agy_stream_events [no_index_named "write_to_file" "DONE" ();
+                        no_index_named "run_command" "DONE" ~output:"done" ()]);
   Alcotest.(check (list string)) "no step_index, DONE only: each shown"
     ["tool:Bash:ls"; "out:a"; "tool:Bash:ls"; "out:b"]
     (agy_stream_events [no_index "DONE" ~output:"a" (); no_index "DONE" ~output:"b" ()]);
