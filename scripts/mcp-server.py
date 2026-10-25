@@ -151,6 +151,42 @@ TOOLS = [
         }
     },
     {
+        "name": "list_project_inventory",
+        "description": "List cached project locations grouped by repository across configured hosts. No probes run. Paginate by location offset; a repository can span pages. Inventory locations are not local start indices and do not authorize starts or cleanup.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8,
+                    "default": 8
+                }
+            }
+        }
+    },
+    {
+        "name": "refresh_host_projects",
+        "description": "Refresh project observations on one enabled configured host, with a 30-second scan deadline and one refresh at a time. Persists the snapshot on the writer. Failed scans retain previous observations; no sessions or project directories are created.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host": {
+                    "type": "string",
+                    "description": "Configured name from list_hosts"
+                }
+            },
+            "required": [
+                "host"
+            ]
+        }
+    },
+    {
         "name": "import_project",
         "description": "Clone a GitHub HTTPS or SSH URL into the bot's project registry, create its Discord project channel, and make the channel session-ready. Reuses local git credentials; no token is accepted.",
         "inputSchema": {
@@ -499,6 +535,14 @@ def handle_tool_call(name, arguments):
         return result["error"] if "error" in result else result["report"]
     if name == "diagnose_host":
         result = control_request("diagnose_host", arguments)
+        return result["error"] if "error" in result else result["report"]
+
+    if name == "list_project_inventory":
+        result = control_request("list_project_inventory", arguments)
+        return result["error"] if "error" in result else result["report"]
+
+    if name == "refresh_host_projects":
+        result = control_request("refresh_host_projects", arguments)
         return result["error"] if "error" in result else result["report"]
 
     if name == "list_projects":

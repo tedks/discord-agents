@@ -1,6 +1,6 @@
 # Multi-host sessions: one Discord writer, remote executors over SSH
 
-Inventory stack in progress (2026-10-25), tracked in
+Inventory implementation (2026-10-25), tracked in
 [167](https://github.com/tedks/discord-agents/issues/167): `Host_project_scan`
 adds bounded, read-only local/SSH discovery with a strict versioned decoder.
 The executor requires Python 3.10+ and Git; the existing transport requires
@@ -29,13 +29,35 @@ reconfigured hosts hide old evidence; observations age after five minutes, and
 clock rollback makes them stale. Atomic, private cache writes must confirm
 durability before callers publish new in-memory state. Corrupt, oversized or
 non-regular caches are errors, not successful empty scans. Cache bounds are
-64 hosts, 512 projects per host, 120 KiB per encoded host entry (with room
-reserved for failure metadata), and 8 MiB total. An oversized host snapshot
+64 hosts, 512 projects per host, 120 KiB per encoded host entry (256 bytes
+reserved from that data budget for later failure metadata), and 8 MiB total. An oversized host snapshot
 becomes a failed observation retaining its prior success. Callers serialize
 prune/record/save/publication and prune removed hosts before recording. Symlinked
 cache files are permitted within the trusted config directory; regular-file
-checks apply to their targets. This layer is independent of session, channel and cleanup
-state; public refresh/listing wiring follows in the final inventory PR.
+checks apply to their targets. This layer is independent of session, channel
+and cleanup state.
+
+Public inventory: MCP `refresh_host_projects {host}` explicitly scans one enabled
+configured host using its roots, or the top-level roots when no override is set.
+Only one inventory refresh runs at a time; refusal happens before contacting
+unknown, disabled or unroutable hosts. The writer checks its cache disk policy,
+saves the new observation atomically, and publishes only after confirmed save.
+Cache errors remain visible. A failed startup load is retried before refresh;
+if it still fails, refresh is refused until the cache is repaired or removed.
+A refresh never silently replaces unreadable history with one host. The raw
+refresh response uses `ok` for completion of the observation workflow and
+`scan_succeeded` for acceptance of the scan; its report states any failure.
+Renamed/removed hosts are pruned from this cache.
+MCP `list_project_inventory {offset?, limit?}` reads that cache without probes.
+It groups network repository identities while preserving every host/path
+location; repositories without network identities remain host/path-specific.
+Pages contain up to eight locations, so a repository may span pages. Host rows
+show timestamps, failure reasons and unknown/observed/stale/unavailable/disabled/
+configuration-changed/unroutable state. No background scans are introduced.
+The existing local `list_projects`, start numbering, channel registry and cleanup
+remain independent; this inventory does not authorize remote session creation.
+
+No live-host acceptance or deployment is implied by its fixture-based tests.
 
 Current implementation slice (2026-10-24): read-only MCP `list_hosts` and
 `diagnose_host {host, agent, cwd}`. Listing uses configured membership only and

@@ -101,6 +101,8 @@ let expected_method_ids = [
   List_projects_id;
   List_hosts_id;
   Diagnose_host_id;
+  List_project_inventory_id;
+  Refresh_host_projects_id;
   List_sessions_id;
   Import_project_id;
   List_claude_sessions_id;
@@ -171,6 +173,8 @@ let expected_mcp_exposed_method_ids = [
   Control_api.List_projects_id;
   List_hosts_id;
   Diagnose_host_id;
+  List_project_inventory_id;
+  Refresh_host_projects_id;
   List_sessions_id;
   Import_project_id;
   List_claude_sessions_id;
@@ -250,6 +254,7 @@ let expected_mutability = function
   | List_projects_id
   | List_hosts_id
   | Diagnose_host_id
+  | List_project_inventory_id
   | List_sessions_id
   | List_claude_sessions_id
   | List_codex_sessions_id
@@ -265,7 +270,8 @@ let expected_mutability = function
   | Set_effort_id
   | Set_goal_id -> Mutates_session
   | Default_agent_id
-  | Rescue_agent_id -> Mutates_runtime
+  | Rescue_agent_id
+  | Refresh_host_projects_id -> Mutates_runtime
   | Import_project_id
   | Refresh_projects_id -> Mutates_projects
   | Rename_thread_id

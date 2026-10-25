@@ -8,6 +8,8 @@ type id =
   | List_projects
   | List_hosts
   | Diagnose_host
+  | List_project_inventory
+  | Refresh_host_projects
   | Import_project
   | List_sessions
   | Send_message
@@ -43,6 +45,8 @@ let string_of_id = function
   | List_projects -> "list_projects"
   | List_hosts -> "list_hosts"
   | Diagnose_host -> "diagnose_host"
+  | List_project_inventory -> "list_project_inventory"
+  | Refresh_host_projects -> "refresh_host_projects"
   | Import_project -> "import_project"
   | List_sessions -> "list_sessions"
   | Send_message -> "send_message"
@@ -159,6 +163,19 @@ let all_specs = [
       ("agent", property ~type_:string_type ~enum:agent_enum ());
       ("cwd", property ~type_:string_type ~max_length:4096
         ~description:"Absolute working directory on the selected host (4096-byte server cap). No directory is created." ());
+    ]);
+  spec ~id:List_project_inventory
+    ~description:"List cached project locations grouped by repository across configured hosts. No probes run. Paginate by location offset; a repository can span pages. Inventory locations are not local start indices and do not authorize starts or cleanup."
+    ~control_method:Control_api.List_project_inventory_id
+    ~input_schema:(object_schema [
+      ("offset", property ~type_:integer_type ~minimum:0 ~default:(`Int 0) ());
+      ("limit", property ~type_:integer_type ~minimum:1 ~maximum:8 ~default:(`Int 8) ());
+    ]);
+  spec ~id:Refresh_host_projects
+    ~description:"Refresh project observations on one enabled configured host, with a 30-second scan deadline and one refresh at a time. Persists the snapshot on the writer. Failed scans retain previous observations; no sessions or project directories are created."
+    ~control_method:Control_api.Refresh_host_projects_id
+    ~input_schema:(object_schema ~required:["host"] [
+      ("host", property ~type_:string_type ~description:"Configured name from list_hosts" ());
     ]);
   spec ~id:Import_project
     ~description:"Clone a GitHub HTTPS or SSH URL into the bot's project registry, create its Discord project channel, and make the channel session-ready. Reuses local git credentials; no token is accepted."

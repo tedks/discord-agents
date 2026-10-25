@@ -140,6 +140,8 @@ let expected_tool_ids = [
   List_projects;
   List_hosts;
   Diagnose_host;
+  List_project_inventory;
+  Refresh_host_projects;
   Import_project;
   List_sessions;
   Send_message;
