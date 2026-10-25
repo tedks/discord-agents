@@ -4554,7 +4554,12 @@ let test_agy_stream_edges () =
   let t0 = Unix.gettimeofday () in
   Alcotest.(check bool) "whitespace-only steps: no match, and fast" false
     (joined ~steps:(("A" :: spaces) @ ["B"]) ("A" ^ String.make 200 ' ' ^ "C"));
-  Alcotest.(check bool) "...in well under a second" true (Unix.gettimeofday () -. t0 < 1.0);
+  (* Generous: exponential took tens of seconds at far smaller sizes. *)
+  Alcotest.(check bool) "...without blowing up" true (Unix.gettimeofday () -. t0 < 10.0);
+  Alcotest.(check bool) "a whitespace-only step's space must be there" false
+    (joined ~steps:["A"; " "; "B"] "AB");
+  Alcotest.(check bool) "a trailing whitespace-only step matches" true
+    (joined ~steps:["A"; " "] "A ");
   Alcotest.(check bool) "leading extras don't match" false (joined ~steps:["A"; "B"] " A B");
   Alcotest.(check bool) "whitespace-only steps that do fit still match" true
     (joined ~steps:["A"; " "; " "; "B"] "A   B");

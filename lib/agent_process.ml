@@ -1264,11 +1264,9 @@ let is_reply_sep c = c = ' ' || c = '\n' || c = '\r' || c = '\t'
 
 let is_steps_joined ~steps s =
   let n = String.length s in
-  (* A whitespace-only step is absorbed by the separators around it, and
-     dropping it means every remaining step can match in only one place
-     per gap. *)
-  let steps =
-    Array.of_list (List.filter (String.exists (fun c -> not (is_reply_sep c))) steps) in
+  (* Every step is kept, whitespace-only ones too: dropping them would
+     change what counts as a match. The memo below bounds the search. *)
+  let steps = Array.of_list steps in
   let k = Array.length steps in
   let at pos t =
     let m = String.length t in
@@ -1277,8 +1275,11 @@ let is_steps_joined ~steps s =
   let is_sep = is_reply_sep in
   (* [go i pos]: steps i.. match s from pos, separators allowed before
      each step after the first. Failed (i, pos) states are memoised, so
-     the search is bounded by steps x positions x separator run instead
-     of backtracking combinatorially over whitespace-only steps. *)
+     the search visits at most steps x positions states instead of
+     backtracking combinatorially over whitespace-only steps. The worst
+     case is O(n x total step length) byte comparisons, which needs
+     huge whitespace gaps beside huge steps; agy replies aren't like
+     that. *)
   let failed = Hashtbl.create 16 in
   let rec go i pos =
     if i = k then pos = n
