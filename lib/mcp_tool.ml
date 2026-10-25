@@ -6,6 +6,8 @@
 type id =
   | Start_session
   | List_projects
+  | List_hosts
+  | Diagnose_host
   | Import_project
   | List_sessions
   | Send_message
@@ -39,6 +41,8 @@ type spec = {
 let string_of_id = function
   | Start_session -> "start_session"
   | List_projects -> "list_projects"
+  | List_hosts -> "list_hosts"
+  | Diagnose_host -> "diagnose_host"
   | Import_project -> "import_project"
   | List_sessions -> "list_sessions"
   | Send_message -> "send_message"
@@ -143,6 +147,19 @@ let all_specs = [
     ~description:"List all discovered projects that can have agent sessions started on them."
     ~control_method:Control_api.List_projects_id
     ~input_schema:no_args_schema;
+  spec ~id:List_hosts
+    ~description:"List configured executor hosts and the current writer without contacting them. This does not discover projects or establish host availability."
+    ~control_method:Control_api.List_hosts_id
+    ~input_schema:no_args_schema;
+  spec ~id:Diagnose_host
+    ~description:"Observe one enabled configured host's CLI version, advertised flags, credential-store presence and MCP callback. Read-only, bounded to 50 seconds, one diagnostic at a time. Does not log in, query models, or authorize sessions."
+    ~control_method:Control_api.Diagnose_host_id
+    ~input_schema:(object_schema ~required:["host"; "agent"; "cwd"] [
+      ("host", property ~type_:string_type ~description:"Configured name from list_hosts" ());
+      ("agent", property ~type_:string_type ~enum:agent_enum ());
+      ("cwd", property ~type_:string_type ~max_length:4096
+        ~description:"Absolute working directory on the selected host (4096-byte server cap). No directory is created." ());
+    ]);
   spec ~id:Import_project
     ~description:"Clone a GitHub HTTPS or SSH URL into the bot's project registry, create its Discord project channel, and make the channel session-ready. Reuses local git credentials; no token is accepted."
     ~control_method:Control_api.Import_project_id

@@ -138,6 +138,8 @@ let sorted_strings values =
 let expected_tool_ids = [
   Mcp_tool.Start_session;
   List_projects;
+  List_hosts;
+  Diagnose_host;
   Import_project;
   List_sessions;
   Send_message;

@@ -133,6 +133,24 @@ TOOLS = [
         }
     },
     {
+        "name": "list_hosts",
+        "description": "List configured executor hosts and the current writer without contacting them. This does not discover projects or establish host availability.",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "diagnose_host",
+        "description": "Observe one enabled configured host's CLI version, advertised flags, credential-store presence and MCP callback. Read-only, bounded to 50 seconds, one diagnostic at a time. Does not log in, query models, or authorize sessions.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Configured name from list_hosts"},
+                "agent": {"type": "string", "enum": ["claude", "codex", "gemini", "agy"]},
+                "cwd": {"type": "string", "maxLength": 4096, "description": "Absolute working directory on the selected host (4096-byte server cap). No directory is created."}
+            },
+            "required": ["host", "agent", "cwd"]
+        }
+    },
+    {
         "name": "import_project",
         "description": "Clone a GitHub HTTPS or SSH URL into the bot's project registry, create its Discord project channel, and make the channel session-ready. Reuses local git credentials; no token is accepted.",
         "inputSchema": {
@@ -475,6 +493,13 @@ TOOLS = [
 
 def handle_tool_call(name, arguments):
     """Forward tool call to the bot's control API and format the response."""
+
+    if name == "list_hosts":
+        result = control_request("list_hosts")
+        return result["error"] if "error" in result else result["report"]
+    if name == "diagnose_host":
+        result = control_request("diagnose_host", arguments)
+        return result["error"] if "error" in result else result["report"]
 
     if name == "list_projects":
         result = control_request("list_projects")

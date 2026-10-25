@@ -66,6 +66,7 @@ type t = {
   child_pids : (Pid_set.t ref * Mutex.t);
   mutable wrap_width : int;
   mutable refreshing : bool;
+  host_diagnostics_gate : Host_diagnostics.gate;
   mutable output_lines : int;
   mutable policy_sync_clear_last_warning : (string * string) option;
   mutable last_top_level_disk_refresh_at : float;
@@ -3512,6 +3513,7 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
                draining = false; child_pids = (ref Pid_set.empty, Mutex.create ());
                wrap_width = Agent_process.desktop_width;
                refreshing = false;
+               host_diagnostics_gate = Host_diagnostics.create_gate ();
                output_lines = Agent_process.default_output_lines;
                policy_sync_clear_last_warning = None;
                last_top_level_disk_refresh_at = 0.0;

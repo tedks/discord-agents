@@ -84,6 +84,7 @@ let with_test_bot ?rest_call f =
         child_pids = (ref Discord_agents.Bot.Pid_set.empty, Mutex.create ());
         wrap_width = Discord_agents.Agent_process.desktop_width;
         refreshing = false;
+        host_diagnostics_gate = Discord_agents.Host_diagnostics.create_gate ();
         output_lines = Discord_agents.Agent_process.default_output_lines;
         policy_sync_clear_last_warning = None;
         last_top_level_disk_refresh_at = 0.0;
@@ -2414,9 +2415,42 @@ let test_login_guidance_uses_session_executor () =
     Alcotest.(check bool) "missing session cannot fall back to writer guidance" true
       (missing |> member "login" = `Null))
 
+let test_host_diagnostic_refusals () =
+  with_test_bot (fun bot ->
+    let module Api = Discord_agents.Control_api in
+    let module Host = Discord_agents.Host in
+    let here = Discord_agents.Bot.local_host_name bot in
+    let disabled = { (Host.local_host "hands-off") with
+      transport = Host.Ssh "never-contact-this-host"; enabled = false } in
+    let bot = { bot with config = { bot.config with hosts = Some Host.{
+      writer = here; hosts = [Host.local_host here; disabled] } } } in
+    let params host cwd = Some (`Assoc ["host", `String host;
+      "agent", `String "claude"; "cwd", `String cwd]) in
+    let refused label params =
+      let response = Api.handle_diagnose_host bot params in
+      Alcotest.(check bool) label true
+        (Yojson.Safe.Util.member "error" response <> `Null) in
+    refused "disabled host" (params "hands-off" "/");
+    refused "unregistered host" (params "missing" "/");
+    refused "relative cwd" (params here "relative");
+    refused "missing params" None;
+    List.iter (fun key ->
+      refused "wrong parameter type" (Some (`Assoc (List.map (fun (k, v) ->
+        k, if k = key then `Int 1 else v)
+        ["host", `String here; "agent", `String "claude"; "cwd", `String "/"]))))
+      ["host"; "agent"; "cwd"];
+    refused "oversized cwd" (params here ("/" ^ String.make 4096 'x'));
+    bot.host_diagnostics_gate.busy <- true;
+    refused "busy service" (params here "/");
+    bot.host_diagnostics_gate.busy <- false;
+    let listing = Api.handle_list_hosts bot in
+    Alcotest.(check int) "both configured hosts listed" 2
+      Yojson.Safe.Util.(listing |> member "hosts" |> to_list |> List.length))
+
 let () =
   Alcotest.run "bot_defaults" [
     ("session_hosts", [
+      Alcotest.test_case "host diagnostics refuse before probe" `Quick test_host_diagnostic_refusals;
       Alcotest.test_case "persist migrated session hosts" `Quick
         test_persist_migrated_session_hosts;
       Alcotest.test_case "bot create persists legacy hosts" `Quick

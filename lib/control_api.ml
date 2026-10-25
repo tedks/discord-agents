@@ -58,6 +58,8 @@ let json_of_int64 n =
 type method_id =
   | Health_id
   | List_projects_id
+  | List_hosts_id
+  | Diagnose_host_id
   | List_sessions_id
   | Import_project_id
   | List_claude_sessions_id
@@ -101,6 +103,8 @@ type method_spec = {
 let string_of_method_id = function
   | Health_id -> "health"
   | List_projects_id -> "list_projects"
+  | List_hosts_id -> "list_hosts"
+  | Diagnose_host_id -> "diagnose_host"
   | List_sessions_id -> "list_sessions"
   | Import_project_id -> "import_project"
   | List_claude_sessions_id -> "list_claude_sessions"
@@ -424,6 +428,40 @@ let handle_health (bot : Bot.t) =
     | Some kind ->
       [("rescue_agent", `String (Config.string_of_agent_kind kind))]
     | None -> [])
+
+let handle_list_hosts (bot : Bot.t) =
+  Host_diagnostics.inventory ~local_name:(Bot.local_host_name bot) bot.config.hosts
+
+let handle_diagnose_host (bot : Bot.t) params =
+  let open Yojson.Safe.Util in
+  let params = match params with Some (`Assoc _ as p) -> p | _ -> `Assoc [] in
+  let field name = match member name params with `String s -> Some s | _ -> None in
+  match field "host", field "agent", field "cwd" with
+  | Some name, Some agent, Some cwd ->
+    (match Config.agent_kind_of_string agent,
+       Host_diagnostics.resolve ~local_name:(Bot.local_host_name bot)
+         ~registry:bot.config.hosts name with
+     | Error _, _ -> error_response "Unknown agent; use claude, codex, gemini or agy."
+     | _, Error message -> error_response message
+     | Ok agent, Ok host ->
+       if String.length cwd > 4096 || not (Host_callback.valid_path cwd) then
+         error_response "cwd must be an absolute path without control characters (at most 4096 bytes)."
+       else
+         let clock = Eio.Stdenv.mono_clock bot.env in
+         (* One explicit request at a time; no background discovery or cache.
+            Deadline leaves time for cleanup before the 60s control client limit. *)
+         match Host_diagnostics.with_slot bot.host_diagnostics_gate (fun () ->
+           Host_diagnostics.with_deadline ~clock ~seconds:50. (fun () ->
+             Host_diagnostics.diagnose
+               ~run:(fun ~timeout_s ~max_output_bytes ~cwd host argv ->
+                 Host_probe.run ~clock ~timeout_s ~max_output_bytes ~cwd host argv)
+               ~now:Unix.gettimeofday ~host ~cwd ~agent
+               ~writer:(Bot.local_host_name bot) ~registry:bot.config.hosts
+               ~mcp_path:(Agent_process.mcp_command_opt ()) ~socket_path:(socket_path ()))) with
+         | Error message -> error_response message
+         | Ok (Error `Timeout) -> error_response "Host diagnostic timed out; no complete report is available."
+         | Ok (Ok response) -> response)
+  | _ -> error_response "host, agent and cwd are required strings. Use list_hosts for configured names."
 
 let handle_list_projects (bot : Bot.t) =
   let projects = List.map (fun (p : Project.t) ->
@@ -1565,6 +1603,10 @@ let all_method_specs = [
     ~handler:(fun bot _params -> handle_health bot) ();
   method_spec ~id:List_projects_id ~mutability:Read_only ~mcp_exposed:true
     ~handler:(fun bot _params -> handle_list_projects bot) ();
+  method_spec ~id:List_hosts_id ~mutability:Read_only ~mcp_exposed:true
+    ~handler:(fun bot _params -> handle_list_hosts bot) ();
+  method_spec ~id:Diagnose_host_id ~mutability:Read_only ~mcp_exposed:true
+    ~handler:(fun bot params -> handle_diagnose_host bot params) ();
   method_spec ~id:List_sessions_id ~mutability:Read_only ~mcp_exposed:true
     ~handler:(fun bot _params -> handle_list_sessions bot) ();
   method_spec ~id:Import_project_id ~mutability:Mutates_projects ~mcp_exposed:true
