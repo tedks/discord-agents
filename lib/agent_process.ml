@@ -1193,22 +1193,97 @@ let parse_gemini_stream_json_line line =
 
    [init] arrives first, so the conversation id is reported from it as
    well as from [result]; a turn that dies mid-run still leaves a
-   resumable id. [step_update] carries no text or tool detail in the
-   runs captured so far (all of which ended in quota errors), so it
-   passes through as [Other]. A text-delta field exists in the binary
-   but hasn't been observed on the wire, so it isn't guessed at. Until
-   it is, the final [response] is the only text the user sees,
-   delivered as one [Text_delta]. Once text deltas are parsed, drop
-   that delta or the reply will appear twice.
+   resumable id.
+
+   Successful runs (captured 2026-10-24) put the content in
+   [step_update]:
+   - [step_type = "agent_response"] with [text_delta]: streamed reply
+     text. Planner responses that only call tools carry none.
+   - [step_type = "tool"]: [state = "ACTIVE"] with
+     [tool_name] and [tool_info.parameters] when the call starts, then
+     [state = "DONE"] with [tool_info.output] (absent for edits).
+   [result.response] repeats the streamed text, so it is used only when
+   no delta was streamed. Parsing is therefore stateful per run: use
+   [agy_stream_parser] for a whole run. [parse_agy_stream_json_line]
+   is a fresh parser for one line.
 
    An empty [conversation_id] (agy emits one when it fails before a
    conversation exists, e.g. signed out) is treated as no id, so the
    session stays unconfirmed and the next turn starts fresh. *)
 
-let parse_agy_stream_json_line line =
+(** agy tool names and parameters onto the Claude-shaped ones the
+    runner's display table knows. Only the parameter names seen on the
+    wire are mapped. Anything else (search_web, read_url_content, ...)
+    keeps agy's own name and parameters and gets the generic display. *)
+let agy_tool_of name params =
+  let open Yojson.Safe.Util in
+  let str key = match params |> member key with
+    | `String v -> Some v | _ -> None | exception _ -> None in
+  let obj pairs =
+    `Assoc (List.filter_map (fun (k, v) -> Option.map (fun v -> (k, `String v)) v) pairs) in
+  match name with
+  | "run_command" -> "Bash", obj ["command", str "CommandLine"]
+  | "view_file" -> "Read", obj ["file_path", str "AbsolutePath"]
+  | "write_to_file" -> "Write", obj ["file_path", str "TargetFile"]
+  | "replace_file_content" | "multi_replace_file_content" ->
+    "Edit", obj ["file_path", str "TargetFile"]
+  | "grep_search" -> "Grep", obj ["pattern", str "Query"; "path", str "SearchPath"]
+  | "call_mcp_tool" ->
+    (match str "ServerName", str "ToolName" with
+     | Some server, Some tool ->
+       Printf.sprintf "mcp__%s__%s" server tool,
+       (match params |> member "Arguments" with
+        | `Assoc _ as a -> a | _ -> `Assoc [] | exception _ -> `Assoc [])
+     | _ -> name, params)
+  | _ -> name, (match params with `Assoc _ -> params | _ -> `Assoc [])
+
+let agy_stream_parser () =
+  let streamed_text = ref false in
+  let tools_started = Hashtbl.create 8 in
+  let tool_use step =
+    let open Yojson.Safe.Util in
+    let info = step |> member "tool_info" in
+    let raw_name = match step |> member "tool_name" with
+      | `String n -> n
+      | _ -> (match info |> member "name" with `String n -> n | _ -> "unknown") in
+    let params = match info with `Assoc _ -> info |> member "parameters" | _ -> `Null in
+    let tool_name, input = agy_tool_of raw_name params in
+    Tool_use { tool_name; tool_summary = summarize_tool_input tool_name input;
+               tool_detail = detail_of_tool_input tool_name input }
+  in
+  let step_events line step =
+    let open Yojson.Safe.Util in
+    let get k = match step |> member k with `String v -> Some v | _ -> None in
+    match get "step_type", get "state" with
+    | Some "agent_response", _ ->
+      (match get "text_delta" with
+       | Some t when t <> "" -> streamed_text := true; [Text_delta t]
+       | _ -> [Other line])
+    | Some "tool", Some state ->
+      let index = match step |> member "step_index" with `Int i -> Some i | _ -> None in
+      let started = match index with
+        | Some i -> Hashtbl.mem tools_started i | None -> false in
+      let start =
+        if started then []
+        else (Option.iter (fun i -> Hashtbl.replace tools_started i ()) index;
+              [tool_use step]) in
+      let output =
+        if state = "ACTIVE" then []
+        else match step |> member "tool_info" |> member "output" with
+          | `String o when String.trim o <> "" -> [Tool_result { content = o }]
+          | _ | exception _ -> []
+      in
+      (match start @ output with [] -> [Other line] | evs -> evs)
+    | _ -> [Other line]
+  in
+  fun line ->
   try
     let json = Yojson.Safe.from_string line in
     match get_string_opt "event" json with
+    | Some "step_update" ->
+      (match Yojson.Safe.Util.member "step_update" json with
+       | `Assoc _ as step -> step_events line step
+       | _ -> [Other line])
     | Some "init" ->
       (match get_string_opt "conversation_id" json with
        | Some id when String.trim id <> "" ->
@@ -1224,7 +1299,8 @@ let parse_agy_stream_json_line line =
       let response = get_string ~default:"" "response" result in
       let status = get_string ~default:"" "status" result in
       let error = get_string ~default:"" "error" result in
-      let text = if response = "" then [] else [Text_delta response] in
+      let text =
+        if response = "" || !streamed_text then [] else [Text_delta response] in
       (* agy's success status value hasn't been observed yet, so an
          unfamiliar non-empty status is logged, not failed. A result
          with no status at all doesn't match any shape we've seen and
@@ -1243,6 +1319,8 @@ let parse_agy_stream_json_line line =
       text @ err @ [Result { text = ""; session_id }]
     | _ -> [Other line]
   with _ -> [Other line]
+
+let parse_agy_stream_json_line line = agy_stream_parser () line
 
 (** [agy --conversation <id>] with an id agy doesn't know does not
     fail: it silently starts a new conversation under a fresh id
@@ -2621,11 +2699,12 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
       agy_resume_guard ~requested:session_id
     | Config.Agy | Config.Claude | Config.Codex | Config.Gemini -> Fun.id
   in
+  let agy_parse = agy_stream_parser () in
   let parse_events line = match kind with
     | Config.Claude -> parse_stream_json_line line
     | Config.Codex -> parse_codex_json_line line
     | Config.Gemini -> parse_gemini_stream_json_line line
-    | Config.Agy -> agy_guard (parse_agy_stream_json_line line)
+    | Config.Agy -> agy_guard (agy_parse line)
   in
   let parse_line line =
     if String.length line > 0 then List.iter on_event (parse_events line)

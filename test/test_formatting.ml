@@ -4414,6 +4414,99 @@ let test_agy_prompt_no_notice_with_mcp () =
   Alcotest.(check string) "MCP wired: plain bot-context"
     "<bot-context>\nyou are a lead\n</bot-context>\n\nhi" out
 
+(* ── agy streaming: lines shaped exactly like a captured successful
+   run (agy 1.1.3, 2026-10-24), with neutral ids and paths ── *)
+
+let agy_step fields =
+  Yojson.Safe.to_string (`Assoc [
+    ("event", `String "step_update");
+    ("step_update", `Assoc (("conversation_id", `String "c0") :: fields)) ])
+
+let agy_tool ~index ~state ~name ?output params =
+  agy_step [
+    ("step_index", `Int index); ("state", `String state);
+    ("step_type", `String "tool"); ("tool_name", `String name);
+    ("tool_info", `Assoc ([("name", `String name); ("parameters", params)]
+                          @ (match output with Some o -> [("output", `String o)] | None -> []))) ]
+
+let agy_text ~index ~state t =
+  agy_step [ ("step_index", `Int index); ("state", `String state);
+             ("step_type", `String "agent_response"); ("text_delta", `String t) ]
+
+let agy_stream_events lines =
+  let parse = AP.agy_stream_parser () in
+  List.concat_map (fun l ->
+    List.map (function
+      | AP.Tool_use { tool_name; tool_summary; _ } ->
+        Printf.sprintf "tool:%s:%s" tool_name tool_summary
+      | AP.Tool_result { content } -> "out:" ^ content
+      | e -> agy_event_to_string e) (parse l)) lines
+
+let test_agy_stream_successful_run () =
+  let result =
+    {|{"event":"result","result":{"conversation_id":"c0","status":"SUCCESS","response":"It returned 3 projects.\n","num_turns":1}}|} in
+  Alcotest.(check (list string)) "tools, output and streamed text; response not repeated"
+    [ "other"; "other";
+      "tool:mcp__discord_agents__list_projects:";
+      "out:1. alpha\n2. beta\n3. gamma";
+      "tool:Bash:cat a.txt";
+      "out:hello agy\r\n";
+      "text:It returned 3 ";
+      "text:projects.\n";
+      "result:c0" ]
+    (agy_stream_events [
+       agy_step [("step_index", `Int 0); ("state", `String "DONE"); ("step_type", `String "user_input")];
+       agy_step [("step_index", `Int 2); ("state", `String "DONE"); ("step_type", `String "agent_response");
+                 ("usage", `Assoc [("input_tokens", `Int 1)])];
+       agy_tool ~index:3 ~state:"ACTIVE" ~name:"call_mcp_tool"
+         (`Assoc [("Arguments", `Assoc []); ("ServerName", `String "discord_agents");
+                  ("ToolName", `String "list_projects")]);
+       agy_tool ~index:3 ~state:"DONE" ~name:"call_mcp_tool" ~output:"1. alpha\n2. beta\n3. gamma"
+         (`Assoc [("Arguments", `Assoc []); ("ServerName", `String "discord_agents");
+                  ("ToolName", `String "list_projects")]);
+       agy_tool ~index:6 ~state:"ACTIVE" ~name:"run_command"
+         (`Assoc [("CommandLine", `String "cat a.txt")]);
+       agy_tool ~index:6 ~state:"DONE" ~name:"run_command" ~output:"hello agy\r\n"
+         (`Assoc [("CommandLine", `String "cat a.txt")]);
+       agy_text ~index:9 ~state:"ACTIVE" "It returned 3 ";
+       agy_text ~index:9 ~state:"DONE" "projects.\n";
+       result ])
+
+let test_agy_stream_tool_names () =
+  let one name params =
+    match agy_stream_events [agy_tool ~index:1 ~state:"ACTIVE" ~name params] with
+    | [e] -> e | l -> String.concat "|" l in
+  let path k = `Assoc [(k, `String "/w/src/main.ml")] in
+  Alcotest.(check string) "view_file is Read" "tool:Read:/w/src/main.ml" (one "view_file" (path "AbsolutePath"));
+  Alcotest.(check string) "write_to_file is Write" "tool:Write:/w/src/main.ml" (one "write_to_file" (path "TargetFile"));
+  Alcotest.(check string) "replace_file_content is Edit" "tool:Edit:/w/src/main.ml"
+    (one "replace_file_content" (path "TargetFile"));
+  Alcotest.(check string) "grep_search is Grep" "tool:Grep:/second/ in a.txt"
+    (one "grep_search" (`Assoc [("Query", `String "second"); ("SearchPath", `String "/w/a.txt")]));
+  Alcotest.(check string) "unmapped tools keep agy's name" "tool:search_web:cats"
+    (one "search_web" (`Assoc [("query", `String "cats")]))
+
+let test_agy_stream_edges () =
+  Alcotest.(check (list string)) "DONE without ACTIVE still shows the tool once"
+    ["tool:Bash:ls"; "out:a.txt"]
+    (agy_stream_events [
+       agy_tool ~index:4 ~state:"DONE" ~name:"run_command" ~output:"a.txt"
+         (`Assoc [("CommandLine", `String "ls")]) ]);
+  Alcotest.(check (list string)) "edit DONE has no output: nothing more"
+    ["tool:Edit:/w/a.txt"; "other"]
+    (agy_stream_events [
+       agy_tool ~index:5 ~state:"ACTIVE" ~name:"replace_file_content" (`Assoc [("TargetFile", `String "/w/a.txt")]);
+       agy_tool ~index:5 ~state:"DONE" ~name:"replace_file_content" (`Assoc [("TargetFile", `String "/w/a.txt")]) ]);
+  Alcotest.(check (list string)) "no deltas streamed: result supplies the reply"
+    ["text:ok"; "result:c0"]
+    (agy_stream_events [
+       {|{"event":"result","result":{"conversation_id":"c0","status":"SUCCESS","response":"ok"}}|} ]);
+  Alcotest.(check (list string)) "a fresh parser per run: no state leaks between runs"
+    ["text:ok"; "result:c0"]
+    (ignore (agy_stream_events [agy_text ~index:1 ~state:"DONE" "earlier run"]);
+     agy_stream_events [
+       {|{"event":"result","result":{"conversation_id":"c0","status":"SUCCESS","response":"ok"}}|} ])
+
 let agy_tests = [
   Alcotest.test_case "signed-out result" `Quick test_agy_signed_out_result;
   Alcotest.test_case "success result" `Quick test_agy_success_result;
@@ -4446,6 +4539,9 @@ let agy_tests = [
   Alcotest.test_case "args: --add-dir" `Quick test_agy_args_add_dir;
   Alcotest.test_case "prompt: no notice when MCP wired" `Quick
     test_agy_prompt_no_notice_with_mcp;
+  Alcotest.test_case "stream: successful run" `Quick test_agy_stream_successful_run;
+  Alcotest.test_case "stream: tool names" `Quick test_agy_stream_tool_names;
+  Alcotest.test_case "stream: edges" `Quick test_agy_stream_edges;
   Alcotest.test_case "fresh args" `Quick test_agy_args_fresh;
   Alcotest.test_case "resume args" `Quick test_agy_args_resume;
   Alcotest.test_case "dash-prefixed prompt" `Quick test_agy_args_dash_prompt;

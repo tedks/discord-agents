@@ -61,17 +61,33 @@ Signed in, a run emits `init`, then one `step_update` per step, then
 {"event":"result","result":{"conversation_id":"b94541d7-…","status":"ERROR","response":"","error":"Individual quota reached. …","num_turns":1, …}}
 ```
 
-`step_update` carried no text or tool detail in these runs. The binary
-has a `text_delta` struct tag, but no successful turn has been captured
-to show where text and tool calls appear. **Text-delta and tool-step
-shapes are still unverified.** The parser reads the id from `init` and
-`result`, takes the reply from `result.response`, and passes
-`step_update` through as `Other`. agy's built-in tools include
-`run_command`, `view_file`, `replace_file_content`,
-`multi_replace_file_content`, `write_to_file`, `grep_search`,
-`find_by_name`, `list_dir`, `search_web` and `read_url_content`. MCP
-tools are reached through a generic `call_mcp_tool`, not listed
-individually in `init`.
+In those quota-failed runs, `step_update` carried no text or tool detail. A successful run (captured 2026-10-24, once the quota reset) shows where they are:
+
+```json
+{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"tool","tool_name":"call_mcp_tool","tool_info":{"name":"call_mcp_tool","parameters":{"Arguments":{},"ServerName":"discord_agents","ToolName":"list_projects"}}}}
+{"event":"step_update","step_update":{"step_index":3,"state":"DONE","step_type":"tool","tool_name":"call_mcp_tool","tool_info":{"name":"call_mcp_tool","parameters":{…},"output":"1. …"}}}
+{"event":"step_update","step_update":{"step_index":9,"state":"ACTIVE","step_type":"agent_response","text_delta":"`list_projects` returned 73 projects; …"}}
+{"event":"step_update","step_update":{"step_index":9,"state":"DONE","step_type":"agent_response","text_delta":"…`zotero-scholar-citations`.\n"}}
+{"event":"result","result":{"conversation_id":"…","status":"SUCCESS","response":"<the same text>", …}}
+```
+
+- **Text:** `agent_response` steps carry `text_delta`. Planner responses that only call tools carry none.
+- **Tools:** each tool step is `ACTIVE`, with name and parameters, then `DONE`, with `tool_info.output`. Edit tools give no output and only `TargetFile`.
+- **Result:** `result.response` repeats the streamed text, so it's shown only when nothing streamed.
+- **Status:** the success value is `SUCCESS`.
+
+Parameter names seen on the wire:
+
+| Tool | Parameters |
+|---|---|
+| `run_command` | `CommandLine` |
+| `view_file` | `AbsolutePath` |
+| `write_to_file`, `replace_file_content` | `TargetFile` |
+| `grep_search` | `Query`, `SearchPath` |
+| `list_dir` | `DirectoryPath` |
+| `call_mcp_tool` | `ServerName`, `ToolName`, `Arguments` |
+
+MCP tools aren't listed in `init`; they're reached through `call_mcp_tool`.
 
 ### Other verified behaviour
 
@@ -190,10 +206,7 @@ With only the cwd set, agy reports "No workspace is open" and its file tools wor
 
 ## Remaining
 
-1. Capture a **successful** `stream-json` turn that uses tools, once the
-   account quota resets. Then parse text deltas and tool steps and add
-   `agy_tool_name_of`.
-2. MCP for remote agy turns (the executor's own global config, plus a route back to the writer).
-3. Decide whether to detect a signed-out run early (stderr
+1. MCP for remote agy turns (the executor's own global config, plus a route back to the writer).
+2. Decide whether to detect a signed-out run early (stderr
    `Authentication required`) instead of waiting out agy's 60s auth
    timeout.
