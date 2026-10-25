@@ -17,11 +17,14 @@ let test_decode () =
      document (List.init 513 (fun i -> record ~path:("/" ^ string_of_int i) ()))];
   List.iter (fun url -> check "no cross-host identity for private/local remotes" None (S.repository_key url))
     ["/srv/repo.git"; "../repo"; "file:///repo"; "https://token:secret@example.org/repo.git";
-     "https://example.org/repo?token=secret"; "https://example.org/repo#secret"];
-  check "arbitrary server paths retain case" (Some "example.org/Owner/Repo")
+     "https://example.org/repo?token=secret"; "https://example.org/repo#secret"; "https://token:secret@github.com/org/repo";
+     "https://github.com/org/repo?secret=token"; "https://example.org/.git"];
+  check "arbitrary server paths retain case" (Some "ssh://git@example.org/Owner/Repo")
     (S.repository_key "ssh://git@example.org/Owner/Repo.git");
-  check "scp same identity" (S.repository_key "ssh://git@example.org/Owner/Repo.git")
-    (S.repository_key "git@example.org:Owner/Repo.git")
+  check "scp home-relative path differs from absolute SSH URL" false
+    (S.repository_key "ssh://git@example.org/Owner/Repo.git" = S.repository_key "git@example.org:Owner/Repo.git");
+  check "HTTP and SSH identities conservative outside GitHub" false
+    (S.repository_key "https://example.org/Owner/Repo.git" = S.repository_key "ssh://git@example.org/Owner/Repo.git")
 
 let test_refusal_and_transport () =
   let calls = ref 0 in
@@ -34,6 +37,7 @@ let test_refusal_and_transport () =
   check "one command" 1 !calls;
   check "disabled" (Error (S.Transport Disabled))
     (S.observe ~run ~host:{remote with enabled=false} ~roots:["/"]);
+  check "no roots is not a scan" (Error S.Invalid_roots) (S.observe ~run ~host:remote ~roots:[]);
   check "relative roots" (Error S.Invalid_roots) (S.observe ~run ~host:remote ~roots:["relative"]);
   check "too many roots" (Error S.Invalid_roots) (S.observe ~run ~host:remote ~roots:(List.init 33 (fun _ -> "/")));
   check "no refused commands" 1 !calls;
@@ -49,7 +53,7 @@ let rec remove dir =
   | Unix.S_DIR -> Sys.readdir dir |> Array.iter (fun name -> remove (Filename.concat dir name)); Unix.rmdir dir
   | _ -> Unix.unlink dir
 let test_real_scan () =
-  let dir = Filename.temp_dir "inventory ' " "" in
+  let dir = Unix.realpath (Filename.temp_dir "inventory ': " "") in
   Fun.protect ~finally:(fun () -> remove dir) (fun () ->
     let base = Filename.concat dir "projects" in Unix.mkdir base 0o700;
     let repo = Filename.concat base "repo" and bare = Filename.concat base "bare" in
@@ -72,6 +76,26 @@ let test_real_scan () =
           check "bare metadata" true (List.exists (fun (p:S.project) -> p.path=bare && p.is_bare) projects);
           check "origin identity" true (List.exists (fun (p:S.project) -> p.path=repo && p.repository=Some "github.com/tedks/repo") projects);
           check "missing root fails whole scan" true (Result.is_error (scan host [base; dir ^ "/missing"]))) [local;remote];
+      run ["git";"-C";repo;"-c";"user.email=test@example.invalid";"-c";"user.name=Fixture";
+           "-c";"commit.gpgsign=false";"commit";"-q";"--allow-empty";"-m";"fixture"];
+      let linked = Filename.concat base "linked" in
+      run ["git";"-C";repo;"worktree";"add";"-q";linked];
+      (match scan local [base] with
+       | Ok ps -> check "gitfile worktree supported" true (List.exists (fun (p:S.project) -> p.path=linked) ps)
+       | Error _ -> Alcotest.fail "gitfile scan failed");
+      run ["git";"init";"-q";base];
+      let partial = Filename.concat base "partial" in Unix.mkdir partial 0o700;
+      Unix.mkdir (Filename.concat partial ".git") 0o700;
+      check "broken .git directory cannot borrow parent repo" true (Result.is_error (scan local [base]));
+      Unix.rmdir (Filename.concat partial ".git"); Unix.rmdir partial;
+      let private_repo = Filename.concat group "private" in
+      run ["git";"init";"-q";private_repo];
+      if Unix.geteuid () <> 0 then begin
+        Unix.chmod private_repo 0;
+        Fun.protect ~finally:(fun () -> Unix.chmod private_repo 0o700) (fun () ->
+          check "unsearchable nested repo fails whole scan" true (Result.is_error (scan local [base])))
+      end;
+      check "base repo does not list its .git internals" (Ok []) (scan local [repo]);
       let empty = Filename.concat dir "empty" in Unix.mkdir empty 0o700;
       check "successful empty scan" (Ok []) (scan local [empty]);
       check "unreachable" (Error (S.Transport Unreachable)) (scan {remote with transport=H.Ssh "unreachable"} [base]);

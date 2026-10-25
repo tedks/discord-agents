@@ -8,7 +8,7 @@ let timeout_s = 30
 let valid_text s = s <> "" && String.length s <= 4096 &&
   not (String.contains s '\000') && Resource.sanitize_utf8 s = s
 let valid_path s = valid_text s && String.starts_with ~prefix:"/" s
-let valid_roots roots = List.length roots <= 32 && List.for_all valid_path roots &&
+let valid_roots roots = roots <> [] && List.length roots <= 32 && List.for_all valid_path roots &&
   List.fold_left (fun n s -> n + String.length s) 0 roots <= 8192
 
 (* Only network repository identities can group across hosts. Local and
@@ -20,19 +20,23 @@ let repository_key url =
   | Some (owner, repo) -> Some ("github.com/" ^ owner ^ "/" ^ String.lowercase_ascii repo)
   | None ->
     let key host port path =
+      let path = if String.starts_with ~prefix:"/" path then String.sub path 1 (String.length path - 1) else path in
+      let path = Project.strip_suffix path ".git" in
       if host = "" || path = "" || path = "/" then None
-      else Some (String.lowercase_ascii host ^ port ^ "/" ^
-        Project.strip_suffix (if path.[0] = '/' then String.sub path 1 (String.length path - 1) else path) ".git") in
+      else Some (String.lowercase_ascii host ^ port ^ "/" ^ path) in
     let uri = Uri.of_string url in
     match Uri.scheme uri, Uri.host uri with
     | Some ("https" | "http" | "ssh" | "git" as scheme), Some host
       when Uri.query uri = [] && Uri.fragment uri = None &&
         (Uri.userinfo uri = None || (scheme = "ssh" && Uri.userinfo uri = Some "git")) ->
-      key host (match Uri.port uri with None -> "" | Some port -> ":" ^ string_of_int port) (Uri.path uri)
+      Option.map (fun key -> scheme ^ "://" ^
+        (if Uri.userinfo uri = Some "git" then "git@" else "") ^ key)
+        (key host (match Uri.port uri with None -> "" | Some port -> ":" ^ string_of_int port) (Uri.path uri))
     | _ ->
       if String.starts_with ~prefix:"git@" url && not (String.contains url '?') && not (String.contains url '#') then
         match String.split_on_char ':' (String.sub url 4 (String.length url - 4)) with
-        | [host; path] when Result.is_ok (Host.validate_name host) -> key host "" path
+        | [host; path] when Result.is_ok (Host.validate_name host) && path <> "" ->
+          Some ("scp:git@" ^ String.lowercase_ascii host ^ ":" ^ path)
         | _ -> None
       else None
 
@@ -72,8 +76,8 @@ entries_seen = 0
 projects = {}
 env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
 env['GIT_TERMINAL_PROMPT'] = '0'
-def git(path, args, absent=False):
-    p = subprocess.Popen(['git', '-C', path] + args, stdin=subprocess.DEVNULL,
+def git(path, git_dir, args, absent=False):
+    p = subprocess.Popen(['git', '--git-dir=' + git_dir, '-C', path] + args, stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
     try:
         data = p.stdout.read(8193)
@@ -98,23 +102,34 @@ def children(path):
             entries_seen += 1
             if entries_seen > LIMIT:
                 raise ValueError('directory entry limit')
+            if entry.name == '.git':
+                continue
             # Follow symlinks, matching local project discovery. Depth is fixed;
             # real paths deduplicate aliases. Broken links/churn fail the scan.
             if stat.S_ISDIR(entry.stat(follow_symlinks=True).st_mode):
                 result.append(entry.name)
     return sorted(result)
+def exists(path, follow=True):
+    try:
+        os.stat(path, follow_symlinks=follow)
+        return True
+    except FileNotFoundError:
+        return False
+
 def candidate(path, name):
     path = os.path.realpath(path, strict=True)
-    marker = os.path.lexists(os.path.join(path, '.git'))
-    bare = all(os.path.exists(os.path.join(path, item)) for item in ('HEAD', 'objects', 'refs'))
+    marker = exists(os.path.join(path, '.git'), follow=False)
+    bare = all(exists(os.path.join(path, item)) for item in ('HEAD', 'objects', 'refs'))
     if not (marker or bare):
         return False
     if path in projects:
         return True
-    actual_bare = git(path, ['rev-parse', '--is-bare-repository']).strip()
+    # Explicit metadata also handles gitfiles; never search an enclosing repo.
+    git_dir = os.path.join(path, '.git') if marker else path
+    actual_bare = git(path, git_dir, ['rev-parse', '--is-bare-repository']).strip()
     if actual_bare not in ('true', 'false'):
         raise ValueError('invalid git response')
-    remote = git(path, ['config', '--local', '--null', '--get', 'remote.origin.url'], absent=True)
+    remote = git(path, git_dir, ['config', '--local', '--null', '--get', 'remote.origin.url'], absent=True)
     if remote is not None:
         if not remote.endswith('\0') or '\0' in remote[:-1]:
             raise ValueError('invalid remote response')
@@ -137,10 +152,10 @@ try:
                     if nested > 10:
                         raise ValueError('nested project limit')
     text = json.dumps(dict(version=1, projects=list(projects.values())), ensure_ascii=True)
-    if len(text) > 524288:
+    if len(text) + 1 > 524288:
         raise ValueError('inventory output limit')
     print(text)
-except (OSError, ValueError, UnicodeError):
+except Exception:
     # Never emit partial inventory or raw Git/SSH/credential diagnostics.
     sys.exit(1)
 |python}
