@@ -4216,7 +4216,10 @@ let test_agy_later_turn_has_no_context () =
     ~agent_kind:Discord_agents.Config.Agy
     ~system_prompt:(Some "you are a lead") ~message_count:3
     ~goal_context:None ~user_prompt:"hi" () in
-  Alcotest.(check string) "history carries it; prompt passes through" "hi" out
+  Alcotest.(check string)
+    "history carries the system prompt; later turns restate MCP state"
+    "<bot-context>discord-agents MCP tools are NOT available this turn; do not attempt them.</bot-context>\n\nhi"
+    out
 
 (* ── agy MCP via the user-global config ── *)
 
@@ -4237,62 +4240,116 @@ let agy_servers_of text =
 
 let test_agy_mcp_update_cases () =
   let k x = agy_update_kind (AP.agy_mcp_config_update x) in
+  let ours_args = Yojson.Safe.to_string AP.agy_mcp_args_json in
   Alcotest.(check string) "missing file: write" "write" (k None);
   Alcotest.(check string) "empty file (agy ships one): write" "write" (k (Some " \n"));
-  Alcotest.(check string) "garbage is left alone" "declined:not valid JSON"
-    (k (Some "{not json"));
-  Alcotest.(check string) "non-object is left alone" "declined:not a JSON object"
-    (k (Some "[1,2]"));
-  Alcotest.(check string) "non-object mcpServers is left alone"
-    "declined:mcpServers is not an object" (k (Some {|{"mcpServers": []}|}));
+  List.iter (fun (label, text, why) ->
+    Alcotest.(check string) label ("declined:" ^ why) (k (Some text)))
+    [ "garbage", "{not json", "not valid JSON";
+      "non-object", "[1,2]", "not a JSON object";
+      "non-object mcpServers", {|{"mcpServers": []}|}, "mcpServers is not an object";
+      "comments would be dropped", "{\"a\": 1 // keep me\n}", "has comments, which a rewrite would drop";
+      "block comment", "{/* x */ \"a\": 1}", "has comments, which a rewrite would drop";
+      "duplicate mcpServers", {|{"mcpServers":{},"mcpServers":{"x":{}}}|}, "has more than one mcpServers key";
+      "duplicate ours", {|{"mcpServers":{"discord_agents":{},"discord_agents":{}}}|}, "has more than one discord_agents entry";
+      "someone else's discord_agents", {|{"mcpServers":{"discord_agents":{"command":"their-server"}}}|},
+        "a different discord_agents server is configured there";
+      "user disabled ours", Printf.sprintf {|{"mcpServers":{"discord_agents":{"command":"/bin/sh","args":%s,"disabled":true}}}|} ours_args,
+        "the discord_agents entry is disabled there";
+      "non-finite number", {|{"x": 1e400}|}, "would not re-serialise as standard JSON" ];
+  Alcotest.(check string) "a // inside a string is not a comment" "write"
+    (k (Some {|{"url": "https://example.com/x"}|}));
+  Alcotest.(check string) "ours plus IDE-added keys: present, no rewrite" "present"
+    (k (Some (Printf.sprintf {|{"mcpServers":{"discord_agents":{"command":"/bin/sh","args":%s,"disabled":false,"env":{}}}}|} ours_args)));
   (match AP.agy_mcp_config_update
-           (Some {|{"theme":"dark","mcpServers":{"mine":{"command":"x"},"discord_agents":{"command":"old"}}}|}) with
+           (Some {|{"theme":"dark","mcpServers":{"mine":{"command":"x"},"discord_agents":{"command":"/bin/sh","args":["-c","exec \"$DISCORD_AGENTS_MCP_FOR_AGY\""],"env":{"K":"V"}}}}|}) with
    | AP.Agy_mcp_write text ->
-     Alcotest.(check (list string)) "user servers kept, ours replaced once"
+     Alcotest.(check (list string)) "older entry of ours updated in place"
        ["mine"; "discord_agents"] (agy_servers_of text);
-     Alcotest.(check bool) "unrelated keys kept" true
-       (match Yojson.Safe.from_string text with
-        | `Assoc f -> List.assoc_opt "theme" f = Some (`String "dark")
-        | _ -> false);
-     Alcotest.(check string) "rewritten file is now up to date" "present"
-       (k (Some text))
+     let json = Yojson.Safe.from_string text in
+     let open Yojson.Safe.Util in
+     Alcotest.(check string) "unrelated keys kept" "dark" (json |> member "theme" |> to_string);
+     Alcotest.(check bool) "extra keys on our entry kept" true
+       (json |> member "mcpServers" |> member "discord_agents" |> member "env" <> `Null);
+     Alcotest.(check string) "rewritten file is now up to date" "present" (k (Some text))
    | other -> Alcotest.failf "expected a write, got %s" (agy_update_kind other))
 
-let test_agy_mcp_setup_file () =
+let with_temp_dir f =
   let dir = Filename.temp_dir "agy-mcp-config" "" in
   Fun.protect
     ~finally:(fun () -> ignore (Sys.command (Filename.quote_command "rm" ["-rf"; "--"; dir])))
-    (fun () ->
-       Alcotest.(check bool) "no agy config dir: not created, no MCP" false
-         (AP.setup_agy_mcp ~path:(Filename.concat dir "absent/mcp_config.json") ());
-       Alcotest.(check bool) "absent dir stays absent" false
-         (Sys.file_exists (Filename.concat dir "absent"));
-       let path = Filename.concat dir "mcp_config.json" in
-       Out_channel.with_open_bin path (fun oc -> output_string oc "");
-       Alcotest.(check bool) "installs into agy's empty file" true (AP.setup_agy_mcp ~path ());
-       let first = In_channel.with_open_bin path In_channel.input_all in
-       Alcotest.(check bool) "second run: still present" true (AP.setup_agy_mcp ~path ());
-       Alcotest.(check string) "and nothing rewritten" first
-         (In_channel.with_open_bin path In_channel.input_all);
-       Out_channel.with_open_bin path (fun oc -> output_string oc "{broken");
-       Alcotest.(check bool) "broken user file: no MCP" false (AP.setup_agy_mcp ~path ());
-       Alcotest.(check string) "and left untouched" "{broken"
-         (In_channel.with_open_bin path In_channel.input_all))
+    (fun () -> f dir)
+
+let read_all path = In_channel.with_open_bin path In_channel.input_all
+
+let test_agy_mcp_setup_file () =
+  with_temp_dir (fun dir ->
+    let lock_path = Filename.concat dir "bot.lock" in
+    let setup path = AP.setup_agy_mcp ~path ~lock_path () in
+    Alcotest.(check bool) "no agy config dir: not created, no MCP" false
+      (setup (Filename.concat dir "absent/mcp_config.json"));
+    Alcotest.(check bool) "absent dir stays absent" false
+      (Sys.file_exists (Filename.concat dir "absent"));
+    let path = Filename.concat dir "mcp_config.json" in
+    Out_channel.with_open_bin path (fun oc -> output_string oc "");
+    Unix.chmod path 0o644;
+    Alcotest.(check bool) "installs into agy's empty file" true (setup path);
+    Alcotest.(check int) "file mode kept" 0o644 ((Unix.stat path).Unix.st_perm);
+    let first = read_all path in
+    Alcotest.(check bool) "ends with exactly one newline" true
+      (String.ends_with ~suffix:"}\n" first && not (String.ends_with ~suffix:"\n\n" first));
+    Alcotest.(check bool) "second run: still present" true (setup path);
+    Alcotest.(check string) "and nothing rewritten" first (read_all path);
+    Alcotest.(check (list string)) "no lock or temp litter beside the config"
+      ["mcp_config.json"]
+      (List.filter (fun f -> String.starts_with ~prefix:"mcp_config" f)
+         (Array.to_list (Sys.readdir dir)));
+    Out_channel.with_open_bin path (fun oc -> output_string oc "{broken");
+    Alcotest.(check bool) "broken user file: no MCP" false (setup path);
+    Alcotest.(check string) "and left untouched" "{broken" (read_all path);
+    let real = Filename.concat dir "managed.json" and link = Filename.concat dir "link/mcp_config.json" in
+    Unix.mkdir (Filename.concat dir "link") 0o755;
+    Out_channel.with_open_bin real (fun oc -> output_string oc "{}");
+    Unix.symlink real link;
+    Alcotest.(check bool) "symlinked config: no MCP" false (setup link);
+    Alcotest.(check bool) "symlink kept" true ((Unix.lstat link).Unix.st_kind = Unix.S_LNK);
+    Alcotest.(check string) "target untouched" "{}" (read_all real))
+
+let test_agy_mcp_replace_refuses_changed_file () =
+  with_temp_dir (fun dir ->
+    let path = Filename.concat dir "mcp_config.json" in
+    Out_channel.with_open_bin path (fun oc -> output_string oc "{\"user\":2}");
+    Alcotest.(check bool) "content changed since read: refused" false
+      (AP.replace_agy_mcp_file ~path ~expected:(Some "{\"user\":1}") ~perm:0o644 "ours");
+    Alcotest.(check string) "user's newer content survives" "{\"user\":2}" (read_all path);
+    Alcotest.(check bool) "file appeared since read as missing: refused" false
+      (AP.replace_agy_mcp_file ~path ~expected:None ~perm:0o644 "ours");
+    Alcotest.(check bool) "unchanged: replaced" true
+      (AP.replace_agy_mcp_file ~path ~expected:(Some "{\"user\":2}") ~perm:0o640 "ours");
+    Alcotest.(check string) "new content" "ours" (read_all path);
+    Alcotest.(check int) "requested mode" 0o640 ((Unix.stat path).Unix.st_perm);
+    Alcotest.(check (list string)) "no temp files left" ["mcp_config.json"]
+      (Array.to_list (Sys.readdir dir)))
 
 let test_agy_mcp_entry_gate () =
-  (* Run the entry's own command line, the way agy would. *)
-  let argv = match AP.agy_mcp_entry with
-    | `Assoc f ->
-      (match List.assoc "command" f, List.assoc "args" f with
-       | `String c, `List a -> c :: List.map (function `String x -> x | _ -> "") a
-       | _ -> [])
-    | _ -> [] in
-  let run env =
-    let cmd = String.concat " " (List.map Filename.quote (["env"; "-i"] @ env @ argv)) in
-    Sys.command (cmd ^ " </dev/null >/dev/null 2>&1") in
-  Alcotest.(check int) "unset: exits 0 without running anything" 0 (run []);
-  Alcotest.(check int) "set: execs the named server" 1
-    (run [AP.agy_mcp_env_var ^ "=/bin/false"])
+  (* Run the entry's own command line, the way agy would, against a
+     stand-in server that exits 42 (no /bin/false on NixOS). *)
+  with_temp_dir (fun dir ->
+    let server = Filename.concat dir "server" in
+    Out_channel.with_open_bin server (fun oc -> output_string oc "#!/bin/sh\nexit 42\n");
+    Unix.chmod server 0o755;
+    let argv = match AP.agy_mcp_entry with
+      | `Assoc f ->
+        (match List.assoc "command" f, List.assoc "args" f with
+         | `String c, `List a -> c :: List.map (function `String x -> x | _ -> "") a
+         | _ -> [])
+      | _ -> [] in
+    let run env =
+      let cmd = String.concat " " (List.map Filename.quote (["env"; "-i"] @ env @ argv)) in
+      Sys.command (cmd ^ " </dev/null >/dev/null 2>&1") in
+    Alcotest.(check int) "unset: exits 0 without running anything" 0 (run []);
+    Alcotest.(check int) "set: execs the named server" 42
+      (run [AP.agy_mcp_env_var ^ "=" ^ server]))
 
 let test_agy_mcp_env_not_inherited () =
   let env = AP.child_environment
@@ -4308,6 +4365,22 @@ let test_agy_args_add_dir () =
   Alcotest.(check bool) "empty working dir: no dangling --add-dir" false
     (List.mem "--add-dir"
        (agy_args ~working_dir:"" ~session_id:"x" ~session_id_confirmed:false "hi"))
+
+let test_agy_prompt_later_turn_status () =
+  let later available =
+    AP.compose_session_prompt ~agy_mcp:available
+      ~agent_kind:Discord_agents.Config.Agy
+      ~system_prompt:(Some "you are a lead") ~message_count:4
+      ~goal_context:None ~user_prompt:"hi" () in
+  Alcotest.(check string) "later turn restates availability"
+    "<bot-context>discord-agents MCP tools are available this turn.</bot-context>\n\nhi"
+    (later true);
+  Alcotest.(check bool) "and says when they are gone" true
+    (String.starts_with ~prefix:"<bot-context>discord-agents MCP tools are NOT available"
+       (later false));
+  Alcotest.(check string) "no system prompt (thread session): untouched" "hi"
+    (AP.compose_session_prompt ~agy_mcp:false ~agent_kind:Discord_agents.Config.Agy
+       ~system_prompt:None ~message_count:4 ~goal_context:None ~user_prompt:"hi" ())
 
 let test_agy_prompt_no_notice_with_mcp () =
   let out = AP.compose_session_prompt ~agy_mcp:true
@@ -4342,6 +4415,9 @@ let agy_tests = [
   Alcotest.test_case "mcp: config update cases" `Quick test_agy_mcp_update_cases;
   Alcotest.test_case "mcp: setup against a file" `Quick test_agy_mcp_setup_file;
   Alcotest.test_case "mcp: entry gate" `Quick test_agy_mcp_entry_gate;
+  Alcotest.test_case "mcp: replace refuses a changed file" `Quick
+    test_agy_mcp_replace_refuses_changed_file;
+  Alcotest.test_case "prompt: later-turn MCP status" `Quick test_agy_prompt_later_turn_status;
   Alcotest.test_case "mcp: env var not inherited" `Quick test_agy_mcp_env_not_inherited;
   Alcotest.test_case "args: --add-dir" `Quick test_agy_args_add_dir;
   Alcotest.test_case "prompt: no notice when MCP wired" `Quick

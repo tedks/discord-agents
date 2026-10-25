@@ -152,15 +152,30 @@ Measured on 2026-10-24 with a wrapper that records being launched and then execs
 | `<cwd>/.agents/mcp_config.json` | **no** |
 | `~/.gemini/config/mcp_config.json` (global) | **yes**: launched at startup, cwd = workspace, agy's env inherited |
 
-Ted ruled (2026-10-24) that agy gets the MCP tools. The bot keeps one static, inert entry in the global file:
+Operator approved (2026-10-24, issue #161) giving agy the MCP tools. The bot keeps one static, inert entry in the global file:
 
 ```json
 {"mcpServers":{"discord_agents":{"command":"/bin/sh","args":["-c","[ -n \"$DISCORD_AGENTS_MCP_FOR_AGY\" ] || exit 0; exec \"$DISCORD_AGENTS_MCP_FOR_AGY\"","discord-agents-mcp"]}}}
 ```
 
-- The entry is merged in and other servers are kept. The file is rewritten only when the entry is missing or differs. A file the bot can't parse, or whose `mcpServers` isn't an object, is left alone, and the session runs without MCP.
+- The entry is merged in, and other servers and keys are kept. The file is rewritten only when our entry is missing or out of date. Extra keys on our entry, from the user or the IDE, are kept and don't trigger a rewrite. A rewrite pretty-prints the whole file, so whitespace changes.
+- The file is left alone, and the session runs without MCP, when it:
+  - is a symlink;
+  - won't parse, isn't an object, or has a non-object `mcpServers`;
+  - has duplicate `mcpServers` keys or duplicate `discord_agents` entries;
+  - has comments, which a rewrite would drop;
+  - holds a number that wouldn't re-serialise as JSON (e.g. `1e400`);
+  - names someone else's server `discord_agents`;
+  - has our entry marked `"disabled": true`.
+
+  The reason is logged once.
+- Writes follow the dotfiles installer for `config.json`: a bot-owned lock (`~/.config/discord-agents/agy-mcp-config.lock`), raw bytes kept, re-read just before the rename, refusal if anything changed, and the original mode preserved. agy and the IDE don't take that lock, so a change in the final instant before the rename can still be lost.
+- `~/.gemini/config/` must already exist: run agy once. The bot doesn't create agy's state.
 - The bot sets `DISCORD_AGENTS_MCP_FOR_AGY` to the resolved server, and only on its local agy children. Every child's inherited copy is stripped first.
 - With the variable unset (the user's own agy), the server exits at once, and agy's turn still succeeds (verified).
+- Processes agy itself starts inherit the variable. A nested `agy` run from inside an agy session also gets the tools, under the parent's thread id. That's acceptable under the single-tenant trust model.
+- MCP availability is decided per turn. The first turn's bot-context carries the full notice when the tools are missing. Later turns of a channel session carry a one-line status, so a first-turn "unavailable" doesn't stick once the tools come back.
+- `--add-dir` together with `--conversation` on a resumed turn: verified (same conversation id, tools in the workspace).
 - Verified end to end: agy called `list_sessions` on the live bot through `call_mcp_tool`, with the caller's thread id intact.
 - Remote agy turns don't get MCP yet: the executor has its own agy config and no route back. They get the no-MCP notice.
 
