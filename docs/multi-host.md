@@ -42,7 +42,12 @@ configured host using its roots, or the top-level roots when no override is set.
 Only one inventory refresh runs at a time; refusal happens before contacting
 unknown, disabled or unroutable hosts. The writer checks its cache disk policy,
 saves the new observation atomically, and publishes only after confirmed save.
-Cache errors remain visible. Renamed/removed hosts are pruned from this cache.
+Cache errors remain visible. A failed startup load is retried before refresh;
+if it still fails, refresh is refused until the cache is repaired or removed.
+A refresh never silently replaces unreadable history with one host. The raw
+refresh response uses `ok` for completion of the observation workflow and
+`scan_succeeded` for acceptance of the scan; its report states any failure.
+Renamed/removed hosts are pruned from this cache.
 MCP `list_project_inventory {offset?, limit?}` reads that cache without probes.
 It groups network repository identities while preserving every host/path
 location; repositories without network identities remain host/path-specific.

@@ -7,12 +7,24 @@ type t = {
   path : string;
   mutable entries : Store.t;
   mutable cache_error : string option;
+  mutable load_failed : bool;
   mutable busy : bool;
 }
-let create path =
-  let entries, cache_error = match Store.load path with
+let create ?(load=Store.load) path =
+  let entries, cache_error = match load path with
     | Ok entries -> entries, None | Error message -> [], Some message in
-  {path; entries; cache_error; busy=false}
+  {path; entries; cache_error; load_failed=Option.is_some cache_error; busy=false}
+(* A failed startup read is not an authoritative empty cache. Retry only
+   that condition while holding the refresh slot; save failures keep their
+   already-known in-memory state and are not silently reloaded. *)
+let ensure_loaded t =
+  if not t.load_failed then Ok ()
+  else match Store.load t.path with
+    | Error message ->
+      t.cache_error <- Some message;
+      Error "Project inventory cache is unreadable; repair or remove the cache file before refreshing."
+    | Ok entries ->
+      t.entries <- entries; t.cache_error <- None; t.load_failed <- false; Ok ()
 let roots ~base_directories host = Option.value host.Host.base_directories ~default:base_directories
 let hosts ~local_name registry = Host_diagnostics.hosts ~local_name registry
 let configured ~local_name registry =
@@ -30,6 +42,9 @@ let refresh ?(save=fun path entries -> Store.save path entries) ~collect ~prefli
     else begin
       t.busy <- true;
       Fun.protect ~finally:(fun () -> t.busy <- false) (fun () ->
+        match ensure_loaded t with
+        | Error e -> Error e
+        | Ok () ->
         match preflight t.path with
         | Error _ -> Error "Project inventory cache is not writable under the current disk policy."
         | Ok () ->

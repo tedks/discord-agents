@@ -63,6 +63,31 @@ let test_refresh () = with_store (fun store ->
   let too_many=Some H.{writer="writer";hosts=List.init 65(fun i -> H.local_host ("h"^string_of_int i))} in
   check "host bound" true (Result.is_error (S.listing ~now:101. ~local_name:"writer" ~registry:too_many
     ~base_directories:roots ~offset:0 ~limit:8 store)))
+let test_load_recovery () = with_store (fun store ->
+  let initial=record (record [] local [project "/local/repo"]) remote [project "/remote/repo"] in
+  ignore(get(I.save store.path initial));
+  let recovering=S.create ~load:(fun _ -> Error "injected transient read failure") store.path in
+  check "failed load identified separately" true recovering.load_failed;
+  let calls=ref 0 in
+  let collect ~host:_ ~roots:_ = incr calls; Ok [project "/remote/new"] in
+  ignore(get(refresh ~collect recovering "remote"));
+  check "load retried before one scan" 1 !calls;
+  check "other host preserved through recovery" 2 (int "total_locations" (listing recovering));
+  check "other host exact data preserved" (I.find initial local) (I.find recovering.entries local);
+  check "recovery durable" (Ok recovering.entries) (I.load store.path);
+  check "load warning cleared after recovery" false recovering.load_failed;
+  Out_channel.with_open_bin store.path (fun oc -> output_string oc "broken");
+  let broken=S.create store.path in
+  calls := 0;
+  check "unreadable cache blocks refresh" true (Result.is_error (refresh ~collect broken "remote"));
+  check "unreadable cache prevents scan" 0 !calls;
+  check "unreadable cache warning persists" true (Option.is_some broken.cache_error);
+  check "slot released after refused recovery" false broken.busy;
+  check "bad file preserved for repair" "broken"
+    (In_channel.with_open_bin store.path In_channel.input_all);
+  ignore(get(I.save store.path initial));
+  ignore(get(refresh ~collect broken "remote"));
+  check "repair recovers every host" 2 (int "total_locations" (listing broken)))
 let test_listing () = with_store (fun store ->
   let ps = [project "/projects/a"; project "/projects/b";project ~repository:None "/projects/local"] in
   store.entries <- record (record [] local ps) remote ps;
@@ -103,6 +128,7 @@ let test_listing () = with_store (fun store ->
   Out_channel.with_open_bin store.path (fun oc -> output_string oc "broken");
   check "corrupt cache warning preserved" true (Option.is_some (S.create store.path).cache_error))
 let () = Alcotest.run "Host project service" ["inventory",[
+  Alcotest.test_case "cache load recovery preserves other hosts" `Quick test_load_recovery;
   Alcotest.test_case "refresh provenance, refusal and atomic publication" `Quick test_refresh;
   Alcotest.test_case "grouped paginated observations and display" `Quick test_listing;
 ]]

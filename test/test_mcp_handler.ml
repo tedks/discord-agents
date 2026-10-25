@@ -2758,6 +2758,20 @@ let test_login_host_render_boundary () =
       (Discord_agents.Resource.contains_substring ~haystack:text
         ~needle:"\nInjected instruction")
 
+let test_inventory_default_arguments () =
+  let client=Control_client.make ~request:(fun request ->
+    Alcotest.(check string) "default inventory method" "list_project_inventory" request.method_name;
+    Alcotest.(check bool) "omitted arguments become empty object" true (request.params = Some (`Assoc []));
+    Ok (`Assoc ["ok",`Bool true;"report",`String "cached inventory"])) in
+  let response=Mcp_server.handle_line ~handle_tool_call:(Mcp_handler.handle_tool_call ~control_client:client)
+    {|{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_project_inventory"}}|} in
+  match response with
+  | None -> Alcotest.fail "missing inventory response"
+  | Some response ->
+    let open Yojson.Safe.Util in
+    let content=response |> member "result" |> member "content" |> to_list |> List.hd in
+    Alcotest.(check string) "default inventory result" "cached inventory" (content |> member "text" |> to_string)
+
 let test_host_report_tools () =
   List.iter (fun (tool, arguments) ->
     List.iter (fun response ->
@@ -2781,6 +2795,7 @@ let test_host_report_tools () =
 let () =
   Alcotest.run "mcp_handler" [
     ("formatter", [
+      Alcotest.test_case "inventory default arguments" `Quick test_inventory_default_arguments;
       Alcotest.test_case "host diagnostic tool wiring" `Quick test_host_report_tools;
       Alcotest.test_case "login host render boundary" `Quick
         test_login_host_render_boundary;
