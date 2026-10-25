@@ -1942,7 +1942,7 @@ let agy_mcp_config_update existing =
          (match List.assoc_opt agy_mcp_server_name servers with
           | None -> render (with_servers (servers @ [(agy_mcp_server_name, agy_mcp_entry)]))
           | Some (`Assoc entry)
-            when List.exists (fun k -> count_key k entry > 1) ["command"; "args"; "disabled"] ->
+            when List.exists (fun (k, _) -> count_key k entry > 1) entry ->
             Agy_mcp_declined "the discord_agents entry has duplicate keys"
           | Some (`Assoc entry) ->
             let field k = List.assoc_opt k entry in
@@ -1989,14 +1989,37 @@ let read_agy_mcp_file path =
      | exception exn -> Result.Error exn)
   | _ -> Result.Error (Failure "not a regular file")
 
+(* Our temp files live next to the config (the rename must not cross
+   filesystems) under a prefix nobody else uses. agy's own atomic writes
+   use "<name>.tmp.<n>" (the binary has "config.json.tmp.%d"), so reaping
+   that pattern could delete agy's in-flight temp. *)
+let agy_mcp_temp_prefix path =
+  ".discord-agents." ^ Filename.basename path ^ ".tmp."
+
+let reap_agy_mcp_temps path =
+  let dir = Filename.dirname path and prefix = agy_mcp_temp_prefix path in
+  match Sys.readdir dir with
+  | exception Sys_error _ -> ()
+  | names ->
+    Array.iter (fun name ->
+      if String.starts_with ~prefix name then
+        let p = Filename.concat dir name in
+        match Unix.lstat p with
+        | { Unix.st_kind = Unix.S_REG; _ } -> (try Unix.unlink p with _ -> ())
+        | _ | exception _ -> ()) names
+
 (* Replace [path] with [contents] if it still holds [expected] (raw bytes;
-   [None] = must still be absent). The same durability steps as
-   [write_file_safely]/[Resource.write_file_atomic]: disk-pressure
-   preflight, temp file fsynced before the rename, parent directory
-   fsynced after it, the outcome reported to Disk_health, and stale temps
-   from a crashed earlier attempt reaped. The difference is that the
-   bytes are written exactly as given and the mode is [perm]. Must be
-   called with the agy MCP lock held. *)
+   [None] = must still be absent). Durability follows
+   [Resource.write_file_atomic]: the temp file is fsynced before the
+   rename and the parent directory after it. Differences:
+   - bytes are written exactly and the mode is [perm];
+   - a failed directory fsync is logged, not raised (the new file is
+     already in place);
+   - outcomes are deliberately not fed to Disk_health. This file sits
+     under ~/.gemini, outside the bot's state, and a failure recorded
+     there would hold the bot in read-only mode until another write
+     there succeeded. The disk-pressure preflight still applies.
+   Must be called with the agy MCP lock held. *)
 let replace_agy_mcp_file ~path ~expected ~perm contents =
   let dir = Filename.dirname path in
   match Disk_health.preflight_write path with
@@ -2004,12 +2027,15 @@ let replace_agy_mcp_file ~path ~expected ~perm contents =
   | Ok () ->
     if (try Unix.access dir [Unix.W_OK]; false with Unix.Unix_error _ -> true) then
       Result.Error "its directory is not writable"
-    else begin
-      Resource.cleanup_atomic_write_temps path;
-      let tmp = Filename.temp_file ~temp_dir:dir (Filename.basename path ^ ".tmp.") "" in
-      let cleanup () = try Sys.remove tmp with Sys_error _ -> () in
+    else
+      let tmp = ref None in
+      let cleanup () =
+        Option.iter (fun t -> try Sys.remove t with Sys_error _ -> ()) !tmp in
       match
-        let fd = Unix.openfile tmp [Unix.O_WRONLY; Unix.O_TRUNC] 0o600 in
+        reap_agy_mcp_temps path;
+        let t = Filename.temp_file ~temp_dir:dir (agy_mcp_temp_prefix path) "" in
+        tmp := Some t;
+        let fd = Unix.openfile t [Unix.O_WRONLY; Unix.O_TRUNC] 0o600 in
         Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
           Resource.write_all fd contents 0 (String.length contents);
           Unix.fchmod fd perm;
@@ -2020,18 +2046,17 @@ let replace_agy_mcp_file ~path ~expected ~perm contents =
           | _ -> false
         in
         if still then begin
-          Unix.rename tmp path;
-          (try Resource.fsync_dir dir with _ -> ());
+          Unix.rename t path;
+          tmp := None;
+          (try Resource.fsync_dir dir with exn ->
+             Logs.warn (fun m ->
+               m "agent_process: wrote %s but could not fsync %s: %s"
+                 path dir (Printexc.to_string exn)));
           true
         end else (cleanup (); false)
       with
-      | true -> Disk_health.note_write_success path; Result.Ok true
-      | false -> Result.Ok false
-      | exception exn ->
-        cleanup ();
-        Disk_health.note_write_failure path exn;
-        Result.Error (Printexc.to_string exn)
-    end
+      | ok -> Result.Ok ok
+      | exception exn -> cleanup (); Result.Error (Printexc.to_string exn)
 
 (* The last reason logged, so a persisting problem is logged once and
    not on every spawn. Cleared when MCP is available again, so a

@@ -4263,6 +4263,8 @@ let test_agy_mcp_update_cases () =
         "a different discord_agents server is configured there";
       "duplicate keys inside ours", Printf.sprintf {|{"mcpServers":{"discord_agents":{"command":"/bin/sh","args":%s,"disabled":true,"disabled":false}}}|} ours_args,
         "the discord_agents entry has duplicate keys";
+      "any duplicate key inside ours", Printf.sprintf {|{"mcpServers":{"discord_agents":{"command":"/bin/sh","args":%s,"env":{},"env":{"K":"V"}}}}|} ours_args,
+        "the discord_agents entry has duplicate keys";
       "non-finite elsewhere, ours present", Printf.sprintf {|{"x":1e400,"mcpServers":{"discord_agents":{"command":"/bin/sh","args":%s}}}|} ours_args,
         "would not re-serialise as standard JSON";
       "non-finite number", {|{"x": 1e400}|}, "would not re-serialise as standard JSON" ];
@@ -4344,7 +4346,14 @@ let test_agy_mcp_replace_refuses_changed_file () =
     Alcotest.(check string) "new content" "ours" (read_all path);
     Alcotest.(check int) "requested mode" 0o640 ((Unix.stat path).Unix.st_perm);
     Alcotest.(check (list string)) "no temp files left" ["mcp_config.json"]
-      (Array.to_list (Sys.readdir dir)))
+      (Array.to_list (Sys.readdir dir));
+    (* agy's own temp naming must survive; a stale temp of ours is reaped. *)
+    let agys = Filename.concat dir "mcp_config.json.tmp.123"
+    and ours = Filename.concat dir (AP.agy_mcp_temp_prefix path ^ "stale") in
+    List.iter (fun f -> Out_channel.with_open_bin f (fun oc -> output_string oc "x")) [agys; ours];
+    Alcotest.(check bool) "replaced again" true (replace ~expected:(Some "ours") ~perm:0o640 "ours2");
+    Alcotest.(check bool) "agy's in-flight temp untouched" true (Sys.file_exists agys);
+    Alcotest.(check bool) "our stale temp reaped" false (Sys.file_exists ours))
 
 let test_agy_mcp_entry_gate () =
   (* Run the entry's own command line, the way agy would, against a
@@ -4425,7 +4434,7 @@ let agy_tests = [
     test_agy_missing_status_is_error;
   Alcotest.test_case "unknown status is not a failure" `Quick
     test_agy_unknown_status_not_failed;
-  Alcotest.test_case "later turn passes through" `Quick
+  Alcotest.test_case "later turn restates MCP state" `Quick
     test_agy_later_turn_restates_mcp;
   Alcotest.test_case "mcp: config update cases" `Quick test_agy_mcp_update_cases;
   Alcotest.test_case "mcp: setup against a file" `Quick test_agy_mcp_setup_file;

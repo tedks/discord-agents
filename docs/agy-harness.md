@@ -162,14 +162,19 @@ Operator approved (2026-10-24, issue #161) giving agy the MCP tools. The bot kee
 - The file is left alone, and the session runs without MCP, when it:
   - is a symlink;
   - won't parse, isn't an object, or has a non-object `mcpServers`;
-  - has duplicate `mcpServers` keys or duplicate `discord_agents` entries;
+  - has duplicate `mcpServers` keys, duplicate `discord_agents` entries, or duplicate keys inside ours;
   - has comments, which a rewrite would drop;
-  - holds a number that wouldn't re-serialise as JSON (e.g. `1e400`);
+  - holds a number that wouldn't re-serialise as JSON (e.g. `1e400`), even if no rewrite is needed;
   - names someone else's server `discord_agents`;
   - has our entry marked `"disabled": true`.
 
   The reason is logged once.
-- Writes follow the dotfiles installer for `config.json`: a bot-owned lock (`~/.config/discord-agents/agy-mcp-config.lock`), raw bytes kept, re-read just before the rename, refusal if anything changed, and the original mode preserved. agy and the IDE don't take that lock, so a change in the final instant before the rename can still be lost.
+- Writes follow the dotfiles installer for `config.json`. The bot holds its own lock (`~/.config/discord-agents/agy-mcp-config.lock`), keeps the raw bytes, re-reads just before the rename, and refuses if anything changed.
+  - The temp file is fsynced, and so is the directory.
+  - The original mode is kept, and a new file is created `0600`.
+  - Temps use a bot-only prefix (`.discord-agents.mcp_config.json.tmp.*`), so agy's own `*.tmp.<n>` files are never reaped.
+  - Outcomes aren't fed to Disk_health: a failure on this foreign path would otherwise hold the bot read-only.
+  - agy and the IDE don't take that lock, so a change in the final instant before the rename can still be lost.
 - `~/.gemini/config/` must already exist: run agy once. The bot doesn't create agy's state.
 - The bot sets `DISCORD_AGENTS_MCP_FOR_AGY` to the resolved server, and only on its local agy children. Every child's inherited copy is stripped first.
 - With the variable unset (the user's own agy), the server exits at once, and agy's turn still succeeds (verified).
