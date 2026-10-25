@@ -4556,6 +4556,16 @@ let test_agy_stream_edges () =
     (joined ~steps:(("A" :: spaces) @ ["B"]) ("A" ^ String.make 200 ' ' ^ "C"));
   (* Generous: exponential took tens of seconds at far smaller sizes. *)
   Alcotest.(check bool) "...without blowing up" true (Unix.gettimeofday () -. t0 < 10.0);
+  (* The cases that took minutes with a rescanning matcher: many
+     whitespace-only steps over a long run, mismatch at the end. *)
+  let t1 = Unix.gettimeofday () in
+  Alcotest.(check bool) "100 whitespace steps over a 10k run: no match" false
+    (joined ~steps:(("A" :: List.init 100 (fun _ -> " ")) @ ["B"]) ("A" ^ String.make 10_000 ' ' ^ "C"));
+  Alcotest.(check bool) "1000 steps over a 1000 run: no match" false
+    (joined ~steps:(("A" :: List.init 1000 (fun _ -> "\n")) @ ["B"]) ("A" ^ String.make 1000 '\n' ^ "C"));
+  Alcotest.(check bool) "...both well within bounds" true (Unix.gettimeofday () -. t1 < 10.0);
+  Alcotest.(check bool) "a whitespace-only first step allows leading whitespace" true
+    (joined ~steps:[" "; "A"] " A");
   Alcotest.(check bool) "a whitespace-only step's space must be there" false
     (joined ~steps:["A"; " "; "B"] "AB");
   Alcotest.(check bool) "a trailing whitespace-only step matches" true

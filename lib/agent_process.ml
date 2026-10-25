@@ -1258,7 +1258,7 @@ let crlf_to_lf s =
   Buffer.contents b
 
 (** Whether [s] is exactly [steps] in order, with nothing but whitespace
-    (spaces, newlines) between consecutive steps; each boundary may
+    (space, \n, \r, \t) between consecutive steps; each boundary may
     differ. Text inside a step must match byte for byte. *)
 let is_reply_sep c = c = ' ' || c = '\n' || c = '\r' || c = '\t'
 
@@ -1275,30 +1275,28 @@ let is_steps_joined ~steps s =
   let is_sep = is_reply_sep in
   (* [go i pos]: steps i.. match s from pos, separators allowed before
      each step after the first. Failed (i, pos) states are memoised, so
-     the search visits at most steps x positions states instead of
-     backtracking combinatorially over whitespace-only steps. Each state
-     may scan a separator run, so the worst case is polynomial, roughly
-     O(k x n^2) for k steps and an n-byte response plus the step
-     comparisons. That needs long whitespace runs; agy replies aren't
-     like that. *)
+     the search visits each of the k x n states at most once, each doing
+     one step comparison. Recursion depth is up to about n + k. Measured:
+     a 1 MiB whitespace run with a mismatch takes about 4 s (no stack
+     trouble); realistic replies are microseconds. *)
   let failed = Hashtbl.create 16 in
   let rec go i pos =
     if i = k then pos = n
     else if Hashtbl.mem failed (i, pos) then false
     else begin
       let t = steps.(i) in
-      let rec try_from p =
-        (at p t && go (i + 1) (p + String.length t))
-        || (p < n && is_sep s.[p] && try_from (p + 1))
-      in
-      let ok = try_from pos in
+      (* Step i here, or skip one separator and stay on step i: each
+         (i, pos) is a single memoised state, so overlapping whitespace
+         runs aren't rescanned. *)
+      let ok =
+        (at pos t && go (i + 1) (pos + String.length t))
+        || (pos < n && is_sep s.[pos] && go i (pos + 1)) in
       if not ok then Hashtbl.replace failed (i, pos) ();
       ok
     end
   in
-  (* Anchored at 0: leading whitespace (even from a dropped
-     whitespace-only first step) is a mismatch, which only costs a
-     labelled repost. *)
+  (* Anchored at 0: leading whitespace matches only when the first step
+     itself contains it. *)
   k > 0 && at 0 steps.(0) && go 1 (String.length steps.(0))
 
 let agy_stream_parser () =
