@@ -209,6 +209,15 @@ Operator approved (2026-10-24, issue #161) giving agy the MCP tools. The bot kee
 
   The variable is forwarded through the remote run script's environment.
 - The first released entry (`exec "$DISCORD_AGENTS_MCP_FOR_AGY"`, #164) is matched exactly and updated in place, keeping any keys added to it.
+- **Remote read and write scripts.** The read comes back as one framed line (`DISCORD-AGENTS-AGY-CONFIG <md5> <base64>`), which the bot decodes and checks. Capture merges ssh's own stderr into the output, so a warning can't pass for the file. The write:
+  - is checked against the new content's MD5, so truncated input is never installed;
+  - takes the original's mode via `cp -p`;
+  - uses an exclusive `mktemp` temp and reaps only bot temps older than 10 minutes;
+  - syncs before the compare, so the race with the user's own writers is just the rename.
+
+  The scripts need only POSIX sh plus `md5sum`/`md5`/`openssl`, `base64`, `mktemp`, `cp -p` and `find`, so macOS executors work.
+- **Deploy order.** An older bot (#164 code) treats the new `eval` entry as someone else's and declines MCP for its own local agy until it's upgraded. Nothing is damaged, and rolling back is safe.
+- **Cost.** A remote agy turn adds an ssh round trip (the read) before spawning, and a second one only when the entry needs writing.
 
 ### Workspace: `--add-dir` is required
 

@@ -2684,14 +2684,69 @@ let setup_gemini_mcp_remote ?ssh ~(host : Host.t) ~working_dir ~mcp () =
       | Ok _ -> ()
       | Error f -> warn "updating .git/info/exclude" f
 
+(* Portable MD5 of stdin: GNU md5sum, macOS md5, or openssl. *)
+let agy_remote_hash_fn = {|h() { if command -v md5sum >/dev/null 2>&1; then md5sum | cut -d' ' -f1
+elif command -v md5 >/dev/null 2>&1; then md5 -q
+elif command -v openssl >/dev/null 2>&1; then openssl md5 -r | cut -d' ' -f1
+else return 1; fi; }
+|}
+
+(* Exit codes: 3 no config dir, 4 symlink, 5 absent, 6 not a regular
+   file, 8 no MD5 tool. The content comes back framed and base64'd
+   with its MD5, because capture merges ssh's own stderr (warnings)
+   into the output: the bot decodes only the framed line and checks
+   the hash, so a stray line can't be mistaken for the user's file. *)
+let agy_remote_read_script = agy_remote_hash_fn ^ {|f="$HOME/.gemini/config/mcp_config.json"
+[ -d "${f%/*}" ] || exit 3
+[ -L "$f" ] && exit 4
+[ -e "$f" ] || exit 5
+[ -f "$f" ] || exit 6
+sum=$(h < "$f") || exit 8
+printf 'DISCORD-AGENTS-AGY-CONFIG %s ' "$sum"
+base64 < "$f" | tr -d '\n'
+printf '\n'|}
+(* $1: MD5 of the bytes we read, or "absent". $2: MD5 of the new
+   contents on stdin. Exit codes: 3 no config dir, 4 symlink, 7
+   changed since read, 8 no MD5 tool, 9 temp write failed, 10 rename
+   failed, 11 couldn't copy the mode, 12 incomplete input. The temp is
+   created exclusively (mktemp), takes the original's mode via cp -p,
+   is checked against $2 so truncated input is never installed, and is
+   synced before the compare, so the race window with the user's own
+   writers is only the rename. *)
+let agy_remote_write_script = agy_remote_hash_fn ^ {|f="$HOME/.gemini/config/mcp_config.json"; d="${f%/*}"
+[ -d "$d" ] || exit 3
+printf x | h >/dev/null 2>&1 || exit 8
+find "$d" -maxdepth 1 -type f -name '.discord-agents.mcp_config.json.tmp.*' -mmin +10 \
+-exec rm -f {} + 2>/dev/null
+tmp=$(umask 077; mktemp "$d/.discord-agents.mcp_config.json.tmp.XXXXXX") || exit 9
+fail() { rm -f -- "$tmp"; exit "$1"; }
+if [ -f "$f" ] && [ ! -L "$f" ]; then cp -p -- "$f" "$tmp" 2>/dev/null || fail 11; fi
+cat > "$tmp" 2>/dev/null || fail 9
+[ "$(h < "$tmp")" = "$2" ] || fail 12
+sync "$tmp" 2>/dev/null
+[ -L "$f" ] && fail 4
+if [ -e "$f" ]; then
+[ "$1" != absent ] && [ "$(h < "$f")" = "$1" ] || fail 7
+else
+[ "$1" = absent ] || fail 7
+fi
+mv -f -- "$tmp" "$f" || fail 10
+sync "$d" 2>/dev/null
+exit 0|}
+
+
 (** Make sure our inert entry is in agy's global MCP config on an
     executor. Returns whether it is there afterwards. The same rules as
     [setup_agy_mcp] apply, through the same pure [agy_mcp_config_update]:
     - nothing is created when the executor has no ~/.gemini/config;
     - a symlinked config is refused;
-    - the file is replaced only if its bytes (by MD5) are what we read;
+    - the file is replaced only if its bytes (by MD5) are what we read,
+      and only by a temp verified to hold all the new bytes;
     - its mode is kept (a new file is 0600);
-    - temps use the bot-only prefix, and only those are reaped.
+    - temps are created exclusively under the bot-only prefix, and only
+      stale ones (over 10 minutes) are reaped.
+    The scripts stick to POSIX sh plus md5sum/md5/openssl, base64,
+    mktemp, cp -p and find, so macOS executors work too.
     Serialised per host by a bot-owned local lock. Blocking; call from a
     system thread. *)
 let setup_agy_mcp_remote ?ssh ~(host : Host.t) ~working_dir () =
@@ -2706,46 +2761,36 @@ let setup_agy_mcp_remote ?ssh ~(host : Host.t) ~working_dir () =
     unavailable (Printf.sprintf "%s: %s: %s" what
       (Host_exec.describe_failure ~host:host.name f) (Host_exec.failure_detail f))
   in
-  (* Exit codes: 3 no config dir, 4 symlink, 5 absent, 6 not a regular
-     file. Silent on stderr, which capture merges into the output. *)
-  let read_script = {|f="$HOME/.gemini/config/mcp_config.json"
-[ -d "${f%/*}" ] || exit 3
-[ -L "$f" ] && exit 4
-[ -e "$f" ] || exit 5
-[ -f "$f" ] || exit 6
-exec cat -- "$f"|} in
-  (* $1: MD5 of the bytes we read, or "absent". Exit codes: 3 no config
-     dir, 4 symlink, 7 changed since read, 8 no md5sum, 9 temp write
-     failed, 10 rename failed. *)
-  let write_script = {|f="$HOME/.gemini/config/mcp_config.json"; d="${f%/*}"
-[ -d "$d" ] || exit 3
-command -v md5sum >/dev/null 2>&1 || exit 8
-rm -f -- "$d"/.discord-agents.mcp_config.json.tmp.* 2>/dev/null
-tmp="$d/.discord-agents.mcp_config.json.tmp.$$"
-( umask 077; cat > "$tmp" ) 2>/dev/null || { rm -f -- "$tmp"; exit 9; }
-if [ -L "$f" ]; then rm -f -- "$tmp"; exit 4; fi
-if [ -e "$f" ]; then
-  [ "$1" != absent ] && [ "$(md5sum < "$f" | cut -d' ' -f1)" = "$1" ]     || { rm -f -- "$tmp"; exit 7; }
-  chmod --reference="$f" "$tmp" 2>/dev/null || chmod 600 "$tmp"
-else
-  [ "$1" = absent ] || { rm -f -- "$tmp"; exit 7; }
-fi
-sync "$tmp" 2>/dev/null
-mv -f -- "$tmp" "$f" || { rm -f -- "$tmp"; exit 10; }
-sync "$d" 2>/dev/null
-exit 0|} in
+  (* The framed line from [read_script]: decode and verify it. *)
+  let parse_read output =
+    let prefix = "DISCORD-AGENTS-AGY-CONFIG " in
+    match List.find_opt (String.starts_with ~prefix) (String.split_on_char '\n' output) with
+    | None -> Result.Error "its agy MCP config came back unframed"
+    | Some line ->
+      let rest = String.sub line (String.length prefix) (String.length line - String.length prefix) in
+      match String.index_opt rest ' ' with
+      | None -> Result.Error "its agy MCP config came back malformed"
+      | Some i ->
+        let sum = String.sub rest 0 i
+        and b64 = String.trim (String.sub rest (i + 1) (String.length rest - i - 1)) in
+        match Base64.decode b64 with
+        | Result.Error _ -> Result.Error "its agy MCP config came back malformed"
+        | Result.Ok raw when Digest.to_hex (Digest.string raw) = String.trim sum -> Result.Ok raw
+        | Result.Ok _ -> Result.Error "its agy MCP config came back corrupted in transit"
+  in
   let lock_path =
     Filename.concat (Resource.app_config_dir ())
       (Printf.sprintf "agy-mcp-config.%s.lock" (Digest.to_hex (Digest.string host.name))) in
   try
     Resource.with_flock lock_path (fun () ->
       let existing =
-        match run ["sh"; "-c"; read_script] with
-        | Ok text -> Ok (Some text)
+        match run ["sh"; "-c"; agy_remote_read_script] with
+        | Ok output -> Result.map Option.some (parse_read output)
         | Error (Host_exec.Exited (5, _)) -> Ok None
         | Error (Host_exec.Exited (3, _)) -> Error "~/.gemini/config does not exist (run agy once there)"
         | Error (Host_exec.Exited (4, _)) -> Error "its agy MCP config is a symlink"
         | Error (Host_exec.Exited (6, _)) -> Error "its agy MCP config is not a regular file"
+        | Error (Host_exec.Exited (8, _)) -> Error "it has no md5sum, md5 or openssl"
         | Error f ->
           Error (Printf.sprintf "reading its agy MCP config: %s: %s"
                    (Host_exec.describe_failure ~host:host.name f)
@@ -2760,12 +2805,18 @@ exit 0|} in
         | Agy_mcp_write contents ->
           let expected = match raw with
             | Some r -> Digest.to_hex (Digest.string r) | None -> "absent" in
-          match run ~input:contents ["sh"; "-c"; write_script; "discord-agents"; expected] with
+          let incoming = Digest.to_hex (Digest.string contents) in
+          match run ~input:contents
+                  ["sh"; "-c"; agy_remote_write_script; "discord-agents"; expected; incoming] with
           | Ok _ -> report_agy_mcp_available (); true
           | Error (Host_exec.Exited (7, _)) ->
             unavailable "its agy MCP config changed while we were updating it; will retry next turn"
           | Error (Host_exec.Exited (4, _)) -> unavailable "its agy MCP config is a symlink"
-          | Error (Host_exec.Exited (8, _)) -> unavailable "md5sum is not installed there"
+          | Error (Host_exec.Exited (8, _)) -> unavailable "it has no md5sum, md5 or openssl"
+          | Error (Host_exec.Exited (11, _)) ->
+            unavailable "couldn't keep its agy MCP config's mode; left it alone"
+          | Error (Host_exec.Exited (12, _)) ->
+            unavailable "the new agy MCP config arrived incomplete; left the old one in place"
           | Error f -> failure "writing its agy MCP config" f)
   with exn -> unavailable ("could not update its agy MCP config: " ^ Printexc.to_string exn)
 
