@@ -211,7 +211,8 @@ Operator approved (2026-10-24, issue #161) giving agy the MCP tools. The bot kee
 - The first released entry (`exec "$DISCORD_AGENTS_MCP_FOR_AGY"`, #164) is matched exactly and updated in place, keeping any keys added to it.
 - **Remote read and write scripts.** The read comes back as one framed line (`DISCORD-AGENTS-AGY-CONFIG <md5> <base64>`), which the bot decodes and checks. Capture merges ssh's own stderr into the output, so a warning can't pass for the file. The write:
   - is checked against the new content's MD5, so truncated input is never installed;
-  - takes the original's mode via `stat` (GNU or BSD), applied after the bytes are written and verified, so a read-only 0400 config works;
+  - keeps the original's group and mode via `stat` (GNU or BSD), applied after the bytes are written and verified, so a read-only 0400 config works;
+  - refuses a config owned by another user, since the rename would change its owner;
   - uses an exclusive `mktemp` temp and reaps only bot temps older than 10 minutes;
   - does all its work before the compare, so the race with the user's own writers is just the rename (`sync` is best-effort).
 

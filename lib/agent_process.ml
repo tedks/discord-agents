@@ -2708,11 +2708,13 @@ printf '\n'|}
 (* $1: MD5 of the bytes we read, or "absent". $2: MD5 of the new
    contents on stdin. Exit codes: 3 no config dir, 4 symlink, 7
    changed since read, 8 no MD5 tool, 9 temp write failed, 10 rename
-   failed, 11 couldn't read or apply the mode, 12 incomplete input. The
+   failed, 11 couldn't keep its mode or group (or it isn't ours), 12
+   incomplete input. The
    temp is created exclusively (mktemp), filled and checked against $2
    first so truncated input is never installed, then given the
-   original's mode (stat -c, or BSD stat -f; a read-only 0400 config
-   works), all before the compare, so the race window with the user's
+   original's group and mode (stat -c, or BSD stat -f; a read-only 0400
+   config works). A config owned by someone else is refused, since the
+   rename would change its owner. All this happens before the compare, so the race window with the user's
    own writers is only the rename. sync is best-effort durability (GNU
    sync FILE; elsewhere it may flush everything or nothing). *)
 let agy_remote_write_script = agy_remote_hash_fn ^ {|f="$HOME/.gemini/config/mcp_config.json"; d="${f%/*}"
@@ -2722,13 +2724,21 @@ find "$d" -maxdepth 1 -type f -name '.discord-agents.mcp_config.json.tmp.*' -mmi
 -exec rm -f {} + 2>/dev/null
 tmp=$(umask 077; mktemp "$d/.discord-agents.mcp_config.json.tmp.XXXXXX") || exit 9
 fail() { rm -f -- "$tmp"; exit "$1"; }
-mode=600
+mode=600; grp=
+st() { stat -c "$1" -- "$f" 2>/dev/null || stat -f "$2" -- "$f" 2>/dev/null; }
 if [ -f "$f" ] && [ ! -L "$f" ]; then
-  mode=$(stat -c %a -- "$f" 2>/dev/null || stat -f %Lp -- "$f" 2>/dev/null) || fail 11
-  case "$mode" in ''|*[!0-7]*) fail 11;; esac
+  mode=$(st %a %Lp) || fail 11
+  own=$(st %u %u) || fail 11
+  grp=$(st %g %g) || fail 11
+  case "$mode$own$grp" in ''|*[!0-9]*) fail 11;; esac
+  case "$mode" in *[!0-7]*) fail 11;; esac
+  # The rename would make us the owner: refuse a file someone else owns.
+  [ "$own" = "$(id -u)" ] || fail 11
 fi
 cat > "$tmp" 2>/dev/null || fail 9
 [ "$(h < "$tmp")" = "$2" ] || fail 12
+# Group before mode: chgrp can clear setgid/setuid bits.
+[ -z "$grp" ] || chgrp "$grp" "$tmp" 2>/dev/null || fail 11
 chmod "$mode" "$tmp" 2>/dev/null || fail 11
 sync "$tmp" 2>/dev/null
 [ -L "$f" ] && fail 4

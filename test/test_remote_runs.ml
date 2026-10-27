@@ -340,6 +340,17 @@ let test_agy_remote_write_script () =
     Alcotest.(check string) "with the new bytes" "ro" (read cfg);
     Alcotest.(check int) "and stays 0400" 0o400 ((Unix.stat cfg).Unix.st_perm);
     Unix.chmod cfg 0o640;
+    (* Group kept: switch to another group we belong to, if any. *)
+    (match List.filter (fun g -> g <> Unix.getgid ()) (Array.to_list (Unix.getgroups ())) with
+     | g :: _ ->
+       Unix.chown cfg (-1) g;
+       let code, _ = run_script ~home ~input:"grp" w [md5 "ro"; md5 "grp"] in
+       Alcotest.(check int) "replaced, other group" 0 code;
+       Alcotest.(check int) "group kept" g ((Unix.stat cfg).Unix.st_gid);
+       Alcotest.(check int) "mode kept with it" 0o640 ((Unix.stat cfg).Unix.st_perm);
+       Unix.chown cfg (-1) (Unix.getgid ());
+       Out_channel.with_open_bin cfg (fun oc -> output_string oc "ro")
+     | [] -> ());
     (* Temps: agy's own naming and a fresh bot temp are left alone; a stale
        bot temp is reaped. *)
     let dir = Filename.dirname cfg in
