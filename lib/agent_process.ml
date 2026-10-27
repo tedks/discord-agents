@@ -2708,21 +2708,28 @@ printf '\n'|}
 (* $1: MD5 of the bytes we read, or "absent". $2: MD5 of the new
    contents on stdin. Exit codes: 3 no config dir, 4 symlink, 7
    changed since read, 8 no MD5 tool, 9 temp write failed, 10 rename
-   failed, 11 couldn't copy the mode, 12 incomplete input. The temp is
-   created exclusively (mktemp), takes the original's mode via cp -p,
-   is checked against $2 so truncated input is never installed, and is
-   synced before the compare, so the race window with the user's own
-   writers is only the rename. *)
+   failed, 11 couldn't read or apply the mode, 12 incomplete input. The
+   temp is created exclusively (mktemp), filled and checked against $2
+   first so truncated input is never installed, then given the
+   original's mode (stat -c, or BSD stat -f; a read-only 0400 config
+   works), all before the compare, so the race window with the user's
+   own writers is only the rename. sync is best-effort durability (GNU
+   sync FILE; elsewhere it may flush everything or nothing). *)
 let agy_remote_write_script = agy_remote_hash_fn ^ {|f="$HOME/.gemini/config/mcp_config.json"; d="${f%/*}"
 [ -d "$d" ] || exit 3
-printf x | h >/dev/null 2>&1 || exit 8
+[ "$(printf x | h 2>/dev/null)" = 9dd4e461268c8034f5c8564e155c67a6 ] || exit 8
 find "$d" -maxdepth 1 -type f -name '.discord-agents.mcp_config.json.tmp.*' -mmin +10 \
 -exec rm -f {} + 2>/dev/null
 tmp=$(umask 077; mktemp "$d/.discord-agents.mcp_config.json.tmp.XXXXXX") || exit 9
 fail() { rm -f -- "$tmp"; exit "$1"; }
-if [ -f "$f" ] && [ ! -L "$f" ]; then cp -p -- "$f" "$tmp" 2>/dev/null || fail 11; fi
+mode=600
+if [ -f "$f" ] && [ ! -L "$f" ]; then
+  mode=$(stat -c %a -- "$f" 2>/dev/null || stat -f %Lp -- "$f" 2>/dev/null) || fail 11
+  case "$mode" in ''|*[!0-7]*) fail 11;; esac
+fi
 cat > "$tmp" 2>/dev/null || fail 9
 [ "$(h < "$tmp")" = "$2" ] || fail 12
+chmod "$mode" "$tmp" 2>/dev/null || fail 11
 sync "$tmp" 2>/dev/null
 [ -L "$f" ] && fail 4
 if [ -e "$f" ]; then
@@ -2745,8 +2752,9 @@ exit 0|}
     - its mode is kept (a new file is 0600);
     - temps are created exclusively under the bot-only prefix, and only
       stale ones (over 10 minutes) are reaped.
-    The scripts stick to POSIX sh plus md5sum/md5/openssl, base64,
-    mktemp, cp -p and find, so macOS executors work too.
+    The scripts use POSIX sh plus md5sum/md5/openssl, base64, mktemp,
+    GNU-or-BSD stat, and find -maxdepth/-mmin (both GNU and BSD have
+    them), so macOS executors work too.
     Serialised per host by a bot-owned local lock. Blocking; call from a
     system thread. *)
 let setup_agy_mcp_remote ?ssh ~(host : Host.t) ~working_dir () =
@@ -2776,7 +2784,7 @@ let setup_agy_mcp_remote ?ssh ~(host : Host.t) ~working_dir () =
         match Base64.decode b64 with
         | Result.Error _ -> Result.Error "its agy MCP config came back malformed"
         | Result.Ok raw when Digest.to_hex (Digest.string raw) = String.trim sum -> Result.Ok raw
-        | Result.Ok _ -> Result.Error "its agy MCP config came back corrupted in transit"
+        | Result.Ok _ -> Result.Error "its agy MCP config read back inconsistent (changed while being read, or garbled); will retry next turn"
   in
   let lock_path =
     Filename.concat (Resource.app_config_dir ())

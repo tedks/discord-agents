@@ -334,6 +334,12 @@ let test_agy_remote_write_script () =
     let code, _ = run_script ~home ~input:"newer" w [md5 "new"; md5 "newer"] in
     Alcotest.(check int) "replaced again" 0 code;
     Alcotest.(check int) "0640 kept" 0o640 ((Unix.stat cfg).Unix.st_perm);
+    Unix.chmod cfg 0o400;
+    let code, _ = run_script ~home ~input:"ro" w [md5 "newer"; md5 "ro"] in
+    Alcotest.(check int) "a read-only config is still updated" 0 code;
+    Alcotest.(check string) "with the new bytes" "ro" (read cfg);
+    Alcotest.(check int) "and stays 0400" 0o400 ((Unix.stat cfg).Unix.st_perm);
+    Unix.chmod cfg 0o640;
     (* Temps: agy's own naming and a fresh bot temp are left alone; a stale
        bot temp is reaped. *)
     let dir = Filename.dirname cfg in
@@ -343,7 +349,7 @@ let test_agy_remote_write_script () =
     List.iter (fun p -> Out_channel.with_open_bin p (fun oc -> output_string oc "t")) [agys; fresh; stale];
     let old = Unix.gettimeofday () -. 3600. in
     Unix.utimes stale old old;
-    let code, _ = run_script ~home ~input:"last" w [md5 "newer"; md5 "last"] in
+    let code, _ = run_script ~home ~input:"last" w [md5 "ro"; md5 "last"] in
     Alcotest.(check int) "replaced once more" 0 code;
     Alcotest.(check bool) "agy's temp untouched" true (Sys.file_exists agys);
     Alcotest.(check bool) "a fresh bot temp untouched" true (Sys.file_exists fresh);
