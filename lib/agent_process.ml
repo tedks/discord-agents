@@ -2730,8 +2730,8 @@ if [ -f "$f" ] && [ ! -L "$f" ]; then
   mode=$(st %a %Lp) || fail 11
   own=$(st %u %u) || fail 11
   grp=$(st %g %g) || fail 11
-  case "$mode$own$grp" in ''|*[!0-9]*) fail 11;; esac
-  case "$mode" in *[!0-7]*) fail 11;; esac
+  for v in "$own" "$grp"; do case "$v" in ''|*[!0-9]*) fail 11;; esac; done
+  case "$mode" in ''|*[!0-7]*) fail 11;; esac
   # The rename would make us the owner: refuse a file someone else owns.
   [ "$own" = "$(id -u)" ] || fail 11
 fi
