@@ -2100,13 +2100,32 @@ let agy_mcp_env_var = "DISCORD_AGENTS_MCP_FOR_AGY"
 let agy_mcp_server_name = "discord_agents"
 
 let agy_mcp_command_json = `String "/bin/sh"
+(* The variable holds a shell-quoted command line, not a single path:
+   locally the quoted server path, on an executor the quoted writer-ssh
+   command ([remote_mcp_command]). Only the bot sets it, on its own agy
+   children; every inherited copy is stripped first. *)
 let agy_mcp_args_json =
+  `List [
+    `String "-c";
+    `String (Printf.sprintf
+      "[ -n \"$%s\" ] || exit 0; eval \"exec $%s\"" agy_mcp_env_var agy_mcp_env_var);
+    `String "discord-agents-mcp";
+  ]
+
+(* Entries earlier versions of the bot wrote, matched exactly (command
+   and args) and updated in place. Only the form released in #164. *)
+let agy_mcp_previous_args_json = [
   `List [
     `String "-c";
     `String (Printf.sprintf
       "[ -n \"$%s\" ] || exit 0; exec \"$%s\"" agy_mcp_env_var agy_mcp_env_var);
     `String "discord-agents-mcp";
-  ]
+  ];
+]
+
+(** The value of [agy_mcp_env_var] that runs [command args]. *)
+let agy_mcp_value ~command ~args =
+  String.concat " " (List.map Remote_script.quote (command :: args))
 
 let agy_mcp_entry =
   `Assoc [("command", agy_mcp_command_json); ("args", agy_mcp_args_json)]
@@ -2182,19 +2201,29 @@ let agy_mcp_config_update existing =
             Agy_mcp_declined "the discord_agents entry has duplicate keys"
           | Some (`Assoc entry) ->
             let field k = List.assoc_opt k entry in
-            let ours =
+            let ours_now =
               field "command" = Some agy_mcp_command_json
               && field "args" = Some agy_mcp_args_json in
-            (* Ours only on an exact command+args match; there is no older
-               format of ours to migrate. Anything else under this name is
-               somebody else's server. *)
-            if not ours then
+            let ours_before =
+              field "command" = Some agy_mcp_command_json
+              && List.exists (fun a -> field "args" = Some a) agy_mcp_previous_args_json in
+            (* Ours only on an exact command+args match with the current
+               entry or one an earlier release wrote. Anything else under
+               this name is somebody else's server. *)
+            if not (ours_now || ours_before) then
               Agy_mcp_declined "a different discord_agents server is configured there"
             else
               (match field "disabled" with
                | Some (`Bool true) ->
                  Agy_mcp_declined "the discord_agents entry is disabled there"
-               | _ -> Agy_mcp_present)
+               | _ when ours_now -> Agy_mcp_present
+               | _ ->
+                 (* Update an earlier entry of ours in place, keeping any
+                    keys the user or IDE added to it. *)
+                 let entry' = List.map (fun (k, v) ->
+                   if k = "args" then (k, agy_mcp_args_json) else (k, v)) entry in
+                 render (with_servers (List.map (fun (k, v) ->
+                   if k = agy_mcp_server_name then (k, `Assoc entry') else (k, v)) servers)))
           | Some _ -> Agy_mcp_declined "the discord_agents entry is not an object")
        | None -> render (with_servers [(agy_mcp_server_name, agy_mcp_entry)])
        | Some _ -> Agy_mcp_declined "mcpServers is not an object")
@@ -2655,6 +2684,160 @@ let setup_gemini_mcp_remote ?ssh ~(host : Host.t) ~working_dir ~mcp () =
       | Ok _ -> ()
       | Error f -> warn "updating .git/info/exclude" f
 
+(* Portable MD5 of stdin: GNU md5sum, macOS md5, or openssl. *)
+let agy_remote_hash_fn = {|h() { if command -v md5sum >/dev/null 2>&1; then md5sum | cut -d' ' -f1
+elif command -v md5 >/dev/null 2>&1; then md5 -q
+elif command -v openssl >/dev/null 2>&1; then openssl md5 -r | cut -d' ' -f1
+else return 1; fi; }
+|}
+
+(* Exit codes: 3 no config dir, 4 symlink, 5 absent, 6 not a regular
+   file, 8 no MD5 tool. The content comes back framed and base64'd
+   with its MD5, because capture merges ssh's own stderr (warnings)
+   into the output: the bot decodes only the framed line and checks
+   the hash, so a stray line can't be mistaken for the user's file. *)
+let agy_remote_read_script = agy_remote_hash_fn ^ {|f="$HOME/.gemini/config/mcp_config.json"
+[ -d "${f%/*}" ] || exit 3
+[ -L "$f" ] && exit 4
+[ -e "$f" ] || exit 5
+[ -f "$f" ] || exit 6
+sum=$(h < "$f") || exit 8
+printf 'DISCORD-AGENTS-AGY-CONFIG %s ' "$sum"
+base64 < "$f" | tr -d '\n'
+printf '\n'|}
+(* $1: MD5 of the bytes we read, or "absent". $2: MD5 of the new
+   contents on stdin. Exit codes: 3 no config dir, 4 symlink, 7
+   changed since read, 8 no MD5 tool, 9 temp write failed, 10 rename
+   failed, 11 couldn't keep its mode or group (or it isn't ours), 12
+   incomplete input. The
+   temp is created exclusively (mktemp), filled and checked against $2
+   first so truncated input is never installed, then given the
+   original's group and mode (stat -c, or BSD stat -f; a read-only 0400
+   config works). A config owned by someone else is refused, since the
+   rename would change its owner. All this happens before the compare, so the race window with the user's
+   own writers is only the rename. sync is best-effort durability (GNU
+   sync FILE; elsewhere it may flush everything or nothing). *)
+let agy_remote_write_script = agy_remote_hash_fn ^ {|f="$HOME/.gemini/config/mcp_config.json"; d="${f%/*}"
+[ -d "$d" ] || exit 3
+[ "$(printf x | h 2>/dev/null)" = 9dd4e461268c8034f5c8564e155c67a6 ] || exit 8
+find "$d" -maxdepth 1 -type f -name '.discord-agents.mcp_config.json.tmp.*' -mmin +10 \
+-exec rm -f {} + 2>/dev/null
+tmp=$(umask 077; mktemp "$d/.discord-agents.mcp_config.json.tmp.XXXXXX") || exit 9
+fail() { rm -f -- "$tmp"; exit "$1"; }
+mode=600; grp=
+st() { stat -c "$1" -- "$f" 2>/dev/null || stat -f "$2" -- "$f" 2>/dev/null; }
+if [ -f "$f" ] && [ ! -L "$f" ]; then
+  mode=$(st %a %Lp) || fail 11
+  own=$(st %u %u) || fail 11
+  grp=$(st %g %g) || fail 11
+  for v in "$own" "$grp"; do case "$v" in ''|*[!0-9]*) fail 11;; esac; done
+  case "$mode" in ''|*[!0-7]*) fail 11;; esac
+  # The rename would make us the owner: refuse a file someone else owns.
+  [ "$own" = "$(id -u)" ] || fail 11
+fi
+cat > "$tmp" 2>/dev/null || fail 9
+[ "$(h < "$tmp")" = "$2" ] || fail 12
+# Group before mode: chgrp can clear setgid/setuid bits.
+[ -z "$grp" ] || chgrp "$grp" "$tmp" 2>/dev/null || fail 11
+chmod "$mode" "$tmp" 2>/dev/null || fail 11
+sync "$tmp" 2>/dev/null
+[ -L "$f" ] && fail 4
+if [ -e "$f" ]; then
+[ "$1" != absent ] && [ "$(h < "$f")" = "$1" ] || fail 7
+else
+[ "$1" = absent ] || fail 7
+fi
+mv -f -- "$tmp" "$f" || fail 10
+sync "$d" 2>/dev/null
+exit 0|}
+
+
+(** Make sure our inert entry is in agy's global MCP config on an
+    executor. Returns whether it is there afterwards. The same rules as
+    [setup_agy_mcp] apply, through the same pure [agy_mcp_config_update]:
+    - nothing is created when the executor has no ~/.gemini/config;
+    - a symlinked config is refused;
+    - the file is replaced only if its bytes (by MD5) are what we read,
+      and only by a temp verified to hold all the new bytes;
+    - its mode is kept (a new file is 0600);
+    - temps are created exclusively under the bot-only prefix, and only
+      stale ones (over 10 minutes) are reaped.
+    The scripts use POSIX sh plus md5sum/md5/openssl, base64, mktemp,
+    GNU-or-BSD stat, and find -maxdepth/-mmin (both GNU and BSD have
+    them), so macOS executors work too.
+    Serialised per host by a bot-owned local lock. Blocking; call from a
+    system thread. *)
+let setup_agy_mcp_remote ?ssh ~(host : Host.t) ~working_dir () =
+  let run ?input argv =
+    Host_exec.run_capture ?ssh ~timeout_s:remote_setup_timeout_s
+      ~cwd:working_dir ?input host argv in
+  let unavailable why =
+    report_agy_mcp_unavailable (Printf.sprintf "on %s: %s" host.name why);
+    false
+  in
+  let failure what f =
+    unavailable (Printf.sprintf "%s: %s: %s" what
+      (Host_exec.describe_failure ~host:host.name f) (Host_exec.failure_detail f))
+  in
+  (* The framed line from [read_script]: decode and verify it. *)
+  let parse_read output =
+    let prefix = "DISCORD-AGENTS-AGY-CONFIG " in
+    match List.find_opt (String.starts_with ~prefix) (String.split_on_char '\n' output) with
+    | None -> Result.Error "its agy MCP config came back unframed"
+    | Some line ->
+      let rest = String.sub line (String.length prefix) (String.length line - String.length prefix) in
+      match String.index_opt rest ' ' with
+      | None -> Result.Error "its agy MCP config came back malformed"
+      | Some i ->
+        let sum = String.sub rest 0 i
+        and b64 = String.trim (String.sub rest (i + 1) (String.length rest - i - 1)) in
+        match Base64.decode b64 with
+        | Result.Error _ -> Result.Error "its agy MCP config came back malformed"
+        | Result.Ok raw when Digest.to_hex (Digest.string raw) = String.trim sum -> Result.Ok raw
+        | Result.Ok _ -> Result.Error "its agy MCP config read back inconsistent (changed while being read, or garbled); will retry next turn"
+  in
+  let lock_path =
+    Filename.concat (Resource.app_config_dir ())
+      (Printf.sprintf "agy-mcp-config.%s.lock" (Digest.to_hex (Digest.string host.name))) in
+  try
+    Resource.with_flock lock_path (fun () ->
+      let existing =
+        match run ["sh"; "-c"; agy_remote_read_script] with
+        | Ok output -> Result.map Option.some (parse_read output)
+        | Error (Host_exec.Exited (5, _)) -> Ok None
+        | Error (Host_exec.Exited (3, _)) -> Error "~/.gemini/config does not exist (run agy once there)"
+        | Error (Host_exec.Exited (4, _)) -> Error "its agy MCP config is a symlink"
+        | Error (Host_exec.Exited (6, _)) -> Error "its agy MCP config is not a regular file"
+        | Error (Host_exec.Exited (8, _)) -> Error "it has no md5sum, md5 or openssl"
+        | Error f ->
+          Error (Printf.sprintf "reading its agy MCP config: %s: %s"
+                   (Host_exec.describe_failure ~host:host.name f)
+                   (Host_exec.failure_detail f))
+      in
+      match existing with
+      | Error why -> unavailable why
+      | Ok raw ->
+        match agy_mcp_config_update raw with
+        | Agy_mcp_present -> report_agy_mcp_available (); true
+        | Agy_mcp_declined why -> unavailable ("left its agy MCP config alone: " ^ why)
+        | Agy_mcp_write contents ->
+          let expected = match raw with
+            | Some r -> Digest.to_hex (Digest.string r) | None -> "absent" in
+          let incoming = Digest.to_hex (Digest.string contents) in
+          match run ~input:contents
+                  ["sh"; "-c"; agy_remote_write_script; "discord-agents"; expected; incoming] with
+          | Ok _ -> report_agy_mcp_available (); true
+          | Error (Host_exec.Exited (7, _)) ->
+            unavailable "its agy MCP config changed while we were updating it; will retry next turn"
+          | Error (Host_exec.Exited (4, _)) -> unavailable "its agy MCP config is a symlink"
+          | Error (Host_exec.Exited (8, _)) -> unavailable "it has no md5sum, md5 or openssl"
+          | Error (Host_exec.Exited (11, _)) ->
+            unavailable "couldn't keep its agy MCP config's mode; left it alone"
+          | Error (Host_exec.Exited (12, _)) ->
+            unavailable "the new agy MCP config arrived incomplete; left the old one in place"
+          | Error f -> failure "writing its agy MCP config" f)
+  with exn -> unavailable ("could not update its agy MCP config: " ^ Printexc.to_string exn)
+
 (** A failed remote turn, worded like the local one ("agent exited with
     code N: <stderr>") so callers that match on the agent's own stderr,
     such as Claude session recovery, work unchanged; other failures name
@@ -2717,8 +2900,9 @@ let compose_session_prompt ?(agy_mcp = false) ~agent_kind ~system_prompt
         (escape_prompt_block goal) user_prompt
     | _ -> user_prompt
   in
-  (* When agy runs without the discord-agents MCP server (remote turn,
-     no server resolved, or a global config we wouldn't touch), the
+  (* When agy runs without the discord-agents MCP server (no server
+     resolved, or a global config we wouldn't touch, here or on the
+     executor), the
      channel system prompts still list those tools. Say so, or a control
      agent under agy would try tools it doesn't have. *)
   let system_prompt = match system_prompt, agent_kind with
@@ -2748,35 +2932,6 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
   let fs = Eio.Stdenv.fs env in
   let cwd = Eio.Path.(fs / working_dir) in
   let child_env = child_environment ~thread_id () in
-  (* agy reaches the MCP server through its global config entry, which
-     runs whatever [agy_mcp_env_var] names. Remote turns don't get it
-     yet: the executor's agy has its own config and no route back. *)
-  let agy_mcp_command =
-    match kind, target with
-    | Config.Agy, Local ->
-      (match mcp_command_opt () with
-       | Some command
-         when Eio_unix.run_in_systhread (fun () -> setup_agy_mcp ()) ->
-         Some command
-       | _ -> None)
-    | Config.Agy, Remote _
-    | (Config.Claude | Config.Codex | Config.Gemini), _ -> None
-  in
-  let child_env = match agy_mcp_command with
-    | Some command ->
-      Array.append child_env [| Printf.sprintf "%s=%s" agy_mcp_env_var command |]
-    | None -> child_env
-  in
-  (* Codex/Gemini/agy get the system prompt prepended to the first user
-     turn (compose_session_prompt); Claude gets it via the dedicated
-     [--append-system-prompt] flag instead. *)
-  let prompt = compose_session_prompt
-    ~agy_mcp:(Option.is_some agy_mcp_command)
-    ~agent_kind:kind ~system_prompt ~message_count ~goal_context
-    ~user_prompt:prompt () in
-  let close_noerr flow =
-    try Eio.Resource.close flow with _ -> ()
-  in
   (* For a remote turn: the ssh command that reaches this bot's MCP server,
      or None when no server resolves (as locally, run without tools). *)
   let remote_mcp =
@@ -2787,6 +2942,44 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
         remote_mcp_command ~writer_ssh ~mcp_path
           ~config_home:(Filename.dirname (Resource.app_config_dir ())))
         (mcp_command_opt ())
+  in
+  (* The [agy_mcp_env_var] value for this turn's agy child, when its
+     global config holds our entry: the server path locally, the
+     writer-ssh command on an executor. *)
+  let agy_mcp_command =
+    match kind, target with
+    | Config.Agy, Local ->
+      (match mcp_command_opt () with
+       | Some command
+         when Eio_unix.run_in_systhread (fun () -> setup_agy_mcp ()) ->
+         Some (agy_mcp_value ~command ~args:[])
+       | _ -> None)
+    | Config.Agy, Remote { host; destination; _ } ->
+      (match remote_mcp with
+       | Some (command, args) ->
+         let host =
+           { (Host.local_host host) with Host.transport = Host.Ssh destination } in
+         if Eio_unix.run_in_systhread (fun () ->
+             setup_agy_mcp_remote ?ssh ~host ~working_dir ())
+         then Some (agy_mcp_value ~command ~args)
+         else None
+       | None -> None)
+    | (Config.Claude | Config.Codex | Config.Gemini), _ -> None
+  in
+  let child_env = match kind, target, agy_mcp_command with
+    | Config.Agy, Local, Some value ->
+      Array.append child_env [| Printf.sprintf "%s=%s" agy_mcp_env_var value |]
+    | _ -> child_env
+  in
+  (* Codex/Gemini/agy get the system prompt prepended to the first user
+     turn (compose_session_prompt); Claude gets it via the dedicated
+     [--append-system-prompt] flag instead. *)
+  let prompt = compose_session_prompt
+    ~agy_mcp:(Option.is_some agy_mcp_command)
+    ~agent_kind:kind ~system_prompt ~message_count ~goal_context
+    ~user_prompt:prompt () in
+  let close_noerr flow =
+    try Eio.Resource.close flow with _ -> ()
   in
   let claude_mcp_arg = match kind, target with
     | Config.Claude, Local ->
@@ -2881,7 +3074,11 @@ let run_streaming ~sw ~env ?(target = Local) ?ssh
     else
       Host_exec.run_streaming_ssh ~sw ~mgr ?ssh
         ~prefix:[setsid_command (); "--wait"] ~destination ~cwd:working_dir
-        ~lock_key:thread_id ~env:[session_thread_id_env, thread_id]
+        ~lock_key:thread_id
+        ~env:((session_thread_id_env, thread_id)
+              :: (match agy_mcp_command with
+                  | Some value -> [(agy_mcp_env_var, value)]
+                  | None -> []))
         ~argv ~on_line:parse_line ?on_spawn:on_pid ()
       |> Result.map_error (remote_failure_message ~host)
   in

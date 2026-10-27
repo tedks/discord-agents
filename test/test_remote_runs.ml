@@ -66,6 +66,14 @@ echo '{"type":"thread.started","thread_id":"t-9"}'
 echo '{"type":"item.completed","item":{"type":"agent_message","text":"codex says hi"}}'
 echo '{"type":"turn.completed","usage":{}}'
 |};
+      (* A fake agy: records argv and the MCP variable, prints a turn. *)
+      write_exe (Filename.concat bin "agy") {|#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done > "$HOME/agy.argv"
+printf '%s' "${DISCORD_AGENTS_MCP_FOR_AGY:-unset}" > "$HOME/agy.mcp"
+echo '{"event":"init","conversation_id":"s-1","init":{}}'
+echo '{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"agent_response","text_delta":"agy says hi"}}'
+echo '{"event":"result","result":{"conversation_id":"s-1","status":"SUCCESS","response":"agy says hi"}}'
+|};
       (* A real executable for mcp_command_opt to resolve; never run. *)
       let mcp = Filename.concat bin "discord agents-mcp" in
       write_exe mcp "#!/bin/sh\nexit 0\n";
@@ -263,6 +271,233 @@ let test_codex_turn_over_ssh () =
       (Discord_agents.Resource.contains_substring ~haystack:argv
          ~needle:{|mcp_servers.discord_agents.env.DISCORD_AGENTS_THREAD_ID="4242"|}))
 
+(* ── agy over ssh: the executor's global MCP config ── *)
+
+let agy_config base = Filename.concat base ".gemini/config/mcp_config.json"
+
+let mkdir_p path = ignore (Sys.command (Filename.quote_command "mkdir" ["-p"; path]))
+
+(* Run the value agy's entry would eval, with an ssh stand-in that prints
+   its argv, to see what reaches the writer. *)
+let eval_agy_value value =
+  let dir = Filename.temp_dir "discord_agents_agy_value_" "" in
+  Fun.protect ~finally:(fun () -> rm_rf dir) @@ fun () ->
+  write_exe (Filename.concat dir "ssh")
+    "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n";
+  let args = match Agent_process.agy_mcp_entry with
+    | `Assoc f -> (match List.assoc "args" f with
+        | `List l -> List.map (function `String x -> x | _ -> "") l | _ -> [])
+    | _ -> [] in
+  let env = [| "PATH=" ^ dir ^ ":/usr/bin:/bin"; "DISCORD_AGENTS_THREAD_ID=4242";
+               Agent_process.agy_mcp_env_var ^ "=" ^ value |] in
+  let ((out, _, _) as proc) =
+    Unix.open_process_args_full "/bin/sh" (Array.of_list ("/bin/sh" :: args)) env in
+  let output = In_channel.input_all out in
+  ignore (Unix.close_process_full proc);
+  output
+
+(* The remote scripts themselves, run with sh against a private HOME. *)
+let with_agy_home f =
+  let home = Filename.temp_dir "discord_agents_agy_home_" "" in
+  Fun.protect ~finally:(fun () -> rm_rf home) @@ fun () ->
+  mkdir_p (Filename.concat home ".gemini/config");
+  f ~home ~cfg:(Filename.concat home ".gemini/config/mcp_config.json")
+
+let run_script ~home ?(input = "") script args =
+  let env = [| "HOME=" ^ home; "PATH=/usr/bin:/bin" ^ (match Sys.getenv_opt "PATH" with Some p -> ":" ^ p | None -> "") |] in
+  let ((out, inp, _) as proc) =
+    Unix.open_process_args_full "/bin/sh"
+      (Array.of_list (["/bin/sh"; "-c"; script; "discord-agents"] @ args)) env in
+  output_string inp input; close_out inp;
+  let output = In_channel.input_all out in
+  let code = match Unix.close_process_full proc with Unix.WEXITED c -> c | _ -> -1 in
+  code, output
+
+let md5 s = Digest.to_hex (Digest.string s)
+
+let test_agy_remote_write_script () =
+  let w = Agent_process.agy_remote_write_script in
+  with_agy_home (fun ~home ~cfg ->
+    Out_channel.with_open_bin cfg (fun oc -> output_string oc "old");
+    Unix.chmod cfg 0o644;
+    let code, _ = run_script ~home ~input:"new-par" w [md5 "old"; md5 "new-partial-and-more"] in
+    Alcotest.(check int) "incomplete input refused" 12 code;
+    Alcotest.(check string) "old file untouched" "old" (read cfg);
+    let code, _ = run_script ~home ~input:"new" w [md5 "something else"; md5 "new"] in
+    Alcotest.(check int) "changed since read refused" 7 code;
+    Alcotest.(check string) "still untouched" "old" (read cfg);
+    let code, _ = run_script ~home ~input:"new" w [md5 "old"; md5 "new"] in
+    Alcotest.(check int) "replaced" 0 code;
+    Alcotest.(check string) "new bytes, exactly" "new" (read cfg);
+    Alcotest.(check int) "0644 kept" 0o644 ((Unix.stat cfg).Unix.st_perm);
+    Unix.chmod cfg 0o640;
+    let code, _ = run_script ~home ~input:"newer" w [md5 "new"; md5 "newer"] in
+    Alcotest.(check int) "replaced again" 0 code;
+    Alcotest.(check int) "0640 kept" 0o640 ((Unix.stat cfg).Unix.st_perm);
+    Unix.chmod cfg 0o400;
+    let code, _ = run_script ~home ~input:"ro" w [md5 "newer"; md5 "ro"] in
+    Alcotest.(check int) "a read-only config is still updated" 0 code;
+    Alcotest.(check string) "with the new bytes" "ro" (read cfg);
+    Alcotest.(check int) "and stays 0400" 0o400 ((Unix.stat cfg).Unix.st_perm);
+    Unix.chmod cfg 0o640;
+    (* Group kept: switch to another group we belong to, if any. *)
+    (match List.filter (fun g -> g <> Unix.getgid ()) (Array.to_list (Unix.getgroups ())) with
+     | g :: _ ->
+       Unix.chown cfg (-1) g;
+       let code, _ = run_script ~home ~input:"grp" w [md5 "ro"; md5 "grp"] in
+       Alcotest.(check int) "replaced, other group" 0 code;
+       Alcotest.(check int) "group kept" g ((Unix.stat cfg).Unix.st_gid);
+       Alcotest.(check int) "mode kept with it" 0o640 ((Unix.stat cfg).Unix.st_perm);
+       Unix.chown cfg (-1) (Unix.getgid ());
+       Out_channel.with_open_bin cfg (fun oc -> output_string oc "ro")
+     | [] -> ());
+    (* Temps: agy's own naming and a fresh bot temp are left alone; a stale
+       bot temp is reaped. *)
+    let dir = Filename.dirname cfg in
+    let agys = Filename.concat dir "mcp_config.json.tmp.77"
+    and fresh = Filename.concat dir ".discord-agents.mcp_config.json.tmp.fresh"
+    and stale = Filename.concat dir ".discord-agents.mcp_config.json.tmp.stale" in
+    List.iter (fun p -> Out_channel.with_open_bin p (fun oc -> output_string oc "t")) [agys; fresh; stale];
+    let old = Unix.gettimeofday () -. 3600. in
+    Unix.utimes stale old old;
+    let code, _ = run_script ~home ~input:"last" w [md5 "ro"; md5 "last"] in
+    Alcotest.(check int) "replaced once more" 0 code;
+    Alcotest.(check bool) "agy's temp untouched" true (Sys.file_exists agys);
+    Alcotest.(check bool) "a fresh bot temp untouched" true (Sys.file_exists fresh);
+    Alcotest.(check bool) "a stale bot temp reaped" false (Sys.file_exists stale);
+    Alcotest.(check (list string)) "no temp of this write left"
+      [".discord-agents.mcp_config.json.tmp.fresh"; "mcp_config.json"; "mcp_config.json.tmp.77"]
+      (List.sort compare (Array.to_list (Sys.readdir dir))));
+  with_agy_home (fun ~home ~cfg ->
+    let code, _ = run_script ~home ~input:"fresh" w ["absent"; md5 "fresh"] in
+    Alcotest.(check int) "created" 0 code;
+    Alcotest.(check int) "a new file is 0600" 0o600 ((Unix.stat cfg).Unix.st_perm);
+    let code, _ = run_script ~home ~input:"x" w ["absent"; md5 "x"] in
+    Alcotest.(check int) "appeared since read as absent: refused" 7 code;
+    Alcotest.(check string) "kept" "fresh" (read cfg))
+
+let test_agy_remote_read_script () =
+  with_agy_home (fun ~home ~cfg ->
+    let body = "{\"a\": \"line1\\nline2\"}\n\n" in
+    Out_channel.with_open_bin cfg (fun oc -> output_string oc body);
+    let code, out = run_script ~home Agent_process.agy_remote_read_script [] in
+    Alcotest.(check int) "read" 0 code;
+    (* Stray lines around it (ssh warnings merged into capture) are ignored. *)
+    let noisy = "Warning: Permanently added 'h' to the list of known hosts.\n" ^ out ^ "motd\n" in
+    Alcotest.(check bool) "framed line found" true
+      (Discord_agents.Resource.contains_substring ~haystack:noisy ~needle:"DISCORD-AGENTS-AGY-CONFIG ");
+    let line = List.find (String.starts_with ~prefix:"DISCORD-AGENTS-AGY-CONFIG ")
+        (String.split_on_char '\n' noisy) in
+    match String.split_on_char ' ' line with
+    | [_; sum; b64] ->
+      Alcotest.(check string) "hash of the exact bytes" (md5 body) sum;
+      Alcotest.(check string) "exact bytes, trailing newlines too" body
+        (match Base64.decode b64 with Ok s -> s | Error _ -> "?")
+    | _ -> Alcotest.failf "unexpected framed line: %s" line)
+
+let test_agy_turn_over_ssh () =
+  with_env (fun ~base ~ssh ~mcp ~work ->
+    mkdir_p (Filename.concat base ".gemini/config");
+    let cfg = agy_config base in
+    Out_channel.with_open_text cfg (fun oc ->
+      output_string oc {|{"theme":"dark","mcpServers":{"mine":{"command":"x"}}}|});
+    Unix.chmod cfg 0o644;
+    let r, events = run_turn ~ssh ~work ~kind:Discord_agents.Config.Agy () in
+    (match r with Ok () -> () | Error e -> Alcotest.failf "turn failed: %s" e);
+    Alcotest.(check bool) "agy text arrived" true
+      (List.exists (function Agent_process.Text_delta "agy says hi" -> true | _ -> false) events);
+    let open Yojson.Safe.Util in
+    let json = Yojson.Safe.from_file cfg in
+    Alcotest.(check string) "user key kept" "dark" (json |> member "theme" |> to_string);
+    Alcotest.(check string) "user server kept" "x"
+      (json |> member "mcpServers" |> member "mine" |> member "command" |> to_string);
+    Alcotest.(check bool) "our entry installed on the executor" true
+      (json |> member "mcpServers" |> member "discord_agents" = Agent_process.agy_mcp_entry);
+    Alcotest.(check int) "mode kept" 0o644 ((Unix.stat cfg).Unix.st_perm);
+    Alcotest.(check bool) "no temp left" true
+      (Array.for_all (fun f -> not (String.starts_with ~prefix:".discord-agents." f))
+         (Sys.readdir (Filename.dirname cfg)));
+    Alcotest.(check bool) "agy ran in the worktree" true
+      (Discord_agents.Resource.contains_substring
+         ~haystack:(read (Filename.concat base "agy.argv")) ~needle:("--add-dir\n" ^ work));
+    let value = read (Filename.concat base "agy.mcp") in
+    Alcotest.(check bool) "agy got the MCP variable" true (value <> "unset");
+    (* Evaluated as the entry does: ssh back to the writer with the
+       thread id and this bot's server. *)
+    let reached = eval_agy_value value in
+    Alcotest.(check bool) "reaches the writer" true
+      (List.mem "tower0" (String.split_on_char '\n' reached));
+    Alcotest.(check bool) "carries the thread id" true
+      (Discord_agents.Resource.contains_substring ~haystack:reached
+         ~needle:"DISCORD_AGENTS_THREAD_ID=4242");
+    Alcotest.(check bool) "runs this bot's server" true
+      (Discord_agents.Resource.contains_substring ~haystack:reached
+         ~needle:(Filename.basename mcp)))
+
+(* At the eval boundary, metacharacters in the command line stay data. *)
+let test_agy_value_metacharacters () =
+  let dir = Filename.temp_dir "discord_agents_agy_meta_" "" in
+  Fun.protect ~finally:(fun () -> rm_rf dir) @@ fun () ->
+  let printer = Filename.concat dir "print args" in
+  write_exe printer "#!/bin/sh\nfor a in \"$@\"; do printf '[%s]\\n' \"$a\"; done\n";
+  let canary = Filename.concat dir "pwned" in
+  let tricky = [Printf.sprintf "$(touch %s)" canary; "a; touch " ^ canary; "`id`"; "it's"; "$HOME"; ""] in
+  let value = Agent_process.agy_mcp_value ~command:printer ~args:tricky in
+  let args = match Agent_process.agy_mcp_entry with
+    | `Assoc f -> (match List.assoc "args" f with
+        | `List l -> List.map (function `String x -> x | _ -> "") l | _ -> [])
+    | _ -> [] in
+  let ((out, _, _) as proc) =
+    Unix.open_process_args_full "/bin/sh" (Array.of_list ("/bin/sh" :: args))
+      [| "PATH=/usr/bin:/bin"; Agent_process.agy_mcp_env_var ^ "=" ^ value |] in
+  let output = In_channel.input_all out in
+  let status = Unix.close_process_full proc in
+  Alcotest.(check bool) "exited 0" true (status = Unix.WEXITED 0);
+  Alcotest.(check string) "argv arrives exactly"
+    (String.concat "" (List.map (Printf.sprintf "[%s]\n") tricky)) output;
+  Alcotest.(check bool) "nothing executed" false (Sys.file_exists canary)
+
+let test_agy_remote_declines () =
+  with_env (fun ~base ~ssh ~mcp:_ ~work ->
+    (* No ~/.gemini/config on the executor: nothing created, no variable. *)
+    let r, _ = run_turn ~ssh ~work ~kind:Discord_agents.Config.Agy () in
+    (match r with Ok () -> () | Error e -> Alcotest.failf "turn failed: %s" e);
+    Alcotest.(check bool) "config dir not created" false
+      (Sys.file_exists (Filename.concat base ".gemini"));
+    Alcotest.(check string) "no MCP variable" "unset" (read (Filename.concat base "agy.mcp"));
+    (* A symlinked config is left alone. *)
+    mkdir_p (Filename.concat base ".gemini/config");
+    let target = Filename.concat base "managed.json" in
+    Out_channel.with_open_text target (fun oc -> output_string oc "{}");
+    Unix.symlink target (agy_config base);
+    let r, _ = run_turn ~ssh ~work ~kind:Discord_agents.Config.Agy () in
+    (match r with Ok () -> () | Error e -> Alcotest.failf "turn failed: %s" e);
+    Alcotest.(check bool) "symlink kept" true
+      ((Unix.lstat (agy_config base)).Unix.st_kind = Unix.S_LNK);
+    Alcotest.(check string) "target untouched" "{}" (read target);
+    Alcotest.(check string) "still no MCP variable" "unset" (read (Filename.concat base "agy.mcp")))
+
+let test_agy_remote_new_file_and_old_entry () =
+  with_env (fun ~base ~ssh ~mcp:_ ~work ->
+    mkdir_p (Filename.concat base ".gemini/config");
+    let cfg = agy_config base in
+    let r, _ = run_turn ~ssh ~work ~kind:Discord_agents.Config.Agy () in
+    (match r with Ok () -> () | Error e -> Alcotest.failf "turn failed: %s" e);
+    Alcotest.(check int) "a new config is private" 0o600 ((Unix.stat cfg).Unix.st_perm);
+    (* The entry #164 wrote is recognised and updated, extra keys kept. *)
+    let old_args = match Agent_process.agy_mcp_previous_args_json with a :: _ -> a | [] -> `Null in
+    Yojson.Safe.to_file cfg (`Assoc [("mcpServers", `Assoc [("discord_agents", `Assoc [
+      ("command", `String "/bin/sh"); ("args", old_args); ("env", `Assoc [("K", `String "V")])])])]);
+    let r, _ = run_turn ~ssh ~work ~kind:Discord_agents.Config.Agy () in
+    (match r with Ok () -> () | Error e -> Alcotest.failf "turn failed: %s" e);
+    let open Yojson.Safe.Util in
+    let entry = Yojson.Safe.from_file cfg |> member "mcpServers" |> member "discord_agents" in
+    Alcotest.(check bool) "updated to the current args" true
+      (entry |> member "args" = (match Agent_process.agy_mcp_entry with
+         | `Assoc f -> List.assoc "args" f | _ -> `Null));
+    Alcotest.(check string) "extra key kept" "V" (entry |> member "env" |> member "K" |> to_string);
+    Alcotest.(check bool) "MCP variable set" true (read (Filename.concat base "agy.mcp") <> "unset"))
+
 let test_unreachable_turn () =
   with_env (fun ~base:_ ~ssh ~mcp:_ ~work ->
     Eio_main.run @@ fun env ->
@@ -368,5 +603,14 @@ let () =
         test_remote_gemini_withdraws_entry_without_mcp;
       Alcotest.test_case "timeout refused without coreutils" `Quick
         test_timeout_refused_without_coreutils;
+      Alcotest.test_case "agy turn installs executor MCP entry" `Quick test_agy_turn_over_ssh;
+      Alcotest.test_case "agy remote write script" `Quick test_agy_remote_write_script;
+      Alcotest.test_case "agy remote read script" `Quick test_agy_remote_read_script;
+      Alcotest.test_case "agy value keeps metacharacters as data" `Quick
+        test_agy_value_metacharacters;
+      Alcotest.test_case "agy declines without config dir, on symlink" `Quick
+        test_agy_remote_declines;
+      Alcotest.test_case "agy new file private, old entry updated" `Quick
+        test_agy_remote_new_file_and_old_entry;
     ];
   ]

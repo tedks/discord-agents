@@ -171,7 +171,7 @@ Measured on 2026-10-24 with a wrapper that records being launched and then execs
 Operator approved (2026-10-24, issue #161) giving agy the MCP tools. The bot keeps one static, inert entry in the global file:
 
 ```json
-{"mcpServers":{"discord_agents":{"command":"/bin/sh","args":["-c","[ -n \"$DISCORD_AGENTS_MCP_FOR_AGY\" ] || exit 0; exec \"$DISCORD_AGENTS_MCP_FOR_AGY\"","discord-agents-mcp"]}}}
+{"mcpServers":{"discord_agents":{"command":"/bin/sh","args":["-c","[ -n \"$DISCORD_AGENTS_MCP_FOR_AGY\" ] || exit 0; eval \"exec $DISCORD_AGENTS_MCP_FOR_AGY\"","discord-agents-mcp"]}}}
 ```
 
 - The entry is merged in, and other servers and keys are kept. The file is rewritten only when our entry is missing or out of date. Extra keys on our entry, from the user or the IDE, are kept and don't trigger a rewrite. A rewrite pretty-prints the whole file, so whitespace changes.
@@ -198,7 +198,27 @@ Operator approved (2026-10-24, issue #161) giving agy the MCP tools. The bot kee
 - MCP availability is decided per turn. The first turn's bot-context carries the full notice when the tools are missing. Later turns of a channel session carry a one-line status, so a first-turn "unavailable" doesn't stick once the tools come back.
 - `--add-dir` together with `--conversation` on a resumed turn: verified (same conversation id, tools in the workspace).
 - Verified end to end: agy called `list_sessions` on the live bot through `call_mcp_tool`, with the caller's thread id intact.
-- Remote agy turns don't get MCP yet: the executor has its own agy config and no route back. They get the no-MCP notice.
+- The variable holds a shell-quoted command line. Locally it is the server path. On an executor it is the writer-ssh command that the Claude, Codex and Gemini remote paths use (`remote_mcp_command`), which carries the thread id back to the writer.
+- **Remote agy turns:** the executor's agy reads its own `~/.gemini/config/mcp_config.json`. Before each remote agy turn, the bot installs the same entry there under the same rules:
+  - it reads the file through a small remote script (missing config dir, symlink and non-regular file are all refused);
+  - it decides with the same pure merge as locally;
+  - it writes through a remote script that rewrites only if the file's MD5 is still what was read;
+  - the file's mode is kept, and a new file is 0600;
+  - temps use the bot-only prefix;
+  - a bot-owned local lock serialises writes per host.
+
+  The variable is forwarded through the remote run script's environment.
+- The first released entry (`exec "$DISCORD_AGENTS_MCP_FOR_AGY"`, #164) is matched exactly and updated in place, keeping any keys added to it.
+- **Remote read and write scripts.** The read comes back as one framed line (`DISCORD-AGENTS-AGY-CONFIG <md5> <base64>`), which the bot decodes and checks. Capture merges ssh's own stderr into the output, so a warning can't pass for the file. The write:
+  - is checked against the new content's MD5, so truncated input is never installed;
+  - keeps the original's group and mode via `stat` (GNU or BSD), applied after the bytes are written and verified, so a read-only 0400 config works;
+  - refuses a config owned by another user, since the rename would change its owner;
+  - uses an exclusive `mktemp` temp and reaps only bot temps older than 10 minutes;
+  - does all its work before the compare, so the race with the user's own writers is just the rename (`sync` is best-effort).
+
+  The scripts need only POSIX sh plus `md5sum`/`md5`/`openssl`, `base64`, `mktemp`, GNU-or-BSD `stat`, and `find -maxdepth -mmin`, so macOS executors work.
+- **Deploy order.** An older bot (#164 code) treats the new `eval` entry as someone else's and declines MCP for its own local agy until it's upgraded. Nothing is damaged, and rolling back is safe.
+- **Cost.** A remote agy turn adds an ssh round trip (the read) before spawning, and a second one only when the entry needs writing.
 
 ### Workspace: `--add-dir` is required
 
@@ -206,7 +226,6 @@ With only the cwd set, agy reports "No workspace is open" and its file tools wor
 
 ## Remaining
 
-1. MCP for remote agy turns (the executor's own global config, plus a route back to the writer).
-2. Decide whether to detect a signed-out run early (stderr
+1. Decide whether to detect a signed-out run early (stderr
    `Authentication required`) instead of waiting out agy's 60s auth
    timeout.
