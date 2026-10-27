@@ -66,6 +66,14 @@ echo '{"type":"thread.started","thread_id":"t-9"}'
 echo '{"type":"item.completed","item":{"type":"agent_message","text":"codex says hi"}}'
 echo '{"type":"turn.completed","usage":{}}'
 |};
+      (* A fake agy: records argv and the MCP variable, prints a turn. *)
+      write_exe (Filename.concat bin "agy") {|#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done > "$HOME/agy.argv"
+printf '%s' "${DISCORD_AGENTS_MCP_FOR_AGY:-unset}" > "$HOME/agy.mcp"
+echo '{"event":"init","conversation_id":"s-1","init":{}}'
+echo '{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"agent_response","text_delta":"agy says hi"}}'
+echo '{"event":"result","result":{"conversation_id":"s-1","status":"SUCCESS","response":"agy says hi"}}'
+|};
       (* A real executable for mcp_command_opt to resolve; never run. *)
       let mcp = Filename.concat bin "discord agents-mcp" in
       write_exe mcp "#!/bin/sh\nexit 0\n";
@@ -263,6 +271,111 @@ let test_codex_turn_over_ssh () =
       (Discord_agents.Resource.contains_substring ~haystack:argv
          ~needle:{|mcp_servers.discord_agents.env.DISCORD_AGENTS_THREAD_ID="4242"|}))
 
+(* ── agy over ssh: the executor's global MCP config ── *)
+
+let agy_config base = Filename.concat base ".gemini/config/mcp_config.json"
+
+let mkdir_p path = ignore (Sys.command (Filename.quote_command "mkdir" ["-p"; path]))
+
+(* Run the value agy's entry would eval, with an ssh stand-in that prints
+   its argv, to see what reaches the writer. *)
+let eval_agy_value value =
+  let dir = Filename.temp_dir "discord_agents_agy_value_" "" in
+  Fun.protect ~finally:(fun () -> rm_rf dir) @@ fun () ->
+  write_exe (Filename.concat dir "ssh")
+    "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n";
+  let args = match Agent_process.agy_mcp_entry with
+    | `Assoc f -> (match List.assoc "args" f with
+        | `List l -> List.map (function `String x -> x | _ -> "") l | _ -> [])
+    | _ -> [] in
+  let env = [| "PATH=" ^ dir ^ ":/usr/bin:/bin"; "DISCORD_AGENTS_THREAD_ID=4242";
+               Agent_process.agy_mcp_env_var ^ "=" ^ value |] in
+  let ((out, _, _) as proc) =
+    Unix.open_process_args_full "/bin/sh" (Array.of_list ("/bin/sh" :: args)) env in
+  let output = In_channel.input_all out in
+  ignore (Unix.close_process_full proc);
+  output
+
+let test_agy_turn_over_ssh () =
+  with_env (fun ~base ~ssh ~mcp ~work ->
+    mkdir_p (Filename.concat base ".gemini/config");
+    let cfg = agy_config base in
+    Out_channel.with_open_text cfg (fun oc ->
+      output_string oc {|{"theme":"dark","mcpServers":{"mine":{"command":"x"}}}|});
+    Unix.chmod cfg 0o644;
+    let r, events = run_turn ~ssh ~work ~kind:Discord_agents.Config.Agy () in
+    (match r with Ok () -> () | Error e -> Alcotest.failf "turn failed: %s" e);
+    Alcotest.(check bool) "agy text arrived" true
+      (List.exists (function Agent_process.Text_delta "agy says hi" -> true | _ -> false) events);
+    let open Yojson.Safe.Util in
+    let json = Yojson.Safe.from_file cfg in
+    Alcotest.(check string) "user key kept" "dark" (json |> member "theme" |> to_string);
+    Alcotest.(check string) "user server kept" "x"
+      (json |> member "mcpServers" |> member "mine" |> member "command" |> to_string);
+    Alcotest.(check bool) "our entry installed on the executor" true
+      (json |> member "mcpServers" |> member "discord_agents" = Agent_process.agy_mcp_entry);
+    Alcotest.(check int) "mode kept" 0o644 ((Unix.stat cfg).Unix.st_perm);
+    Alcotest.(check bool) "no temp left" true
+      (Array.for_all (fun f -> not (String.starts_with ~prefix:".discord-agents." f))
+         (Sys.readdir (Filename.dirname cfg)));
+    Alcotest.(check bool) "agy ran in the worktree" true
+      (Discord_agents.Resource.contains_substring
+         ~haystack:(read (Filename.concat base "agy.argv")) ~needle:("--add-dir\n" ^ work));
+    let value = read (Filename.concat base "agy.mcp") in
+    Alcotest.(check bool) "agy got the MCP variable" true (value <> "unset");
+    (* Evaluated as the entry does: ssh back to the writer with the
+       thread id and this bot's server. *)
+    let reached = eval_agy_value value in
+    Alcotest.(check bool) "reaches the writer" true
+      (Discord_agents.Resource.contains_substring ~haystack:reached ~needle:"tower0");
+    Alcotest.(check bool) "carries the thread id" true
+      (Discord_agents.Resource.contains_substring ~haystack:reached
+         ~needle:"DISCORD_AGENTS_THREAD_ID=4242");
+    Alcotest.(check bool) "runs this bot's server" true
+      (Discord_agents.Resource.contains_substring ~haystack:reached
+         ~needle:(Filename.basename mcp)))
+
+let test_agy_remote_declines () =
+  with_env (fun ~base ~ssh ~mcp:_ ~work ->
+    (* No ~/.gemini/config on the executor: nothing created, no variable. *)
+    let r, _ = run_turn ~ssh ~work ~kind:Discord_agents.Config.Agy () in
+    (match r with Ok () -> () | Error e -> Alcotest.failf "turn failed: %s" e);
+    Alcotest.(check bool) "config dir not created" false
+      (Sys.file_exists (Filename.concat base ".gemini"));
+    Alcotest.(check string) "no MCP variable" "unset" (read (Filename.concat base "agy.mcp"));
+    (* A symlinked config is left alone. *)
+    mkdir_p (Filename.concat base ".gemini/config");
+    let target = Filename.concat base "managed.json" in
+    Out_channel.with_open_text target (fun oc -> output_string oc "{}");
+    Unix.symlink target (agy_config base);
+    let r, _ = run_turn ~ssh ~work ~kind:Discord_agents.Config.Agy () in
+    (match r with Ok () -> () | Error e -> Alcotest.failf "turn failed: %s" e);
+    Alcotest.(check bool) "symlink kept" true
+      ((Unix.lstat (agy_config base)).Unix.st_kind = Unix.S_LNK);
+    Alcotest.(check string) "target untouched" "{}" (read target);
+    Alcotest.(check string) "still no MCP variable" "unset" (read (Filename.concat base "agy.mcp")))
+
+let test_agy_remote_new_file_and_old_entry () =
+  with_env (fun ~base ~ssh ~mcp:_ ~work ->
+    mkdir_p (Filename.concat base ".gemini/config");
+    let cfg = agy_config base in
+    let r, _ = run_turn ~ssh ~work ~kind:Discord_agents.Config.Agy () in
+    (match r with Ok () -> () | Error e -> Alcotest.failf "turn failed: %s" e);
+    Alcotest.(check int) "a new config is private" 0o600 ((Unix.stat cfg).Unix.st_perm);
+    (* The entry #164 wrote is recognised and updated, extra keys kept. *)
+    let old_args = match Agent_process.agy_mcp_previous_args_json with a :: _ -> a | [] -> `Null in
+    Yojson.Safe.to_file cfg (`Assoc [("mcpServers", `Assoc [("discord_agents", `Assoc [
+      ("command", `String "/bin/sh"); ("args", old_args); ("env", `Assoc [("K", `String "V")])])])]);
+    let r, _ = run_turn ~ssh ~work ~kind:Discord_agents.Config.Agy () in
+    (match r with Ok () -> () | Error e -> Alcotest.failf "turn failed: %s" e);
+    let open Yojson.Safe.Util in
+    let entry = Yojson.Safe.from_file cfg |> member "mcpServers" |> member "discord_agents" in
+    Alcotest.(check bool) "updated to the current args" true
+      (entry |> member "args" = (match Agent_process.agy_mcp_entry with
+         | `Assoc f -> List.assoc "args" f | _ -> `Null));
+    Alcotest.(check string) "extra key kept" "V" (entry |> member "env" |> member "K" |> to_string);
+    Alcotest.(check bool) "MCP variable set" true (read (Filename.concat base "agy.mcp") <> "unset"))
+
 let test_unreachable_turn () =
   with_env (fun ~base:_ ~ssh ~mcp:_ ~work ->
     Eio_main.run @@ fun env ->
@@ -368,5 +481,10 @@ let () =
         test_remote_gemini_withdraws_entry_without_mcp;
       Alcotest.test_case "timeout refused without coreutils" `Quick
         test_timeout_refused_without_coreutils;
+      Alcotest.test_case "agy turn installs executor MCP entry" `Quick test_agy_turn_over_ssh;
+      Alcotest.test_case "agy declines without config dir, on symlink" `Quick
+        test_agy_remote_declines;
+      Alcotest.test_case "agy new file private, old entry updated" `Quick
+        test_agy_remote_new_file_and_old_entry;
     ];
   ]

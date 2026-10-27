@@ -4270,6 +4270,16 @@ let test_agy_mcp_update_cases () =
       "non-finite number", {|{"x": 1e400}|}, "would not re-serialise as standard JSON" ];
   Alcotest.(check string) "a // inside a string is not a comment" "write"
     (k (Some {|{"url": "https://example.com/x"}|}));
+  (match AP.agy_mcp_config_update (Some (Printf.sprintf
+     {|{"mcpServers":{"discord_agents":{"command":"/bin/sh","args":%s,"env":{"K":"V"}}}}|}
+     (Yojson.Safe.to_string (List.hd AP.agy_mcp_previous_args_json)))) with
+   | AP.Agy_mcp_write text ->
+     let e = Yojson.Safe.Util.(Yojson.Safe.from_string text |> member "mcpServers" |> member "discord_agents") in
+     Alcotest.(check bool) "the #164 entry is updated to the current args" true
+       (Yojson.Safe.Util.member "args" e = AP.agy_mcp_args_json);
+     Alcotest.(check bool) "keeping its extra keys" true (Yojson.Safe.Util.member "env" e <> `Null);
+     Alcotest.(check string) "and is then up to date" "present" (k (Some text))
+   | other -> Alcotest.failf "expected an update, got %s" (agy_update_kind other));
   Alcotest.(check string) "ours plus IDE-added keys: present, no rewrite" "present"
     (k (Some (Printf.sprintf {|{"mcpServers":{"discord_agents":{"command":"/bin/sh","args":%s,"disabled":false,"env":{}}}}|} ours_args)));
   (match AP.agy_mcp_config_update
@@ -4373,7 +4383,11 @@ let test_agy_mcp_entry_gate () =
       Sys.command (cmd ^ " </dev/null >/dev/null 2>&1") in
     Alcotest.(check int) "unset: exits 0 without running anything" 0 (run []);
     Alcotest.(check int) "set: execs the named server" 42
-      (run [AP.agy_mcp_env_var ^ "=" ^ server]))
+      (run [AP.agy_mcp_env_var ^ "=" ^ AP.agy_mcp_value ~command:server ~args:[]]);
+    (* A command line, as on an executor; quoting survives odd args. *)
+    Alcotest.(check int) "set to a command line: runs it with its args" 43
+      (run [AP.agy_mcp_env_var ^ "=" ^ AP.agy_mcp_value ~command:"/bin/sh"
+              ~args:["-c"; "[ \"$1\" = \"it's a b\" ] && exit 43; exit 1"; "x"; "it's a b"]]))
 
 let test_agy_mcp_env_not_inherited () =
   let env = AP.child_environment
