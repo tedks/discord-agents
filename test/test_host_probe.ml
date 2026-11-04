@@ -275,9 +275,13 @@ let test_large_capture () =
   with_dir (fun dir -> with_clock (fun clock ->
     let ssh = fake_ssh dir in
     let bytes = 2 * 1024 * 1024 in
-    let argv = ["head"; "-c"; string_of_int bytes; "/dev/zero"] in
+    let pattern = "\000\r\n\255__DA_EXIT__ marker-like bytes" in
+    let payload = String.init bytes (fun i -> pattern.[i mod String.length pattern]) in
+    let fixture = Filename.concat dir "binary" in
+    Out_channel.with_open_bin fixture (fun oc -> output_string oc payload);
+    let argv = ["cat"; fixture] in
     List.iter (fun host ->
-      ok (String.make bytes '\000')
+      ok payload
         (Discord_agents.Host_capture.run ~clock ~ssh ~timeout_s:10
            ~max_output_bytes:bytes host argv);
       Alcotest.(check bool) "larger captures still reject overflow" true
@@ -289,13 +293,28 @@ let test_large_capture () =
       Alcotest.(check bool) "absolute capture ceiling enforced" true
         (match Discord_agents.Host_capture.run ~clock ~ssh ~timeout_s:10
            ~max_output_bytes:(32 * 1024 * 1024 + 1) host ["true"] with
-         | Error (Process (Setup_failed _)) -> true | _ -> false)
+         | Error (Process (Setup_failed _)) -> true | _ -> false);
+      ok "" (Discord_agents.Host_capture.run ~clock ~ssh ~timeout_s:10
+        ~max_output_bytes:(32 * 1024 * 1024) host ["true"])
     ) [local; remote]))
+
+let test_marker_search () =
+  let text = String.make (2 * 1024 * 1024) '\n' ^ "trailer" in
+  Alcotest.(check (option int)) "missing marker" None (Exec.find_sub text "\nmissing");
+  Alcotest.(check (option int)) "last marker" (Some (String.length text - 7))
+    (Exec.rfind_sub text "trailer");
+  List.iter (fun (s, sub, first, last) ->
+    Alcotest.(check (option int)) "first match" first (Exec.find_sub s sub);
+    Alcotest.(check (option int)) "last match" last (Exec.rfind_sub s sub)
+  ) ["", "", Some 0, Some 0; "ababa", "aba", Some 0, Some 2;
+     "ab", "abc", None, None; "ab", "", Some 0, Some 2];
+  Alcotest.(check (option int)) "offset" (Some 2) (Exec.find_sub ~from:1 "ababa" "aba")
 
 let () = Alcotest.run "host_probe" [
   "transport", [
     Alcotest.test_case "exact bytes local and ssh" `Quick test_roundtrip;
     Alcotest.test_case "larger capture preserves probe ceiling" `Quick test_large_capture;
+    Alcotest.test_case "large failed capture marker search" `Quick test_marker_search;
     Alcotest.test_case "refusals and failure stages" `Quick test_refusals;
     Alcotest.test_case "time and memory limits" `Quick test_limits;
     Alcotest.test_case "executor cleans up after success and disconnect" `Quick test_remote_supervision;

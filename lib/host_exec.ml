@@ -141,11 +141,18 @@ let exchange ~in_w ~payload ~out_r =
   Thread.join writer;
   output
 
+(* Compare in place: failed large captures can scan their entire output.
+   Allocating a substring at every candidate position multiplies that work. *)
+let rec substring_matches s sub offset j =
+  j = String.length sub
+  || (s.[offset + j] = sub.[j] && substring_matches s sub offset (j + 1))
+
 let find_sub ?(from = 0) s sub =
+  if from < 0 then invalid_arg "find_sub: negative offset";
   let n = String.length s and m = String.length sub in
   let rec go i =
-    if i + m > n then None
-    else if String.sub s i m = sub then Some i
+    if i > n - m then None
+    else if substring_matches s sub i 0 then Some i
     else go (i + 1)
   in
   go from
@@ -154,7 +161,7 @@ let rfind_sub s sub =
   let n = String.length s and m = String.length sub in
   let rec go i =
     if i < 0 then None
-    else if String.sub s i m = sub then Some i
+    else if substring_matches s sub i 0 then Some i
     else go (i - 1)
   in
   go (n - m)

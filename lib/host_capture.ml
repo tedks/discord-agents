@@ -16,9 +16,9 @@ let run ~clock ~timeout_s ~max_output_bytes ?(ssh = "ssh") ?cwd
     (host : Host.t) argv =
   if not host.enabled then Error Disabled
   else if max_output_bytes < 0 || max_output_bytes > max_capture_output_bytes then
-    Error (Process (Setup_failed "invalid probe output limit"))
+    Error (Process (Setup_failed "invalid capture output limit"))
   else if timeout_s <= 0 || timeout_s > 3600 then
-    Error (Process (Setup_failed "probe timeout must be between 1 and 3600 seconds"))
+    Error (Process (Setup_failed "capture timeout must be between 1 and 3600 seconds"))
   else
     let cwd = Option.value cwd ~default:"." in
     let nonce = Remote_script.fresh_nonce () in
@@ -28,7 +28,7 @@ let run ~clock ~timeout_s ~max_output_bytes ?(ssh = "ssh") ?cwd
       let command = match host.transport with
         | Host.Local -> Ok (["sh"; "-c"; script], "")
         | Host.Ssh _ when String.length (Remote_script.quote script) + 64 > Remote_script.max_arg_bytes ->
-          Error (Host_exec.Setup_failed "probe script exceeds the executor argument limit")
+          Error (Host_exec.Setup_failed "capture script exceeds the executor argument limit")
         | Host.Ssh destination ->
           Result.map (fun ssh ->
             (* coreutils timeout owns the executor process group. Keep its
