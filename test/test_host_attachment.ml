@@ -51,6 +51,95 @@ let test_real () =
             let oc=open_out_bin (Filename.concat dir name) in
             seek_out oc (9*1024*1024-1); output_char oc 'x'; close_out oc; name) in
           Result.is_error (load paths)))))
+let replace_once ~old ~replacement text =
+  let i = Str.search_forward (Str.regexp_string old) text 0 in
+  String.sub text 0 i ^ replacement ^
+  String.sub text (i + String.length old) (String.length text - i - String.length old)
+
+let test_mutating_paths () =
+  let root = Filename.temp_dir "attachment-race" "" |> Unix.realpath in
+  let moved = root ^ ".moved" in
+  Fun.protect ~finally:(fun () ->
+    if Sys.file_exists root then remove root;
+    if Sys.file_exists moved then remove moved) (fun () ->
+    write (Filename.concat root "file.txt") "stable";
+    Unix.symlink "file.txt" (Filename.concat root "link.txt");
+    Eio_main.run (fun env ->
+      let clock = Eio.Stdenv.mono_clock env in
+      let run ?(path="file.txt") script = Discord_agents.Host_capture.run ~clock ~timeout_s:3
+        ~max_output_bytes:4096 ~cwd:"/" writer
+        ["python3"; "-I"; "-c"; script; root; path] in
+      check "original script positive control" (Result.is_ok (run A.script));
+      let marker = "            data = b''.join(chunks)\n" in
+      let changed_file = replace_once ~old:marker
+        ~replacement:(marker ^ "            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1000000000))\n") A.script in
+      check "file metadata change refused" (Result.is_error (run changed_file));
+      let open_marker = "            data = open_checked(anchors, roots, canonical, MAX_TOTAL - total)\n" in
+      let changed_path = replace_once ~old:open_marker
+        ~replacement:("            os.unlink(requested)\n            os.symlink('/etc/passwd', requested)\n" ^ open_marker) A.script in
+      check "path replacement refused" (Result.is_error (run ~path:"link.txt" changed_path));
+      let anchor_marker = "            check_dirs(anchors)\n" in
+      let changed_root = replace_once ~old:anchor_marker
+        ~replacement:("            os.rename(root, root + '.moved')\n            os.mkdir(root)\n" ^ anchor_marker) A.script in
+      check "root replacement refused" (Result.is_error (run changed_root))))
+
+let running pid =
+  match In_channel.with_open_bin (Printf.sprintf "/proc/%d/stat" pid) In_channel.input_all with
+  | text -> let state = text.[String.rindex text ')' + 2] in state <> 'Z' && state <> 'X'
+  | exception Sys_error _ -> false
+
+let test_cancellation () =
+  let dir = Filename.temp_dir "attachment-cancel" "" |> Unix.realpath in
+  Fun.protect ~finally:(fun () -> remove dir) (fun () ->
+    let pidfile = Filename.concat dir "pid" in
+    let ssh = Filename.concat dir "ssh" in
+    write ssh ("#!/bin/sh\necho $$ > " ^ Filename.quote pidfile ^ "\nexec sleep 300\n");
+    Unix.chmod ssh 0o755;
+    write (Filename.concat dir "file.txt") "contents";
+    Eio_main.run (fun env ->
+      let clock = Eio.Stdenv.mono_clock env in
+      let rec started () =
+        if not (Sys.file_exists pidfile) then (Eio.Time.Mono.sleep clock 0.01; started ()) in
+      let outcome = Eio.Time.Timeout.run_exn (Eio.Time.Timeout.seconds clock 3.) (fun () ->
+        Eio.Fiber.first
+          (fun () -> ignore (A.load ~clock ~ssh ~host:executor ~working_dir:dir ["file.txt"]); `Completed)
+          (fun () -> started (); `Canceled)) in
+      check "read canceled after transport started" (outcome = `Canceled);
+      let pid = In_channel.with_open_bin pidfile (fun ic -> int_of_string (input_line ic)) in
+      let rec await n =
+        if n > 0 && running pid then (Eio.Time.Mono.sleep clock 0.01; await (n-1)) in
+      await 100;
+      check "owned transport stopped" (not (running pid))))
+
+let test_transport_loss () =
+  let dir = Filename.temp_dir "attachment-drop" "" |> Unix.realpath in
+  Fun.protect ~finally:(fun () -> remove dir) (fun () ->
+    let ssh = Filename.concat dir "drop-ssh" in
+    write ssh {py|#!/usr/bin/env python3
+import os, subprocess, sys
+args = sys.argv[1:]
+command = ' '.join(args[args.index('--') + 2:])
+line = sys.stdin.buffer.readline()
+child = subprocess.Popen(['sh', '-c', command], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         start_new_session=True)
+out, _ = child.communicate(input=line, timeout=10)
+if b'discord_agents.remote_started' not in out or len(out) < 2048:
+    sys.exit(254)
+sys.stdout.buffer.write(out[:1024])
+sys.stdout.buffer.flush()
+sys.exit(255)
+|py};
+    Unix.chmod ssh 0o755;
+    write (Filename.concat dir "data.bin") (String.make (1024 * 1024) 'q');
+    Eio_main.run (fun env ->
+      let clock = Eio.Stdenv.mono_clock env in
+      let result = A.load ~clock ~ssh ~host:executor ~working_dir:dir ["data.bin"] in
+      check "partial transport output refused" (Result.is_error result);
+      match result with
+      | Error e -> check "raw transport bytes discarded" (not (String.contains e 'q'))
+      | Ok _ -> Alcotest.fail "partial transport accepted"))
+
 let test_decoder () =
   let manifest = {|{"version":1,"files":[{"name":"a.txt","size":3,"md5":"900150983cd24fb0d6963f7d28e17f72"}]}|} in
   let frame = Printf.sprintf "%08x%sabc" (String.length manifest) manifest in
@@ -62,4 +151,7 @@ let test_decoder () =
 let () = Alcotest.run "host attachment" ["reader", [
   Alcotest.test_case "real local and SSH reads" `Quick test_real;
   Alcotest.test_case "strict framing" `Quick test_decoder;
+  Alcotest.test_case "deterministic file and root replacement" `Quick test_mutating_paths;
+  Alcotest.test_case "canceled transport" `Quick test_cancellation;
+  Alcotest.test_case "partial transport loss" `Quick test_transport_loss;
 ]]
