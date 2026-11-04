@@ -1580,8 +1580,9 @@ let handle_send_attachments ?ssh (bot : Bot.t) params =
           let send () = match read () with
           | Error error -> error_response error
           | Ok files ->
-            (* Reads yield. Do not publish old bytes into a stopped or replaced
-               session, even if its Discord thread still exists. *)
+            (* Reads yield. Normal Session_store setters mutate this record;
+               replacing it means a different session generation, even if its
+               Discord thread or transcript id stays the same. *)
             if session.stop_requested ||
                not (Option.fold ~none:false ~some:(fun current -> current == session)
                  (Session_store.find_opt bot.sessions ~thread_id)) then

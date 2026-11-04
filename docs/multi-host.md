@@ -11,6 +11,12 @@ file or transfer sends nothing. This is change detection, not an atomic
 filesystem snapshot; a writer deliberately hiding changes is outside the
 trusted-executor contract.
 
+Remote upload names use the requested basename, so an in-worktree symlink
+keeps its alias name; the existing local reader uses the resolved basename.
+Changes to entries in the worktree root or traversed subdirectories can
+reject a batch even if the requested file was unaffected; retry after that
+activity settles. Ancestors above the worktree are checked for identity only.
+
 Limits remain ten files, 10 MiB per file and 25 MiB for the final multipart
 request. Remote path strings must be nonempty UTF-8 without NUL, at most 4096
 bytes each and 8192 bytes combined with the cwd; the manifest is capped at
@@ -24,6 +30,8 @@ caller-selected ceiling up to 32 MiB; diagnostics retain `Host_probe`'s 1 MiB
 ceiling. Both reject overflow instead of accepting truncated output. Remote
 reads require the same GNU timeout supervision as probes and Python on the
 executor; no fallback reads the writer's same-path file.
+The 30-second deadline includes SSH setup, reading and transfer, so a full
+batch can time out on a slow link. It does not include the Discord upload.
 
 The session-path audit found no additional unguarded control-API file reads:
 the other references are transcript-listing metadata. Bot disk probes and stop

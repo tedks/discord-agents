@@ -2451,6 +2451,20 @@ sys.exit(code)
     let await_file path = Eio.Time.Timeout.run_exn (Eio.Time.Timeout.seconds clock 5.) (fun () ->
       while not (Sys.file_exists path) do Eio.Time.Mono.sleep clock 0.01 done) in
     let await_started () = await_file started in
+    let session = install () in
+    write mode "wait";
+    let updated_result = ref None in
+    Eio.Fiber.both
+      (fun () -> updated_result := Some (invoke ["report.bin"]))
+      (fun () -> await_started ();
+        Discord_agents.Session_store.set_session_id bot.sessions session
+          ~session_id:"executor-confirmed-id";
+        Discord_agents.Session_store.increment_message_count bot.sessions session;
+        write release "go");
+    success (Option.get !updated_result);
+    Alcotest.(check bool) "normal updates preserve live session identity" true
+      (Option.get (Discord_agents.Session_store.find_opt bot.sessions ~thread_id:"4242") == session);
+    Unix.unlink started; Unix.unlink release; Unix.unlink finished;
     List.iter (fun change ->
       let session = install () in
       write mode "wait";
@@ -2478,7 +2492,7 @@ sys.exit(code)
     await_file finished;
     write mode "normal";
     success (invoke ["report.bin"]);
-    Alcotest.(check int) "only complete current-session batches upload" 3 (List.length !uploaded))
+    Alcotest.(check int) "only complete current-session batches upload" 4 (List.length !uploaded))
 
 let test_login_guidance_uses_session_executor () =
   let rest_call ~headers:_ ?body:_ _ _ =
