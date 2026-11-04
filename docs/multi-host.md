@@ -1,11 +1,36 @@
 # Multi-host sessions: one Discord writer, remote executors over SSH
 
-Attachment prerequisite (2026-11-03): `Host_capture` shares the existing
-bounded local/SSH supervision and framing, with a caller-selected output cap
-up to 32 MiB. `Host_probe` retains its 1 MiB ceiling. Both require a deadline
-and reject overflow rather than accepting truncated output. Executor file
-validation and attachment upload wiring remain issue 145; this extraction
-does not enable remote uploads.
+Executor attachments (2026-11-03, issue 145): `send_attachments` resolves the
+session host before file access. Remote requests run a Python 3.10+ reader on
+that executor with a 30-second deadline. It canonicalizes paths, confines
+descriptor-based opens to the worktree, refuses nonregular files without
+blocking on FIFOs, and rejects observable file/path changes. A complete framed
+batch carries lengths and digests; the writer independently verifies framing,
+file count, byte caps and digests before sending one Discord message. A failed
+file or transfer sends nothing. This is change detection, not an atomic
+filesystem snapshot; a writer deliberately hiding changes is outside the
+trusted-executor contract.
+
+Limits remain ten files, 10 MiB per file and 25 MiB for the final multipart
+request. Remote path strings must be nonempty UTF-8 without NUL, at most 4096
+bytes each and 8192 bytes combined with the cwd; the manifest is capped at
+8192 bytes. Only one remote upload runs at a time per bot, through completion
+of the Discord request. A stopped/replaced session is rechecked after reading.
+Raw transport diagnostics are discarded. Local uploads retain their existing
+reader; its FIFO/path-race hardening is tracked in
+[177](https://github.com/tedks/discord-agents/issues/177).
+`Host_capture` (PR176) shares the bounded local/SSH supervision with a
+caller-selected ceiling up to 32 MiB; diagnostics retain `Host_probe`'s 1 MiB
+ceiling. Both reject overflow instead of accepting truncated output. Remote
+reads require the same GNU timeout supervision as probes and Python on the
+executor; no fallback reads the writer's same-path file.
+
+The session-path audit found no additional unguarded control-API file reads:
+the other references are transcript-listing metadata. Bot disk probes and stop
+cleanup already guard local ownership; remote cleanup remains the worktree
+lifecycle slice. Agent input attachments and subprocess cwd are routed through
+the existing execution target. No live executor acceptance or deployment is
+claimed by the fake-SSH tests here.
 
 Inventory implementation (2026-10-25), tracked in
 [167](https://github.com/tedks/discord-agents/issues/167): `Host_project_scan`

@@ -251,7 +251,7 @@ TOOLS = [
             "properties": {
                 "paths": {
                     "type": "array",
-                    "description": "Local file paths to attach. Each resolved path must be a regular file inside the calling session's worktree. At most 10 files, 10 MiB each, and 25 MiB for the multipart request.",
+                    "description": "File paths on the session's host to attach. Each resolved path must be a regular file inside the calling session's worktree. At most 10 files, 10 MiB each, and 25 MiB for the multipart request.",
                     "items": {"type": "string"},
                     "minItems": 1,
                     "maxItems": 10

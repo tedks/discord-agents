@@ -68,6 +68,7 @@ type t = {
   mutable refreshing : bool;
   host_diagnostics_gate : Host_diagnostics.gate;
   host_project_service : Host_project_service.t;
+  remote_attachment_busy : bool ref;
   mutable output_lines : int;
   mutable policy_sync_clear_last_warning : (string * string) option;
   mutable last_top_level_disk_refresh_at : float;
@@ -3520,6 +3521,7 @@ let create ~sw ~(env : Eio_unix.Stdenv.base) config =
                refreshing = false;
                host_diagnostics_gate = Host_diagnostics.create_gate ();
                host_project_service = Host_project_service.create (Host_project_inventory.filename ());
+               remote_attachment_busy = ref false;
                output_lines = Agent_process.default_output_lines;
                policy_sync_clear_last_warning = None;
                last_top_level_disk_refresh_at = 0.0;
