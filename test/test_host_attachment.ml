@@ -59,9 +59,11 @@ let replace_once ~old ~replacement text =
 let test_mutating_paths () =
   let root = Filename.temp_dir "attachment-race" "" |> Unix.realpath in
   let moved = root ^ ".moved" in
+  let sibling = root ^ ".sibling" in
   Fun.protect ~finally:(fun () ->
     if Sys.file_exists root then remove root;
-    if Sys.file_exists moved then remove moved) (fun () ->
+    if Sys.file_exists moved then remove moved;
+    if Sys.file_exists sibling then remove sibling) (fun () ->
     write (Filename.concat root "file.txt") "stable";
     Unix.symlink "file.txt" (Filename.concat root "link.txt");
     Eio_main.run (fun env ->
@@ -78,9 +80,17 @@ let test_mutating_paths () =
       let changed_path = replace_once ~old:open_marker
         ~replacement:("            os.unlink(requested)\n            os.symlink('/etc/passwd', requested)\n" ^ open_marker) A.script in
       check "path replacement refused" (Result.is_error (run ~path:"link.txt" changed_path));
-      let anchor_marker = "            check_dirs(anchors)\n" in
+      let anchor_marker = "            check_dirs(anchors, ancestors=True)\n" in
+      let sibling_change = replace_once ~old:anchor_marker
+        ~replacement:("            os.mkdir(roots + '.sibling')\n" ^ anchor_marker) A.script in
+      check "unrelated ancestor entry permitted" (Result.is_ok (run sibling_change));
+      Unix.rmdir sibling;
       let changed_root = replace_once ~old:anchor_marker
-        ~replacement:("            os.rename(root, root + '.moved')\n            os.mkdir(root)\n" ^ anchor_marker) A.script in
+        ~replacement:("            os.rename(roots, roots + '.moved')\n            os.mkdir(roots)\n            os.link(os.path.join(roots + '.moved', 'file.txt'), os.path.join(roots, 'file.txt'))\n" ^ anchor_marker) A.script in
+      let no_anchor_check = Str.global_replace
+        (Str.regexp_string "check_dirs(anchors, ancestors=True)") "pass" changed_root in
+      check "fixture reaches root check" (Result.is_ok (run no_anchor_check));
+      remove root; Unix.rename moved root;
       check "root replacement refused" (Result.is_error (run changed_root))))
 
 let running pid =
