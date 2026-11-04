@@ -11,6 +11,9 @@ let timeout_s = 30
 
 let valid_text s = s <> "" && String.length s <= max_path &&
   not (String.contains s '\000') && Resource.sanitize_utf8 s = s
+let valid_attachment_path s = valid_text s &&
+  not (String.ends_with ~suffix:"/" s) &&
+  not (List.mem (Filename.basename s) ["."; ".."])
 
 let script = {python|
 import hashlib, json, os, stat, sys
@@ -107,6 +110,8 @@ try:
         files = []
         total = 0
         for original in paths:
+            if original.endswith(os.sep) or os.path.basename(original) in ('.', '..'):
+                raise ValueError('invalid path ending')
             requested = original if os.path.isabs(original) else os.path.join(workdir, original)
             canonical = os.path.realpath(requested, strict=True)
             if os.path.commonpath((roots, canonical)) != roots or canonical == roots:
@@ -121,7 +126,7 @@ try:
     finally:
         for fd, _, _ in reversed(anchors):
             os.close(fd)
-    manifest = dict(version=1, files=[dict(name=name, size=len(data), md5=hashlib.md5(data).hexdigest()) for name, data in files])
+    manifest = dict(version=1, files=[dict(name=name, size=len(data), md5=hashlib.md5(data, usedforsecurity=False).hexdigest()) for name, data in files])
     header = json.dumps(manifest, ensure_ascii=True, separators=(',', ':')).encode('ascii')
     if len(header) > 8192:
         raise ValueError('manifest limit')
@@ -146,7 +151,9 @@ let decode ~paths text =
   try
     let n = String.length text in
     if n < 8 || n > max_output_bytes then raise Malformed;
-    let header_len = int_of_string ("0x" ^ String.sub text 0 8) in
+    let prefix = String.sub text 0 8 in
+    if not (String.for_all (function '0'..'9' | 'a'..'f' -> true | _ -> false) prefix) then raise Malformed;
+    let header_len = int_of_string ("0x" ^ prefix) in
     if header_len < 1 || header_len > max_manifest || 8 + header_len > n then raise Malformed;
     let top = fields ["version"; "files"]
       (Yojson.Safe.from_string (String.sub text 8 header_len)) in
@@ -175,7 +182,7 @@ let load ~clock ?ssh ~host ~working_dir paths =
   let error message = Error (Printf.sprintf "attachment read on %s: %s" host.Host.name message) in
   if not (valid_text working_dir && String.starts_with ~prefix:"/" working_dir) then error "invalid worktree"
   else if paths = [] || List.length paths > Discord_rest.max_attachment_count ||
-          not (List.for_all valid_text paths) ||
+          not (List.for_all valid_attachment_path paths) ||
           List.fold_left (fun n s -> n + String.length s) (String.length working_dir) paths > max_args then
     error "invalid attachment paths"
   else
