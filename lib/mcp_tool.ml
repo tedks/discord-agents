@@ -211,7 +211,7 @@ let all_specs = [
     ~control_method:Control_api.Send_attachments_id
     ~input_schema:(object_schema ~required:["paths"] [
       ("paths", property ~type_:(`String "array")
-        ~description:"Local file paths to attach. Each resolved path must be a regular file inside the calling session's worktree. At most 10 files, 10 MiB each, and 25 MiB for the multipart request."
+        ~description:"File paths on the session's host to attach. Each resolved path must be a regular file inside the calling session's worktree. At most 10 files, 10 MiB each, and 25 MiB for the multipart request."
         ~items:(property ~type_:string_type ())
         ~min_items:1 ~max_items:10 ());
       ("message", property ~type_:string_type

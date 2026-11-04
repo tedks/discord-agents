@@ -1523,7 +1523,7 @@ let handle_send_message (bot : Bot.t) params =
   | Bot.Inter_agent_message_rejected err ->
     error_response err
 
-let handle_send_attachments (bot : Bot.t) params =
+let handle_send_attachments ?ssh (bot : Bot.t) params =
   let open Yojson.Safe.Util in
   let params = match params with Some params -> params | None ->
     failwith "missing params" in
@@ -1563,22 +1563,31 @@ let handle_send_attachments (bot : Bot.t) params =
       | None ->
         error_response
           "The calling Discord session is no longer active; retry from an active thread."
+      | Some session when session.stop_requested ->
+        error_response "The calling Discord session is stopping."
       | Some session ->
-        (* The MCP server runs on the writer even when the caller is remote.
-           The same absolute cwd can exist on both hosts with different files.
-           Until uploads read from the executor, reject before any local I/O. *)
+        (* The callback runs on the writer; resolve ownership before file I/O. *)
         match Bot.session_target bot session with
         | Error error -> error_response error
-        | Ok (Agent_process.Remote { host; _ }) ->
-          error_response (Printf.sprintf
-            "send_attachments is not yet supported for sessions on %s; \
-             files must be read on that host." host)
-        | Ok Agent_process.Local ->
-          match Eio_unix.run_in_systhread (fun () ->
-            load_attachment_uploads ~working_dir:session.working_dir paths
-          ) with
+        | Ok target ->
+          let read () = match target with
+            | Agent_process.Local -> Eio_unix.run_in_systhread (fun () ->
+                load_attachment_uploads ~working_dir:session.working_dir paths)
+            | Remote { host; destination; _ } ->
+              let host = { (Host.local_host host) with transport = Host.Ssh destination } in
+              Host_attachment.load ~clock:(Eio.Stdenv.mono_clock bot.env) ?ssh
+                ~host ~working_dir:session.working_dir paths in
+          let send () = match read () with
           | Error error -> error_response error
           | Ok files ->
+            (* Reads yield. Normal Session_store setters mutate this record;
+               replacing it means a different session generation, even if its
+               Discord thread or transcript id stays the same. *)
+            if session.stop_requested ||
+               not (Option.fold ~none:false ~some:(fun current -> current == session)
+                 (Session_store.find_opt bot.sessions ~thread_id)) then
+              error_response "The calling Discord session changed during the attachment read."
+            else
             match Discord_rest.create_message_with_attachments bot.rest
               ~channel_id:thread_id ~content ~files () with
             | Error error ->
@@ -1596,6 +1605,18 @@ let handle_send_attachments (bot : Bot.t) params =
                   "Sent %d attachment%s to <#%s>."
                   file_count (if file_count = 1 then "" else "s") thread_id));
               ]
+          in
+          match target with
+          | Agent_process.Local -> send ()
+          | Remote _ ->
+            (* A framed response and the multipart body make bounded copies.
+               Admit one remote upload at a time, without an unbounded queue. *)
+            if !(bot.remote_attachment_busy) then
+              error_response "A remote attachment upload is already running. Try again shortly."
+            else begin
+              bot.remote_attachment_busy := true;
+              Fun.protect ~finally:(fun () -> bot.remote_attachment_busy := false) send
+            end
 
 let handle_restart (bot : Bot.t) =
   match Bot.trigger_restart bot ~notify:(fun msg ->

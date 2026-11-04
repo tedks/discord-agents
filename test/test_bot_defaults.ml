@@ -86,6 +86,7 @@ let with_test_bot ?rest_call f =
         refreshing = false;
         host_diagnostics_gate = Discord_agents.Host_diagnostics.create_gate ();
         host_project_service = Discord_agents.Host_project_service.create (Discord_agents.Host_project_inventory.filename ());
+        remote_attachment_busy = ref false;
         output_lines = Discord_agents.Agent_process.default_output_lines;
         policy_sync_clear_last_warning = None;
         last_top_level_disk_refresh_at = 0.0;
@@ -2309,6 +2310,9 @@ let test_attachment_upload_respects_session_host () =
     let file = Filename.concat working_dir "report.txt" in
     Out_channel.with_open_bin file (fun oc ->
       output_string oc "writer-only attachment bytes");
+    let ssh = Filename.concat (Sys.getenv "HOME") "unreachable-ssh" in
+    Out_channel.with_open_text ssh (fun oc -> output_string oc "#!/bin/sh\nexit 255\n");
+    Unix.chmod ssh 0o700;
     let registry = Discord_agents.Host.registry_of_yojson (Yojson.Safe.from_string
       {|{"writer":"test-host","executors":{
         "framework0":{"ssh":"fw0"},
@@ -2322,7 +2326,7 @@ let test_attachment_upload_respects_session_host () =
         Discord_agents.Config.Claude) with host } in
       Discord_agents.Session_store.add bot.Discord_agents.Bot.sessions
         ~thread_id:"4242" session;
-      Discord_agents.Control_api.handle_send_attachments bot (Some (`Assoc [
+      Discord_agents.Control_api.handle_send_attachments ~ssh bot (Some (`Assoc [
         (Discord_agents.Control_api.caller_thread_id_param, `String "4242");
         ("paths", `List [`String path]);
       ])) in
@@ -2333,10 +2337,10 @@ let test_attachment_upload_respects_session_host () =
       Alcotest.(check bool) (host ^ ": " ^ error) true
         (Discord_agents.Resource.contains_substring ~haystack:error ~needle:fragment);
       Alcotest.(check int) "no Discord upload" 0 (List.length !uploaded) in
-    reject configured "framework0" "report.txt" "sessions on framework0";
-    reject configured "FRAMEWORK0" file "sessions on framework0";
+    reject configured "framework0" "report.txt" "executor unreachable";
+    reject configured "FRAMEWORK0" file "executor unreachable";
     (* An unavailable path still yields the host error, before filesystem I/O. *)
-    reject configured "framework0" "does-not-exist" "sessions on framework0";
+    reject configured "framework0" "does-not-exist" "executor unreachable";
     reject configured "disabled" "report.txt" "disabled in config.json";
     reject configured "unknown" "report.txt" "not a configured host";
     reject configured "ambiguous" "report.txt" "matches several configured hosts";
@@ -2360,6 +2364,135 @@ let test_attachment_upload_respects_session_host () =
       Alcotest.(check bool) "local bytes preserved" true
         (Discord_agents.Resource.contains_substring ~haystack:bytes
           ~needle:"writer-only attachment bytes")) !uploaded)
+
+let test_executor_attachment_upload () =
+  let uploaded = ref [] in
+  let rest_call ~headers:_ ?body meth uri =
+    Alcotest.(check string) "POST" "POST" (Http.Method.to_string meth);
+    let bytes = Option.get body |> Discord_agents.Discord_rest.read_body in
+    uploaded := bytes :: !uploaded;
+    response 200 (posted_message_json ~id:"upload-remote"
+      ~channel_id:(channel_id_of_create_message_path (Uri.path uri)) ~content:"") in
+  with_test_bot ~rest_call (fun bot ->
+    let base = Sys.getenv "HOME" in
+    let writer = Filename.concat base "writer" and remote = Filename.concat base "executor" in
+    let shim_dir = Filename.concat base "bin" in
+    List.iter (fun p -> Unix.mkdir p 0o700) [writer; remote; shim_dir];
+    let write p s = Out_channel.with_open_bin p (fun oc -> output_string oc s) in
+    write (Filename.concat writer "report.bin") "WRITER-DECOY-MUST-NOT-UPLOAD";
+    let remote_bytes = "EXECUTOR\000\255\r\nbytes" in
+    write (Filename.concat remote "report.bin") remote_bytes;
+    let mode = Filename.concat base "mode" and started = Filename.concat base "started"
+    and release = Filename.concat base "release" and finished = Filename.concat base "finished" in
+    write mode "normal";
+    let python = Option.get (Discord_agents.Resource.executable_in_path "python3") in
+    let json s = Yojson.Safe.to_string (`String s) in
+    (* A virtual executor maps the same absolute request into its own tree.
+       Only the executor interpreter does the mapping; writer decoys stay put.
+       The real capture, bootstrap, reader, framing and HTTP handler all run. *)
+    let shim = Filename.concat shim_dir "python3" in
+    write shim (Printf.sprintf {python|#!%s
+import os, sys, time, subprocess
+args = sys.argv[1:]
+writer, remote, mode, started, release, finished, python = %s, %s, %s, %s, %s, %s, %s
+if args[:2] != ['-I', '-c']:
+    sys.exit(90)
+state = open(mode).read()
+if state == 'malformed':
+    print('PRIVATE-TRANSPORT-TEXT')
+    sys.exit(0)
+if state == 'wait':
+    open(started, 'w').close()
+    while not os.path.exists(release):
+        time.sleep(0.01)
+args[3:] = [remote + p[len(writer):] if p == writer or p.startswith(writer + '/') else p for p in args[3:]]
+code = subprocess.call([python] + args)
+if state == 'wait':
+    open(finished, 'w').close()
+sys.exit(code)
+|python} python (json writer) (json remote) (json mode) (json started) (json release) (json finished) (json python));
+    Unix.chmod shim 0o700;
+    let ssh = Filename.concat base "ssh" in
+    write ssh (Printf.sprintf "#!/bin/sh\nexport PATH=%s:\"$PATH\"\nexec %s -I %s \"$@\"\n"
+      (Filename.quote shim_dir) (Filename.quote python)
+      (Filename.quote (Filename.concat (Sys.getcwd ()) "fake_ssh.py")));
+    Unix.chmod ssh 0o700;
+    let registry = Discord_agents.Host.registry_of_yojson (Yojson.Safe.from_string
+      {|{"writer":"test-host","executors":{"executor":{"ssh":"executor"}}}|}) in
+    let bot = { bot with Discord_agents.Bot.config = { bot.config with hosts = Some registry } } in
+    let install () =
+      let s = { (make_session ~working_dir:writer ~thread_id:"4242" Discord_agents.Config.Agy)
+        with host = "executor" } in
+      Discord_agents.Session_store.add bot.sessions ~thread_id:"4242" s; s in
+    let invoke paths = Discord_agents.Control_api.handle_send_attachments ~ssh bot
+      (Some (`Assoc [Discord_agents.Control_api.caller_thread_id_param, `String "4242";
+                    "paths", `List (List.map (fun p -> `String p) paths)])) in
+    let success r = Alcotest.(check bool) "successful upload" true
+      Yojson.Safe.Util.(r |> member "ok" |> to_bool) in
+    let refused fragment r =
+      let error = Yojson.Safe.Util.(r |> member "error" |> to_string) in
+      Alcotest.(check bool) error true
+        (Discord_agents.Resource.contains_substring ~haystack:error ~needle:fragment);
+      Alcotest.(check bool) "private diagnostics discarded" false
+        (Discord_agents.Resource.contains_substring ~haystack:error ~needle:"PRIVATE-TRANSPORT-TEXT") in
+    ignore (install ());
+    success (invoke [Filename.concat writer "report.bin"]);
+    success (invoke ["report.bin"]);
+    List.iter (fun bytes ->
+      Alcotest.(check bool) "executor bytes uploaded" true
+        (Discord_agents.Resource.contains_substring ~haystack:bytes ~needle:remote_bytes);
+      Alcotest.(check bool) "writer decoy absent" false
+        (Discord_agents.Resource.contains_substring ~haystack:bytes ~needle:"WRITER-DECOY")) !uploaded;
+    refused "executor read failed" (invoke ["report.bin"; "missing"]);
+    write mode "malformed";
+    refused "malformed attachment response" (invoke ["report.bin"]);
+    Alcotest.(check int) "failed batches never upload" 2 (List.length !uploaded);
+    let clock = Eio.Stdenv.mono_clock bot.env in
+    let await_file path = Eio.Time.Timeout.run_exn (Eio.Time.Timeout.seconds clock 5.) (fun () ->
+      while not (Sys.file_exists path) do Eio.Time.Mono.sleep clock 0.01 done) in
+    let await_started () = await_file started in
+    let session = install () in
+    write mode "wait";
+    let updated_result = ref None in
+    Eio.Fiber.both
+      (fun () -> updated_result := Some (invoke ["report.bin"]))
+      (fun () -> await_started ();
+        Discord_agents.Session_store.set_session_id bot.sessions session
+          ~session_id:"executor-confirmed-id";
+        Discord_agents.Session_store.increment_message_count bot.sessions session;
+        write release "go");
+    success (Option.get !updated_result);
+    Alcotest.(check bool) "normal updates preserve live session identity" true
+      (Option.get (Discord_agents.Session_store.find_opt bot.sessions ~thread_id:"4242") == session);
+    Unix.unlink started; Unix.unlink release; Unix.unlink finished;
+    List.iter (fun change ->
+      let session = install () in
+      write mode "wait";
+      let result = ref None in
+      Eio.Fiber.both
+        (fun () -> result := Some (invoke ["report.bin"]))
+        (fun () -> await_started ();
+          refused "already running" (invoke ["report.bin"]);
+          change session;
+          write release "go");
+      refused "session changed" (Option.get !result);
+      Alcotest.(check bool) "slot released after refusal" false !(bot.remote_attachment_busy);
+      Unix.unlink started; Unix.unlink release; Unix.unlink finished
+    ) [(fun s -> s.Discord_agents.Session_store.stop_requested <- true);
+       (fun _ -> ignore (install ()))];
+    ignore (install ());
+    write mode "wait";
+    (try Eio.Fiber.both
+       (fun () -> ignore (invoke ["report.bin"]))
+       (fun () -> await_started (); raise Exit)
+     with Exit -> ());
+    Alcotest.(check bool) "slot released after cancellation" false !(bot.remote_attachment_busy);
+    (* Release the fake executor relay after transport cancellation too. *)
+    write release "go";
+    await_file finished;
+    write mode "normal";
+    success (invoke ["report.bin"]);
+    Alcotest.(check int) "only complete current-session batches upload" 4 (List.length !uploaded))
 
 let test_login_guidance_uses_session_executor () =
   let rest_call ~headers:_ ?body:_ _ _ =
@@ -2501,6 +2634,8 @@ let () =
       Alcotest.test_case "session target" `Quick test_session_target;
       Alcotest.test_case "attachments respect session host" `Quick
         test_attachment_upload_respects_session_host;
+      Alcotest.test_case "executor attachments and transfer lifetime" `Quick
+        test_executor_attachment_upload;
       Alcotest.test_case "login guidance uses session executor" `Quick
         test_login_guidance_uses_session_executor;
     ]);
