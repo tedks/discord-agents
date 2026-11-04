@@ -20,15 +20,38 @@ MAX_TOTAL = 25 * 1024 * 1024
 def stamp(s):
     return (s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
 
-def open_checked(root, path):
+def anchored_root(root):
+    # Walk every component from a pinned filesystem root. O_NOFOLLOW on
+    # the final component alone would not protect mutable ancestors.
+    current = '/'
+    fd = os.open(current, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    anchors = [(fd, current, stamp(os.fstat(fd)))]
+    try:
+        for part in root.split(os.sep)[1:]:
+            if not part:
+                continue
+            current = os.path.join(current, part)
+            fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            anchors.append((fd, current, stamp(os.fstat(fd))))
+        return anchors
+    except Exception:
+        for fd, _, _ in reversed(anchors):
+            os.close(fd)
+        raise
+
+def check_dirs(dirs):
+    for dirfd, dirname, initial in dirs:
+        if stamp(os.fstat(dirfd)) != initial or stamp(os.stat(dirname, follow_symlinks=False)) != initial:
+            raise ValueError('directory changed')
+
+def open_checked(anchors, root, path, remaining):
     rel = os.path.relpath(path, root)
     parts = rel.split(os.sep)
     if rel == '.' or any(p in ('', '.', '..') for p in parts):
         raise ValueError('invalid path')
-    base = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    dirs = [(base, root, stamp(os.fstat(base)))]
+    dirs = []
     try:
-        parent = base
+        parent = anchors[-1][0]
         current = root
         for part in parts[:-1]:
             current = os.path.join(current, part)
@@ -38,24 +61,24 @@ def open_checked(root, path):
         fd = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
         try:
             before = os.fstat(fd)
-            if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_FILE:
+            limit = min(MAX_FILE, remaining)
+            if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
                 raise ValueError('not a bounded regular file')
             chunks = []
-            remaining = MAX_FILE + 1
-            while remaining:
-                chunk = os.read(fd, min(65536, remaining))
+            left = limit + 1
+            while left:
+                chunk = os.read(fd, min(65536, left))
                 if not chunk:
                     break
                 chunks.append(chunk)
-                remaining -= len(chunk)
+                left -= len(chunk)
             data = b''.join(chunks)
-            if len(data) > MAX_FILE or len(data) != before.st_size:
+            if len(data) > limit or len(data) != before.st_size:
                 raise ValueError('file size changed')
             if stamp(before) != stamp(os.fstat(fd)) or stamp(before) != stamp(os.stat(path, follow_symlinks=False)):
                 raise ValueError('file changed')
-            for dirfd, dirname, initial in dirs:
-                if stamp(os.fstat(dirfd)) != initial or stamp(os.stat(dirname, follow_symlinks=False)) != initial:
-                    raise ValueError('directory changed')
+            check_dirs(anchors)
+            check_dirs(dirs)
             return data
         finally:
             os.close(fd)
@@ -71,20 +94,25 @@ try:
     paths = sys.argv[2:]
     if not 1 <= len(paths) <= 10:
         raise ValueError('invalid count')
-    files = []
-    total = 0
-    for original in paths:
-        requested = original if os.path.isabs(original) else os.path.join(workdir, original)
-        canonical = os.path.realpath(requested, strict=True)
-        if os.path.commonpath((roots, canonical)) != roots or canonical == roots:
-            raise ValueError('outside worktree')
-        data = open_checked(roots, canonical)
-        if os.path.realpath(requested, strict=True) != canonical or os.path.realpath(workdir, strict=True) != roots:
-            raise ValueError('path changed')
-        total += len(data)
-        if total > MAX_TOTAL:
-            raise ValueError('batch limit')
-        files.append((os.path.basename(original), data))
+    anchors = anchored_root(roots)
+    try:
+        files = []
+        total = 0
+        for original in paths:
+            requested = original if os.path.isabs(original) else os.path.join(workdir, original)
+            canonical = os.path.realpath(requested, strict=True)
+            if os.path.commonpath((roots, canonical)) != roots or canonical == roots:
+                raise ValueError('outside worktree')
+            data = open_checked(anchors, roots, canonical, MAX_TOTAL - total)
+            if os.path.realpath(requested, strict=True) != canonical or os.path.realpath(workdir, strict=True) != roots:
+                raise ValueError('path changed')
+            check_dirs(anchors)
+            total += len(data)
+            files.append((os.path.basename(original), data))
+        check_dirs(anchors)
+    finally:
+        for fd, _, _ in reversed(anchors):
+            os.close(fd)
     manifest = dict(version=1, files=[dict(name=name, size=len(data), md5=hashlib.md5(data).hexdigest()) for name, data in files])
     header = json.dumps(manifest, ensure_ascii=True, separators=(',', ':')).encode('ascii')
     if len(header) > 8192:
