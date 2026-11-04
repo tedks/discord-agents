@@ -43,6 +43,10 @@ let test_real () =
         check "too many" (Result.is_error (load (List.init 11 (fun _ -> "big.bin"))));
         check "overlong" (Result.is_error (load [String.make 4097 'a']));
         check "invalid UTF8" (Result.is_error (load ["\255"]));
+        List.iter (fun path ->
+          check "invalid terminal path component" (not (A.valid_attachment_path path));
+          check "odd path refused" (Result.is_error (load [path])))
+          ["big.bin/"; "big.bin/."; "big.bin/.."; "."; ".."; "sub/link.bin/."];
         check "over file limit" (let path=Filename.concat dir "large" in
           let oc=open_out_bin path in seek_out oc (10*1024*1024+1); output_char oc 'x'; close_out oc;
           Result.is_error (load ["large"]));
@@ -72,6 +76,8 @@ let test_mutating_paths () =
         ~max_output_bytes:4096 ~cwd:"/" writer
         ["python3"; "-I"; "-c"; script; root; path] in
       check "original script positive control" (Result.is_ok (run A.script));
+      List.iter (fun path -> check "script refuses odd ending" (Result.is_error (run ~path A.script)))
+        ["file.txt/"; "file.txt/."; "file.txt/.."];
       let marker = "            data = b''.join(chunks)\n" in
       let changed_file = replace_once ~old:marker
         ~replacement:(marker ^ "            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1000000000))\n") A.script in
@@ -154,8 +160,10 @@ let test_decoder () =
   let manifest = {|{"version":1,"files":[{"name":"a.txt","size":3,"md5":"900150983cd24fb0d6963f7d28e17f72"}]}|} in
   let frame = Printf.sprintf "%08x%sabc" (String.length manifest) manifest in
   check "valid frame" (Result.is_ok (A.decode ~paths:["a.txt"] frame));
+  let upper = String.sub frame 0 7 ^ "A" ^ String.sub frame 8 (String.length frame - 8) in
+  let underscore = String.sub frame 0 5 ^ "_" ^ String.sub frame 6 (String.length frame - 6) in
   List.iter (fun frame -> check "bad frame" (Result.is_error (A.decode ~paths:["a.txt"] frame)))
-    ["noise" ^ frame; frame ^ "x"; String.sub frame 0 (String.length frame-1);
+    [upper; underscore; "noise" ^ frame; frame ^ "x"; String.sub frame 0 (String.length frame-1);
      Printf.sprintf "%08x%sabd" (String.length manifest) manifest;
      "ffffffff" ^ manifest ^ "abc"]
 let () = Alcotest.run "host attachment" ["reader", [
