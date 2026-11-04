@@ -20,6 +20,9 @@ MAX_TOTAL = 25 * 1024 * 1024
 def stamp(s):
     return (s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
 
+def identity(s):
+    return (s.st_dev, s.st_ino, s.st_mode)
+
 def anchored_root(root):
     # Walk every component from a pinned filesystem root. O_NOFOLLOW on
     # the final component alone would not protect mutable ancestors.
@@ -39,9 +42,14 @@ def anchored_root(root):
             os.close(fd)
         raise
 
-def check_dirs(dirs):
-    for dirfd, dirname, initial in dirs:
-        if stamp(os.fstat(dirfd)) != initial or stamp(os.stat(dirname, follow_symlinks=False)) != initial:
+def check_dirs(dirs, ancestors=False):
+    for index, (dirfd, dirname, initial) in enumerate(dirs):
+        # A sibling created under / or /tmp must not invalidate this read.
+        # Pin the identity of all ancestors, and full metadata at the
+        # worktree/subdirectory boundary where a changed entry matters.
+        fingerprint = identity if ancestors and index < len(dirs) - 1 else stamp
+        expected = initial[:3] if fingerprint is identity else initial
+        if fingerprint(os.fstat(dirfd)) != expected or fingerprint(os.stat(dirname, follow_symlinks=False)) != expected:
             raise ValueError('directory changed')
 
 def open_checked(anchors, root, path, remaining):
@@ -77,7 +85,7 @@ def open_checked(anchors, root, path, remaining):
                 raise ValueError('file size changed')
             if stamp(before) != stamp(os.fstat(fd)) or stamp(before) != stamp(os.stat(path, follow_symlinks=False)):
                 raise ValueError('file changed')
-            check_dirs(anchors)
+            check_dirs(anchors, ancestors=True)
             check_dirs(dirs)
             return data
         finally:
@@ -106,10 +114,10 @@ try:
             data = open_checked(anchors, roots, canonical, MAX_TOTAL - total)
             if os.path.realpath(requested, strict=True) != canonical or os.path.realpath(workdir, strict=True) != roots:
                 raise ValueError('path changed')
-            check_dirs(anchors)
+            check_dirs(anchors, ancestors=True)
             total += len(data)
             files.append((os.path.basename(original), data))
-        check_dirs(anchors)
+        check_dirs(anchors, ancestors=True)
     finally:
         for fd, _, _ in reversed(anchors):
             os.close(fd)
