@@ -1,5 +1,12 @@
 # Multi-host sessions: one Discord writer, remote executors over SSH
 
+Attachment prerequisite (2026-11-03): `Host_capture` shares the existing
+bounded local/SSH supervision and framing, with a caller-selected output cap
+up to 32 MiB. `Host_probe` retains its 1 MiB ceiling. Both require a deadline
+and reject overflow rather than accepting truncated output. Executor file
+validation and attachment upload wiring remain issue 145; this extraction
+does not enable remote uploads.
+
 Inventory implementation (2026-10-25), tracked in
 [167](https://github.com/tedks/discord-agents/issues/167): `Host_project_scan`
 adds bounded, read-only local/SSH discovery with a strict versioned decoder.

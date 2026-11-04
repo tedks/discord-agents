@@ -6,6 +6,7 @@ module Host = Host
 module Remote_script = Remote_script
 module Host_exec = Host_exec
 module Probe_process = Probe_process
+module Host_capture = Host_capture
 module Host_probe = Host_probe
 module Host_capability = Host_capability
 module Host_callback = Host_callback

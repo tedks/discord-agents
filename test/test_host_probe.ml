@@ -271,9 +271,31 @@ let test_auto_reaping_refused () =
         (match Process.run ~clock ~timeout_s:1. ~max_output_bytes:10 ["true"] with
          | Error (Process.Setup_failed _) -> true | _ -> false)))
 
+let test_large_capture () =
+  with_dir (fun dir -> with_clock (fun clock ->
+    let ssh = fake_ssh dir in
+    let bytes = 2 * 1024 * 1024 in
+    let argv = ["head"; "-c"; string_of_int bytes; "/dev/zero"] in
+    List.iter (fun host ->
+      ok (String.make bytes '\000')
+        (Discord_agents.Host_capture.run ~clock ~ssh ~timeout_s:10
+           ~max_output_bytes:bytes host argv);
+      Alcotest.(check bool) "larger captures still reject overflow" true
+        (Discord_agents.Host_capture.run ~clock ~ssh ~timeout_s:10
+           ~max_output_bytes:(bytes - 1) host argv = Error (Probe.Process Output_limit_exceeded));
+      Alcotest.(check bool) "probe budget stays at 1 MiB" true
+        (match Probe.run ~clock ~ssh ~timeout_s:10 ~max_output_bytes:bytes host argv with
+         | Error (Process (Setup_failed _)) -> true | _ -> false);
+      Alcotest.(check bool) "absolute capture ceiling enforced" true
+        (match Discord_agents.Host_capture.run ~clock ~ssh ~timeout_s:10
+           ~max_output_bytes:(32 * 1024 * 1024 + 1) host ["true"] with
+         | Error (Process (Setup_failed _)) -> true | _ -> false)
+    ) [local; remote]))
+
 let () = Alcotest.run "host_probe" [
   "transport", [
     Alcotest.test_case "exact bytes local and ssh" `Quick test_roundtrip;
+    Alcotest.test_case "larger capture preserves probe ceiling" `Quick test_large_capture;
     Alcotest.test_case "refusals and failure stages" `Quick test_refusals;
     Alcotest.test_case "time and memory limits" `Quick test_limits;
     Alcotest.test_case "executor cleans up after success and disconnect" `Quick test_remote_supervision;
