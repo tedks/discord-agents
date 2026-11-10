@@ -12,6 +12,7 @@ configure_make(
     configure_options = [
         "--with-relative-libdir",
         "--disable-native-compiler",
+        "--without-zstd",
         "--disable-warn-error",
     ],
     lib_source = "@ocaml_source//:sources",
