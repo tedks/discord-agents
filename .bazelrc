@@ -1,3 +1,6 @@
 common --enable_bzlmod
 build --incompatible_strict_action_env
+# The pinned GCC toolchain drives rules_cc_autoconf's C++ exec probes through
+# gcc, so supply libstdc++ when those probe binaries are linked.
+build --host_linkopt=-lstdc++
 test --test_output=errors
