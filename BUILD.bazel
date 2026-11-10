@@ -11,6 +11,7 @@ configure_make(
     configure_in_place = True,
     configure_options = [
         "--with-relative-libdir",
+        "--disable-native-compiler",
         "--disable-warn-error",
     ],
     lib_source = "@ocaml_source//:sources",
@@ -20,7 +21,7 @@ configure_make(
     ],
     out_data_dirs = ["lib/ocaml"],
     targets = [
-        "world.opt",
+        "world",
         "install",
     ],
     visibility = [
