@@ -1,0 +1,9 @@
+load("//bazel:ocaml_rules.bzl", "ocaml_library")
+
+ocaml_library(
+    name = "project",
+    src = "project.ml",
+    stdlib_libraries = ["unix"],
+    visibility = ["//test:__pkg__"],
+    deps = ["//third_party:logs"],
+)

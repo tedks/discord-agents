@@ -1,0 +1,37 @@
+module(
+    name = "discord_agents",
+    version = "0.1.0",
+)
+
+# GCC and the configure/make tools are fetched at pinned BCR versions. The
+# compiler itself is built from the official, checksum-pinned source release.
+bazel_dep(name = "gcc_toolchain", version = "0.11.0")
+bazel_dep(name = "rules_foreign_cc", version = "0.17.0")
+
+gcc_toolchains = use_extension("@gcc_toolchain//toolchain:module_extensions.bzl", "gcc_toolchains")
+gcc_toolchains.toolchain(
+    name = "gcc_toolchain_x86_64",
+    target_arch = "x86_64",
+)
+use_repo(gcc_toolchains, "gcc_toolchain_x86_64")
+
+register_toolchains("@gcc_toolchain_x86_64//:cc_toolchain")
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "ocaml_source",
+    build_file_content = 'filegroup(name = "sources", srcs = glob(["**"], exclude = ["BUILD", "BUILD.bazel"]), visibility = ["//visibility:public"])',
+    sha256 = "bb3ffef5e4fce4f04915b9f254f570663311e1f227fd669aa87a5ef7de9a1523",
+    strip_prefix = "ocaml-5.5.2",
+    urls = ["https://github.com/ocaml/ocaml/releases/download/5.5.2/ocaml-5.5.2.tar.gz"],
+)
+
+# The core Logs module used by Project has no runtime package dependencies.
+http_archive(
+    name = "logs_source",
+    build_file_content = 'exports_files(["src/logs.ml"])',
+    sha256 = "ee97065ba41ce28f19dea9453c6bec4e0ef26165ad7394c4131ea0c65c0f06d5",
+    strip_prefix = "logs-0.9.0",
+    urls = ["https://erratique.ch/software/logs/releases/logs-0.9.0.tbz"],
+)
