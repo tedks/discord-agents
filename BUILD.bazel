@@ -6,6 +6,9 @@ package(default_visibility = ["//visibility:private"])
 # and standard library can travel together to a remote action sandbox.
 configure_make(
     name = "ocaml_compiler",
+    # OCaml's release archive carries its root Makefile; configure only
+    # generates Makefile.build_config, so make must run in that source tree.
+    configure_in_place = True,
     configure_options = [
         "--with-relative-libdir",
         "--disable-warn-error",
