@@ -1,4 +1,5 @@
 common --enable_bzlmod
+common --lockfile_mode=error
 build --incompatible_strict_action_env
 # The pinned GCC toolchain drives rules_cc_autoconf's C++ exec probes through
 # gcc, so supply libstdc++ when those probe binaries are linked.

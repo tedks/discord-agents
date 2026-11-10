@@ -71,7 +71,26 @@ ocaml_library = rule(
 def _ocaml_test_impl(ctx):
     tool = _compiler_files(ctx)
     deps = _dependency_inputs(ctx.attr.deps)
+    obj = ctx.actions.declare_file(ctx.label.name + ".cmo")
+    interface = ctx.actions.declare_file(ctx.label.name + ".cmi")
     bytecode = ctx.actions.declare_file(ctx.label.name + ".byte")
+    compile_args = ctx.actions.args()
+    compile_args.add("-I", tool.libdir.path)
+    for library in deps.stdlib_libraries + ctx.attr.stdlib_libraries:
+        compile_args.add("-I", "+" + library)
+    for directory in deps.includes:
+        compile_args.add("-I", directory)
+    compile_args.add("-c", ctx.file.src.path)
+    compile_args.add("-o", obj.path)
+    ctx.actions.run(
+        executable = tool.runtime,
+        arguments = [tool.compiler.path, compile_args],
+        inputs = [ctx.file.src] + deps.interfaces,
+        tools = tool.files,
+        outputs = [obj, interface],
+        env = {"OCAMLLIB": tool.libdir.path},
+        mnemonic = "OcamlCompileTest",
+    )
     args = ctx.actions.args()
     args.add("-I", tool.libdir.path)
     for library in deps.stdlib_libraries + ctx.attr.stdlib_libraries:
@@ -82,11 +101,11 @@ def _ocaml_test_impl(ctx):
     for library in deps.stdlib_libraries + ctx.attr.stdlib_libraries:
         args.add(library + ".cma")
     args.add_all([obj.path for obj in deps.objects])
-    args.add(ctx.file.src.path)
+    args.add(obj.path)
     ctx.actions.run(
         executable = tool.runtime,
         arguments = [tool.compiler.path, args],
-        inputs = [ctx.file.src] + deps.objects + deps.interfaces,
+        inputs = [obj] + deps.objects + deps.interfaces,
         tools = tool.files,
         outputs = [bytecode],
         env = {"OCAMLLIB": tool.libdir.path},

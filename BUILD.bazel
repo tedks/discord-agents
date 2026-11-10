@@ -2,8 +2,8 @@ load("@rules_foreign_cc//foreign_cc:configure.bzl", "configure_make")
 
 package(default_visibility = ["//visibility:private"])
 
-# OCaml 5.5 supports a relative library directory, so the installed compiler
-# and standard library can travel together to a remote action sandbox.
+# OCaml 5.5's relative library directory lets the installed compiler and
+# standard library remain together; remote action portability is still open.
 configure_make(
     name = "ocaml_compiler",
     # OCaml's release archive carries its root Makefile; configure only
