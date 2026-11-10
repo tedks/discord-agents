@@ -39,8 +39,9 @@ def _ocaml_library_impl(ctx):
     args.add("-c", ctx.file.src.path)
     args.add("-o", obj.path)
     ctx.actions.run(
-        executable = tool.compiler,
-        arguments = [args],
+        # Installed ocamlc is bytecode with a staging-path shell prefix.
+        executable = tool.runtime,
+        arguments = [tool.compiler.path, args],
         inputs = [ctx.file.src] + deps.objects + deps.interfaces,
         tools = tool.files,
         outputs = [obj, interface],
@@ -83,8 +84,8 @@ def _ocaml_test_impl(ctx):
     args.add_all([obj.path for obj in deps.objects])
     args.add(ctx.file.src.path)
     ctx.actions.run(
-        executable = tool.compiler,
-        arguments = [args],
+        executable = tool.runtime,
+        arguments = [tool.compiler.path, args],
         inputs = [ctx.file.src] + deps.objects + deps.interfaces,
         tools = tool.files,
         outputs = [bytecode],
