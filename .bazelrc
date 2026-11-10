@@ -1,6 +1,8 @@
 common --enable_bzlmod
 common --lockfile_mode=error
 build --incompatible_strict_action_env
+# Keep Bazel convenience links out of the Dune worktree.
+build --symlink_prefix=/
 # The pinned GCC toolchain drives rules_cc_autoconf's C++ exec probes through
 # gcc, so supply libstdc++ when those probe binaries are linked.
 build --host_linkopt=-lstdc++
