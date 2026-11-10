@@ -1,7 +1,0 @@
-load("//bazel:ocaml_rules.bzl", "ocaml_test")
-
-ocaml_test(
-    name = "project_parser_bazel_test",
-    src = "project_parser_bazel_test.ml",
-    deps = ["//lib:project"],
-)

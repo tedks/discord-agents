@@ -30,21 +30,44 @@ def _ocaml_library_impl(ctx):
     stem = ctx.file.src.basename[:-3]
     obj = ctx.actions.declare_file(stem + ".cmo")
     interface = ctx.actions.declare_file(stem + ".cmi")
+    if ctx.file.intf:
+        intf_args = ctx.actions.args()
+        intf_args.add("-I", tool.libdir.path)
+        for directory in deps.includes:
+            intf_args.add("-I", directory)
+        intf_args.add("-c", ctx.file.intf.path)
+        intf_args.add("-o", interface.path)
+        ctx.actions.run(
+            executable = tool.runtime,
+            arguments = [tool.compiler.path, intf_args],
+            inputs = [ctx.file.intf] + deps.interfaces,
+            tools = tool.files,
+            outputs = [interface],
+            env = {"OCAMLLIB": tool.libdir.path},
+            mnemonic = "OcamlCompileInterface",
+        )
     args = ctx.actions.args()
     args.add("-I", tool.libdir.path)
+    if ctx.file.intf:
+        args.add("-I", obj.dirname)
     for library in ctx.attr.stdlib_libraries:
         args.add("-I", "+" + library)
     for directory in deps.includes:
         args.add("-I", directory)
     args.add("-c", ctx.file.src.path)
     args.add("-o", obj.path)
+    inputs = [ctx.file.src] + deps.objects + deps.interfaces
+    outputs = [obj, interface]
+    if ctx.file.intf:
+        inputs.extend([ctx.file.intf, interface])
+        outputs = [obj]
     ctx.actions.run(
         # Installed ocamlc is bytecode with a staging-path shell prefix.
         executable = tool.runtime,
         arguments = [tool.compiler.path, args],
-        inputs = [ctx.file.src] + deps.objects + deps.interfaces,
+        inputs = inputs,
         tools = tool.files,
-        outputs = [obj, interface],
+        outputs = outputs,
         env = {"OCAMLLIB": tool.libdir.path},
         mnemonic = "OcamlCompile",
     )
@@ -62,6 +85,7 @@ ocaml_library = rule(
     implementation = _ocaml_library_impl,
     attrs = {
         "src": attr.label(allow_single_file = [".ml"], mandatory = True),
+        "intf": attr.label(allow_single_file = [".mli"]),
         "deps": attr.label_list(providers = [OcamlInfo]),
         "stdlib_libraries": attr.string_list(),
         "compiler": attr.label(default = "//:ocaml_compiler"),

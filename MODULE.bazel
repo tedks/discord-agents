@@ -27,11 +27,11 @@ http_archive(
     urls = ["https://github.com/ocaml/ocaml/releases/download/5.5.2/ocaml-5.5.2.tar.gz"],
 )
 
-# The core Logs module used by Project has no runtime package dependencies.
+# Base64's public module uses only OCaml primitives and the standard library.
 http_archive(
-    name = "logs_source",
-    build_file_content = 'exports_files(["src/logs.ml"])',
-    sha256 = "ee97065ba41ce28f19dea9453c6bec4e0ef26165ad7394c4131ea0c65c0f06d5",
-    strip_prefix = "logs-0.9.0",
-    urls = ["https://erratique.ch/software/logs/releases/logs-0.9.0.tbz"],
+    name = "base64_source",
+    build_file_content = 'exports_files(["src/base64.ml", "src/base64.mli"])',
+    sha256 = "b3f5ce301aa72c7032ef90be2332d72ff3962922c00ee2aec6bcade187a2f59b",
+    strip_prefix = "base64-3.5.2",
+    urls = ["https://github.com/mirage/ocaml-base64/releases/download/v3.5.2/base64-3.5.2.tbz"],
 )

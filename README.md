@@ -1,14 +1,14 @@
 # discord-agents
 
-## Bazel OCaml project parser tracer
+## Bazel OCaml remote-script tracer
 
-`bazel test //test:project_parser_bazel_test` compiles the existing project
-discovery module with OCaml's Unix library and checksum-pinned Logs 0.9.0
-core source. It checks HTTPS/SSH remote equivalence and rejects path traversal
-and malformed names. The Bazel module pins OCaml 5.5.2 source plus its
-GCC/configure-make compiler build. This bounded target does not include the
-Discord bot, Eio/TLS stack, C stubs, or full Alcotest suite. The standalone
-Nix/Dune entry points remain available.
+`bazel test //bazel_test:remote_script_test` compiles the existing pure
+`Remote_script` module with checksum-pinned Base64 3.5.2 source and public
+interface. It checks shell quoting, environment and lock-key validation,
+base64 transport, and nonce-bound protocol markers. The Bazel module pins
+OCaml 5.5.2 source plus its GCC/configure-make compiler build. This bounded
+target does not include the Discord bot, Eio/TLS stack, C stubs, or full
+Alcotest suite. The standalone Nix/Dune entry points remain available.
 
 discord-agents is a Discord server interface for coding agents. Every channel is a project, and every agent session is a thread. Channels are connected to their own management agent sessions that can spawn new threads conversationally. You can drop in your existing projects or resume the sessions that are already on your machine. New sessions automatically get their own worktrees.
 

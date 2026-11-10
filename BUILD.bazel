@@ -27,8 +27,8 @@ configure_make(
     ],
     visibility = [
         "//bazel:__pkg__",
+        "//bazel_test:__pkg__",
         "//lib:__pkg__",
-        "//test:__pkg__",
         "//third_party:__pkg__",
     ],
 )

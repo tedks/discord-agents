@@ -1,7 +1,8 @@
 load("//bazel:ocaml_rules.bzl", "ocaml_library")
 
 ocaml_library(
-    name = "logs",
-    src = "@logs_source//:src/logs.ml",
+    name = "base64",
+    src = "@base64_source//:src/base64.ml",
+    intf = "@base64_source//:src/base64.mli",
     visibility = ["//lib:__pkg__"],
 )
