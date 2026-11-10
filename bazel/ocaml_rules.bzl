@@ -95,7 +95,9 @@ def _ocaml_test_impl(ctx):
     workspace = ctx.workspace_name
     ctx.actions.write(
         launcher,
-        "#!/bin/sh\nset -eu\nroot=${RUNFILES_DIR:-\"$0.runfiles\"}\nexec \"$root/%s/%s\" \"$root/%s/%s\"\n" % (
+        "#!/bin/sh\nset -eu\nroot=${RUNFILES_DIR:-\"$0.runfiles\"}\nstdlib=\"$root/%s/%s\"\nexport OCAMLLIB=\"$stdlib\"\nexport CAML_LD_LIBRARY_PATH=\"$stdlib/stublibs\"\nexec \"$root/%s/%s\" \"$root/%s/%s\"\n" % (
+            workspace,
+            tool.libdir.short_path,
             workspace,
             tool.runtime.short_path,
             workspace,
@@ -105,7 +107,7 @@ def _ocaml_test_impl(ctx):
     )
     return DefaultInfo(
         executable = launcher,
-        runfiles = ctx.runfiles(files = [tool.runtime, bytecode]),
+        runfiles = ctx.runfiles(files = [tool.runtime, tool.libdir, bytecode]),
     )
 
 ocaml_test = rule(
