@@ -1,0 +1,8 @@
+load("//bazel:ocaml_rules.bzl", "ocaml_library")
+
+ocaml_library(
+    name = "remote_script",
+    src = "remote_script.ml",
+    visibility = ["//bazel_test:__pkg__"],
+    deps = ["//third_party:base64"],
+)

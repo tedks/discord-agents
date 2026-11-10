@@ -1,0 +1,7 @@
+load("//bazel:ocaml_rules.bzl", "ocaml_test")
+
+ocaml_test(
+    name = "remote_script_test",
+    src = "remote_script_test.ml",
+    deps = ["//lib:remote_script"],
+)
